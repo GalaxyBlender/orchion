@@ -43,7 +43,7 @@ cargo run -p orchion --features tts-qwen3,download-all,cpu --example tts_preset 
 
 ## 核心库
 
-公开 facade crate 位于 `crates/orchion`，提供用于加载、下载和运行 ASR/TTS 模型的异步 Rust API。领域类型位于 `crates/orchion-core`，FFmpeg 音频转换位于 `crates/orchion-audio`，模型下载位于 `crates/orchion-download`，Qwen3 运行时适配位于 `crates/orchion-qwen3`。
+公开 facade crate 位于 `libs/orchion`，提供用于加载、下载和运行 ASR/TTS 模型的异步 Rust API。领域类型位于 `libs/orchion-core`，FFmpeg 音频转换位于 `libs/orchion-audio`，模型下载位于 `libs/orchion-download`，Qwen3 运行时适配位于 `libs/orchion-qwen3`。
 
 ### Cargo Features
 

@@ -43,7 +43,7 @@ cargo run -p orchion --features tts-qwen3,download-all,cpu --example tts_preset 
 
 ## Core Library
 
-The public facade crate lives at `crates/orchion` and exposes async Rust APIs for loading, downloading, and running ASR/TTS models. Domain types live in `crates/orchion-core`, FFmpeg-backed audio conversion lives in `crates/orchion-audio`, model downloads live in `crates/orchion-download`, and Qwen3 runtime adapters live in `crates/orchion-qwen3`.
+The public facade crate lives at `libs/orchion` and exposes async Rust APIs for loading, downloading, and running ASR/TTS models. Domain types live in `libs/orchion-core`, FFmpeg-backed audio conversion lives in `libs/orchion-audio`, model downloads live in `libs/orchion-download`, and Qwen3 runtime adapters live in `libs/orchion-qwen3`.
 
 ### Cargo Features
 

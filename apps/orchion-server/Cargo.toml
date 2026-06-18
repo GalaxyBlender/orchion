@@ -10,7 +10,7 @@ anyhow = "1"
 axum = { version = "0.8", features = ["json", "multipart"] }
 clap = { version = "4", features = ["derive"] }
 http = "1"
-orchion = { path = "../../crates/orchion", default-features = false, features = ["asr-qwen3", "tts-qwen3", "audio-ffmpeg", "download-all"] }
+orchion = { path = "../../libs/orchion", default-features = false, features = ["asr-qwen3", "tts-qwen3", "audio-ffmpeg", "download-all"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
@@ -24,10 +24,10 @@ utoipa = "5"
 utoipa-swagger-ui = { version = "9", features = ["axum"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-orchion = { path = "../../crates/orchion", default-features = false, features = ["asr-qwen3", "tts-qwen3", "audio-ffmpeg", "download-all", "metal"] }
+orchion = { path = "../../libs/orchion", default-features = false, features = ["asr-qwen3", "tts-qwen3", "audio-ffmpeg", "download-all", "metal"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
-orchion = { path = "../../crates/orchion", default-features = false, features = ["asr-qwen3", "tts-qwen3", "audio-ffmpeg", "download-all", "cuda"] }
+orchion = { path = "../../libs/orchion", default-features = false, features = ["asr-qwen3", "tts-qwen3", "audio-ffmpeg", "download-all", "cuda"] }
 
 [dev-dependencies]
 http-body-util = "0.1"

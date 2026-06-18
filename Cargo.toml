@@ -1,10 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/orchion-core",
-    "crates/orchion-audio",
-    "crates/orchion-download",
-    "crates/orchion-qwen3",
-    "crates/orchion",
+    "libs/orchion-core",
+    "libs/orchion-audio",
+    "libs/orchion-download",
+    "libs/orchion-qwen3",
+    "libs/orchion",
     "apps/orchion-server",
 ]
