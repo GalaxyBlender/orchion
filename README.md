@@ -4,7 +4,7 @@
 
 Orchion is an easy-to-use async Rust library for speech AI workflows such as ASR and TTS. It includes typed Rust APIs, standalone example binaries, and an OpenAI-compatible HTTP server with Swagger documentation.
 
-Orchion currently supports Qwen3 ASR/TTS models and is designed so additional speech model backends can be added over time. It focuses on practical local inference workflows: model names are represented as Rust enums, model downloads are handled through HuggingFace and ModelScope clients, synchronous upstream inference is wrapped behind async APIs, and the server defaults to platform GPU acceleration when the target platform supports it.
+Orchion currently supports Qwen3 ASR/TTS models and is designed so additional speech model backends can be added over time. It focuses on practical local inference workflows: model names are represented as Rust enums, model downloads are handled through HuggingFace and ModelScope clients, synchronous upstream inference is wrapped behind async APIs, and the server defaults to CPU with optional Metal or CUDA backends.
 
 ## Highlights
 
@@ -13,7 +13,7 @@ Orchion currently supports Qwen3 ASR/TTS models and is designed so additional sp
 - Minimal OpenAI-style extensions for TTS voice clone and voice design.
 - `config.toml` based server configuration for model selection and defaults.
 - Model downloads from HuggingFace or ModelScope, with automatic fallback support.
-- Platform GPU feature defaults in the server crate: Metal on macOS, CUDA on Linux and Windows.
+- Server defaults to CPU, with optional Metal on macOS or CUDA on Linux and Windows.
 - Swagger UI at `/docs` and OpenAPI JSON at `/openapi/v1.json`.
 
 ## Requirements
@@ -99,7 +99,11 @@ The server crate lives at `apps/orchion-server`. It uses Axum and exposes OpenAI
 
 ```sh
 cargo run -p orchion-server -- --config apps/orchion-server/config.toml
+cargo run -p orchion-server --features metal -- --config apps/orchion-server/config.toml
+cargo run -p orchion-server --features cuda -- --config apps/orchion-server/config.toml
 ```
+
+`orchion-server` defaults to the `cpu` feature. Add `--features metal` on macOS, or `--features cuda` on Linux or Windows with a supported CUDA stack; GPU builds still include the CPU backend.
 
 The repository includes `apps/orchion-server/config.toml` as a development config. If `--config` is omitted, the server looks for `config.toml` beside the executable. If `models.dir` is omitted, models are stored in `models/` beside the executable.
 

@@ -4,7 +4,7 @@
 
 Orchion 是一个简单易用的异步 Rust 语音 AI 库，适用于 ASR、TTS 等工作流。它提供类型安全的 Rust API、独立示例二进制程序，以及带 Swagger 文档的 OpenAI 兼容 HTTP 服务。
 
-Orchion 目前支持 Qwen3 ASR/TTS 模型，并预留了后续扩展更多语音模型后端的空间。它关注本地推理的实用工作流：模型名称使用 Rust 枚举表达，模型下载通过 HuggingFace 和 ModelScope 客户端完成，同步上游推理被封装在异步 API 后面，服务端在目标平台支持时默认启用平台 GPU 加速。
+Orchion 目前支持 Qwen3 ASR/TTS 模型，并预留了后续扩展更多语音模型后端的空间。它关注本地推理的实用工作流：模型名称使用 Rust 枚举表达，模型下载通过 HuggingFace 和 ModelScope 客户端完成，同步上游推理被封装在异步 API 后面，服务端默认使用 CPU，Metal 或 CUDA 后端作为可选特性。
 
 ## 亮点
 
@@ -13,7 +13,7 @@ Orchion 目前支持 Qwen3 ASR/TTS 模型，并预留了后续扩展更多语音
 - 面向 TTS 音色克隆和音色设计的最小 OpenAI 风格扩展。
 - 基于 `config.toml` 的服务端模型选择和默认值配置。
 - 支持从 HuggingFace 或 ModelScope 下载模型，并支持自动回退。
-- 服务端 crate 默认启用平台 GPU 特性：macOS 使用 Metal，Linux 和 Windows 使用 CUDA。
+- 服务端默认使用 CPU，也可选用 macOS Metal 或 Linux/Windows CUDA。
 - Swagger UI 位于 `/docs`，OpenAPI JSON 位于 `/openapi/v1.json`。
 
 ## 环境要求
@@ -99,7 +99,11 @@ async fn main() -> Result<()> {
 
 ```sh
 cargo run -p orchion-server -- --config apps/orchion-server/config.toml
+cargo run -p orchion-server --features metal -- --config apps/orchion-server/config.toml
+cargo run -p orchion-server --features cuda -- --config apps/orchion-server/config.toml
 ```
+
+`orchion-server` 默认启用 `cpu` feature。macOS 可追加 `--features metal`，Linux 或 Windows 且 CUDA 环境满足要求时可追加 `--features cuda`；GPU 构建仍会包含 CPU 后端。
 
 仓库内置了 `apps/orchion-server/config.toml` 作为开发配置。如果省略 `--config`，服务会读取可执行文件旁边的 `config.toml`。如果省略 `models.dir`，模型会存储到可执行文件旁边的 `models/`。
 
