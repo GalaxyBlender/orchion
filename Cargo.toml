@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = [
+    "apps/server",
+    "libs/orchion",
+    "examples/asr_file",
+    "examples/asr_streaming",
+    "examples/download_model",
+    "examples/tts_preset",
+]
