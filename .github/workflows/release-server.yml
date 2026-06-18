@@ -17,7 +17,7 @@ env:
 
 jobs:
   build-macos:
-    name: Build macos-aarch64-metal
+    name: Build macos packages
     runs-on: macos-latest
     steps:
       - name: Checkout
@@ -75,6 +75,18 @@ jobs:
 
       - name: Configure sccache
         uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: ${{ env.CUDA_VERSION }}
+          log-file-suffix: windows-x86_64-cuda.txt
+
+      - name: Verify CUDA Toolkit
+        run: nvcc --version
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
 
       - name: Build CPU server
         run: cargo build --release -p orchion-server --features cpu
@@ -152,18 +164,6 @@ jobs:
           name: orchion-server-${{ github.ref_name }}-windows-x86_64-cpu
           path: dist/orchion-server-${{ github.ref_name }}-windows-x86_64-cpu.zip
           if-no-files-found: error
-
-      - name: Install CUDA Toolkit
-        uses: Jimver/cuda-toolkit@v0.2.35
-        with:
-          cuda: ${{ env.CUDA_VERSION }}
-          log-file-suffix: windows-x86_64-cuda.txt
-
-      - name: Verify CUDA Toolkit
-        run: nvcc --version
-
-      - name: Set up MSVC
-        uses: ilammy/msvc-dev-cmd@v1
 
       - name: Build CUDA server
         env:
