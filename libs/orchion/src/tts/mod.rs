@@ -2,6 +2,7 @@ use crate::error::{OrchionError, Result};
 use crate::model::{ModelSpec, TtsModel};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 pub type TtsAudio = qwen3_tts::AudioBuffer;
 pub type TtsOptions = qwen3_tts::SynthesisOptions;
@@ -122,6 +123,13 @@ impl Tts {
                 .ok_or_else(|| OrchionError::NonUtf8Path { path: path.clone() })?;
             let device =
                 qwen3_tts::auto_device().map_err(|source| OrchionError::ModelLoad { source })?;
+            let device_debug = format!("{device:?}");
+            tracing::info!(
+                model = ?model,
+                device = %qwen3_tts::device_info(&device),
+                "TTS device selected"
+            );
+            tracing::debug!(device_debug, "TTS device details selected");
             let engine = qwen3_tts::Qwen3TTS::from_pretrained(path_text, device)
                 .map_err(|source| OrchionError::ModelLoad { source })?;
             Ok(Self {
@@ -157,12 +165,14 @@ impl Tts {
     ) -> Result<TtsAudio> {
         voice_supported(self.model, &voice)?;
         let text = text.as_ref().to_string();
+        let text_len = text.chars().count();
         let engine = Arc::clone(&self.engine);
         crate::blocking::run(move || {
+            let started = Instant::now();
             let engine = engine.lock().map_err(|error| OrchionError::Inference {
                 source: anyhow::anyhow!(error.to_string()),
             })?;
-            match voice {
+            let audio = match voice {
                 TtsVoice::Preset { speaker, language } => engine
                     .synthesize_with_voice(
                         text.as_str(),
@@ -198,7 +208,15 @@ impl Tts {
                         Some(options),
                     )
                     .map_err(|source| OrchionError::Inference { source }),
-            }
+            }?;
+            tracing::debug!(
+                text_chars = text_len,
+                samples = audio.samples.len(),
+                sample_rate = audio.sample_rate,
+                elapsed_ms = started.elapsed().as_millis(),
+                "TTS synthesis completed"
+            );
+            Ok(audio)
         })
         .await
     }

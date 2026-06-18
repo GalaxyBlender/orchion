@@ -1,7 +1,8 @@
 use anyhow::Context;
 use clap::Parser;
-use orchion_server::{config::ServerConfig, routes, state::AppState};
+use orchion_server::{config::ServerConfig, logging, routes, state::AppState};
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 #[derive(Debug, Parser)]
 #[command(name = "orchion-server", about = "OpenAI-compatible ASR/TTS server")]
@@ -11,14 +12,44 @@ struct Cli {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            tracing::error!(error = %format!("{error:#}"), "orchion server failed");
+            ExitCode::FAILURE
+        }
+    }
+}
 
+async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("orchion-server"));
+    let work_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let rust_log = logging::init(&exe_path, &work_dir).context("initialize logging")?;
+    tracing::debug!(
+        %rust_log,
+        exe_path = %exe_path.display(),
+        work_dir = %work_dir.display(),
+        "logging initialized"
+    );
+
     let config = ServerConfig::load(cli.config).context("load server config")?;
     let bind = config.server.bind;
+    tracing::info!(
+        %bind,
+        asr_model = ?config.models.asr,
+        tts_model = ?config.models.tts,
+        "server config loaded"
+    );
+    tracing::debug!(
+        config_path = %config.config_path.display(),
+        models_dir = %config.models.dir.display(),
+        max_upload_size = config.server.max_upload_size,
+        model_source = ?config.models.source,
+        default_tts_format = %config.defaults.tts.format,
+        "server config details loaded"
+    );
     let state = AppState::load(config)
         .await
         .context("initialize app state")?;

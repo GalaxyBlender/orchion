@@ -1,32 +1,80 @@
 use crate::config::ServerConfig;
+use crate::model_cache::{AsrModelCache, TtsModelCache, ensure_available_models};
 use anyhow::Context;
 use orchion::{Asr, ModelDownloader, Tts};
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: ServerConfig,
-    pub asr: Asr,
-    pub tts: Tts,
+    pub asr_models: AsrModelCache,
+    pub tts_models: TtsModelCache,
 }
 
 impl AppState {
     pub async fn load(config: ServerConfig) -> anyhow::Result<Arc<Self>> {
         let downloader = ModelDownloader::new(config.models.source.into());
-        let asr_dir = downloader
-            .download(config.models.asr, &config.models.dir)
+        ensure_available_models(
+            "ASR",
+            &downloader,
+            &config.models.asr.available,
+            &config.models.dir,
+        )
+        .await
+        .context("download ASR models")?;
+        ensure_available_models(
+            "TTS",
+            &downloader,
+            &config.models.tts.available,
+            &config.models.dir,
+        )
+        .await
+        .context("download TTS models")?;
+        let asr_models = AsrModelCache::new(config.models.asr.clone(), config.models.dir.clone());
+        let tts_models = TtsModelCache::new(config.models.tts.clone(), config.models.dir.clone());
+        let state = Arc::new(Self {
+            config,
+            asr_models,
+            tts_models,
+        });
+        state.spawn_idle_cleanup();
+        tracing::info!("model cache initialized");
+        Ok(state)
+    }
+
+    pub async fn asr(&self, model: orchion::AsrModel) -> anyhow::Result<Option<Asr>> {
+        self.asr_models
+            .get_or_load(model, |model, path| async move {
+                tracing::info!(model = ?model, "loading ASR model");
+                Asr::load(model, path).await.context("load ASR model")
+            })
             .await
-            .context("download ASR model")?;
-        let tts_dir = downloader
-            .download(config.models.tts, &config.models.dir)
+    }
+
+    pub async fn tts(&self, model: orchion::TtsModel) -> anyhow::Result<Option<Tts>> {
+        self.tts_models
+            .get_or_load(model, |model, path| async move {
+                tracing::info!(model = ?model, "loading TTS model");
+                Tts::load(model, path).await.context("load TTS model")
+            })
             .await
-            .context("download TTS model")?;
-        let asr = Asr::load(config.models.asr, asr_dir)
-            .await
-            .context("load ASR model")?;
-        let tts = Tts::load(config.models.tts, tts_dir)
-            .await
-            .context("load TTS model")?;
-        Ok(Arc::new(Self { config, asr, tts }))
+    }
+
+    fn spawn_idle_cleanup(self: &Arc<Self>) {
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            let interval = state
+                .asr_models
+                .idle_timeout()
+                .min(state.tts_models.idle_timeout())
+                .min(Duration::from_secs(60));
+            let mut interval = tokio::time::interval(interval);
+            loop {
+                interval.tick().await;
+                state.asr_models.cleanup_idle().await;
+                state.tts_models.cleanup_idle().await;
+            }
+        });
     }
 }

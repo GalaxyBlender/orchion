@@ -3,31 +3,33 @@ name = "orchion"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Typed async ASR/TTS orchestration wrappers for Qwen3 models"
+description = "Typed async ASR/TTS orchestration wrappers"
 license = "MIT"
 repository = "https://github.com/xuan/orchion"
 
 [features]
 default = ["asr", "tts", "download"]
 asr = ["dep:qwen3-asr", "dep:tokio"]
-tts = ["dep:qwen3-tts", "dep:tokio", "qwen3-tts/cpu"]
-download = ["dep:tokio", "dep:hf-hub", "dep:modelscope"]
+tts = ["dep:hound", "dep:qwen3-tts", "dep:tokio", "qwen3-tts/cpu"]
+download = ["dep:tokio", "dep:hf-hub", "dep:modelscope", "dep:reqwest"]
 metal = ["qwen3-asr?/metal", "qwen3-tts?/metal"]
-cuda = ["qwen3-asr?/cuda", "qwen3-tts?/cuda"]
-flash-attn = ["qwen3-tts?/flash-attn"]
+cuda = ["qwen3-asr?/cuda", "qwen3-tts?/cuda", "qwen3-tts?/flash-attn"]
 
 [dependencies]
 anyhow = "1"
 thiserror = "2"
+tracing = "0.1"
+serde_json = "1"
 tokio = { version = "1", optional = true, features = ["rt-multi-thread", "macros", "fs"] }
 qwen3-asr = { version = "0.2.2", optional = true, default-features = false }
 qwen3-tts = { git = "https://github.com/TrevorS/qwen3-tts-rs", optional = true, default-features = false }
 hf-hub = { version = "0.5", optional = true, default-features = false, features = ["tokio", "rustls-tls"] }
 modelscope = { version = "0.1.5", optional = true }
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls"] }
+hound = { version = "3", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
-hound = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
 
 [lints.rust]

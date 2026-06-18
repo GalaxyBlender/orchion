@@ -1,7 +1,7 @@
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use orchion::{TtsLanguage, TtsSpeaker, TtsVoice};
+use orchion::{AudioOutputFormat, ModelSpec, TtsLanguage, TtsOptions, TtsSpeaker, TtsVoice};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::path::PathBuf;
 use utoipa::ToSchema;
@@ -60,6 +60,19 @@ impl ApiError {
     }
 
     #[must_use]
+    pub fn invalid_api_key() -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            error: ErrorObject {
+                message: "invalid API key".to_string(),
+                error_type: "invalid_request_error",
+                param: None,
+                code: Some("invalid_api_key".to_string()),
+            },
+        }
+    }
+
+    #[must_use]
     pub fn model_not_loaded(model: &str) -> Self {
         Self::invalid_request(
             format!("model `{model}` is not loaded by this server"),
@@ -69,14 +82,67 @@ impl ApiError {
     }
 
     #[must_use]
+    pub fn model_not_available(model: &str) -> Self {
+        Self::invalid_request(
+            format!("model `{model}` is not available on this server"),
+            Some("model"),
+            Some("model_not_available"),
+        )
+    }
+
+    #[must_use]
     pub fn into_status_body(self) -> (StatusCode, ErrorBody) {
         (self.status, ErrorBody { error: self.error })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ModelList {
+    pub object: &'static str,
+    pub data: Vec<ModelObject>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ModelObject {
+    pub id: String,
+    pub object: &'static str,
+    pub created: u64,
+    pub owned_by: &'static str,
+}
+
+impl ModelObject {
+    pub fn new(model: impl ModelSpec) -> Self {
+        Self {
+            id: model.cache_key().to_string(),
+            object: "model",
+            created: 0,
+            owned_by: "orchion",
+        }
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, body) = self.into_status_body();
+        if status.is_server_error() {
+            tracing::error!(
+                %status,
+                error_type = body.error.error_type,
+                code = ?body.error.code,
+                param = ?body.error.param,
+                message = %body.error.message,
+                "request failed"
+            );
+        } else {
+            tracing::debug!(
+                %status,
+                error_type = body.error.error_type,
+                code = ?body.error.code,
+                param = ?body.error.param,
+                message = %body.error.message,
+                "request rejected"
+            );
+        }
         (status, Json(body)).into_response()
     }
 }
@@ -91,6 +157,9 @@ impl From<orchion::OrchionError> for ApiError {
                     Some("unsupported_voice"),
                 )
             }
+            orchion::OrchionError::InvalidAudio { reason } => {
+                Self::invalid_request(reason, None, Some("invalid_audio"))
+            }
             other => Self::internal(other.to_string()),
         }
     }
@@ -100,11 +169,29 @@ impl From<orchion::OrchionError> for ApiError {
 #[serde(rename_all = "snake_case")]
 pub enum SpeechFormat {
     Wav,
+    Mp3,
+    Aac,
+    Opus,
+    Flac,
+    Pcm,
 }
 
 impl Default for SpeechFormat {
     fn default() -> Self {
         Self::Wav
+    }
+}
+
+impl std::fmt::Display for SpeechFormat {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Wav => "wav",
+            Self::Mp3 => "mp3",
+            Self::Aac => "aac",
+            Self::Opus => "opus",
+            Self::Flac => "flac",
+            Self::Pcm => "pcm",
+        })
     }
 }
 
@@ -114,8 +201,13 @@ impl TryFrom<&str> for SpeechFormat {
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         match value.trim().to_ascii_lowercase().as_str() {
             "wav" => Ok(Self::Wav),
+            "mp3" => Ok(Self::Mp3),
+            "aac" => Ok(Self::Aac),
+            "opus" => Ok(Self::Opus),
+            "flac" => Ok(Self::Flac),
+            "pcm" => Ok(Self::Pcm),
             _ => Err(ApiError::invalid_request(
-                "unsupported audio format; only `wav` is currently supported",
+                "unsupported audio format; supported formats are wav, mp3, aac, opus, flac, and pcm",
                 Some("response_format"),
                 Some("unsupported_audio_format"),
             )),
@@ -147,7 +239,7 @@ pub struct SpeechRequest {
     pub input: String,
     pub voice: String,
     #[serde(default)]
-    pub response_format: SpeechFormat,
+    pub response_format: Option<SpeechFormat>,
     #[serde(default = "default_speed")]
     pub speed: f32,
     #[serde(default)]
@@ -158,9 +250,36 @@ pub struct SpeechRequest {
     pub reference_text: Option<String>,
     #[serde(default)]
     pub voice_prompt: Option<String>,
+    #[serde(default)]
+    pub seed: Option<u64>,
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    #[serde(default)]
+    pub top_k: Option<usize>,
+    #[serde(default)]
+    pub top_p: Option<f64>,
+    #[serde(default)]
+    pub repetition_penalty: Option<f64>,
+    #[serde(default)]
+    pub max_length: Option<usize>,
 }
 
 impl SpeechRequest {
+    pub fn to_tts_options(&self) -> TtsOptions {
+        let defaults = TtsOptions::default();
+        TtsOptions {
+            seed: Some(self.seed.unwrap_or(42)),
+            temperature: self.temperature.unwrap_or(defaults.temperature),
+            top_k: self.top_k.unwrap_or(defaults.top_k),
+            top_p: self.top_p.unwrap_or(defaults.top_p),
+            repetition_penalty: self
+                .repetition_penalty
+                .unwrap_or(defaults.repetition_penalty),
+            max_length: self.max_length.unwrap_or(defaults.max_length),
+            ..defaults
+        }
+    }
+
     pub fn to_tts_voice(&self) -> Result<TtsVoice, ApiError> {
         let language = self
             .language
@@ -210,6 +329,10 @@ impl SpeechRequest {
         }
     }
 
+    pub fn is_voice_clone(&self) -> bool {
+        normalize_identifier(&self.voice) == "clone"
+    }
+
     pub fn validate(&self) -> Result<(), ApiError> {
         if self.input.trim().is_empty() {
             return Err(ApiError::invalid_request(
@@ -223,6 +346,44 @@ impl SpeechRequest {
                 "`speed` values other than 1.0 are not currently supported",
                 Some("speed"),
                 Some("unsupported_speed"),
+            ));
+        }
+        if self.temperature.is_some_and(|value| value <= 0.0) {
+            return Err(ApiError::invalid_request(
+                "`temperature` must be greater than 0",
+                Some("temperature"),
+                Some("invalid_temperature"),
+            ));
+        }
+        if self.top_k.is_some_and(|value| value == 0) {
+            return Err(ApiError::invalid_request(
+                "`top_k` must be greater than 0",
+                Some("top_k"),
+                Some("invalid_top_k"),
+            ));
+        }
+        if self
+            .top_p
+            .is_some_and(|value| !(0.0..=1.0).contains(&value))
+        {
+            return Err(ApiError::invalid_request(
+                "`top_p` must be between 0 and 1",
+                Some("top_p"),
+                Some("invalid_top_p"),
+            ));
+        }
+        if self.repetition_penalty.is_some_and(|value| value <= 0.0) {
+            return Err(ApiError::invalid_request(
+                "`repetition_penalty` must be greater than 0",
+                Some("repetition_penalty"),
+                Some("invalid_repetition_penalty"),
+            ));
+        }
+        if self.max_length.is_some_and(|value| value == 0) {
+            return Err(ApiError::invalid_request(
+                "`max_length` must be greater than 0",
+                Some("max_length"),
+                Some("invalid_max_length"),
             ));
         }
         Ok(())
@@ -273,8 +434,19 @@ pub struct TranscriptionVerboseJson {
 
 #[must_use]
 pub fn content_type_for(format: SpeechFormat) -> &'static str {
-    match format {
-        SpeechFormat::Wav => "audio/wav",
+    AudioOutputFormat::from(format).content_type()
+}
+
+impl From<SpeechFormat> for AudioOutputFormat {
+    fn from(format: SpeechFormat) -> Self {
+        match format {
+            SpeechFormat::Wav => Self::Wav,
+            SpeechFormat::Mp3 => Self::Mp3,
+            SpeechFormat::Aac => Self::Aac,
+            SpeechFormat::Opus => Self::Opus,
+            SpeechFormat::Flac => Self::Flac,
+            SpeechFormat::Pcm => Self::Pcm,
+        }
     }
 }
 

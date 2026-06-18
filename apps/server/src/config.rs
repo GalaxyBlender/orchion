@@ -1,7 +1,8 @@
-use orchion::{AsrModel, DownloadSource, TtsModel};
+use orchion::{AsrModel, DownloadSource, ModelSpec, TtsModel};
 use serde::Deserialize;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelSource {
@@ -25,20 +26,35 @@ pub struct ServerConfig {
     pub config_path: PathBuf,
     pub server: ServerSection,
     pub models: ModelsSection,
+    pub auth: AuthSection,
     pub defaults: DefaultsSection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerSection {
     pub bind: SocketAddr,
+    pub max_upload_size: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelsSection {
     pub dir: PathBuf,
     pub source: ModelSource,
-    pub asr: AsrModel,
-    pub tts: TtsModel,
+    pub asr: ModelRegistrySection<AsrModel>,
+    pub tts: ModelRegistrySection<TtsModel>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelRegistrySection<M> {
+    pub default: M,
+    pub available: Vec<M>,
+    pub idle_timeout: Duration,
+    pub max_loaded: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthSection {
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,8 +64,6 @@ pub struct DefaultsSection {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TtsDefaults {
-    pub voice: String,
-    pub language: Option<String>,
     pub format: String,
 }
 
@@ -67,12 +81,24 @@ pub enum ConfigError {
         value: String,
         source: std::net::AddrParseError,
     },
+    #[error("invalid upload size `{value}`: {message}")]
+    InvalidUploadSize { value: String, message: String },
     #[error("unknown model source `{0}`; expected auto, huggingface, or modelscope")]
     UnknownModelSource(String),
     #[error("unknown ASR model `{0}`")]
     UnknownAsrModel(String),
     #[error("unknown TTS model `{0}`")]
     UnknownTtsModel(String),
+    #[error("invalid duration `{value}`: {message}")]
+    InvalidDuration { value: String, message: String },
+    #[error("invalid {section}.max_loaded `{value}`: value must be greater than zero")]
+    InvalidMaxLoaded { section: &'static str, value: usize },
+    #[error("default {category} model `{default}` must be included in {section}.available")]
+    DefaultModelUnavailable {
+        category: &'static str,
+        section: &'static str,
+        default: String,
+    },
 }
 
 impl ServerConfig {
@@ -82,18 +108,28 @@ impl ServerConfig {
         Self {
             config_path: exe_dir.join("config.toml"),
             server: ServerSection {
-                bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
+                bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9090),
+                max_upload_size: 30 * 1024 * 1024,
             },
             models: ModelsSection {
                 dir: exe_dir.join("models"),
                 source: ModelSource::Auto,
-                asr: AsrModel::Qwen3Asr06B,
-                tts: TtsModel::Qwen3Tts06BCustomVoice,
+                asr: ModelRegistrySection {
+                    default: AsrModel::Qwen3Asr06B,
+                    available: vec![AsrModel::Qwen3Asr06B],
+                    idle_timeout: Duration::from_secs(600),
+                    max_loaded: 1,
+                },
+                tts: ModelRegistrySection {
+                    default: TtsModel::Qwen3Tts06BCustomVoice,
+                    available: vec![TtsModel::Qwen3Tts06BCustomVoice],
+                    idle_timeout: Duration::from_secs(600),
+                    max_loaded: 1,
+                },
             },
+            auth: AuthSection { api_key: None },
             defaults: DefaultsSection {
                 tts: TtsDefaults {
-                    voice: "ryan".to_string(),
-                    language: Some("english".to_string()),
                     format: "wav".to_string(),
                 },
             },
@@ -131,6 +167,9 @@ impl ServerConfig {
                     source,
                 })?;
             }
+            if let Some(max_upload_size) = server.max_upload_size {
+                config.server.max_upload_size = parse_upload_size(&max_upload_size)?;
+            }
         }
 
         if let Some(models) = raw.models {
@@ -141,29 +180,218 @@ impl ServerConfig {
                 config.models.source = parse_model_source(&source)?;
             }
             if let Some(asr) = models.asr {
-                config.models.asr = parse_asr_model(&asr)?;
+                config.models.asr = parse_asr_registry(asr, config.models.asr)?;
             }
             if let Some(tts) = models.tts {
-                config.models.tts = parse_tts_model(&tts)?;
+                config.models.tts = parse_tts_registry(tts, config.models.tts)?;
             }
         }
 
         if let Some(defaults) = raw.defaults {
             if let Some(tts) = defaults.tts {
-                if let Some(voice) = tts.voice {
-                    config.defaults.tts.voice = voice;
-                }
-                if let Some(language) = tts.language {
-                    config.defaults.tts.language = Some(language);
-                }
                 if let Some(format) = tts.format {
                     config.defaults.tts.format = format;
                 }
             }
         }
 
+        if let Some(auth) = raw.auth {
+            if let Some(api_key) = auth.api_key {
+                let api_key = api_key.trim();
+                config.auth.api_key = if api_key.is_empty() {
+                    None
+                } else {
+                    Some(api_key.to_string())
+                };
+            }
+        }
+
         Ok(config)
     }
+}
+
+fn parse_asr_registry(
+    raw: RawModelRegistry,
+    mut registry: ModelRegistrySection<AsrModel>,
+) -> Result<ModelRegistrySection<AsrModel>, ConfigError> {
+    let available = raw.available;
+    if let Some(default) = raw.default {
+        registry.default = parse_asr_model(&default)?;
+    }
+    if let Some(available) = available {
+        registry.available = available
+            .iter()
+            .map(String::as_str)
+            .map(parse_asr_model)
+            .collect::<Result<Vec<_>, _>>()?;
+    } else {
+        registry.available = vec![registry.default];
+    }
+    apply_registry_limits(
+        "models.asr",
+        raw.idle_timeout,
+        raw.max_loaded,
+        &mut registry,
+    )?;
+    ensure_default_available(
+        "ASR",
+        "models.asr",
+        registry.default.cache_key(),
+        registry.available.contains(&registry.default),
+    )?;
+    Ok(registry)
+}
+
+fn parse_tts_registry(
+    raw: RawModelRegistry,
+    mut registry: ModelRegistrySection<TtsModel>,
+) -> Result<ModelRegistrySection<TtsModel>, ConfigError> {
+    let available = raw.available;
+    if let Some(default) = raw.default {
+        registry.default = parse_tts_model(&default)?;
+    }
+    if let Some(available) = available {
+        registry.available = available
+            .iter()
+            .map(String::as_str)
+            .map(parse_tts_model)
+            .collect::<Result<Vec<_>, _>>()?;
+    } else {
+        registry.available = vec![registry.default];
+    }
+    apply_registry_limits(
+        "models.tts",
+        raw.idle_timeout,
+        raw.max_loaded,
+        &mut registry,
+    )?;
+    ensure_default_available(
+        "TTS",
+        "models.tts",
+        registry.default.cache_key(),
+        registry.available.contains(&registry.default),
+    )?;
+    Ok(registry)
+}
+
+fn apply_registry_limits<M>(
+    section: &'static str,
+    idle_timeout: Option<String>,
+    max_loaded: Option<usize>,
+    registry: &mut ModelRegistrySection<M>,
+) -> Result<(), ConfigError> {
+    if let Some(idle_timeout) = idle_timeout {
+        registry.idle_timeout = parse_duration(&idle_timeout)?;
+    }
+    if let Some(max_loaded) = max_loaded {
+        if max_loaded == 0 {
+            return Err(ConfigError::InvalidMaxLoaded {
+                section,
+                value: max_loaded,
+            });
+        }
+        registry.max_loaded = max_loaded;
+    }
+    Ok(())
+}
+
+fn ensure_default_available(
+    category: &'static str,
+    section: &'static str,
+    default: &str,
+    available: bool,
+) -> Result<(), ConfigError> {
+    if available {
+        Ok(())
+    } else {
+        Err(ConfigError::DefaultModelUnavailable {
+            category,
+            section,
+            default: default.to_string(),
+        })
+    }
+}
+
+fn parse_duration(value: &str) -> Result<Duration, ConfigError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(ConfigError::InvalidDuration {
+            value: value.to_string(),
+            message: "value must not be empty".to_string(),
+        });
+    }
+    let split_at = value
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (digits, unit) = value.split_at(split_at);
+    let amount = digits
+        .parse::<u64>()
+        .map_err(|error| ConfigError::InvalidDuration {
+            value: value.to_string(),
+            message: error.to_string(),
+        })?;
+    if amount == 0 {
+        return Err(ConfigError::InvalidDuration {
+            value: value.to_string(),
+            message: "value must be greater than zero".to_string(),
+        });
+    }
+    let multiplier = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "s" | "sec" | "secs" | "second" | "seconds" => 1,
+        "m" | "min" | "mins" | "minute" | "minutes" => 60,
+        "h" | "hr" | "hrs" | "hour" | "hours" => 60 * 60,
+        _ => {
+            return Err(ConfigError::InvalidDuration {
+                value: value.to_string(),
+                message: "expected seconds, minutes, or hours".to_string(),
+            });
+        }
+    };
+    amount
+        .checked_mul(multiplier)
+        .map(Duration::from_secs)
+        .ok_or_else(|| ConfigError::InvalidDuration {
+            value: value.to_string(),
+            message: "value is too large".to_string(),
+        })
+}
+
+fn parse_upload_size(value: &str) -> Result<usize, ConfigError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(ConfigError::InvalidUploadSize {
+            value: value.to_string(),
+            message: "value must not be empty".to_string(),
+        });
+    }
+
+    let (digits, multiplier) = match value.as_bytes().last().copied() {
+        Some(b'k' | b'K') => (&value[..value.len() - 1], 1024_usize),
+        Some(b'm' | b'M') => (&value[..value.len() - 1], 1024_usize * 1024),
+        Some(b'g' | b'G') => (&value[..value.len() - 1], 1024_usize * 1024 * 1024),
+        Some(_) => (value, 1),
+        None => unreachable!("empty value handled above"),
+    };
+    let amount =
+        digits
+            .trim()
+            .parse::<usize>()
+            .map_err(|error| ConfigError::InvalidUploadSize {
+                value: value.to_string(),
+                message: error.to_string(),
+            })?;
+    if amount == 0 {
+        return Err(ConfigError::InvalidUploadSize {
+            value: value.to_string(),
+            message: "value must be greater than zero".to_string(),
+        });
+    }
+    amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| ConfigError::InvalidUploadSize {
+            value: value.to_string(),
+            message: "value is too large".to_string(),
+        })
 }
 
 pub fn parse_asr_model(value: &str) -> Result<AsrModel, ConfigError> {
@@ -214,33 +442,53 @@ fn normalize_identifier(value: &str) -> String {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawConfig {
     server: Option<RawServer>,
     models: Option<RawModels>,
+    auth: Option<RawAuth>,
     defaults: Option<RawDefaults>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawServer {
     bind: Option<String>,
+    max_upload_size: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawModels {
     dir: Option<PathBuf>,
     source: Option<String>,
-    asr: Option<String>,
-    tts: Option<String>,
+    asr: Option<RawModelRegistry>,
+    tts: Option<RawModelRegistry>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawModelRegistry {
+    default: Option<String>,
+    available: Option<Vec<String>>,
+    idle_timeout: Option<String>,
+    max_loaded: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAuth {
+    api_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawDefaults {
     tts: Option<RawTtsDefaults>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawTtsDefaults {
-    voice: Option<String>,
-    language: Option<String>,
     format: Option<String>,
 }

@@ -4,6 +4,7 @@ use crate::error::{OrchionError, Result};
 use crate::model::AsrModel;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 pub use audio::{ASR_SAMPLE_RATE, prepare_asr_samples};
 
@@ -118,6 +119,13 @@ impl Asr {
         let model_dir = model_dir.as_ref().to_path_buf();
         crate::blocking::run(move || {
             let device = qwen3_asr::best_device();
+            let device_debug = format!("{device:?}");
+            tracing::info!(
+                model = ?model,
+                device = device_label_from_debug(&device_debug),
+                "ASR device selected"
+            );
+            tracing::debug!(device_debug, "ASR device details selected");
             let engine = qwen3_asr::AsrInference::load(&model_dir, device).map_err(|source| {
                 OrchionError::ModelLoad {
                     source: anyhow::Error::new(source),
@@ -145,6 +153,36 @@ impl Asr {
 
     pub async fn transcribe_file(&self, path: impl AsRef<Path>) -> Result<AsrTranscript> {
         self.transcribe_file_with(path, AsrOptions::default()).await
+    }
+
+    pub async fn transcribe_audio_bytes(&self, bytes: impl Into<Vec<u8>>) -> Result<AsrTranscript> {
+        self.transcribe_audio_bytes_with(bytes, AsrOptions::default())
+            .await
+    }
+
+    pub async fn transcribe_audio_bytes_with(
+        &self,
+        bytes: impl Into<Vec<u8>>,
+        options: AsrOptions,
+    ) -> Result<AsrTranscript> {
+        let decode_started = Instant::now();
+        let decoded = crate::audio::decode_audio_bytes(bytes.into()).await?;
+        let decode_elapsed = decode_started.elapsed();
+        tracing::debug!(
+            samples = decoded.samples.len(),
+            sample_rate = decoded.sample_rate,
+            elapsed_ms = decode_elapsed.as_millis(),
+            "ASR audio decode completed"
+        );
+        let inference_started = Instant::now();
+        self.transcribe_samples_with(&decoded.samples, decoded.sample_rate, options)
+            .await
+            .inspect(|_| {
+                tracing::debug!(
+                    elapsed_ms = inference_started.elapsed().as_millis(),
+                    "ASR inference completed"
+                );
+            })
     }
 
     pub async fn transcribe_file_with(
@@ -275,6 +313,16 @@ impl AsrStream {
     }
 }
 
+fn device_label_from_debug(device_debug: &str) -> &'static str {
+    if device_debug.contains("Cuda") {
+        "cuda"
+    } else if device_debug.contains("Metal") {
+        "metal"
+    } else {
+        "cpu"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,5 +345,12 @@ mod tests {
             ..Default::default()
         };
         assert!(options.validate().is_err());
+    }
+
+    #[test]
+    fn device_label_detects_runtime_backend() {
+        assert_eq!(device_label_from_debug("Cpu"), "cpu");
+        assert_eq!(device_label_from_debug("Cuda(CudaDevice(0))"), "cuda");
+        assert_eq!(device_label_from_debug("Metal(MetalDevice(0))"), "metal");
     }
 }

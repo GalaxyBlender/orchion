@@ -1,0 +1,31 @@
+[server]
+bind = "127.0.0.1:9090"
+max_upload_size = "30M"
+
+[models]
+dir = "models"
+source = "auto"
+
+[models.asr]
+default = "qwen3-asr-0.6b"
+available = ["qwen3-asr-0.6b", "qwen3-asr-1.7b"]
+idle_timeout = "10m"
+max_loaded = 1
+
+[models.tts]
+default = "qwen3-tts-0.6b-custom-voice"
+available = [
+  "qwen3-tts-0.6b-base",
+  "qwen3-tts-0.6b-custom-voice",
+  "qwen3-tts-1.7b-base",
+  "qwen3-tts-1.7b-custom-voice",
+  "qwen3-tts-1.7b-voice-design",
+]
+idle_timeout = "10m"
+max_loaded = 1
+
+[auth]
+# api_key = "change-me"
+
+[defaults.tts]
+format = "wav"
