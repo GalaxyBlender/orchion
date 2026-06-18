@@ -30,29 +30,29 @@ Orchion 目前支持 Qwen3 ASR/TTS 模型，并预留了后续扩展更多语音
 ### 运行测试
 
 ```sh
-cargo test -p orchion --lib
-cargo test -p orchion-server --lib --tests
+cargo test --workspace --features full,cpu
 ```
 
 ### 运行示例
 
 ```sh
-cargo run -p orchion-example-download-model -- models
-cargo run -p orchion-example-asr-file -- audio.wav models
-cargo run -p orchion-example-tts-preset -- "Hello from Orchion" output.wav models
+cargo run -p orchion --features download-all --example download_model -- models
+cargo run -p orchion --features asr-qwen3,download-all,cpu --example asr_file -- audio.wav models
+cargo run -p orchion --features tts-qwen3,download-all,cpu --example tts_preset -- "Hello from Orchion" output.wav models
 ```
 
 ## 核心库
 
-核心 crate 位于 `libs/orchion`，提供用于加载、下载和运行 ASR/TTS 模型的异步 Rust API。
+公开 facade crate 位于 `crates/orchion`，提供用于加载、下载和运行 ASR/TTS 模型的异步 Rust API。领域类型位于 `crates/orchion-core`，FFmpeg 音频转换位于 `crates/orchion-audio`，模型下载位于 `crates/orchion-download`，Qwen3 运行时适配位于 `crates/orchion-qwen3`。
 
 ### Cargo Features
 
-- `default = ["asr", "tts", "download"]`
-- `asr`：Qwen3 ASR 转录和流式封装。
-- `tts`：Qwen3 TTS 预设音色、音色克隆和音色设计封装。
-- `download`：通过 `hf-hub` 和 `modelscope` 异步下载模型。
-- `metal`、`cuda`：传递给上游 crate 的 GPU 后端特性开关。CUDA 会同时启用上游后端支持的 CUDA 专属加速能力。
+- `default = []`
+- `full`：Qwen3 ASR/TTS、FFmpeg 音频转换和全部下载 provider。
+- `asr-qwen3`、`tts-qwen3`：Qwen3 ASR/TTS 运行时适配。
+- `audio-ffmpeg`：通过系统 `ffmpeg` 做内存音频解码/编码。
+- `download-all`：通过 `hf-hub` 和 `modelscope` 异步下载模型。
+- `cpu`、`metal`、`cuda`：传递给上游 crate 的后端特性开关。
 
 ### ASR 示例
 
@@ -93,17 +93,17 @@ async fn main() -> Result<()> {
 
 ## OpenAI 兼容服务
 
-服务端 crate 位于 `apps/server`。它使用 Axum 并提供 OpenAI 风格的音频接口。
+服务端 crate 位于 `apps/orchion-server`。它使用 Axum 并提供 OpenAI 风格的音频接口。
 
 ### 运行服务
 
 ```sh
-cargo run -p orchion-server -- --config apps/server/config.toml
+cargo run -p orchion-server -- --config apps/orchion-server/config.toml
 ```
 
-仓库内置了 `apps/server/config.toml` 作为开发配置。如果省略 `--config`，服务会读取可执行文件旁边的 `config.toml`。如果省略 `models.dir`，模型会存储到可执行文件旁边的 `models/`。
+仓库内置了 `apps/orchion-server/config.toml` 作为开发配置。如果省略 `--config`，服务会读取可执行文件旁边的 `config.toml`。如果省略 `models.dir`，模型会存储到可执行文件旁边的 `models/`。
 
-日志通过 `RUST_LOG` 控制。服务会先读取可执行文件目录下的 `.env`，再读取当前工作目录下的 `.env`。仓库内置了开发用 `.env`，因此 `cargo run -p orchion-server -- --config apps/server/config.toml` 默认会输出启动、模型加载、下载和请求 debug 日志。
+日志通过 `RUST_LOG` 控制。服务会先读取可执行文件目录下的 `.env`，再读取当前工作目录下的 `.env`。仓库内置了开发用 `.env`，因此 `cargo run -p orchion-server -- --config apps/orchion-server/config.toml` 默认会输出启动、模型加载、下载和请求 debug 日志。
 
 ### 路由
 
@@ -290,10 +290,8 @@ RUST_LOG=orchion_server=debug,orchion=info,tower_http=debug
 
 ```sh
 cargo fmt --all -- --check
-cargo test -p orchion --lib
-cargo test -p orchion-server --lib --tests
-cargo check --workspace --exclude orchion-server
-cargo check -p orchion-server
+cargo test --workspace --features full,cpu
+cargo check --workspace
 ```
 
 真实模型下载测试不会进入默认测试路径。如需运行，请在有网络和模型存储空间时显式运行 ignored integration tests。

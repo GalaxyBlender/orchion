@@ -1,0 +1,305 @@
+use orchion_core::{
+    OrchionError, Result, TtsAudio, TtsLanguage, TtsModel, TtsOptions, TtsSpeaker, TtsVoice,
+    ensure_voice_supported,
+};
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+#[derive(Clone)]
+pub struct Tts {
+    model: TtsModel,
+    engine: Arc<Mutex<qwen3_tts::Qwen3TTS>>,
+}
+
+impl Tts {
+    pub async fn load(model: TtsModel, model_dir: impl AsRef<Path>) -> Result<Self> {
+        let path = model_dir.as_ref().to_path_buf();
+        crate::blocking::run(move || {
+            let path_text = path
+                .to_str()
+                .ok_or_else(|| OrchionError::NonUtf8Path { path: path.clone() })?;
+            let device =
+                qwen3_tts::auto_device().map_err(|source| OrchionError::ModelLoad { source })?;
+            let device_debug = format!("{device:?}");
+            tracing::info!(
+                model = ?model,
+                device = %qwen3_tts::device_info(&device),
+                "TTS device selected"
+            );
+            tracing::debug!(device_debug, "TTS device details selected");
+            let engine = qwen3_tts::Qwen3TTS::from_pretrained(path_text, device)
+                .map_err(|source| OrchionError::ModelLoad { source })?;
+            Ok(Self {
+                model,
+                engine: Arc::new(Mutex::new(engine)),
+            })
+        })
+        .await
+    }
+
+    pub const fn model(&self) -> TtsModel {
+        self.model
+    }
+
+    pub async fn synthesize(&self, text: impl AsRef<str>, voice: TtsVoice) -> Result<TtsAudio> {
+        self.synthesize_with(text, voice, TtsOptions::default())
+            .await
+    }
+
+    pub async fn synthesize_with(
+        &self,
+        text: impl AsRef<str>,
+        voice: TtsVoice,
+        options: TtsOptions,
+    ) -> Result<TtsAudio> {
+        ensure_voice_supported(self.model, &voice)?;
+        let text = text.as_ref().to_string();
+        let text_len = text.chars().count();
+        let engine = Arc::clone(&self.engine);
+        crate::blocking::run(move || {
+            let started = Instant::now();
+            let engine = engine.lock().map_err(|error| OrchionError::Inference {
+                source: anyhow::anyhow!(error.to_string()),
+            })?;
+            let audio = match voice {
+                TtsVoice::Preset { speaker, language } => engine
+                    .synthesize_with_voice(
+                        text.as_str(),
+                        speaker_to_upstream(speaker),
+                        language_to_upstream(language),
+                        Some(options_to_upstream(options)),
+                    )
+                    .map_err(|source| OrchionError::Inference { source }),
+                TtsVoice::Clone {
+                    reference_audio,
+                    reference_text,
+                    language,
+                } => {
+                    let audio = qwen3_tts::AudioBuffer::load(&reference_audio)
+                        .map_err(|source| OrchionError::Inference { source })?;
+                    let prompt = engine
+                        .create_voice_clone_prompt(&audio, Some(reference_text.as_str()))
+                        .map_err(|source| OrchionError::Inference { source })?;
+                    engine
+                        .synthesize_voice_clone(
+                            text.as_str(),
+                            &prompt,
+                            language_to_upstream(language),
+                            Some(options_to_upstream(options)),
+                        )
+                        .map_err(|source| OrchionError::Inference { source })
+                }
+                TtsVoice::Design { prompt, language } => engine
+                    .synthesize_voice_design(
+                        text.as_str(),
+                        prompt.as_str(),
+                        language_to_upstream(language),
+                        Some(options_to_upstream(options)),
+                    )
+                    .map_err(|source| OrchionError::Inference { source }),
+            }?;
+            tracing::debug!(
+                text_chars = text_len,
+                samples = audio.samples.len(),
+                sample_rate = audio.sample_rate,
+                elapsed_ms = started.elapsed().as_millis(),
+                "TTS synthesis completed"
+            );
+            Ok(audio_from_upstream(audio))
+        })
+        .await
+    }
+
+    pub async fn synthesize_to_file(
+        &self,
+        text: impl AsRef<str>,
+        voice: TtsVoice,
+        output_path: impl AsRef<Path>,
+    ) -> Result<()> {
+        let output_path = output_path.as_ref().to_path_buf();
+        let audio = self
+            .synthesize_upstream(text, voice, TtsOptions::default())
+            .await?;
+        crate::blocking::run(move || {
+            audio
+                .save(output_path)
+                .map_err(|source| OrchionError::Inference { source })
+        })
+        .await
+    }
+
+    async fn synthesize_upstream(
+        &self,
+        text: impl AsRef<str>,
+        voice: TtsVoice,
+        options: TtsOptions,
+    ) -> Result<qwen3_tts::AudioBuffer> {
+        ensure_voice_supported(self.model, &voice)?;
+        let text = text.as_ref().to_string();
+        let text_len = text.chars().count();
+        let engine = Arc::clone(&self.engine);
+        crate::blocking::run(move || {
+            let started = Instant::now();
+            let engine = engine.lock().map_err(|error| OrchionError::Inference {
+                source: anyhow::anyhow!(error.to_string()),
+            })?;
+            let audio = match voice {
+                TtsVoice::Preset { speaker, language } => engine
+                    .synthesize_with_voice(
+                        text.as_str(),
+                        speaker_to_upstream(speaker),
+                        language_to_upstream(language),
+                        Some(options_to_upstream(options)),
+                    )
+                    .map_err(|source| OrchionError::Inference { source }),
+                TtsVoice::Clone {
+                    reference_audio,
+                    reference_text,
+                    language,
+                } => {
+                    let audio = qwen3_tts::AudioBuffer::load(&reference_audio)
+                        .map_err(|source| OrchionError::Inference { source })?;
+                    let prompt = engine
+                        .create_voice_clone_prompt(&audio, Some(reference_text.as_str()))
+                        .map_err(|source| OrchionError::Inference { source })?;
+                    engine
+                        .synthesize_voice_clone(
+                            text.as_str(),
+                            &prompt,
+                            language_to_upstream(language),
+                            Some(options_to_upstream(options)),
+                        )
+                        .map_err(|source| OrchionError::Inference { source })
+                }
+                TtsVoice::Design { prompt, language } => engine
+                    .synthesize_voice_design(
+                        text.as_str(),
+                        prompt.as_str(),
+                        language_to_upstream(language),
+                        Some(options_to_upstream(options)),
+                    )
+                    .map_err(|source| OrchionError::Inference { source }),
+            }?;
+            tracing::debug!(
+                text_chars = text_len,
+                samples = audio.samples.len(),
+                sample_rate = audio.sample_rate,
+                elapsed_ms = started.elapsed().as_millis(),
+                "TTS synthesis completed"
+            );
+            Ok(audio)
+        })
+        .await
+    }
+}
+
+fn speaker_to_upstream(speaker: TtsSpeaker) -> qwen3_tts::Speaker {
+    match speaker {
+        TtsSpeaker::Serena => qwen3_tts::Speaker::Serena,
+        TtsSpeaker::Vivian => qwen3_tts::Speaker::Vivian,
+        TtsSpeaker::UncleFu => qwen3_tts::Speaker::UncleFu,
+        TtsSpeaker::Ryan => qwen3_tts::Speaker::Ryan,
+        TtsSpeaker::Aiden => qwen3_tts::Speaker::Aiden,
+        TtsSpeaker::OnoAnna => qwen3_tts::Speaker::OnoAnna,
+        TtsSpeaker::Sohee => qwen3_tts::Speaker::Sohee,
+        TtsSpeaker::Eric => qwen3_tts::Speaker::Eric,
+        TtsSpeaker::Dylan => qwen3_tts::Speaker::Dylan,
+    }
+}
+
+fn language_to_upstream(language: TtsLanguage) -> qwen3_tts::Language {
+    match language {
+        TtsLanguage::English => qwen3_tts::Language::English,
+        TtsLanguage::Chinese => qwen3_tts::Language::Chinese,
+        TtsLanguage::Japanese => qwen3_tts::Language::Japanese,
+        TtsLanguage::Korean => qwen3_tts::Language::Korean,
+        TtsLanguage::German => qwen3_tts::Language::German,
+        TtsLanguage::French => qwen3_tts::Language::French,
+        TtsLanguage::Russian => qwen3_tts::Language::Russian,
+        TtsLanguage::Portuguese => qwen3_tts::Language::Portuguese,
+        TtsLanguage::Spanish => qwen3_tts::Language::Spanish,
+        TtsLanguage::Italian => qwen3_tts::Language::Italian,
+    }
+}
+
+fn options_to_upstream(options: TtsOptions) -> qwen3_tts::SynthesisOptions {
+    let mut upstream = qwen3_tts::SynthesisOptions::default();
+    upstream.seed = options.seed;
+    upstream.temperature = options.temperature;
+    upstream.top_k = options.top_k;
+    upstream.top_p = options.top_p;
+    upstream.repetition_penalty = options.repetition_penalty;
+    upstream.max_length = options.max_length;
+    upstream
+}
+
+fn audio_from_upstream(audio: qwen3_tts::AudioBuffer) -> TtsAudio {
+    TtsAudio::new(audio.samples, audio.sample_rate)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn speaker_mapping_covers_all_public_speakers() {
+        let speakers = [
+            TtsSpeaker::Serena,
+            TtsSpeaker::Vivian,
+            TtsSpeaker::UncleFu,
+            TtsSpeaker::Ryan,
+            TtsSpeaker::Aiden,
+            TtsSpeaker::OnoAnna,
+            TtsSpeaker::Sohee,
+            TtsSpeaker::Eric,
+            TtsSpeaker::Dylan,
+        ];
+        for speaker in speakers {
+            let _ = speaker_to_upstream(speaker);
+        }
+    }
+
+    #[test]
+    fn language_mapping_covers_supported_languages() {
+        let languages = [
+            TtsLanguage::English,
+            TtsLanguage::Chinese,
+            TtsLanguage::Japanese,
+            TtsLanguage::Korean,
+            TtsLanguage::German,
+            TtsLanguage::French,
+            TtsLanguage::Russian,
+            TtsLanguage::Portuguese,
+            TtsLanguage::Spanish,
+            TtsLanguage::Italian,
+        ];
+        for language in languages {
+            let _ = language_to_upstream(language);
+        }
+    }
+
+    #[test]
+    fn model_capability_checks_match_voice_variants() {
+        assert!(
+            ensure_voice_supported(
+                TtsModel::Qwen3Tts06BCustomVoice,
+                &TtsVoice::Preset {
+                    speaker: TtsSpeaker::Ryan,
+                    language: TtsLanguage::English,
+                }
+            )
+            .is_ok()
+        );
+        assert!(
+            ensure_voice_supported(
+                TtsModel::Qwen3Tts06BBase,
+                &TtsVoice::Preset {
+                    speaker: TtsSpeaker::Ryan,
+                    language: TtsLanguage::English,
+                }
+            )
+            .is_err()
+        );
+    }
+}

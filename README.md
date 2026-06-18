@@ -30,29 +30,29 @@ Orchion currently supports Qwen3 ASR/TTS models and is designed so additional sp
 ### Run Tests
 
 ```sh
-cargo test -p orchion --lib
-cargo test -p orchion-server --lib --tests
+cargo test --workspace --features full,cpu
 ```
 
 ### Run An Example
 
 ```sh
-cargo run -p orchion-example-download-model -- models
-cargo run -p orchion-example-asr-file -- audio.wav models
-cargo run -p orchion-example-tts-preset -- "Hello from Orchion" output.wav models
+cargo run -p orchion --features download-all --example download_model -- models
+cargo run -p orchion --features asr-qwen3,download-all,cpu --example asr_file -- audio.wav models
+cargo run -p orchion --features tts-qwen3,download-all,cpu --example tts_preset -- "Hello from Orchion" output.wav models
 ```
 
 ## Core Library
 
-The core crate lives at `libs/orchion` and exposes async Rust APIs for loading, downloading, and running ASR/TTS models.
+The public facade crate lives at `crates/orchion` and exposes async Rust APIs for loading, downloading, and running ASR/TTS models. Domain types live in `crates/orchion-core`, FFmpeg-backed audio conversion lives in `crates/orchion-audio`, model downloads live in `crates/orchion-download`, and Qwen3 runtime adapters live in `crates/orchion-qwen3`.
 
 ### Cargo Features
 
-- `default = ["asr", "tts", "download"]`
-- `asr`: Qwen3 ASR transcription and streaming wrappers.
-- `tts`: Qwen3 TTS preset speaker, voice clone, and voice design wrappers.
-- `download`: async model downloads through `hf-hub` and `modelscope`.
-- `metal`, `cuda`: GPU backend feature opt-ins passed through to upstream crates. CUDA also enables supported CUDA-only acceleration in upstream backends.
+- `default = []`
+- `full`: Qwen3 ASR/TTS, FFmpeg audio conversion, and all download providers.
+- `asr-qwen3`, `tts-qwen3`: Qwen3 ASR/TTS runtime adapters.
+- `audio-ffmpeg`: in-memory audio decode/encode through system `ffmpeg`.
+- `download-all`: async model downloads through `hf-hub` and `modelscope`.
+- `cpu`, `metal`, `cuda`: backend feature opt-ins passed through to upstream crates.
 
 ### ASR Example
 
@@ -93,17 +93,17 @@ async fn main() -> Result<()> {
 
 ## OpenAI-Compatible Server
 
-The server crate lives at `apps/server`. It uses Axum and exposes OpenAI-style audio routes.
+The server crate lives at `apps/orchion-server`. It uses Axum and exposes OpenAI-style audio routes.
 
 ### Run The Server
 
 ```sh
-cargo run -p orchion-server -- --config apps/server/config.toml
+cargo run -p orchion-server -- --config apps/orchion-server/config.toml
 ```
 
-The repository includes `apps/server/config.toml` as a development config. If `--config` is omitted, the server looks for `config.toml` beside the executable. If `models.dir` is omitted, models are stored in `models/` beside the executable.
+The repository includes `apps/orchion-server/config.toml` as a development config. If `--config` is omitted, the server looks for `config.toml` beside the executable. If `models.dir` is omitted, models are stored in `models/` beside the executable.
 
-Logging is controlled by `RUST_LOG`. The server loads `.env` from the executable directory first, then from the current working directory. The repository includes a development `.env`, so `cargo run -p orchion-server -- --config apps/server/config.toml` emits startup, model loading, download, and request debug logs by default.
+Logging is controlled by `RUST_LOG`. The server loads `.env` from the executable directory first, then from the current working directory. The repository includes a development `.env`, so `cargo run -p orchion-server -- --config apps/orchion-server/config.toml` emits startup, model loading, download, and request debug logs by default.
 
 ### Routes
 
@@ -290,10 +290,8 @@ Useful commands:
 
 ```sh
 cargo fmt --all -- --check
-cargo test -p orchion --lib
-cargo test -p orchion-server --lib --tests
-cargo check --workspace --exclude orchion-server
-cargo check -p orchion-server
+cargo test --workspace --features full,cpu
+cargo check --workspace
 ```
 
 Real model download tests are kept out of the default test path. Run ignored integration tests explicitly when network access and model storage are available.

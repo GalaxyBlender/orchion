@@ -1,0 +1,59 @@
+[package]
+name = "orchion"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+
+[features]
+default = []
+full = ["asr-qwen3", "tts-qwen3", "audio-ffmpeg", "download-all"]
+asr = ["asr-qwen3"]
+tts = ["tts-qwen3"]
+download = ["download-all"]
+asr-qwen3 = ["dep:orchion-qwen3", "orchion-qwen3/asr"]
+tts-qwen3 = ["dep:orchion-qwen3", "orchion-qwen3/tts"]
+audio-ffmpeg = ["dep:orchion-audio"]
+download-all = ["dep:orchion-download", "orchion-download/all-providers"]
+cpu = ["orchion-qwen3?/cpu"]
+metal = ["orchion-qwen3?/metal"]
+cuda = ["orchion-qwen3?/cuda"]
+flash-attn = []
+
+[dependencies]
+orchion-audio = { path = "../orchion-audio", optional = true }
+orchion-core = { path = "../orchion-core" }
+orchion-download = { path = "../orchion-download", default-features = false, optional = true }
+orchion-qwen3 = { path = "../orchion-qwen3", default-features = false, optional = true }
+tracing = "0.1"
+
+[dev-dependencies]
+hound = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[[example]]
+name = "asr_file"
+path = "examples/asr_file.rs"
+required-features = ["asr-qwen3", "download-all"]
+
+[[example]]
+name = "asr_streaming"
+path = "examples/asr_streaming.rs"
+required-features = ["asr-qwen3", "download-all"]
+
+[[example]]
+name = "download_model"
+path = "examples/download_model.rs"
+required-features = ["download-all"]
+
+[[example]]
+name = "tts_preset"
+path = "examples/tts_preset.rs"
+required-features = ["tts-qwen3", "download-all"]
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

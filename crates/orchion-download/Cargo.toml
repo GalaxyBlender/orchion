@@ -1,0 +1,32 @@
+[package]
+name = "orchion-download"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+
+[features]
+default = ["all-providers"]
+all-providers = ["huggingface", "modelscope"]
+huggingface = []
+modelscope = []
+
+[dependencies]
+hf-hub = { version = "0.4", features = ["tokio"] }
+modelscope = "0.1"
+orchion-core = { path = "../orchion-core" }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+serde_json = "1"
+tokio = { version = "1", features = ["fs", "time"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
