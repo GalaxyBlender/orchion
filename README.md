@@ -2,28 +2,26 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-Orchion is an easy-to-use async Rust library for speech AI workflows such as ASR and TTS. It includes typed Rust APIs, standalone example binaries, and an OpenAI-compatible HTTP server with Swagger documentation.
+Orchion provides a unified Rust API library and an out-of-the-box OpenAI-compatible API server for local speech AI workflows. It supports ASR and TTS through typed Rust APIs, standalone examples, and HTTP endpoints that are easy to integrate with existing OpenAI-style clients.
 
-Orchion currently supports Qwen3 ASR/TTS models and is designed so additional speech model backends can be added over time. It focuses on practical local inference workflows: model names are represented as Rust enums, model downloads are handled through HuggingFace and ModelScope clients, synchronous upstream inference is wrapped behind async APIs, and the server defaults to CPU with optional Metal or CUDA backends.
+Orchion currently focuses on Qwen3 ASR/TTS models and is structured to support more speech backends over time.
 
 ## Highlights
 
-- Easy-to-use async Rust APIs for ASR and TTS workflows.
-- OpenAI-compatible `/v1/audio/transcriptions` and `/v1/audio/speech` APIs.
-- Minimal OpenAI-style extensions for TTS voice clone and voice design.
-- `config.toml` based server configuration for model selection and defaults.
-- Model downloads from HuggingFace or ModelScope, with automatic fallback support.
-- Server defaults to CPU, with optional Metal on macOS or CUDA on Linux and Windows.
+- Unified async Rust APIs for ASR and TTS workflows.
+- Ready-to-run OpenAI-compatible API server.
+- `/v1/audio/transcriptions` and `/v1/audio/speech` endpoints.
+- TTS support for preset voices, voice cloning, and voice design.
+- Model downloads from HuggingFace or ModelScope.
+- CPU by default, with optional Metal and CUDA builds.
 - Swagger UI at `/docs` and OpenAPI JSON at `/openapi/v1.json`.
 
 ## Requirements
 
 - Rust `1.85` or newer.
-- `ffmpeg` available on `PATH` for in-memory ASR upload decoding and TTS response encoding.
-- A supported Qwen3 ASR/TTS backend through the upstream `qwen3-asr` and `qwen3-tts` crates.
-- Optional GPU stack:
-  - macOS: Metal-capable device.
-  - Linux or Windows: CUDA-capable device and compatible CUDA runtime.
+- `ffmpeg` available on `PATH` for audio decode/encode.
+- Enough local disk space for downloaded models.
+- Optional GPU runtime for Metal or CUDA acceleration.
 
 ## Quick Start
 
@@ -33,7 +31,7 @@ Orchion currently supports Qwen3 ASR/TTS models and is designed so additional sp
 cargo test --workspace --features full,cpu
 ```
 
-### Run An Example
+### Run Examples
 
 ```sh
 cargo run -p orchion --features download-all --example download_model -- models
@@ -41,59 +39,9 @@ cargo run -p orchion --features asr-qwen3,download-all,cpu --example asr_file --
 cargo run -p orchion --features tts-qwen3,download-all,cpu --example tts_preset -- "Hello from Orchion" output.wav models
 ```
 
-## Core Library
-
-The public facade crate lives at `libs/orchion` and exposes async Rust APIs for loading, downloading, and running ASR/TTS models. Domain types live in `libs/orchion-core`, FFmpeg-backed audio conversion lives in `libs/orchion-audio`, model downloads live in `libs/orchion-download`, and Qwen3 runtime adapters live in `libs/orchion-qwen3`.
-
-### Cargo Features
-
-- `default = []`
-- `full`: Qwen3 ASR/TTS, FFmpeg audio conversion, and all download providers.
-- `asr-qwen3`, `tts-qwen3`: Qwen3 ASR/TTS runtime adapters.
-- `audio-ffmpeg`: in-memory audio decode/encode through system `ffmpeg`.
-- `download-all`: async model downloads through `hf-hub` and `modelscope`.
-- `cpu`, `metal`, `cuda`: backend feature opt-ins passed through to upstream crates.
-
-### ASR Example
-
-```rust,no_run
-use orchion::{Asr, AsrModel, Result};
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    let asr = Asr::load_or_download(AsrModel::Qwen3Asr06B, "models").await?;
-    let transcript = asr.transcribe_file("audio.wav").await?;
-    println!("{}", transcript.text);
-    Ok(())
-}
-```
-
-Streaming accepts mono `f32` samples plus the source sample rate. Orchion automatically resamples chunks to 16 kHz before forwarding them to Qwen3 ASR.
-
-### TTS Example
-
-```rust,no_run
-use orchion::{Result, Tts, TtsLanguage, TtsModel, TtsSpeaker, TtsVoice};
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    let tts = Tts::load_or_download(TtsModel::Qwen3Tts06BCustomVoice, "models").await?;
-    tts.synthesize_to_file(
-        "Hello from Orchion.",
-        TtsVoice::Preset {
-            speaker: TtsSpeaker::Ryan,
-            language: TtsLanguage::English,
-        },
-        "output.wav",
-    )
-    .await?;
-    Ok(())
-}
-```
-
 ## OpenAI-Compatible Server
 
-The server crate lives at `apps/orchion-server`. It uses Axum and exposes OpenAI-style audio routes.
+The server crate lives at `apps/orchion-server` and exposes OpenAI-style audio routes.
 
 ### Run The Server
 
@@ -103,16 +51,14 @@ cargo run -p orchion-server --features metal -- --config apps/orchion-server/con
 cargo run -p orchion-server --features cuda -- --config apps/orchion-server/config.toml
 ```
 
-`orchion-server` defaults to the `cpu` feature. Add `--features metal` on macOS, or `--features cuda` on Linux or Windows with a supported CUDA stack; GPU builds still include the CPU backend.
-
-The repository includes `apps/orchion-server/config.toml` as a development config. If `--config` is omitted, the server looks for `config.toml` beside the executable. If `models.dir` is omitted, models are stored in `models/` beside the executable.
+`orchion-server` defaults to CPU. Use `--features metal` on macOS, or `--features cuda` on Linux/Windows with a supported CUDA stack. The repository includes `apps/orchion-server/config.toml` as a development config.
 
 ### Routes
 
 - `GET /healthz`: health check.
-- `GET /v1/models`: OpenAI-style list of configured available models.
+- `GET /v1/models`: OpenAI-style list of configured models.
 - `POST /v1/audio/transcriptions`: OpenAI-style multipart ASR request.
-- `POST /v1/audio/speech`: OpenAI-style JSON TTS request.
+- `POST /v1/audio/speech`: OpenAI-style TTS request.
 - `GET /docs`: Swagger UI.
 - `GET /openapi/v1.json`: OpenAPI document.
 
@@ -126,15 +72,15 @@ curl http://127.0.0.1:9090/v1/audio/transcriptions \
   -F "timestamp_granularities[]=segment"
 ```
 
-Uploaded audio is decoded in memory through system `ffmpeg`; common formats such as `wav`, `mp3`, `m4a`, `flac`, `ogg`, and `webm` work when supported by the installed ffmpeg build. Supported `response_format` values are `json`, `text`, `verbose_json`, and `srt`. `timestamp_granularities[]=segment` enables WebRTC VAD segment timestamps in `verbose_json`; `response_format=srt` enables segmenting implicitly and returns subtitle cues as `text/plain`. Word-level timestamps remain unsupported and `timestamp_granularities[]=word` is rejected.
+Uploaded audio is decoded through system `ffmpeg`; common formats such as `wav`, `mp3`, `m4a`, `flac`, `ogg`, and `webm` work when supported by the installed ffmpeg build. Supported `response_format` values are `json`, `text`, `verbose_json`, and `srt`. `timestamp_granularities[]=segment` enables segment timestamps in `verbose_json`; `response_format=srt` returns subtitle cues as `text/plain`. Word-level timestamps are not supported.
 
 ### Speech Request
 
-Speech synthesis uses `POST /v1/audio/speech`. The `voice` field selects one of three request types: preset voice, voice clone, or voice design.
+Speech synthesis uses `POST /v1/audio/speech`. The `voice` field selects preset voice, voice clone, or voice design.
 
 #### Preset Voice
 
-Preset voice synthesis uses a JSON request and passes a built-in speaker name such as `ryan` as `voice`.
+Preset voice synthesis uses JSON and passes a built-in speaker name as `voice`.
 
 Fields:
 
@@ -160,7 +106,7 @@ curl http://127.0.0.1:9090/v1/audio/speech \
 
 #### Voice Clone
 
-Voice clone uses the same `POST /v1/audio/speech` endpoint, but the request body must be `multipart/form-data` and upload the reference audio directly as a file field. JSON requests do not support voice clone.
+Voice clone uses the same endpoint with `multipart/form-data` and uploads reference audio directly.
 
 Fields:
 
@@ -186,7 +132,7 @@ curl http://127.0.0.1:9090/v1/audio/speech \
 
 #### Voice Design
 
-Voice design uses a JSON request, passes `design` as `voice`, and describes the generated voice through `voice_prompt`.
+Voice design uses JSON, passes `design` as `voice`, and describes the generated voice through `voice_prompt`.
 
 Fields:
 
@@ -211,9 +157,9 @@ curl http://127.0.0.1:9090/v1/audio/speech \
   --output designed.wav
 ```
 
-Supported speech output formats are `wav`, `mp3`, `aac`, `opus`, `flac`, and `pcm`. If `response_format` is omitted, the server uses `[defaults.tts] format` from `config.toml`, which defaults to `wav`. `speed` must remain `1.0` because the upstream wrapper does not expose speed control.
+Supported speech output formats are `wav`, `mp3`, `aac`, `opus`, `flac`, and `pcm`. If `response_format` is omitted, the server uses `[defaults.tts] format` from `config.toml`, which defaults to `wav`. `speed` must remain `1.0` because speed control is not exposed yet.
 
-Qwen3 TTS requests also accept sampling controls: `seed`, `temperature`, `top_k`, `top_p`, `repetition_penalty`, and `max_length`. If `seed` is omitted, Orchion uses `42` to make TTS output reproducible by default. Other sampling fields keep the upstream `qwen3-tts` defaults unless provided. `max_length` is the maximum number of generated codec frames and can be lowered to cap long generations when EOS is delayed.
+Qwen3 TTS requests also accept `seed`, `temperature`, `top_k`, `top_p`, `repetition_penalty`, and `max_length`. If `seed` is omitted, Orchion uses `42` by default. Other sampling fields keep upstream defaults unless provided.
 
 ### Model List Request
 
@@ -224,6 +170,53 @@ curl http://127.0.0.1:9090/v1/models
 The response follows the OpenAI model list shape: `object` is `list`, and `data` contains model objects with `id`, `object`, `created`, and `owned_by`. The list is built from `models.asr.available` and `models.tts.available` in `config.toml`.
 
 If `[auth] api_key` is configured, pass it as `Authorization: Bearer <api_key>` for every `/v1/*` request.
+
+## Rust Library
+
+The public facade crate lives at `libs/orchion` and exposes async Rust APIs for loading, downloading, and running ASR/TTS models.
+
+### ASR Example
+
+```rust,no_run
+use orchion::{Asr, AsrModel, Result};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let asr = Asr::load_or_download(AsrModel::Qwen3Asr06B, "models").await?;
+    let transcript = asr.transcribe_file("audio.wav").await?;
+    println!("{}", transcript.text);
+    Ok(())
+}
+```
+
+### TTS Example
+
+```rust,no_run
+use orchion::{Result, Tts, TtsLanguage, TtsModel, TtsSpeaker, TtsVoice};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let tts = Tts::load_or_download(TtsModel::Qwen3Tts06BCustomVoice, "models").await?;
+    tts.synthesize_to_file(
+        "Hello from Orchion.",
+        TtsVoice::Preset {
+            speaker: TtsSpeaker::Ryan,
+            language: TtsLanguage::English,
+        },
+        "output.wav",
+    )
+    .await?;
+    Ok(())
+}
+```
+
+### Cargo Features
+
+- `full`: Qwen3 ASR/TTS, FFmpeg audio conversion, and all download providers.
+- `asr-qwen3`, `tts-qwen3`: Qwen3 ASR/TTS runtime adapters.
+- `audio-ffmpeg`: audio decode/encode through system `ffmpeg`.
+- `download-all`: async model downloads through HuggingFace and ModelScope.
+- `cpu`, `metal`, `cuda`: backend feature opt-ins.
 
 ## Configuration
 
@@ -263,7 +256,7 @@ max_loaded = 1
 format = "wav"
 ```
 
-`models.asr.available` and `models.tts.available` define the server allowlists. First startup can download all allowlisted model files into `models.dir`; trim `models.*.available` for local development if you do not need every example model. Models are loaded into memory lazily when a request asks for them. Requests for models outside the allowlist are rejected immediately. `idle_timeout` unloads inactive models, and `max_loaded` evicts the least recently used loaded model when the cache is full.
+`models.asr.available` and `models.tts.available` define the server allowlists. First startup can download all allowlisted model files into `models.dir`; trim `models.*.available` for local development if you do not need every example model. Models are loaded lazily when requested. Requests for models outside the allowlist are rejected. `idle_timeout` unloads inactive models, and `max_loaded` evicts the least recently used loaded model when the cache is full.
 
 `models.asr.device` and `models.tts.device` control runtime placement independently. Omitted fields or `auto` prefer CUDA, then Metal, then CPU. When multiple CUDA devices are visible, `auto` chooses the CUDA GPU with the most free memory at model load time. Explicit values include `cpu`, `metal`/`metal0`, `cuda`, `cuda0`, `cuda:0`, `cuda1`, and `cuda:1`.
 
@@ -277,9 +270,7 @@ format = "wav"
 - `huggingface`: use HuggingFace only.
 - `modelscope`: use ModelScope only.
 
-When `HF_ENDPOINT` is set, Orchion passes it to the HuggingFace client.
-
-The server also accepts `models.source` in `config.toml` with the same values.
+When `HF_ENDPOINT` is set, Orchion passes it to the HuggingFace client. The server also accepts `models.source` in `config.toml` with the same values.
 
 `server.max_upload_size` limits request body size for uploads. It defaults to `30M` and accepts bytes or `K`, `M`, `G` suffixes.
 
@@ -301,7 +292,7 @@ cargo test --workspace --features full,cpu
 cargo check --workspace
 ```
 
-Real model download tests are kept out of the default test path. Run ignored integration tests explicitly when network access and model storage are available.
+Real model download tests are ignored by default. Run them explicitly when network access and model storage are available.
 
 ## Project Status
 
