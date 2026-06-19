@@ -23,22 +23,6 @@ Orchion currently focuses on Qwen3 ASR/TTS models and is structured to support m
 - Enough local disk space for downloaded models.
 - Optional GPU runtime for Metal or CUDA acceleration.
 
-## Quick Start
-
-### Run Tests
-
-```sh
-cargo test --workspace --features full,cpu
-```
-
-### Run Examples
-
-```sh
-cargo run -p orchion --features download-all --example download_model -- models
-cargo run -p orchion --features asr-qwen3,download-all,cpu --example asr_file -- audio.wav models
-cargo run -p orchion --features tts-qwen3,download-all,cpu --example tts_preset -- "Hello from Orchion" output.wav models
-```
-
 ## OpenAI-Compatible Server
 
 The server crate lives at `apps/orchion-server` and exposes OpenAI-style audio routes.
@@ -174,6 +158,22 @@ If `[auth] api_key` is configured, pass it as `Authorization: Bearer <api_key>` 
 ## Rust Library
 
 The public facade crate lives at `libs/orchion` and exposes async Rust APIs for loading, downloading, and running ASR/TTS models.
+
+### Quick Start
+
+#### Run Tests
+
+```sh
+cargo test --workspace --features full,cpu
+```
+
+#### Run Examples
+
+```sh
+cargo run -p orchion --features download-all --example download_model -- models
+cargo run -p orchion --features asr-qwen3,download-all,cpu --example asr_file -- audio.wav models
+cargo run -p orchion --features tts-qwen3,download-all,cpu --example tts_preset -- "Hello from Orchion" output.wav models
+```
 
 ### ASR Example
 

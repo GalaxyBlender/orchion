@@ -23,22 +23,6 @@ Orchion 目前聚焦 Qwen3 ASR/TTS 模型，同时保留了后续扩展更多语
 - 足够的本地磁盘空间用于存放模型文件。
 - 如需加速，可准备 Metal 或 CUDA GPU 运行环境。
 
-## 快速开始
-
-### 运行测试
-
-```sh
-cargo test --workspace --features full,cpu
-```
-
-### 运行示例
-
-```sh
-cargo run -p orchion --features download-all --example download_model -- models
-cargo run -p orchion --features asr-qwen3,download-all,cpu --example asr_file -- audio.wav models
-cargo run -p orchion --features tts-qwen3,download-all,cpu --example tts_preset -- "Hello from Orchion" output.wav models
-```
-
 ## OpenAI 兼容服务
 
 服务端 crate 位于 `apps/orchion-server`，提供 OpenAI 风格的音频接口。
@@ -174,6 +158,22 @@ curl http://127.0.0.1:9090/v1/models
 ## Rust 库
 
 公开 facade crate 位于 `libs/orchion`，提供用于加载、下载和运行 ASR/TTS 模型的异步 Rust API。
+
+### 快速开始
+
+#### 运行测试
+
+```sh
+cargo test --workspace --features full,cpu
+```
+
+#### 运行示例
+
+```sh
+cargo run -p orchion --features download-all --example download_model -- models
+cargo run -p orchion --features asr-qwen3,download-all,cpu --example asr_file -- audio.wav models
+cargo run -p orchion --features tts-qwen3,download-all,cpu --example tts_preset -- "Hello from Orchion" output.wav models
+```
 
 ### ASR 示例
 
