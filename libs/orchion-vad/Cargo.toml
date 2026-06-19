@@ -1,0 +1,19 @@
+[package]
+name = "orchion-vad"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Voice activity detection utilities for Orchion"
+license = "MIT"
+repository = "https://github.com/xuan/orchion"
+
+[dependencies]
+orchion-core = { path = "../orchion-core" }
+wavekat-vad = { version = "0.1", default-features = false, features = ["webrtc"] }
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

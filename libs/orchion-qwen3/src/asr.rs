@@ -154,6 +154,7 @@ fn transcript_from_upstream(result: qwen3_asr::TranscribeResult) -> AsrTranscrip
         text: result.text,
         language: result.language,
         raw_output: result.raw_output,
+        segments: Vec::new(),
     }
 }
 

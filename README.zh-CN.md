@@ -107,8 +107,6 @@ cargo run -p orchion-server --features cuda -- --config apps/orchion-server/conf
 
 仓库内置了 `apps/orchion-server/config.toml` 作为开发配置。如果省略 `--config`，服务会读取可执行文件旁边的 `config.toml`。如果省略 `models.dir`，模型会存储到可执行文件旁边的 `models/`。
 
-日志通过 `RUST_LOG` 控制。服务会先读取可执行文件目录下的 `.env`，再读取当前工作目录下的 `.env`。仓库内置了开发用 `.env`，因此 `cargo run -p orchion-server -- --config apps/orchion-server/config.toml` 默认会输出启动、模型加载、下载和请求 debug 日志。
-
 ### 路由
 
 - `GET /healthz`：健康检查。
@@ -124,10 +122,11 @@ cargo run -p orchion-server --features cuda -- --config apps/orchion-server/conf
 curl http://127.0.0.1:9090/v1/audio/transcriptions \
   -F model=qwen3-asr-0.6b \
   -F file=@audio.mp3 \
-  -F response_format=json
+  -F response_format=verbose_json \
+  -F "timestamp_granularities[]=segment"
 ```
 
-上传音频会通过系统 `ffmpeg` 在内存中解码；只要当前 ffmpeg 构建支持，常见的 `wav`、`mp3`、`m4a`、`flac`、`ogg`、`webm` 等格式都可以使用。支持的 `response_format` 值为 `json`、`text` 和 `verbose_json`。当前 ASR 封装不暴露词级或片段级时间戳，因此 timestamp granularities 会被明确拒绝。
+上传音频会通过系统 `ffmpeg` 在内存中解码；只要当前 ffmpeg 构建支持，常见的 `wav`、`mp3`、`m4a`、`flac`、`ogg`、`webm` 等格式都可以使用。支持的 `response_format` 值为 `json`、`text`、`verbose_json` 和 `srt`。`timestamp_granularities[]=segment` 会启用 WebRTC VAD 分段，并在 `verbose_json` 中返回片段时间戳；`response_format=srt` 会隐式启用分段，并以 `text/plain` 返回字幕 cues。词级时间戳仍不支持，`timestamp_granularities[]=word` 会被拒绝。
 
 ### 语音合成请求
 

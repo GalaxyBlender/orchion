@@ -3,6 +3,7 @@ use crate::api::openai::{
     ApiError, ModelList, ModelObject, SpeechFormat, SpeechRequest, TranscriptionFormat,
     TranscriptionJson, TranscriptionVerboseJson, content_type_for,
 };
+use crate::api::srt::format_srt;
 use crate::infrastructure::orchion::AppState;
 use crate::settings::{parse_asr_model, parse_tts_model};
 use axum::body::Body;
@@ -12,7 +13,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use orchion::{AsrOptions, AudioOutputFormat, encode_tts_audio};
+use orchion::{AsrOptions, AsrTimestampGranularity, AudioOutputFormat, encode_tts_audio};
 use std::sync::Arc;
 use std::time::Instant;
 use tempfile::NamedTempFile;
@@ -326,13 +327,8 @@ async fn create_transcription(
         }
     }
 
-    if !timestamp_granularities.is_empty() {
-        return Err(ApiError::invalid_request(
-            "timestamp granularities are not currently supported",
-            Some("timestamp_granularities"),
-            Some("unsupported_timestamp_granularity"),
-        ));
-    }
+    let segment_timestamps = parse_timestamp_granularities(&timestamp_granularities)?;
+    let use_segments = segment_timestamps || matches!(response_format, TranscriptionFormat::Srt);
 
     let model = model.ok_or_else(|| {
         ApiError::invalid_request(
@@ -361,15 +357,17 @@ async fn create_transcription(
         audio_bytes = audio_bytes.len(),
         "transcription request received"
     );
-    let transcript = asr
-        .transcribe_audio_bytes_with(
-            audio_bytes,
-            AsrOptions {
-                language,
-                ..Default::default()
-            },
-        )
-        .await?;
+    let options = AsrOptions {
+        language,
+        ..Default::default()
+    };
+    let transcript = if use_segments {
+        asr.transcribe_audio_bytes_with_segments(audio_bytes, options)
+            .await?
+    } else {
+        asr.transcribe_audio_bytes_with(audio_bytes, options)
+            .await?
+    };
     tracing::info!(format = ?response_format, "transcription request completed");
 
     Ok(match response_format {
@@ -381,8 +379,17 @@ async fn create_transcription(
             text: transcript.text,
             language: transcript.language,
             raw_output: transcript.raw_output,
+            segments: segment_timestamps.then_some(transcript.segments),
         })
         .into_response(),
+        TranscriptionFormat::Srt => (
+            [(
+                CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            )],
+            format_srt(&transcript),
+        )
+            .into_response(),
         TranscriptionFormat::Text => (
             [(
                 CONTENT_TYPE,
@@ -392,6 +399,29 @@ async fn create_transcription(
         )
             .into_response(),
     })
+}
+
+fn parse_timestamp_granularities(values: &[String]) -> Result<bool, ApiError> {
+    let mut wants_segments = false;
+    for value in values {
+        match value.parse::<AsrTimestampGranularity>().map_err(|error| {
+            ApiError::invalid_request(
+                error,
+                Some("timestamp_granularities"),
+                Some("unsupported_timestamp_granularity"),
+            )
+        })? {
+            AsrTimestampGranularity::Segment => wants_segments = true,
+            AsrTimestampGranularity::Word => {
+                return Err(ApiError::invalid_request(
+                    "word timestamp granularity is not supported",
+                    Some("timestamp_granularities"),
+                    Some("unsupported_timestamp_granularity"),
+                ));
+            }
+        }
+    }
+    Ok(wants_segments)
 }
 
 fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
@@ -467,4 +497,40 @@ async fn read_text_field(
             Some("invalid_multipart_field"),
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_timestamp_granularities_accepts_segment() {
+        let values = vec!["segment".to_string()];
+
+        assert!(parse_timestamp_granularities(&values).unwrap());
+    }
+
+    #[test]
+    fn parse_timestamp_granularities_rejects_word() {
+        let values = vec!["segment".to_string(), "word".to_string()];
+
+        let error = parse_timestamp_granularities(&values).unwrap_err();
+
+        assert_eq!(
+            error.error.code.as_deref(),
+            Some("unsupported_timestamp_granularity")
+        );
+    }
+
+    #[test]
+    fn parse_timestamp_granularities_rejects_unknown_value() {
+        let values = vec!["sentence".to_string()];
+
+        let error = parse_timestamp_granularities(&values).unwrap_err();
+
+        assert_eq!(
+            error.error.param.as_deref(),
+            Some("timestamp_granularities")
+        );
+    }
 }

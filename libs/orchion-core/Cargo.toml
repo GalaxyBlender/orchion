@@ -7,9 +7,16 @@ description = "Domain types and errors for Orchion speech workflows"
 license = "MIT"
 repository = "https://github.com/xuan/orchion"
 
+[features]
+default = []
+serde = ["dep:serde"]
+schema = ["dep:utoipa"]
+
 [dependencies]
 anyhow = "1"
+serde = { version = "1", features = ["derive"], optional = true }
 thiserror = "2"
+utoipa = { version = "5", optional = true }
 
 [lints.rust]
 unsafe_code = "warn"

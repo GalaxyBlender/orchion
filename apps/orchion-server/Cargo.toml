@@ -16,7 +16,7 @@ anyhow = "1"
 axum = { version = "0.8", features = ["json", "multipart"] }
 clap = { version = "4", features = ["derive"] }
 http = "1"
-orchion = { path = "../../libs/orchion", default-features = false, features = ["asr-qwen3", "tts-qwen3", "audio-ffmpeg", "download-all"] }
+orchion = { path = "../../libs/orchion", default-features = false, features = ["asr-qwen3", "tts-qwen3", "audio-ffmpeg", "download-all", "vad-webrtc", "serde", "schema"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"

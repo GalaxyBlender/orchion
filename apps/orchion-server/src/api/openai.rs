@@ -1,7 +1,9 @@
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use orchion::{AudioOutputFormat, ModelSpec, TtsLanguage, TtsOptions, TtsSpeaker, TtsVoice};
+use orchion::{
+    AsrSegment, AudioOutputFormat, ModelSpec, TtsLanguage, TtsOptions, TtsSpeaker, TtsVoice,
+};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::path::PathBuf;
 use utoipa::ToSchema;
@@ -390,17 +392,13 @@ impl SpeechRequest {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TranscriptionFormat {
+    #[default]
     Json,
     Text,
     VerboseJson,
-}
-
-impl Default for TranscriptionFormat {
-    fn default() -> Self {
-        Self::Json
-    }
+    Srt,
 }
 
 impl TryFrom<&str> for TranscriptionFormat {
@@ -411,8 +409,9 @@ impl TryFrom<&str> for TranscriptionFormat {
             "json" => Ok(Self::Json),
             "text" => Ok(Self::Text),
             "verbose_json" => Ok(Self::VerboseJson),
+            "srt" => Ok(Self::Srt),
             _ => Err(ApiError::invalid_request(
-                "unsupported transcription response format; supported formats are json, text, and verbose_json",
+                "unsupported transcription response format; supported formats are json, text, verbose_json, and srt",
                 Some("response_format"),
                 Some("unsupported_response_format"),
             )),
@@ -430,6 +429,8 @@ pub struct TranscriptionVerboseJson {
     pub text: String,
     pub language: String,
     pub raw_output: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segments: Option<Vec<AsrSegment>>,
 }
 
 #[must_use]
@@ -495,4 +496,38 @@ fn parse_language(value: &str) -> Result<TtsLanguage, ApiError> {
 
 fn normalize_identifier(value: &str) -> String {
     value.trim().to_ascii_lowercase().replace('_', "-")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transcription_format_accepts_srt() {
+        assert_eq!(
+            TranscriptionFormat::try_from("srt").unwrap(),
+            TranscriptionFormat::Srt
+        );
+    }
+
+    #[test]
+    fn verbose_json_serializes_segments_when_present() {
+        let response = TranscriptionVerboseJson {
+            text: "hello".to_string(),
+            language: "en".to_string(),
+            raw_output: "raw".to_string(),
+            segments: Some(vec![AsrSegment {
+                id: 0,
+                start: 1.0,
+                end: 2.0,
+                text: "hello".to_string(),
+            }]),
+        };
+
+        let value = serde_json::to_value(response).unwrap();
+
+        assert_eq!(value["segments"][0]["start"], 1.0);
+        assert_eq!(value["segments"][0]["end"], 2.0);
+        assert_eq!(value["segments"][0]["text"], "hello");
+    }
 }

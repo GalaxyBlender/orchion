@@ -7,9 +7,10 @@ pub mod asr;
 pub mod tts;
 
 pub use orchion_core::{
-    ASR_SAMPLE_RATE, AsrModel, AsrOptions, AsrStreamingOptions, AsrTranscript, DevicePreference,
-    ModelCategory, ModelSpec, OrchionError, Result, TtsAudio, TtsLanguage, TtsModel, TtsOptions,
-    TtsSpeaker, TtsVoice, ensure_voice_supported, prepare_asr_samples,
+    ASR_SAMPLE_RATE, AsrModel, AsrOptions, AsrSegment, AsrStreamingOptions,
+    AsrTimestampGranularity, AsrTranscript, DevicePreference, ModelCategory, ModelSpec,
+    OrchionError, Result, TtsAudio, TtsLanguage, TtsModel, TtsOptions, TtsSpeaker, TtsVoice,
+    ensure_voice_supported, prepare_asr_samples,
 };
 
 #[cfg(feature = "audio-ffmpeg")]

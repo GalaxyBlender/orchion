@@ -7,13 +7,16 @@ license = "MIT"
 
 [features]
 default = []
-full = ["asr-qwen3", "tts-qwen3", "audio-ffmpeg", "download-all"]
+full = ["asr-qwen3", "tts-qwen3", "audio-ffmpeg", "download-all", "vad-webrtc"]
 asr = ["asr-qwen3"]
 tts = ["tts-qwen3"]
 download = ["download-all"]
 asr-qwen3 = ["dep:orchion-qwen3", "orchion-qwen3/asr"]
 tts-qwen3 = ["dep:orchion-qwen3", "orchion-qwen3/tts"]
 audio-ffmpeg = ["dep:orchion-audio"]
+vad-webrtc = ["dep:orchion-vad"]
+serde = ["orchion-core/serde"]
+schema = ["orchion-core/schema"]
 download-all = ["dep:orchion-download", "orchion-download/all-providers"]
 cpu = ["orchion-qwen3?/cpu"]
 metal = ["orchion-qwen3?/metal"]
@@ -25,6 +28,7 @@ orchion-audio = { path = "../orchion-audio", optional = true }
 orchion-core = { path = "../orchion-core" }
 orchion-download = { path = "../orchion-download", default-features = false, optional = true }
 orchion-qwen3 = { path = "../orchion-qwen3", default-features = false, optional = true }
+orchion-vad = { path = "../orchion-vad", optional = true }
 tracing = "0.1"
 
 [dev-dependencies]

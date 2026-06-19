@@ -2445,6 +2445,7 @@ dependencies = [
  "orchion-core",
  "orchion-download",
  "orchion-qwen3",
+ "orchion-vad",
  "tokio",
  "tracing",
 ]
@@ -2463,7 +2464,9 @@ name = "orchion-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "serde",
  "thiserror 2.0.18",
+ "utoipa",
 ]
 
 [[package]]
@@ -2515,6 +2518,14 @@ dependencies = [
  "tracing-subscriber",
  "utoipa",
  "utoipa-swagger-ui",
+]
+
+[[package]]
+name = "orchion-vad"
+version = "0.1.0"
+dependencies = [
+ "orchion-core",
+ "wavekat-vad",
 ]
 
 [[package]]
@@ -3016,6 +3027,18 @@ name = "rubato"
 version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b5d18b486e7d29a408ef3f825bc1327d8f87af091c987ca2f5b734625940e234"
+dependencies = [
+ "num-complex",
+ "num-integer",
+ "num-traits",
+ "realfft",
+]
+
+[[package]]
+name = "rubato"
+version = "0.16.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5258099699851cfd0082aeb645feb9c084d9a5e1f1b8d5372086b989fc5e56a1"
 dependencies = [
  "num-complex",
  "num-integer",
@@ -4322,6 +4345,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wavekat-vad"
+version = "0.1.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d480463e20c9e4522e003d198932a02ad811ebffd3e8c5dd8e65e8b1bcdccd6b"
+dependencies = [
+ "rubato 0.16.2",
+ "thiserror 2.0.18",
+ "webrtc-vad",
+]
+
+[[package]]
 name = "web-sys"
 version = "0.3.102"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4357,6 +4391,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf85cb06032201fa7c6f829d7db5a7e5aa45bcc0655327713065f6f0576731bf"
 dependencies = [
  "rustls-pki-types",
+]
+
+[[package]]
+name = "webrtc-vad"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39a1e40fd6ca90be95459152a2537f2ba4286ee1b13073f7ebcaa74fc94e3008"
+dependencies = [
+ "cc",
 ]
 
 [[package]]

@@ -107,8 +107,6 @@ cargo run -p orchion-server --features cuda -- --config apps/orchion-server/conf
 
 The repository includes `apps/orchion-server/config.toml` as a development config. If `--config` is omitted, the server looks for `config.toml` beside the executable. If `models.dir` is omitted, models are stored in `models/` beside the executable.
 
-Logging is controlled by `RUST_LOG`. The server loads `.env` from the executable directory first, then from the current working directory. The repository includes a development `.env`, so `cargo run -p orchion-server -- --config apps/orchion-server/config.toml` emits startup, model loading, download, and request debug logs by default.
-
 ### Routes
 
 - `GET /healthz`: health check.
@@ -124,10 +122,11 @@ Logging is controlled by `RUST_LOG`. The server loads `.env` from the executable
 curl http://127.0.0.1:9090/v1/audio/transcriptions \
   -F model=qwen3-asr-0.6b \
   -F file=@audio.mp3 \
-  -F response_format=json
+  -F response_format=verbose_json \
+  -F "timestamp_granularities[]=segment"
 ```
 
-Uploaded audio is decoded in memory through system `ffmpeg`; common formats such as `wav`, `mp3`, `m4a`, `flac`, `ogg`, and `webm` work when supported by the installed ffmpeg build. Supported `response_format` values are `json`, `text`, and `verbose_json`. Timestamp granularities are rejected explicitly because the current ASR wrapper does not expose word or segment timestamps.
+Uploaded audio is decoded in memory through system `ffmpeg`; common formats such as `wav`, `mp3`, `m4a`, `flac`, `ogg`, and `webm` work when supported by the installed ffmpeg build. Supported `response_format` values are `json`, `text`, `verbose_json`, and `srt`. `timestamp_granularities[]=segment` enables WebRTC VAD segment timestamps in `verbose_json`; `response_format=srt` enables segmenting implicitly and returns subtitle cues as `text/plain`. Word-level timestamps remain unsupported and `timestamp_granularities[]=word` is rejected.
 
 ### Speech Request
 

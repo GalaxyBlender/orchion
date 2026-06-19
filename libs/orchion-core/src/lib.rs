@@ -7,7 +7,8 @@ pub mod model;
 pub mod tts;
 
 pub use asr::{
-    ASR_SAMPLE_RATE, AsrOptions, AsrStreamingOptions, AsrTranscript, prepare_asr_samples,
+    ASR_SAMPLE_RATE, AsrOptions, AsrSegment, AsrStreamingOptions, AsrTimestampGranularity,
+    AsrTranscript, prepare_asr_samples,
 };
 pub use device::{DevicePreference, ParseDevicePreferenceError};
 pub use error::{OrchionError, Result};
