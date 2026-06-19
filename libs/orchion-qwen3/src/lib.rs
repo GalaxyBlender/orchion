@@ -1,6 +1,7 @@
 #![allow(clippy::missing_errors_doc, clippy::must_use_candidate)]
 
 mod blocking;
+mod device;
 
 #[cfg(feature = "asr")]
 pub mod asr;

@@ -1,4 +1,4 @@
-use orchion::{AsrModel, DownloadSource, ModelSpec, TtsModel};
+use orchion::{AsrModel, DevicePreference, DownloadSource, ModelSpec, TtsModel};
 use serde::Deserialize;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -50,6 +50,7 @@ pub struct ModelRegistrySection<M> {
     pub available: Vec<M>,
     pub idle_timeout: Duration,
     pub max_loaded: usize,
+    pub device: DevicePreference,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +94,13 @@ pub enum ConfigError {
     InvalidDuration { value: String, message: String },
     #[error("invalid {section}.max_loaded `{value}`: value must be greater than zero")]
     InvalidMaxLoaded { section: &'static str, value: usize },
+    #[error(
+        "invalid {section}.device `{value}`; expected auto, cpu, metal, metal0, cuda, cuda0, cuda:0, ..."
+    )]
+    InvalidDevice {
+        section: &'static str,
+        value: String,
+    },
     #[error("default {category} model `{default}` must be included in {section}.available")]
     DefaultModelUnavailable {
         category: &'static str,
@@ -119,12 +127,14 @@ impl ServerConfig {
                     available: vec![AsrModel::Qwen3Asr06B],
                     idle_timeout: Duration::from_secs(600),
                     max_loaded: 1,
+                    device: DevicePreference::Auto,
                 },
                 tts: ModelRegistrySection {
                     default: TtsModel::Qwen3Tts06BCustomVoice,
                     available: vec![TtsModel::Qwen3Tts06BCustomVoice],
                     idle_timeout: Duration::from_secs(600),
                     max_loaded: 1,
+                    device: DevicePreference::Auto,
                 },
             },
             auth: AuthSection { api_key: None },
@@ -227,6 +237,9 @@ fn parse_asr_registry(
     } else {
         registry.available = vec![registry.default];
     }
+    if let Some(device) = raw.device {
+        registry.device = parse_device_preference("models.asr", &device)?;
+    }
     apply_registry_limits(
         "models.asr",
         raw.idle_timeout,
@@ -258,6 +271,9 @@ fn parse_tts_registry(
             .collect::<Result<Vec<_>, _>>()?;
     } else {
         registry.available = vec![registry.default];
+    }
+    if let Some(device) = raw.device {
+        registry.device = parse_device_preference("models.tts", &device)?;
     }
     apply_registry_limits(
         "models.tts",
@@ -428,6 +444,18 @@ fn parse_model_source(value: &str) -> Result<ModelSource, ConfigError> {
     }
 }
 
+fn parse_device_preference(
+    section: &'static str,
+    value: &str,
+) -> Result<DevicePreference, ConfigError> {
+    value
+        .parse::<DevicePreference>()
+        .map_err(|_| ConfigError::InvalidDevice {
+            section,
+            value: value.to_string(),
+        })
+}
+
 fn resolve_exe_relative(exe_dir: &Path, value: impl Into<PathBuf>) -> PathBuf {
     let path = value.into();
     if path.is_absolute() {
@@ -473,6 +501,7 @@ struct RawModelRegistry {
     available: Option<Vec<String>>,
     idle_timeout: Option<String>,
     max_loaded: Option<usize>,
+    device: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

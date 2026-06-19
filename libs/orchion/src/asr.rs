@@ -1,4 +1,4 @@
-use orchion_core::{AsrModel, AsrOptions, AsrTranscript, Result};
+use orchion_core::{AsrModel, AsrOptions, AsrTranscript, DevicePreference, Result};
 use std::path::Path;
 use std::time::Instant;
 
@@ -9,8 +9,16 @@ pub struct Asr {
 
 impl Asr {
     pub async fn load(model: AsrModel, model_dir: impl AsRef<Path>) -> Result<Self> {
+        Self::load_with_device(model, model_dir, DevicePreference::Auto).await
+    }
+
+    pub async fn load_with_device(
+        model: AsrModel,
+        model_dir: impl AsRef<Path>,
+        device: DevicePreference,
+    ) -> Result<Self> {
         Ok(Self {
-            inner: orchion_qwen3::Asr::load(model, model_dir).await?,
+            inner: orchion_qwen3::Asr::load_with_device(model, model_dir, device).await?,
         })
     }
 

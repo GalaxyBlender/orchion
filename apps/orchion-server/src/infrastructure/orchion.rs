@@ -44,19 +44,25 @@ impl AppState {
     }
 
     pub async fn asr(&self, model: orchion::AsrModel) -> anyhow::Result<Option<Asr>> {
+        let device = self.config.models.asr.device;
         self.asr_models
             .get_or_load(model, |model, path| async move {
-                tracing::info!(model = ?model, "loading ASR model");
-                Asr::load(model, path).await.context("load ASR model")
+                tracing::info!(model = ?model, device = %device, "loading ASR model");
+                Asr::load_with_device(model, path, device)
+                    .await
+                    .context("load ASR model")
             })
             .await
     }
 
     pub async fn tts(&self, model: orchion::TtsModel) -> anyhow::Result<Option<Tts>> {
+        let device = self.config.models.tts.device;
         self.tts_models
             .get_or_load(model, |model, path| async move {
-                tracing::info!(model = ?model, "loading TTS model");
-                Tts::load(model, path).await.context("load TTS model")
+                tracing::info!(model = ?model, device = %device, "loading TTS model");
+                Tts::load_with_device(model, path, device)
+                    .await
+                    .context("load TTS model")
             })
             .await
     }

@@ -239,12 +239,14 @@ source = "auto"
 
 [models.asr]
 default = "qwen3-asr-0.6b"
+device = "auto"
 available = ["qwen3-asr-0.6b", "qwen3-asr-1.7b"]
 idle_timeout = "10m"
 max_loaded = 1
 
 [models.tts]
 default = "qwen3-tts-0.6b-custom-voice"
+device = "auto"
 available = [
   "qwen3-tts-0.6b-base",
   "qwen3-tts-0.6b-custom-voice",
@@ -262,7 +264,9 @@ max_loaded = 1
 format = "wav"
 ```
 
-`models.asr.available` 和 `models.tts.available` 是服务端允许使用的模型列表。启动时会把这些模型文件下载到 `models.dir`，但不会全部加载进内存；请求指定某个模型时才懒加载。请求不在 allowlist 中的模型会立即被拒绝。`idle_timeout` 会卸载空闲模型，`max_loaded` 会在缓存满时按最近最少使用策略卸载已加载模型。
+`models.asr.available` 和 `models.tts.available` 是服务端允许使用的模型列表。首次启动可能会把 allowlist 中的全部模型文件下载到 `models.dir`；本地开发时如果不需要示例里的所有模型，可以精简 `models.*.available`。模型不会全部加载进内存，请求指定某个模型时才懒加载。请求不在 allowlist 中的模型会立即被拒绝。`idle_timeout` 会卸载空闲模型，`max_loaded` 会在缓存满时按最近最少使用策略卸载已加载模型。
+
+`models.asr.device` 和 `models.tts.device` 分别控制 ASR/TTS 的运行设备。省略该字段或设置为 `auto` 时，会优先选择 CUDA，其次 Metal，最后 CPU；如果可见多张 CUDA 显卡，`auto` 会在模型加载时选择当前剩余显存最多的 CUDA 设备。显式值支持 `cpu`、`metal`/`metal0`、`cuda`、`cuda0`、`cuda:0`、`cuda1` 和 `cuda:1`。
 
 `[auth] api_key` 是可选配置。设置为非空值后，所有 `/v1/*` 路由都要求 `Authorization: Bearer <api_key>`；`/healthz` 和 `/docs` 保持公开。
 

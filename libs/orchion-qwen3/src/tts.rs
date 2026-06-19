@@ -1,6 +1,6 @@
 use orchion_core::{
-    OrchionError, Result, TtsAudio, TtsLanguage, TtsModel, TtsOptions, TtsSpeaker, TtsVoice,
-    ensure_voice_supported,
+    DevicePreference, OrchionError, Result, TtsAudio, TtsLanguage, TtsModel, TtsOptions,
+    TtsSpeaker, TtsVoice, ensure_voice_supported,
 };
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -14,21 +14,29 @@ pub struct Tts {
 
 impl Tts {
     pub async fn load(model: TtsModel, model_dir: impl AsRef<Path>) -> Result<Self> {
+        Self::load_with_device(model, model_dir, DevicePreference::Auto).await
+    }
+
+    pub async fn load_with_device(
+        model: TtsModel,
+        model_dir: impl AsRef<Path>,
+        preference: DevicePreference,
+    ) -> Result<Self> {
         let path = model_dir.as_ref().to_path_buf();
         crate::blocking::run(move || {
             let path_text = path
                 .to_str()
                 .ok_or_else(|| OrchionError::NonUtf8Path { path: path.clone() })?;
-            let device =
-                qwen3_tts::auto_device().map_err(|source| OrchionError::ModelLoad { source })?;
-            let device_debug = format!("{device:?}");
+            let resolved = crate::device::resolve_device(preference)?;
+            let device_debug = format!("{:?}", resolved.device);
             tracing::info!(
                 model = ?model,
-                device = %qwen3_tts::device_info(&device),
+                requested_device = %preference,
+                device = %resolved.kind,
                 "TTS device selected"
             );
             tracing::debug!(device_debug, "TTS device details selected");
-            let engine = qwen3_tts::Qwen3TTS::from_pretrained(path_text, device)
+            let engine = qwen3_tts::Qwen3TTS::from_pretrained(path_text, resolved.device)
                 .map_err(|source| OrchionError::ModelLoad { source })?;
             Ok(Self {
                 model,
@@ -301,5 +309,20 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn device_label_detects_cpu_from_resolver_kind() {
+        assert_eq!(crate::device::ResolvedDeviceKind::Cpu.to_string(), "cpu");
+    }
+
+    #[test]
+    fn exposes_explicit_device_loader_api() {
+        let future = Tts::load_with_device(
+            TtsModel::Qwen3Tts06BCustomVoice,
+            "models/qwen3-tts-0.6b-custom-voice",
+            orchion_core::DevicePreference::Cpu,
+        );
+        std::mem::drop(future);
     }
 }

@@ -1,4 +1,4 @@
-use orchion_core::{Result, TtsAudio, TtsModel, TtsOptions, TtsVoice};
+use orchion_core::{DevicePreference, Result, TtsAudio, TtsModel, TtsOptions, TtsVoice};
 use std::path::Path;
 
 #[derive(Clone)]
@@ -8,8 +8,16 @@ pub struct Tts {
 
 impl Tts {
     pub async fn load(model: TtsModel, model_dir: impl AsRef<Path>) -> Result<Self> {
+        Self::load_with_device(model, model_dir, DevicePreference::Auto).await
+    }
+
+    pub async fn load_with_device(
+        model: TtsModel,
+        model_dir: impl AsRef<Path>,
+        device: DevicePreference,
+    ) -> Result<Self> {
         Ok(Self {
-            inner: orchion_qwen3::Tts::load(model, model_dir).await?,
+            inner: orchion_qwen3::Tts::load_with_device(model, model_dir, device).await?,
         })
     }
 

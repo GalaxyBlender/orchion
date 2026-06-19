@@ -1,6 +1,6 @@
 use orchion_core::{
-    ASR_SAMPLE_RATE, AsrModel, AsrOptions, AsrStreamingOptions, AsrTranscript, OrchionError,
-    Result, prepare_asr_samples,
+    ASR_SAMPLE_RATE, AsrModel, AsrOptions, AsrStreamingOptions, AsrTranscript, DevicePreference,
+    OrchionError, Result, prepare_asr_samples,
 };
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -19,21 +19,31 @@ pub struct AsrStream {
 
 impl Asr {
     pub async fn load(model: AsrModel, model_dir: impl AsRef<Path>) -> Result<Self> {
+        Self::load_with_device(model, model_dir, DevicePreference::Auto).await
+    }
+
+    pub async fn load_with_device(
+        model: AsrModel,
+        model_dir: impl AsRef<Path>,
+        preference: DevicePreference,
+    ) -> Result<Self> {
         let model_dir = model_dir.as_ref().to_path_buf();
         crate::blocking::run(move || {
-            let device = best_device();
-            let device_debug = format!("{device:?}");
+            let resolved = crate::device::resolve_device(preference)?;
+            let device_debug = format!("{:?}", resolved.device);
             tracing::info!(
                 model = ?model,
-                device = device_label_from_debug(&device_debug),
+                requested_device = %preference,
+                device = %resolved.kind,
                 "ASR device selected"
             );
             tracing::debug!(device_debug, "ASR device details selected");
-            let engine = qwen3_asr::AsrInference::load(&model_dir, device).map_err(|source| {
-                OrchionError::ModelLoad {
-                    source: anyhow::Error::new(source),
-                }
-            })?;
+            let engine =
+                qwen3_asr::AsrInference::load(&model_dir, resolved.device).map_err(|source| {
+                    OrchionError::ModelLoad {
+                        source: anyhow::Error::new(source),
+                    }
+                })?;
             Ok(Self {
                 model,
                 engine: Arc::new(Mutex::new(engine)),
@@ -139,36 +149,6 @@ impl AsrStream {
     }
 }
 
-fn best_device() -> candle_core::Device {
-    #[cfg(feature = "cuda")]
-    {
-        if let Ok(device) = candle_core::Device::cuda_if_available(0) {
-            if device.is_cuda() {
-                return device;
-            }
-        }
-    }
-
-    #[cfg(feature = "metal")]
-    {
-        if let Ok(device) = candle_core::Device::new_metal(0) {
-            return device;
-        }
-    }
-
-    candle_core::Device::Cpu
-}
-
-fn device_label_from_debug(device_debug: &str) -> &'static str {
-    if device_debug.contains("Cuda") {
-        "cuda"
-    } else if device_debug.contains("Metal") {
-        "metal"
-    } else {
-        "cpu"
-    }
-}
-
 fn transcript_from_upstream(result: qwen3_asr::TranscribeResult) -> AsrTranscript {
     AsrTranscript {
         text: result.text,
@@ -225,9 +205,20 @@ mod tests {
     }
 
     #[test]
-    fn device_label_detects_runtime_backend() {
-        assert_eq!(device_label_from_debug("Cpu"), "cpu");
-        assert_eq!(device_label_from_debug("Cuda(CudaDevice(0))"), "cuda");
-        assert_eq!(device_label_from_debug("Metal(MetalDevice(0))"), "metal");
+    fn device_label_detects_cuda_index_from_resolver_kind() {
+        assert_eq!(
+            crate::device::ResolvedDeviceKind::Cuda(3).to_string(),
+            "cuda3"
+        );
+    }
+
+    #[test]
+    fn exposes_explicit_device_loader_api() {
+        let future = Asr::load_with_device(
+            AsrModel::Qwen3Asr06B,
+            "models/qwen3-asr-0.6b",
+            orchion_core::DevicePreference::Cpu,
+        );
+        std::mem::drop(future);
     }
 }

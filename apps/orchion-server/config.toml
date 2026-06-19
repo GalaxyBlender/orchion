@@ -8,12 +8,14 @@ source = "auto"
 
 [models.asr]
 default = "qwen3-asr-0.6b"
+device = "auto"
 available = ["qwen3-asr-0.6b", "qwen3-asr-1.7b"]
 idle_timeout = "10m"
 max_loaded = 1
 
 [models.tts]
 default = "qwen3-tts-0.6b-custom-voice"
+device = "auto"
 available = [
   "qwen3-tts-0.6b-base",
   "qwen3-tts-0.6b-custom-voice",

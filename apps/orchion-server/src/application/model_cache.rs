@@ -155,6 +155,7 @@ mod tests {
             available: vec![AsrModel::Qwen3Asr06B, AsrModel::Qwen3Asr17B],
             idle_timeout,
             max_loaded,
+            device: orchion::DevicePreference::Auto,
         }
     }
 
@@ -166,6 +167,7 @@ mod tests {
                 available: vec![AsrModel::Qwen3Asr06B],
                 idle_timeout: Duration::from_secs(60),
                 max_loaded: 1,
+                device: orchion::DevicePreference::Auto,
             },
             PathBuf::from("models"),
         );

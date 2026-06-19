@@ -1,4 +1,4 @@
-use orchion::{AsrModel, TtsModel};
+use orchion::{AsrModel, DevicePreference, TtsModel};
 use orchion_server::config::{ModelSource, ServerConfig};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
@@ -22,6 +22,7 @@ fn defaults_are_executable_relative() {
     assert_eq!(config.models.asr.available, vec![AsrModel::Qwen3Asr06B]);
     assert_eq!(config.models.asr.idle_timeout, Duration::from_secs(600));
     assert_eq!(config.models.asr.max_loaded, 1);
+    assert_eq!(config.models.asr.device, DevicePreference::Auto);
     assert_eq!(config.models.tts.default, TtsModel::Qwen3Tts06BCustomVoice);
     assert_eq!(
         config.models.tts.available,
@@ -29,6 +30,7 @@ fn defaults_are_executable_relative() {
     );
     assert_eq!(config.models.tts.idle_timeout, Duration::from_secs(600));
     assert_eq!(config.models.tts.max_loaded, 1);
+    assert_eq!(config.models.tts.device, DevicePreference::Auto);
     assert_eq!(config.auth.api_key, None);
     assert_eq!(config.server.max_upload_size, 30 * 1024 * 1024);
 }
@@ -50,12 +52,14 @@ default = "qwen3-asr-1.7b"
 available = ["qwen3-asr-0.6b", "qwen3-asr-1.7b"]
 idle_timeout = "5m"
 max_loaded = 2
+device = "cuda0"
 
 [models.tts]
 default = "qwen3-tts-1.7b-voice-design"
 available = ["qwen3-tts-0.6b-custom-voice", "qwen3-tts-1.7b-voice-design"]
 idle_timeout = "30s"
 max_loaded = 1
+device = "cuda:1"
 
 [auth]
 api_key = "test-secret"
@@ -80,6 +84,7 @@ format = "wav"
     );
     assert_eq!(config.models.asr.idle_timeout, Duration::from_secs(300));
     assert_eq!(config.models.asr.max_loaded, 2);
+    assert_eq!(config.models.asr.device, DevicePreference::Cuda(Some(0)));
     assert_eq!(config.models.tts.default, TtsModel::Qwen3Tts17BVoiceDesign);
     assert_eq!(
         config.models.tts.available,
@@ -90,8 +95,43 @@ format = "wav"
     );
     assert_eq!(config.models.tts.idle_timeout, Duration::from_secs(30));
     assert_eq!(config.models.tts.max_loaded, 1);
+    assert_eq!(config.models.tts.device, DevicePreference::Cuda(Some(1)));
     assert_eq!(config.auth.api_key.as_deref(), Some("test-secret"));
     assert_eq!(config.defaults.tts.format, "wav");
+}
+
+#[test]
+fn device_aliases_are_parsed_in_model_registries() {
+    let exe_path = std::path::Path::new("/tmp/orchion-server");
+    let config = ServerConfig::from_toml_str(
+        r#"
+[models.asr]
+device = "metal0"
+
+[models.tts]
+device = "cuda"
+"#,
+        exe_path,
+    )
+    .unwrap();
+
+    assert_eq!(config.models.asr.device, DevicePreference::Metal);
+    assert_eq!(config.models.tts.device, DevicePreference::Cuda(None));
+}
+
+#[test]
+fn malformed_device_config_is_rejected() {
+    let exe_path = std::path::Path::new("/tmp/orchion-server");
+    let error = ServerConfig::from_toml_str(
+        r#"
+[models.asr]
+device = "cuda:"
+"#,
+        exe_path,
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("invalid models.asr.device"));
 }
 
 #[test]

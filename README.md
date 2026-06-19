@@ -239,12 +239,14 @@ source = "auto"
 
 [models.asr]
 default = "qwen3-asr-0.6b"
+device = "auto"
 available = ["qwen3-asr-0.6b", "qwen3-asr-1.7b"]
 idle_timeout = "10m"
 max_loaded = 1
 
 [models.tts]
 default = "qwen3-tts-0.6b-custom-voice"
+device = "auto"
 available = [
   "qwen3-tts-0.6b-base",
   "qwen3-tts-0.6b-custom-voice",
@@ -262,7 +264,9 @@ max_loaded = 1
 format = "wav"
 ```
 
-`models.asr.available` and `models.tts.available` define the server allowlists. Startup downloads those model files into `models.dir`, but models are loaded into memory lazily when a request asks for them. Requests for models outside the allowlist are rejected immediately. `idle_timeout` unloads inactive models, and `max_loaded` evicts the least recently used loaded model when the cache is full.
+`models.asr.available` and `models.tts.available` define the server allowlists. First startup can download all allowlisted model files into `models.dir`; trim `models.*.available` for local development if you do not need every example model. Models are loaded into memory lazily when a request asks for them. Requests for models outside the allowlist are rejected immediately. `idle_timeout` unloads inactive models, and `max_loaded` evicts the least recently used loaded model when the cache is full.
+
+`models.asr.device` and `models.tts.device` control runtime placement independently. Omitted fields or `auto` prefer CUDA, then Metal, then CPU. When multiple CUDA devices are visible, `auto` chooses the CUDA GPU with the most free memory at model load time. Explicit values include `cpu`, `metal`/`metal0`, `cuda`, `cuda0`, `cuda:0`, `cuda1`, and `cuda:1`.
 
 `[auth] api_key` is optional. When it is set to a non-empty value, every `/v1/*` route requires `Authorization: Bearer <api_key>`; `/healthz` and `/docs` remain public.
 
