@@ -175,9 +175,9 @@ cargo test --workspace --features full,cpu
 #### Run Examples
 
 ```sh
-cargo run -p orchion --features download-all --example download_model -- models
-cargo run -p orchion --features asr-qwen3,download-all,cpu --example asr_file -- audio.wav models
-cargo run -p orchion --features tts-qwen3,download-all,cpu --example tts_preset -- "Hello from Orchion" output.wav models
+cargo run -p orchion-example-download-model --features cpu -- models
+cargo run -p orchion-example-asr-file --features cpu -- audio.wav models
+cargo run -p orchion-example-tts-preset --features cpu -- "Hello from Orchion" output.wav models
 ```
 
 ### ASR Example

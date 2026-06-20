@@ -2206,13 +2206,11 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 name = "orchion"
 version = "0.2.0"
 dependencies = [
- "hound",
  "orchion-audio",
  "orchion-audio-vad",
  "orchion-core",
  "orchion-download",
  "orchion-qwen3",
- "tokio",
  "tracing",
 ]
 
@@ -2254,6 +2252,39 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "orchion-example-asr-file"
+version = "0.1.0"
+dependencies = [
+ "orchion",
+ "tokio",
+]
+
+[[package]]
+name = "orchion-example-asr-streaming"
+version = "0.1.0"
+dependencies = [
+ "hound",
+ "orchion",
+ "tokio",
+]
+
+[[package]]
+name = "orchion-example-download-model"
+version = "0.1.0"
+dependencies = [
+ "orchion",
+ "tokio",
+]
+
+[[package]]
+name = "orchion-example-tts-preset"
+version = "0.1.0"
+dependencies = [
+ "orchion",
+ "tokio",
 ]
 
 [[package]]

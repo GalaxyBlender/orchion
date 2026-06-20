@@ -1,0 +1,24 @@
+[package]
+name = "orchion-example-asr-file"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.86"
+license = "MIT"
+
+[features]
+default = []
+cpu = ["orchion/cpu"]
+metal = ["orchion/metal"]
+cuda = ["orchion/cuda"]
+flash-attn = ["orchion/flash-attn"]
+
+[dependencies]
+orchion = { path = "../../libs/orchion", default-features = false, features = ["asr-qwen3", "download-all"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

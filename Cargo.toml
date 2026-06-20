@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
+    "examples/asr-file",
+    "examples/asr-streaming",
+    "examples/download-model",
+    "examples/tts-preset",
     "libs/orchion-core",
     "libs/orchion-audio",
     "libs/orchion-audio-vad",

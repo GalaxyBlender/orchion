@@ -31,30 +31,6 @@ orchion-qwen3 = { path = "../orchion-qwen3", default-features = false, optional 
 orchion-audio-vad = { path = "../orchion-audio-vad", optional = true }
 tracing = "0.1"
 
-[dev-dependencies]
-hound = "3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-
-[[example]]
-name = "asr_file"
-path = "examples/asr_file.rs"
-required-features = ["asr-qwen3", "download-all"]
-
-[[example]]
-name = "asr_streaming"
-path = "examples/asr_streaming.rs"
-required-features = ["asr-qwen3", "download-all"]
-
-[[example]]
-name = "download_model"
-path = "examples/download_model.rs"
-required-features = ["download-all"]
-
-[[example]]
-name = "tts_preset"
-path = "examples/tts_preset.rs"
-required-features = ["tts-qwen3", "download-all"]
-
 [lints.rust]
 unsafe_code = "warn"
 

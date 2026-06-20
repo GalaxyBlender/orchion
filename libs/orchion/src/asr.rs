@@ -1,7 +1,11 @@
-use orchion_core::{
-    ASR_SAMPLE_RATE, AsrModel, AsrOptions, AsrSegment, AsrTranscript, DevicePreference, Result,
-};
-use std::path::{Path, PathBuf};
+use orchion_core::{AsrModel, AsrOptions, AsrTranscript, DevicePreference, Result};
+use std::path::Path;
+
+#[cfg(feature = "vad-webrtc")]
+use orchion_core::{ASR_SAMPLE_RATE, AsrSegment};
+
+#[cfg(feature = "audio-ffmpeg")]
+use std::path::PathBuf;
 
 #[cfg(feature = "audio-ffmpeg")]
 use std::time::Instant;
