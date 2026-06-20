@@ -14,8 +14,8 @@ pub struct Asr {
 #[cfg(all(test, feature = "vad-webrtc"))]
 mod tests {
     use super::*;
+    use orchion_audio_vad::AudioSegment;
     use orchion_core::AsrSegment;
-    use orchion_vad::AudioSegment;
 
     #[test]
     fn transcript_from_segment_results_adds_timestamps_and_joins_text() {
@@ -168,7 +168,7 @@ impl Asr {
         options: AsrOptions,
     ) -> Result<AsrTranscript> {
         let prepared = orchion_core::prepare_asr_samples(samples, sample_rate)?;
-        let segmenter = orchion_vad::WebRtcVadSegmenter::default();
+        let segmenter = orchion_audio_vad::WebRtcVadSegmenter::default();
         let audio_segments = segmenter.segment(&prepared, ASR_SAMPLE_RATE)?;
         if audio_segments.is_empty() {
             return Ok(empty_transcript(options.language));
@@ -319,7 +319,7 @@ impl Asr {
 #[cfg(feature = "vad-webrtc")]
 #[allow(clippy::cast_precision_loss)]
 fn transcript_from_segment_results(
-    segment_results: Vec<(orchion_vad::AudioSegment, AsrTranscript)>,
+    segment_results: Vec<(orchion_audio_vad::AudioSegment, AsrTranscript)>,
     sample_rate: u32,
     fallback_language: Option<String>,
 ) -> AsrTranscript {

@@ -1,5 +1,5 @@
+use orchion_audio_vad::{AudioSegment, VadConfig, WebRtcVadMode, WebRtcVadSegmenter};
 use orchion_core::ASR_SAMPLE_RATE;
-use orchion_vad::{AudioSegment, VadConfig, WebRtcVadMode, WebRtcVadSegmenter};
 
 #[test]
 fn web_rtc_vad_returns_no_segments_for_silence() {
@@ -24,7 +24,7 @@ fn post_processing_merges_short_silence_between_speech_runs() {
     let frame_samples = 480;
     let flags = [true, true, false, true, true, false, false, false];
 
-    let segments = orchion_vad::segments_from_speech_flags(
+    let segments = orchion_audio_vad::segments_from_speech_flags(
         &flags,
         flags.len() * frame_samples,
         frame_samples,
@@ -53,7 +53,7 @@ fn post_processing_filters_short_speech_runs() {
     let frame_samples = 480;
     let flags = [true, false, false, true, true, true];
 
-    let segments = orchion_vad::segments_from_speech_flags(
+    let segments = orchion_audio_vad::segments_from_speech_flags(
         &flags,
         flags.len() * frame_samples,
         frame_samples,
@@ -82,7 +82,7 @@ fn post_processing_applies_padding_and_clamps_to_audio_bounds() {
     let frame_samples = 480;
     let flags = [false, true, false, false];
 
-    let segments = orchion_vad::segments_from_speech_flags(
+    let segments = orchion_audio_vad::segments_from_speech_flags(
         &flags,
         flags.len() * frame_samples,
         frame_samples,
@@ -107,7 +107,7 @@ fn default_post_processing_keeps_clear_pause_between_segments() {
     flags.extend([false; 30]);
     flags.extend([true; 10]);
 
-    let segments = orchion_vad::segments_from_speech_flags(
+    let segments = orchion_audio_vad::segments_from_speech_flags(
         &flags,
         flags.len() * frame_samples,
         frame_samples,
@@ -138,7 +138,7 @@ fn default_post_processing_keeps_short_phrase_pause_in_same_segment() {
     flags.extend([false; 15]);
     flags.extend([true; 12]);
 
-    let segments = orchion_vad::segments_from_speech_flags(
+    let segments = orchion_audio_vad::segments_from_speech_flags(
         &flags,
         flags.len() * frame_samples,
         frame_samples,
@@ -163,7 +163,7 @@ fn default_post_processing_splits_clear_sentence_pause() {
     flags.extend([false; 20]);
     flags.extend([true; 12]);
 
-    let segments = orchion_vad::segments_from_speech_flags(
+    let segments = orchion_audio_vad::segments_from_speech_flags(
         &flags,
         flags.len() * frame_samples,
         frame_samples,
@@ -194,7 +194,7 @@ fn default_post_processing_keeps_brief_pause_in_same_segment() {
     flags.extend([false; 4]);
     flags.extend([true; 12]);
 
-    let segments = orchion_vad::segments_from_speech_flags(
+    let segments = orchion_audio_vad::segments_from_speech_flags(
         &flags,
         flags.len() * frame_samples,
         frame_samples,

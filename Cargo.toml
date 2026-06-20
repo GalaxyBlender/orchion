@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "libs/orchion-core",
     "libs/orchion-audio",
-    "libs/orchion-vad",
+    "libs/orchion-audio-vad",
     "libs/orchion-download",
     "libs/orchion-qwen3",
     "libs/orchion",

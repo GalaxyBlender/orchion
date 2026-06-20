@@ -2208,10 +2208,10 @@ version = "0.2.0"
 dependencies = [
  "hound",
  "orchion-audio",
+ "orchion-audio-vad",
  "orchion-core",
  "orchion-download",
  "orchion-qwen3",
- "orchion-vad",
  "tokio",
  "tracing",
 ]
@@ -2223,6 +2223,14 @@ dependencies = [
  "hound",
  "orchion-core",
  "tokio",
+]
+
+[[package]]
+name = "orchion-audio-vad"
+version = "0.2.0"
+dependencies = [
+ "orchion-core",
+ "wavekat-vad",
 ]
 
 [[package]]
@@ -2284,14 +2292,6 @@ dependencies = [
  "tracing-subscriber",
  "utoipa",
  "utoipa-swagger-ui",
-]
-
-[[package]]
-name = "orchion-vad"
-version = "0.2.0"
-dependencies = [
- "orchion-core",
- "wavekat-vad",
 ]
 
 [[package]]
