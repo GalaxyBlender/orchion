@@ -2457,7 +2457,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "orchion"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hound",
  "orchion-audio",
@@ -2471,7 +2471,7 @@ dependencies = [
 
 [[package]]
 name = "orchion-audio"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hound",
  "orchion-core",
@@ -2480,7 +2480,7 @@ dependencies = [
 
 [[package]]
 name = "orchion-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -2490,7 +2490,7 @@ dependencies = [
 
 [[package]]
 name = "orchion-download"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hf-hub",
  "modelscope",
@@ -2504,7 +2504,7 @@ dependencies = [
 
 [[package]]
 name = "orchion-qwen3"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -2517,7 +2517,7 @@ dependencies = [
 
 [[package]]
 name = "orchion-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2542,7 +2542,7 @@ dependencies = [
 
 [[package]]
 name = "orchion-vad"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "orchion-core",
  "wavekat-vad",

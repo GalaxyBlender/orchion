@@ -86,7 +86,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
             {!collapsed && (
               <div className="stack gap-0">
                 <span className="font-bold text-md text-primary tracking-tight">Orchion</span>
-                <span className="text-xs text-muted">v0.1.0</span>
+                <span className="text-xs text-muted">v0.2.0</span>
               </div>
             )}
           </div>
