@@ -16,7 +16,7 @@ pub use orchion_core::{
 #[cfg(feature = "audio-ffmpeg")]
 pub use orchion_audio::{
     AudioOutputFormat, DecodedAudio, EncodedAudio, FfmpegAudioCodec, decode_audio_bytes,
-    encode_tts_audio,
+    decode_audio_file, encode_tts_audio,
 };
 
 #[cfg(feature = "download-all")]

@@ -4,5 +4,5 @@ mod codec;
 
 pub use codec::{
     AudioOutputFormat, DecodedAudio, EncodedAudio, FfmpegAudioCodec, decode_audio_bytes,
-    encode_tts_audio,
+    decode_audio_file, encode_tts_audio,
 };

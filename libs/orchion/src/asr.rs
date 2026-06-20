@@ -1,7 +1,7 @@
 use orchion_core::{
     ASR_SAMPLE_RATE, AsrModel, AsrOptions, AsrSegment, AsrTranscript, DevicePreference, Result,
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[cfg(feature = "audio-ffmpeg")]
 use std::time::Instant;
@@ -226,6 +226,32 @@ impl Asr {
             })
     }
 
+    #[cfg(feature = "audio-ffmpeg")]
+    pub async fn transcribe_audio_file_with(
+        &self,
+        path: impl Into<PathBuf>,
+        options: AsrOptions,
+    ) -> Result<AsrTranscript> {
+        let decode_started = Instant::now();
+        let decoded = orchion_audio::decode_audio_file(path.into()).await?;
+        tracing::debug!(
+            samples = decoded.samples.len(),
+            sample_rate = decoded.sample_rate,
+            elapsed_ms = decode_started.elapsed().as_millis(),
+            "ASR audio decode completed"
+        );
+        let inference_started = Instant::now();
+        self.inner
+            .transcribe_samples_with(&decoded.samples, decoded.sample_rate, options)
+            .await
+            .inspect(|_| {
+                tracing::debug!(
+                    elapsed_ms = inference_started.elapsed().as_millis(),
+                    "ASR inference completed"
+                );
+            })
+    }
+
     #[cfg(all(feature = "audio-ffmpeg", feature = "vad-webrtc"))]
     pub async fn transcribe_audio_bytes_with_segments(
         &self,
@@ -234,6 +260,32 @@ impl Asr {
     ) -> Result<AsrTranscript> {
         let decode_started = Instant::now();
         let decoded = orchion_audio::decode_audio_bytes(bytes.into()).await?;
+        tracing::debug!(
+            samples = decoded.samples.len(),
+            sample_rate = decoded.sample_rate,
+            elapsed_ms = decode_started.elapsed().as_millis(),
+            "ASR audio decode completed"
+        );
+        let inference_started = Instant::now();
+        self.transcribe_samples_with_segments(&decoded.samples, decoded.sample_rate, options)
+            .await
+            .inspect(|transcript| {
+                tracing::debug!(
+                    elapsed_ms = inference_started.elapsed().as_millis(),
+                    segments = transcript.segments.len(),
+                    "ASR segmented inference completed"
+                );
+            })
+    }
+
+    #[cfg(all(feature = "audio-ffmpeg", feature = "vad-webrtc"))]
+    pub async fn transcribe_audio_file_with_segments(
+        &self,
+        path: impl Into<PathBuf>,
+        options: AsrOptions,
+    ) -> Result<AsrTranscript> {
+        let decode_started = Instant::now();
+        let decoded = orchion_audio::decode_audio_file(path.into()).await?;
         tracing::debug!(
             samples = decoded.samples.len(),
             sample_rate = decoded.sample_rate,

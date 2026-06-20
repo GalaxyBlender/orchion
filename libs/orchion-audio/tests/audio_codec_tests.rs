@@ -64,6 +64,23 @@ async fn encodes_tts_audio_as_wav_with_ffmpeg() {
 }
 
 #[tokio::test]
+async fn encoded_wav_is_readable_by_hound() {
+    if !ffmpeg_available() {
+        return;
+    }
+    let audio = TtsAudio::new(vec![0.0, 0.5, -0.5], 24_000);
+
+    let encoded = encode_tts_audio(&audio, AudioOutputFormat::Wav)
+        .await
+        .unwrap();
+    let mut reader = hound::WavReader::new(Cursor::new(encoded.bytes)).unwrap();
+    let samples = reader.samples::<i16>().collect::<Result<Vec<_>, _>>().unwrap();
+
+    assert_eq!(reader.spec().sample_rate, audio.sample_rate);
+    assert_eq!(samples.len(), audio.samples.len());
+}
+
+#[tokio::test]
 async fn encoded_pcm_is_s16le_without_container() {
     if !ffmpeg_available() {
         return;

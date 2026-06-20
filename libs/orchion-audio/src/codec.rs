@@ -1,8 +1,10 @@
 use orchion_core::{ASR_SAMPLE_RATE, OrchionError, Result, TtsAudio};
-use std::io::Write;
+use std::fs;
+use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::str::FromStr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioOutputFormat {
@@ -111,6 +113,12 @@ impl FfmpegAudioCodec {
         run_blocking(move || decode_for_asr_blocking(&binary, input)).await
     }
 
+    pub async fn decode_file_for_asr(&self, input: impl Into<PathBuf>) -> Result<DecodedAudio> {
+        let binary = self.binary.clone();
+        let input = input.into();
+        run_blocking(move || decode_file_for_asr_blocking(&binary, &input)).await
+    }
+
     pub async fn encode_tts_samples(
         &self,
         samples: Vec<f32>,
@@ -126,6 +134,10 @@ pub async fn decode_audio_bytes(input: impl Into<Vec<u8>>) -> Result<DecodedAudi
     FfmpegAudioCodec::default()
         .decode_for_asr(input.into())
         .await
+}
+
+pub async fn decode_audio_file(input: impl Into<PathBuf>) -> Result<DecodedAudio> {
+    FfmpegAudioCodec::default().decode_file_for_asr(input).await
 }
 
 pub async fn encode_tts_audio(audio: &TtsAudio, format: AudioOutputFormat) -> Result<EncodedAudio> {
@@ -153,26 +165,49 @@ fn decode_for_asr_blocking(binary: &Path, input: Vec<u8>) -> Result<DecodedAudio
         });
     }
 
-    let output = run_ffmpeg(
-        binary,
-        &[
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            "pipe:0",
-            "-vn",
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            "-f",
-            "f32le",
-            "pipe:1",
-        ],
-        input,
-        "decode audio input",
-    )?;
+    let input_path = write_temp_audio_input(&input)?;
+    let decoded = decode_file_for_asr_blocking(binary, &input_path);
+    let remove_result = fs::remove_file(&input_path);
+    match decoded {
+        Ok(decoded) => {
+            remove_result.map_err(|error| OrchionError::InvalidAudio {
+                reason: format!(
+                    "failed to remove temporary audio input `{}`: {error}",
+                    input_path.display()
+                ),
+            })?;
+            Ok(decoded)
+        }
+        Err(error) => {
+            let _ = remove_result;
+            Err(error)
+        }
+    }
+}
+
+fn decode_file_for_asr_blocking(binary: &Path, input: &Path) -> Result<DecodedAudio> {
+    if input.as_os_str().is_empty() {
+        return Err(OrchionError::InvalidAudio {
+            reason: "audio input path is empty".to_string(),
+        });
+    }
+
+    let args = vec![
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+        "-i".to_string(),
+        input.to_string_lossy().into_owned(),
+        "-vn".to_string(),
+        "-ac".to_string(),
+        "1".to_string(),
+        "-ar".to_string(),
+        "16000".to_string(),
+        "-f".to_string(),
+        "f32le".to_string(),
+        "pipe:1".to_string(),
+    ];
+    let output = run_ffmpeg_dynamic(binary, &args, Vec::new(), "decode audio input")?;
     let samples = f32_samples_from_le_bytes(&output)?;
     if samples.is_empty() {
         return Err(OrchionError::InvalidAudio {
@@ -183,6 +218,37 @@ fn decode_for_asr_blocking(binary: &Path, input: Vec<u8>) -> Result<DecodedAudio
         samples,
         sample_rate: ASR_SAMPLE_RATE,
     })
+}
+
+fn write_temp_audio_input(input: &[u8]) -> Result<PathBuf> {
+    let mut path = std::env::temp_dir();
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| OrchionError::InvalidAudio {
+            reason: format!("failed to create temporary audio filename: {error}"),
+        })?
+        .as_nanos();
+    path.push(format!(
+        "orchion-audio-{}-{unique}.input",
+        std::process::id()
+    ));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|error| OrchionError::InvalidAudio {
+            reason: format!(
+                "failed to create temporary audio input `{}`: {error}",
+                path.display()
+            ),
+        })?;
+    file.write_all(input).map_err(|error| OrchionError::InvalidAudio {
+        reason: format!(
+            "failed to write temporary audio input `{}`: {error}",
+            path.display()
+        ),
+    })?;
+    Ok(path)
 }
 
 fn encode_tts_blocking(
@@ -200,6 +266,10 @@ fn encode_tts_blocking(
         return Err(OrchionError::InvalidAudio {
             reason: "audio samples are empty".to_string(),
         });
+    }
+
+    if format == AudioOutputFormat::Wav {
+        return encode_tts_wav(samples, sample_rate);
     }
 
     let input = s16_samples_to_le_bytes(&samples);
@@ -237,12 +307,36 @@ fn encode_tts_blocking(
     })
 }
 
-fn run_ffmpeg(binary: &Path, args: &[&str], input: Vec<u8>, operation: &str) -> Result<Vec<u8>> {
-    let args = args
-        .iter()
-        .map(|arg| (*arg).to_string())
-        .collect::<Vec<_>>();
-    run_ffmpeg_dynamic(binary, &args, input, operation)
+fn encode_tts_wav(samples: Vec<f32>, sample_rate: u32) -> Result<EncodedAudio> {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let mut writer = hound::WavWriter::new(&mut cursor, spec).map_err(|error| {
+            OrchionError::InvalidAudio {
+                reason: format!("failed to start WAV encoder: {error}"),
+            }
+        })?;
+        for sample in samples {
+            writer.write_sample(sample_to_i16(sample)).map_err(|error| {
+                OrchionError::InvalidAudio {
+                    reason: format!("failed to write WAV sample: {error}"),
+                }
+            })?;
+        }
+        writer.finalize().map_err(|error| OrchionError::InvalidAudio {
+            reason: format!("failed to finalize WAV audio: {error}"),
+        })?;
+    }
+    Ok(EncodedAudio {
+        bytes: cursor.into_inner(),
+        format: AudioOutputFormat::Wav,
+        content_type: AudioOutputFormat::Wav.content_type(),
+    })
 }
 
 fn run_ffmpeg_dynamic(

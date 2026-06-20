@@ -8,11 +8,11 @@ license = "MIT"
 repository = "https://github.com/xuan/orchion"
 
 [dependencies]
+hound = "3"
 orchion-core = { path = "../orchion-core" }
 tokio = { version = "1", features = ["rt"] }
 
 [dev-dependencies]
-hound = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [lints.rust]
