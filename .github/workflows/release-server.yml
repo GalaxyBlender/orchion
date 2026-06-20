@@ -29,6 +29,11 @@ jobs:
       - name: Configure sccache
         uses: mozilla-actions/sccache-action@v0.0.9
 
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
       - name: Build Metal server
         run: cargo build --release -p orchion-server --features metal
 
@@ -64,7 +69,8 @@ jobs:
             curl \
             git \
             libssl-dev \
-            pkg-config
+            pkg-config \
+            unzip
           rm -rf /var/lib/apt/lists/*
 
       - name: Checkout
@@ -76,17 +82,13 @@ jobs:
       - name: Configure sccache
         uses: mozilla-actions/sccache-action@v0.0.9
 
-      - name: Install CUDA Toolkit
-        uses: Jimver/cuda-toolkit@v0.2.35
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
         with:
-          cuda: ${{ env.CUDA_VERSION }}
-          log-file-suffix: windows-x86_64-cuda.txt
+          bun-version: latest
 
       - name: Verify CUDA Toolkit
         run: nvcc --version
-
-      - name: Set up MSVC
-        uses: ilammy/msvc-dev-cmd@v1
 
       - name: Build CPU server
         run: cargo build --release -p orchion-server --features cpu
@@ -146,6 +148,14 @@ jobs:
       - name: Configure sccache
         uses: mozilla-actions/sccache-action@v0.0.9
 
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
       - name: Build CPU server
         run: cargo build --release -p orchion-server --features cpu
 
@@ -164,6 +174,12 @@ jobs:
           name: orchion-server-${{ github.ref_name }}-windows-x86_64-cpu
           path: dist/orchion-server-${{ github.ref_name }}-windows-x86_64-cpu.zip
           if-no-files-found: error
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: ${{ env.CUDA_VERSION }}
+          log-file-suffix: windows-x86_64-cuda.txt
 
       - name: Build CUDA server
         env:
