@@ -12,7 +12,7 @@ Orchion currently focuses on Qwen3 ASR/TTS models and is structured to support m
 - Ready-to-run OpenAI-compatible API server.
 - `/v1/audio/transcriptions` and `/v1/audio/speech` endpoints.
 - TTS support for preset voices, voice cloning, and voice design.
-- Model downloads from HuggingFace or ModelScope.
+- Model downloads through `model-hub` from HuggingFace or ModelScope.
 - CPU by default, with optional Metal and CUDA builds.
 - Swagger UI at `/docs` and OpenAPI JSON at `/openapi/v1.json`.
 
@@ -220,7 +220,7 @@ async fn main() -> Result<()> {
 - `full`: Qwen3 ASR/TTS, FFmpeg audio conversion, and all download providers.
 - `asr-qwen3`, `tts-qwen3`: Qwen3 ASR/TTS runtime adapters.
 - `audio-ffmpeg`: audio decode/encode through system `ffmpeg`.
-- `download-all`: async model downloads through HuggingFace and ModelScope.
+- `download-all`: async model downloads through `model-hub` with HuggingFace and ModelScope routing.
 - `cpu`, `metal`, `cuda`: backend feature opt-ins.
 
 ## Configuration
@@ -264,6 +264,8 @@ format = "wav"
 
 `models.asr.available` and `models.tts.available` define the server allowlists. First startup can download all allowlisted model files into `models.dir`; trim `models.*.available` for local development if you do not need every example model. Models are loaded lazily when requested. Requests for models outside the allowlist are rejected. `idle_timeout` unloads inactive models.
 
+Downloaded models use the `model-hub` native repository layout under `models.dir`, for example `models/Qwen/Qwen3-ASR-0.6B`. Orchion writes `.orchion-ready.json` after download and model preparation complete, then uses that manifest plus required local files to skip repeated downloads on later startup.
+
 `models.max_loaded` limits the total resident ASR and TTS models together. `models.asr.max_loaded` and `models.tts.max_loaded` limit each category separately. When any limit is full, the least recently used resident model is evicted. Setting `models.max_loaded = 1` makes ASR and TTS switch residency globally; a request may wait while the evicted category is loaded again, but this does not limit concurrent inference requests.
 
 `models.asr.device` and `models.tts.device` control runtime placement independently. Omitted fields or `auto` prefer CUDA, then Metal, then CPU. When multiple CUDA devices are visible, `auto` chooses the CUDA GPU with the most free memory at model load time. Explicit values include `cpu`, `metal`/`metal0`, `cuda`, `cuda0`, `cuda:0`, `cuda1`, and `cuda:1`.
@@ -278,7 +280,7 @@ format = "wav"
 - `huggingface`: use HuggingFace only.
 - `modelscope`: use ModelScope only.
 
-When `HF_ENDPOINT` is set, Orchion passes it to the HuggingFace client. The server also accepts `models.source` in `config.toml` with the same values.
+When `HF_ENDPOINT` is set, Orchion uses it for the HuggingFace probe and `model-hub` HuggingFace downloads. The server also accepts `models.source` in `config.toml` with the same values.
 
 `server.max_upload_size` limits request body size for uploads. It defaults to `30M` and accepts bytes or `K`, `M`, `G` suffixes.
 

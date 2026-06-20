@@ -242,12 +242,13 @@ fn write_temp_audio_input(input: &[u8]) -> Result<PathBuf> {
                 path.display()
             ),
         })?;
-    file.write_all(input).map_err(|error| OrchionError::InvalidAudio {
-        reason: format!(
-            "failed to write temporary audio input `{}`: {error}",
-            path.display()
-        ),
-    })?;
+    file.write_all(input)
+        .map_err(|error| OrchionError::InvalidAudio {
+            reason: format!(
+                "failed to write temporary audio input `{}`: {error}",
+                path.display()
+            ),
+        })?;
     Ok(path)
 }
 
@@ -322,15 +323,17 @@ fn encode_tts_wav(samples: Vec<f32>, sample_rate: u32) -> Result<EncodedAudio> {
             }
         })?;
         for sample in samples {
-            writer.write_sample(sample_to_i16(sample)).map_err(|error| {
-                OrchionError::InvalidAudio {
+            writer
+                .write_sample(sample_to_i16(sample))
+                .map_err(|error| OrchionError::InvalidAudio {
                     reason: format!("failed to write WAV sample: {error}"),
-                }
-            })?;
+                })?;
         }
-        writer.finalize().map_err(|error| OrchionError::InvalidAudio {
-            reason: format!("failed to finalize WAV audio: {error}"),
-        })?;
+        writer
+            .finalize()
+            .map_err(|error| OrchionError::InvalidAudio {
+                reason: format!("failed to finalize WAV audio: {error}"),
+            })?;
     }
     Ok(EncodedAudio {
         bytes: cursor.into_inner(),

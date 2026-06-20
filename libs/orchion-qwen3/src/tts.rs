@@ -256,11 +256,9 @@ fn audio_from_upstream(audio: qwen3_tts::AudioBuffer) -> TtsAudio {
 
 fn validate_voice_clone_icl_prompt(prompt: &qwen3_tts::VoiceClonePrompt) -> Result<()> {
     if let Some(ref_codes) = &prompt.ref_codes {
-        let reference_frames = ref_codes
-            .dim(0)
-            .map_err(|source| OrchionError::Inference {
-                source: anyhow::anyhow!(source),
-            })?;
+        let reference_frames = ref_codes.dim(0).map_err(|source| OrchionError::Inference {
+            source: anyhow::anyhow!(source),
+        })?;
         validate_voice_clone_icl_frames(reference_frames)?;
     }
     Ok(())

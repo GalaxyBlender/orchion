@@ -12,12 +12,11 @@ huggingface = []
 modelscope = []
 
 [dependencies]
-hf-hub = { version = "0.5", features = ["tokio"] }
-modelscope = "0.1"
+model-hub = "0.1.1"
 orchion-core = { path = "../orchion-core" }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 serde_json = "1"
-tokio = { version = "1", features = ["fs", "time"] }
+tokio = { version = "1", features = ["fs", "sync", "time"] }
 tracing = "0.1"
 
 [dev-dependencies]

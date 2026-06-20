@@ -2,9 +2,14 @@ use orchion_core::{ModelCategory, ModelSpec, OrchionError, Result};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+const READY_MANIFEST_FILE: &str = ".orchion-ready.json";
+const READY_MANIFEST_SCHEMA_VERSION: u64 = 1;
+const READY_MANIFEST_LAYOUT: &str = "model-hub-native";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DownloadSource {
@@ -71,6 +76,7 @@ fn resolve_source(source: DownloadSource, env: &DownloadEnv) -> Result<Vec<Resol
 #[derive(Debug, Clone)]
 pub struct ModelDownloader {
     source: DownloadSource,
+    huggingface_available: Arc<tokio::sync::OnceCell<bool>>,
 }
 
 impl Default for ModelDownloader {
@@ -80,8 +86,11 @@ impl Default for ModelDownloader {
 }
 
 impl ModelDownloader {
-    pub const fn new(source: DownloadSource) -> Self {
-        Self { source }
+    pub fn new(source: DownloadSource) -> Self {
+        Self {
+            source,
+            huggingface_available: Arc::new(tokio::sync::OnceCell::const_new()),
+        }
     }
 
     pub async fn download<M: ModelSpec>(
@@ -120,36 +129,12 @@ impl ModelDownloader {
         probe: &P,
         env: &DownloadEnv,
     ) -> Result<PathBuf> {
-        let target = model.cache_path(cache_dir.as_ref());
-        let marker = target.join(".orchion-complete");
-        if tokio::fs::try_exists(&marker)
-            .await
-            .map_err(|error| OrchionError::Download {
-                source_name: "cache",
-                repo: model.huggingface_repo(),
-                message: error.to_string(),
-            })?
-        {
-            prepare_cached_model(model, &target, "cache").await?;
-            tracing::debug!(model = ?model, path = %target.display(), "model cache hit");
+        let cache_dir = cache_dir.as_ref();
+        let target = model.cache_path(cache_dir);
+
+        if is_ready_cache(model, &target).await? {
+            tracing::debug!(model = ?model, path = %target.display(), "model cache ready");
             return Ok(target);
-        }
-        if tokio::fs::try_exists(&target)
-            .await
-            .map_err(|error| OrchionError::Download {
-                source_name: "cache",
-                repo: model.huggingface_repo(),
-                message: error.to_string(),
-            })?
-        {
-            tracing::warn!(model = ?model, path = %target.display(), "model cache is incomplete; removing before download");
-            tokio::fs::remove_dir_all(&target)
-                .await
-                .map_err(|error| OrchionError::Download {
-                    source_name: "cache",
-                    repo: model.huggingface_repo(),
-                    message: error.to_string(),
-                })?;
         }
 
         let candidates = self.resolve_candidates(env, probe).await?;
@@ -157,7 +142,7 @@ impl ModelDownloader {
             model = ?model,
             path = %target.display(),
             source_count = candidates.len(),
-            "model cache missing; starting download"
+            "ensuring model cache is available"
         );
         let mut failures = Vec::new();
         for candidate in candidates {
@@ -171,19 +156,13 @@ impl ModelDownloader {
                 path = %target.display(),
                 "downloading model"
             );
-            match client.download(candidate, repo, &target, env).await {
+            match client
+                .download(candidate, repo, cache_dir, &target, env)
+                .await
+            {
                 Ok(()) => {
                     prepare_cached_model(model, &target, candidate.label()).await?;
-                    tokio::fs::write(
-                        target.join(".orchion-complete"),
-                        format!("{}\n", candidate.label()),
-                    )
-                    .await
-                    .map_err(|error| OrchionError::Download {
-                        source_name: candidate.label(),
-                        repo,
-                        message: error.to_string(),
-                    })?;
+                    write_ready_manifest(model, &target, candidate.label()).await?;
                     tracing::info!(
                         source = candidate.label(),
                         repo,
@@ -221,7 +200,11 @@ impl ModelDownloader {
         if self.source != DownloadSource::Auto || env.orchion_model_source.is_some() {
             return Ok(candidates);
         }
-        if probe.huggingface_available(env).await {
+        if *self
+            .huggingface_available
+            .get_or_init(|| probe.huggingface_available(env))
+            .await
+        {
             Ok(candidates)
         } else {
             tracing::warn!("huggingface unavailable; using modelscope download source");
@@ -231,6 +214,78 @@ impl ModelDownloader {
                 .collect())
         }
     }
+}
+
+async fn is_ready_cache<M: ModelSpec>(model: M, target: &Path) -> Result<bool> {
+    let manifest = match tokio::fs::read_to_string(target.join(READY_MANIFEST_FILE)).await {
+        Ok(manifest) => manifest,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(OrchionError::Download {
+                source_name: "cache",
+                repo: model.huggingface_repo(),
+                message: error.to_string(),
+            });
+        }
+    };
+    let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&manifest) else {
+        return Ok(false);
+    };
+    if manifest["schema_version"].as_u64() != Some(READY_MANIFEST_SCHEMA_VERSION)
+        || manifest["repo_id"].as_str() != Some(model.huggingface_repo())
+        || manifest["layout"].as_str() != Some(READY_MANIFEST_LAYOUT)
+    {
+        return Ok(false);
+    }
+
+    required_cache_files_exist(model, target).await
+}
+
+async fn required_cache_files_exist<M: ModelSpec>(model: M, target: &Path) -> Result<bool> {
+    if !cache_file_exists(model, target, "config.json").await? {
+        return Ok(false);
+    }
+    match model.category() {
+        ModelCategory::Asr => cache_file_exists(model, target, "tokenizer.json").await,
+        ModelCategory::Tts => Ok(true),
+    }
+}
+
+async fn cache_file_exists<M: ModelSpec>(model: M, target: &Path, file_name: &str) -> Result<bool> {
+    tokio::fs::try_exists(target.join(file_name))
+        .await
+        .map_err(|error| OrchionError::Download {
+            source_name: "cache",
+            repo: model.huggingface_repo(),
+            message: error.to_string(),
+        })
+}
+
+async fn write_ready_manifest<M: ModelSpec>(
+    model: M,
+    target: &Path,
+    source_name: &'static str,
+) -> Result<()> {
+    let manifest = serde_json::json!({
+        "schema_version": READY_MANIFEST_SCHEMA_VERSION,
+        "repo_id": model.huggingface_repo(),
+        "layout": READY_MANIFEST_LAYOUT,
+    });
+    let tmp = target.join(format!("{READY_MANIFEST_FILE}.tmp"));
+    tokio::fs::write(&tmp, manifest.to_string())
+        .await
+        .map_err(|error| OrchionError::Download {
+            source_name,
+            repo: model.huggingface_repo(),
+            message: error.to_string(),
+        })?;
+    tokio::fs::rename(&tmp, target.join(READY_MANIFEST_FILE))
+        .await
+        .map_err(|error| OrchionError::Download {
+            source_name,
+            repo: model.huggingface_repo(),
+            message: error.to_string(),
+        })
 }
 
 trait SourceProbe {
@@ -290,6 +345,7 @@ trait DownloadClient {
         &'a self,
         source: ResolvedSource,
         repo: &'static str,
+        cache_dir: &'a Path,
         target: &'a Path,
         env: &'a DownloadEnv,
     ) -> BoxFuture<'a, Result<()>>;
@@ -302,130 +358,42 @@ impl DownloadClient for LibraryDownloadClient {
         &'a self,
         source: ResolvedSource,
         repo: &'static str,
-        target: &'a Path,
-        env: &'a DownloadEnv,
+        cache_dir: &'a Path,
+        _target: &'a Path,
+        _env: &'a DownloadEnv,
     ) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move {
-            match source {
-                ResolvedSource::HuggingFace => download_huggingface(repo, target, env).await,
-                ResolvedSource::ModelScope => download_modelscope(repo, target).await,
-            }
-        })
+        Box::pin(async move { download_model_hub(source, repo, cache_dir).await })
     }
 }
 
-async fn download_huggingface(repo: &'static str, target: &Path, env: &DownloadEnv) -> Result<()> {
-    let staging = staging_dir(target, "hf-cache", repo, ResolvedSource::HuggingFace)?;
-    let _ = tokio::fs::remove_dir_all(&staging).await;
-    tokio::fs::create_dir_all(target)
-        .await
-        .map_err(|error| OrchionError::Download {
-            source_name: ResolvedSource::HuggingFace.label(),
-            repo,
-            message: error.to_string(),
-        })?;
-
-    let mut builder = hf_hub::api::tokio::ApiBuilder::from_env().with_cache_dir(staging.clone());
-    if let Some(endpoint) = env.hf_endpoint.as_deref() {
-        builder = builder.with_endpoint(endpoint.trim_end_matches('/').to_string());
-    }
-    let api = builder.build().map_err(|error| OrchionError::Download {
-        source_name: ResolvedSource::HuggingFace.label(),
-        repo,
-        message: error.to_string(),
-    })?;
-    let repository = api.model(repo.to_string());
-    let info = repository
-        .info()
-        .await
-        .map_err(|error| OrchionError::Download {
-            source_name: ResolvedSource::HuggingFace.label(),
-            repo,
-            message: error.to_string(),
-        })?;
-    for sibling in info.siblings {
-        let filename = sibling.rfilename;
-        let source_path = repository
-            .download(filename.as_str())
-            .await
-            .map_err(|error| OrchionError::Download {
-                source_name: ResolvedSource::HuggingFace.label(),
-                repo,
-                message: error.to_string(),
-            })?;
-        let destination = target.join(&filename);
-        if let Some(parent) = destination.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|error| OrchionError::Download {
-                    source_name: ResolvedSource::HuggingFace.label(),
-                    repo,
-                    message: error.to_string(),
-                })?;
-        }
-        tokio::fs::copy(source_path, destination)
-            .await
-            .map_err(|error| OrchionError::Download {
-                source_name: ResolvedSource::HuggingFace.label(),
-                repo,
-                message: error.to_string(),
-            })?;
-    }
-    let _ = tokio::fs::remove_dir_all(staging).await;
-    Ok(())
-}
-
-async fn download_modelscope(repo: &'static str, target: &Path) -> Result<()> {
-    let parent = target.parent().ok_or_else(|| OrchionError::Download {
-        source_name: ResolvedSource::ModelScope.label(),
-        repo,
-        message: "target cache path has no parent directory".to_string(),
-    })?;
-    let staging = staging_dir(target, "modelscope-cache", repo, ResolvedSource::ModelScope)?;
-    let _ = tokio::fs::remove_dir_all(&staging).await;
-    tokio::fs::create_dir_all(parent)
-        .await
-        .map_err(|error| OrchionError::Download {
-            source_name: ResolvedSource::ModelScope.label(),
-            repo,
-            message: error.to_string(),
-        })?;
-    modelscope::ModelScope::download(repo, &staging)
-        .await
-        .map_err(|error| OrchionError::Download {
-            source_name: ResolvedSource::ModelScope.label(),
-            repo,
-            message: error.to_string(),
-        })?;
-    let downloaded = staging.join(repo);
-    tokio::fs::rename(&downloaded, target)
-        .await
-        .map_err(|error| OrchionError::Download {
-            source_name: ResolvedSource::ModelScope.label(),
-            repo,
-            message: error.to_string(),
-        })?;
-    let _ = tokio::fs::remove_dir_all(staging).await;
-    Ok(())
-}
-
-fn staging_dir(
-    target: &Path,
-    suffix: &str,
-    repo: &'static str,
+async fn download_model_hub(
     source: ResolvedSource,
-) -> Result<PathBuf> {
-    let parent = target.parent().ok_or_else(|| OrchionError::Download {
-        source_name: source.label(),
-        repo,
-        message: "target cache path has no parent directory".to_string(),
-    })?;
-    let name = target.file_name().ok_or_else(|| OrchionError::Download {
-        source_name: source.label(),
-        repo,
-        message: "target cache path has no final directory name".to_string(),
-    })?;
-    Ok(parent.join(format!(".{}.{}", name.to_string_lossy(), suffix)))
+    repo: &'static str,
+    cache_dir: &Path,
+) -> Result<()> {
+    let provider = match source {
+        ResolvedSource::HuggingFace => model_hub::HubProvider::HuggingFace { token: None },
+        ResolvedSource::ModelScope => model_hub::HubProvider::ModelScope { token: None },
+    };
+    let downloader =
+        model_hub::ModelDownloader::new(provider).map_err(|error| OrchionError::Download {
+            source_name: source.label(),
+            repo,
+            message: error.to_string(),
+        })?;
+    downloader
+        .download(model_hub::DownloadOptions {
+            repo_id: repo.to_string(),
+            revision: None,
+            save_dir: cache_dir.to_path_buf(),
+            files: None,
+        })
+        .await
+        .map_err(|error| OrchionError::Download {
+            source_name: source.label(),
+            repo,
+            message: error.to_string(),
+        })
 }
 
 async fn prepare_cached_model<M: ModelSpec>(
@@ -634,22 +602,27 @@ mod tests {
 #[cfg(test)]
 mod downloader_tests {
     use super::*;
-    use orchion_core::AsrModel;
+    use orchion_core::{AsrModel, TtsModel};
     use std::sync::{Arc, Mutex};
 
     #[derive(Default)]
     struct FakeDownloadClient {
         fail_huggingface: bool,
+        omit_asr_tokenizer_sources: bool,
         calls: Arc<Mutex<Vec<&'static str>>>,
     }
 
     struct FakeProbe {
         huggingface_available: bool,
+        calls: Arc<Mutex<usize>>,
     }
 
     impl SourceProbe for FakeProbe {
         fn huggingface_available<'a>(&'a self, _env: &'a DownloadEnv) -> BoxFuture<'a, bool> {
-            Box::pin(async move { self.huggingface_available })
+            Box::pin(async move {
+                *self.calls.lock().unwrap() += 1;
+                self.huggingface_available
+            })
         }
     }
 
@@ -682,12 +655,27 @@ mod downloader_tests {
             &'a self,
             source: ResolvedSource,
             repo: &'static str,
+            _cache_dir: &'a Path,
             target: &'a Path,
             _env: &'a DownloadEnv,
         ) -> BoxFuture<'a, Result<()>> {
             Box::pin(async move {
                 self.calls.lock().unwrap().push(source.label());
                 if self.fail_huggingface && source == ResolvedSource::HuggingFace {
+                    tokio::fs::create_dir_all(target).await.map_err(|error| {
+                        OrchionError::Download {
+                            source_name: source.label(),
+                            repo,
+                            message: error.to_string(),
+                        }
+                    })?;
+                    tokio::fs::write(target.join("partial.bin"), "partial")
+                        .await
+                        .map_err(|error| OrchionError::Download {
+                            source_name: source.label(),
+                            repo,
+                            message: error.to_string(),
+                        })?;
                     return Err(OrchionError::Download {
                         source_name: source.label(),
                         repo,
@@ -708,7 +696,9 @@ mod downloader_tests {
                         repo,
                         message: error.to_string(),
                     })?;
-                write_asr_tokenizer_sources(target).await;
+                if !self.omit_asr_tokenizer_sources {
+                    write_asr_tokenizer_sources(target).await;
+                }
                 Ok(())
             })
         }
@@ -719,6 +709,7 @@ mod downloader_tests {
         let dir = tempfile::tempdir().unwrap();
         let client = FakeDownloadClient {
             fail_huggingface: true,
+            omit_asr_tokenizer_sources: false,
             calls: Arc::new(Mutex::new(Vec::new())),
         };
         let calls = Arc::clone(&client.calls);
@@ -734,7 +725,9 @@ mod downloader_tests {
             .unwrap();
 
         assert!(path.join("config.json").exists());
-        assert!(path.join(".orchion-complete").exists());
+        assert!(path.join("tokenizer.json").exists());
+        assert!(!path.join("partial.bin").exists());
+        assert!(!path.join(".orchion-complete").exists());
         assert_eq!(&*calls.lock().unwrap(), &["huggingface", "modelscope"]);
     }
 
@@ -756,6 +749,7 @@ mod downloader_tests {
                 &client,
                 &FakeProbe {
                     huggingface_available: false,
+                    calls: Arc::new(Mutex::new(0)),
                 },
                 &env,
             )
@@ -763,18 +757,59 @@ mod downloader_tests {
             .unwrap();
 
         assert!(path.join("config.json").exists());
+        assert!(!path.join(".orchion-complete").exists());
         assert_eq!(&*calls.lock().unwrap(), &["modelscope"]);
     }
 
     #[tokio::test]
-    async fn complete_marker_skips_download() {
+    async fn auto_probe_runs_once_for_downloader_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = FakeDownloadClient::default();
+        let probe_calls = Arc::new(Mutex::new(0));
+        let probe = FakeProbe {
+            huggingface_available: false,
+            calls: Arc::clone(&probe_calls),
+        };
+        let env = DownloadEnv {
+            orchion_model_source: None,
+            hf_endpoint: None,
+        };
+        let downloader = ModelDownloader::new(DownloadSource::Auto);
+
+        downloader
+            .download_with_client_and_probe(
+                AsrModel::Qwen3Asr06B,
+                dir.path(),
+                &client,
+                &probe,
+                &env,
+            )
+            .await
+            .unwrap();
+        downloader
+            .download_with_client_and_probe(
+                TtsModel::Qwen3Tts06BBase,
+                dir.path(),
+                &client,
+                &probe,
+                &env,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(*probe_calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn ready_manifest_skips_download_when_required_files_exist() {
         let dir = tempfile::tempdir().unwrap();
         let target = AsrModel::Qwen3Asr06B.cache_path(dir.path());
         tokio::fs::create_dir_all(&target).await.unwrap();
-        write_asr_tokenizer_json(&target).await;
-        tokio::fs::write(target.join(".orchion-complete"), "huggingface\n")
+        tokio::fs::write(target.join("config.json"), "{}")
             .await
             .unwrap();
+        write_asr_tokenizer_json(&target).await;
+        write_ready_manifest(&target, AsrModel::Qwen3Asr06B.huggingface_repo()).await;
 
         let client = FakeDownloadClient::default();
         let calls = Arc::clone(&client.calls);
@@ -783,6 +818,7 @@ mod downloader_tests {
             hf_endpoint: None,
         };
         let downloader = ModelDownloader::default();
+
         let path = downloader
             .download_with_client(AsrModel::Qwen3Asr06B, dir.path(), &client, &env)
             .await
@@ -793,13 +829,14 @@ mod downloader_tests {
     }
 
     #[tokio::test]
-    async fn incomplete_cache_is_removed_and_downloaded_again() {
+    async fn ready_manifest_redownloads_when_required_file_is_missing() {
         let dir = tempfile::tempdir().unwrap();
         let target = AsrModel::Qwen3Asr06B.cache_path(dir.path());
         tokio::fs::create_dir_all(&target).await.unwrap();
-        tokio::fs::write(target.join("partial.bin"), "partial")
+        tokio::fs::write(target.join("config.json"), "{}")
             .await
             .unwrap();
+        write_ready_manifest(&target, AsrModel::Qwen3Asr06B.huggingface_repo()).await;
 
         let client = FakeDownloadClient::default();
         let calls = Arc::clone(&client.calls);
@@ -808,34 +845,7 @@ mod downloader_tests {
             hf_endpoint: None,
         };
         let downloader = ModelDownloader::default();
-        let path = downloader
-            .download_with_client(AsrModel::Qwen3Asr06B, dir.path(), &client, &env)
-            .await
-            .unwrap();
 
-        assert_eq!(path, target);
-        assert!(!path.join("partial.bin").exists());
-        assert!(path.join(".orchion-complete").exists());
-        assert_eq!(&*calls.lock().unwrap(), &["modelscope"]);
-    }
-
-    #[tokio::test]
-    async fn complete_marker_repairs_missing_asr_tokenizer_json() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = AsrModel::Qwen3Asr06B.cache_path(dir.path());
-        tokio::fs::create_dir_all(&target).await.unwrap();
-        write_asr_tokenizer_sources(&target).await;
-        tokio::fs::write(target.join(".orchion-complete"), "modelscope\n")
-            .await
-            .unwrap();
-
-        let client = FakeDownloadClient::default();
-        let calls = Arc::clone(&client.calls);
-        let env = DownloadEnv {
-            orchion_model_source: None,
-            hf_endpoint: None,
-        };
-        let downloader = ModelDownloader::default();
         let path = downloader
             .download_with_client(AsrModel::Qwen3Asr06B, dir.path(), &client, &env)
             .await
@@ -843,26 +853,19 @@ mod downloader_tests {
 
         assert_eq!(path, target);
         assert!(path.join("tokenizer.json").exists());
-        assert!(
-            std::fs::read_to_string(path.join("tokenizer.json"))
-                .unwrap()
-                .contains("\"type\":\"BPE\"")
-        );
-        assert!(calls.lock().unwrap().is_empty());
+        assert_eq!(&*calls.lock().unwrap(), &["modelscope"]);
     }
 
     #[tokio::test]
-    async fn complete_marker_rejects_unrepairable_asr_cache() {
+    async fn download_rejects_unrepairable_asr_cache_after_model_hub_success() {
         let dir = tempfile::tempdir().unwrap();
-        let target = AsrModel::Qwen3Asr06B.cache_path(dir.path());
-        tokio::fs::create_dir_all(&target).await.unwrap();
-        tokio::fs::write(target.join(".orchion-complete"), "modelscope\n")
-            .await
-            .unwrap();
-
-        let client = FakeDownloadClient::default();
+        let client = FakeDownloadClient {
+            fail_huggingface: false,
+            omit_asr_tokenizer_sources: true,
+            calls: Arc::new(Mutex::new(Vec::new())),
+        };
         let env = DownloadEnv {
-            orchion_model_source: None,
+            orchion_model_source: Some("modelscope".to_string()),
             hf_endpoint: None,
         };
         let downloader = ModelDownloader::default();
@@ -872,6 +875,17 @@ mod downloader_tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("tokenizer_config.json"));
+    }
+
+    async fn write_ready_manifest(target: &Path, repo: &'static str) {
+        let manifest = serde_json::json!({
+            "schema_version": 1,
+            "repo_id": repo,
+            "layout": "model-hub-native",
+        });
+        tokio::fs::write(target.join(".orchion-ready.json"), manifest.to_string())
+            .await
+            .unwrap();
     }
 
     async fn write_asr_tokenizer_json(target: &Path) {

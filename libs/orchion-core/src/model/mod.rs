@@ -35,10 +35,11 @@ pub trait ModelSpec: Copy + fmt::Debug + Eq + Send + 'static {
     fn modelscope_repo(self) -> &'static str;
 
     fn cache_path(self, cache_dir: impl AsRef<Path>) -> PathBuf {
-        cache_dir
-            .as_ref()
-            .join(self.category().cache_segment())
-            .join(self.cache_key())
+        self.huggingface_repo()
+            .split('/')
+            .fold(cache_dir.as_ref().to_path_buf(), |path, segment| {
+                path.join(segment)
+            })
     }
 }
 
@@ -51,11 +52,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn model_cache_paths_are_category_scoped() {
+    fn model_cache_paths_are_repository_scoped() {
         let path = AsrModel::Qwen3Asr06B.cache_path("models");
-        assert!(path.ends_with("asr/qwen3-asr-0.6b"));
+        assert!(path.ends_with("Qwen/Qwen3-ASR-0.6B"));
 
         let path = TtsModel::Qwen3Tts06BCustomVoice.cache_path("models");
-        assert!(path.ends_with("tts/qwen3-tts-0.6b-custom-voice"));
+        assert!(path.ends_with("Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"));
     }
 }

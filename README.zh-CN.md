@@ -12,7 +12,7 @@ Orchion 目前聚焦 Qwen3 ASR/TTS 模型，同时保留了后续扩展更多语
 - 开箱即用的 OpenAI 兼容 API Server。
 - `/v1/audio/transcriptions` 和 `/v1/audio/speech` 接口。
 - TTS 支持预设音色、音色克隆和音色设计。
-- 支持从 HuggingFace 或 ModelScope 下载模型。
+- 通过 `model-hub` 支持从 HuggingFace 或 ModelScope 下载模型。
 - 默认使用 CPU，可选 Metal 或 CUDA 构建。
 - Swagger UI 位于 `/docs`，OpenAPI JSON 位于 `/openapi/v1.json`。
 
@@ -220,7 +220,7 @@ async fn main() -> Result<()> {
 - `full`：Qwen3 ASR/TTS、FFmpeg 音频转换和全部下载来源。
 - `asr-qwen3`、`tts-qwen3`：Qwen3 ASR/TTS 运行时适配。
 - `audio-ffmpeg`：通过系统 `ffmpeg` 解码和编码音频。
-- `download-all`：通过 HuggingFace 和 ModelScope 异步下载模型。
+- `download-all`：通过 `model-hub` 按 HuggingFace 和 ModelScope 路由异步下载模型。
 - `cpu`、`metal`、`cuda`：后端特性开关。
 
 ## 配置
@@ -264,6 +264,8 @@ format = "wav"
 
 `models.asr.available` 和 `models.tts.available` 是服务端允许使用的模型列表。首次启动可能会把 allowlist 中的全部模型文件下载到 `models.dir`；本地开发时如果不需要示例里的所有模型，可以精简 `models.*.available`。模型会在请求指定时懒加载。请求不在 allowlist 中的模型会被拒绝。`idle_timeout` 会卸载空闲模型。
 
+下载后的模型使用 `model-hub` 的仓库原生目录布局，位于 `models.dir` 下，例如 `models/Qwen/Qwen3-ASR-0.6B`。Orchion 会在下载和模型准备完成后写入 `.orchion-ready.json`，后续启动时结合该 manifest 和必要本地文件检查来跳过重复下载。
+
 `models.max_loaded` 限制 ASR 和 TTS 加起来的总驻留模型数。`models.asr.max_loaded` 和 `models.tts.max_loaded` 分别限制单个类别的驻留模型数。任一限制达到上限时，会按最近最少使用策略卸载已驻留模型。设置 `models.max_loaded = 1` 后，ASR/TTS 会在全局范围内切换驻留；如果对应类别已被卸载，请求会等待模型重新加载，但这不是并发推理请求数限制。
 
 `models.asr.device` 和 `models.tts.device` 分别控制 ASR/TTS 的运行设备。省略该字段或设置为 `auto` 时，会优先选择 CUDA，其次 Metal，最后 CPU；如果可见多张 CUDA 显卡，`auto` 会在模型加载时选择当前剩余显存最多的 CUDA 设备。显式值支持 `cpu`、`metal`/`metal0`、`cuda`、`cuda0`、`cuda:0`、`cuda1` 和 `cuda:1`。
@@ -278,7 +280,7 @@ format = "wav"
 - `huggingface`：仅使用 HuggingFace。
 - `modelscope`：仅使用 ModelScope。
 
-设置 `HF_ENDPOINT` 时，Orchion 会把它传给 HuggingFace 客户端。服务端也支持在 `config.toml` 中用 `models.source` 配置相同的值。
+设置 `HF_ENDPOINT` 时，Orchion 会将它用于 HuggingFace 探测和 `model-hub` 的 HuggingFace 下载。服务端也支持在 `config.toml` 中用 `models.source` 配置相同的值。
 
 `server.max_upload_size` 用于限制上传请求体大小，默认是 `30M`，支持纯字节数以及 `K`、`M`、`G` 后缀。
 

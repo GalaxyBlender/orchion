@@ -74,7 +74,10 @@ async fn encoded_wav_is_readable_by_hound() {
         .await
         .unwrap();
     let mut reader = hound::WavReader::new(Cursor::new(encoded.bytes)).unwrap();
-    let samples = reader.samples::<i16>().collect::<Result<Vec<_>, _>>().unwrap();
+    let samples = reader
+        .samples::<i16>()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
 
     assert_eq!(reader.spec().sample_rate, audio.sample_rate);
     assert_eq!(samples.len(), audio.samples.len());
