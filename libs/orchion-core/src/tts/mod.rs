@@ -55,6 +55,7 @@ pub enum TtsSpeaker {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TtsLanguage {
+    Auto,
     English,
     Chinese,
     Japanese,

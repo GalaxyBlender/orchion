@@ -288,7 +288,7 @@ impl SpeechRequest {
             .as_deref()
             .map(parse_language)
             .transpose()?
-            .unwrap_or(TtsLanguage::English);
+            .unwrap_or(TtsLanguage::Auto);
         match normalize_identifier(&self.voice).as_str() {
             "clone" => {
                 let reference_audio = self.reference_audio.as_ref().ok_or_else(|| {
@@ -476,6 +476,7 @@ fn parse_speaker(value: &str) -> Result<TtsSpeaker, ApiError> {
 
 fn parse_language(value: &str) -> Result<TtsLanguage, ApiError> {
     match normalize_identifier(value).as_str() {
+        "" | "auto" => Ok(TtsLanguage::Auto),
         "english" | "en" => Ok(TtsLanguage::English),
         "chinese" | "zh" => Ok(TtsLanguage::Chinese),
         "japanese" | "ja" => Ok(TtsLanguage::Japanese),

@@ -6,6 +6,11 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+const VOICE_CLONE_ICL_PREFILL_TOKENS: usize = 9;
+const VOICE_CLONE_ICL_CODEC_BOS_TOKENS: usize = 1;
+const VOICE_CLONE_ICL_MIN_GENERATED_FRAMES: usize = 75;
+const VOICE_CLONE_ICL_EXTRA_CACHE_TOKENS: usize = 256;
+
 #[derive(Clone)]
 pub struct Tts {
     model: TtsModel,
@@ -89,6 +94,7 @@ impl Tts {
                     let prompt = engine
                         .create_voice_clone_prompt(&audio, Some(reference_text.as_str()))
                         .map_err(|source| OrchionError::Inference { source })?;
+                    validate_voice_clone_icl_prompt(&prompt)?;
                     engine
                         .synthesize_voice_clone(
                             text.as_str(),
@@ -171,6 +177,7 @@ impl Tts {
                     let prompt = engine
                         .create_voice_clone_prompt(&audio, Some(reference_text.as_str()))
                         .map_err(|source| OrchionError::Inference { source })?;
+                    validate_voice_clone_icl_prompt(&prompt)?;
                     engine
                         .synthesize_voice_clone(
                             text.as_str(),
@@ -218,6 +225,7 @@ fn speaker_to_upstream(speaker: TtsSpeaker) -> qwen3_tts::Speaker {
 
 fn language_to_upstream(language: TtsLanguage) -> qwen3_tts::Language {
     match language {
+        TtsLanguage::Auto => qwen3_tts::Language::English,
         TtsLanguage::English => qwen3_tts::Language::English,
         TtsLanguage::Chinese => qwen3_tts::Language::Chinese,
         TtsLanguage::Japanese => qwen3_tts::Language::Japanese,
@@ -246,6 +254,35 @@ fn audio_from_upstream(audio: qwen3_tts::AudioBuffer) -> TtsAudio {
     TtsAudio::new(audio.samples, audio.sample_rate)
 }
 
+fn validate_voice_clone_icl_prompt(prompt: &qwen3_tts::VoiceClonePrompt) -> Result<()> {
+    if let Some(ref_codes) = &prompt.ref_codes {
+        let reference_frames = ref_codes
+            .dim(0)
+            .map_err(|source| OrchionError::Inference {
+                source: anyhow::anyhow!(source),
+            })?;
+        validate_voice_clone_icl_frames(reference_frames)?;
+    }
+    Ok(())
+}
+
+fn validate_voice_clone_icl_frames(reference_frames: usize) -> Result<()> {
+    let max_reference_frames = VOICE_CLONE_ICL_MIN_GENERATED_FRAMES
+        + VOICE_CLONE_ICL_EXTRA_CACHE_TOKENS
+        - VOICE_CLONE_ICL_PREFILL_TOKENS
+        - VOICE_CLONE_ICL_CODEC_BOS_TOKENS;
+
+    if reference_frames > max_reference_frames {
+        return Err(OrchionError::InvalidAudio {
+            reason: format!(
+                "voice clone reference audio is too long for ICL prompting; use a shorter reference clip ({reference_frames} encoded frames, maximum {max_reference_frames})"
+            ),
+        });
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,6 +308,7 @@ mod tests {
     #[test]
     fn language_mapping_covers_supported_languages() {
         let languages = [
+            TtsLanguage::Auto,
             TtsLanguage::English,
             TtsLanguage::Chinese,
             TtsLanguage::Japanese,
@@ -324,5 +362,18 @@ mod tests {
             orchion_core::DevicePreference::Cpu,
         );
         std::mem::drop(future);
+    }
+
+    #[test]
+    fn rejects_voice_clone_reference_that_exceeds_icl_cache_budget() {
+        let result = validate_voice_clone_icl_frames(373);
+
+        let error = result.unwrap_err();
+        assert!(matches!(error, OrchionError::InvalidAudio { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("voice clone reference audio is too long")
+        );
     }
 }

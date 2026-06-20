@@ -1,32 +1,42 @@
-use crate::api::docs;
 use crate::api::openai::{
     ApiError, ModelList, ModelObject, SpeechFormat, SpeechRequest, TranscriptionFormat,
     TranscriptionJson, TranscriptionVerboseJson, content_type_for,
 };
 use crate::api::srt::format_srt;
+use crate::api::{docs, ui};
 use crate::infrastructure::orchion::AppState;
 use crate::settings::{parse_asr_model, parse_tts_model};
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, FromRequest, Multipart, Request, State};
-use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
+use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, LOCATION};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use orchion::{AsrOptions, AsrTimestampGranularity, AudioOutputFormat, encode_tts_audio};
+use orchion::{
+    AsrOptions, AsrTimestampGranularity, AudioOutputFormat, OrchionError, TtsAudio,
+    decode_audio_bytes, encode_tts_audio,
+};
 use std::sync::Arc;
 use std::time::Instant;
-use tempfile::NamedTempFile;
+use tempfile::{Builder as TempFileBuilder, NamedTempFile};
+use tokio::io::AsyncWriteExt;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
 use tracing::Level;
 
 pub fn router(state: Arc<AppState>) -> Router {
+    router_with_ui_routes(state, ui::routes())
+}
+
+pub fn router_with_ui_routes(state: Arc<AppState>, ui_routes: Router<Arc<AppState>>) -> Router {
     let max_upload_size = state.config.server.max_upload_size;
     Router::new()
+        .route("/", get(root_redirect))
         .route("/healthz", get(healthz))
         .route("/v1/models", get(list_models))
         .route("/v1/audio/speech", post(create_speech))
         .route("/v1/audio/transcriptions", post(create_transcription))
+        .merge(ui_routes)
         .merge(docs::swagger_ui())
         .layer(DefaultBodyLimit::max(max_upload_size))
         .with_state(state)
@@ -36,6 +46,13 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .on_request(DefaultOnRequest::new().level(Level::DEBUG))
                 .on_response(DefaultOnResponse::new().level(Level::INFO)),
         )
+}
+
+async fn root_redirect() -> impl IntoResponse {
+    (
+        StatusCode::FOUND,
+        [(LOCATION, HeaderValue::from_static("/ui"))],
+    )
 }
 
 async fn healthz() -> &'static str {
@@ -188,11 +205,7 @@ async fn create_speech_multipart(
             Some("missing_required_parameter"),
         )
     })?;
-    let reference_file =
-        NamedTempFile::new().map_err(|error| ApiError::internal(error.to_string()))?;
-    tokio::fs::write(reference_file.path(), reference_audio)
-        .await
-        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let reference_file = transcode_reference_audio_to_wav_file(reference_audio).await?;
     let reference_path = reference_file
         .path()
         .to_str()
@@ -218,6 +231,35 @@ async fn create_speech_multipart(
     let response = create_speech_from_request(state, request).await;
     drop(reference_file);
     response
+}
+
+async fn transcode_reference_audio_to_wav_file(
+    reference_audio: Vec<u8>,
+) -> Result<NamedTempFile, ApiError> {
+    let decoded = decode_audio_bytes(reference_audio)
+        .await
+        .map_err(reference_audio_error)?;
+    let audio = TtsAudio::new(decoded.samples, decoded.sample_rate);
+    let encoded = encode_tts_audio(&audio, AudioOutputFormat::Wav)
+        .await
+        .map_err(reference_audio_error)?;
+    let reference_file = TempFileBuilder::new()
+        .suffix(".wav")
+        .tempfile()
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    tokio::fs::write(reference_file.path(), encoded.bytes)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    Ok(reference_file)
+}
+
+fn reference_audio_error(error: OrchionError) -> ApiError {
+    match error {
+        OrchionError::InvalidAudio { reason } => {
+            ApiError::invalid_request(reason, Some("reference_audio"), Some("invalid_audio"))
+        }
+        other => ApiError::internal(other.to_string()),
+    }
 }
 
 async fn create_speech_from_request(
@@ -282,7 +324,7 @@ async fn create_transcription(
     mut multipart: Multipart,
 ) -> Result<Response, ApiError> {
     authorize(&state, &headers)?;
-    let mut audio_bytes = None;
+    let mut audio_file = None;
     let mut model = None;
     let mut language = None;
     let mut response_format = TranscriptionFormat::default();
@@ -294,19 +336,7 @@ async fn create_transcription(
         let name = field.name().unwrap_or_default().to_string();
         match name.as_str() {
             "file" => {
-                audio_bytes = Some(
-                    field
-                        .bytes()
-                        .await
-                        .map_err(|error| {
-                            ApiError::invalid_request(
-                                error.to_string(),
-                                Some("file"),
-                                Some("invalid_file"),
-                            )
-                        })?
-                        .to_vec(),
-                );
+                audio_file = Some(write_multipart_file_to_temp_file(field, "file").await?);
             }
             "model" => model = Some(read_text_field(field, "model").await?),
             "language" => language = Some(read_text_field(field, "language").await?),
@@ -343,18 +373,26 @@ async fn create_transcription(
         .await
         .map_err(|error| ApiError::internal(error.to_string()))?
         .ok_or_else(|| ApiError::model_not_available(&model))?;
-    let audio_bytes = audio_bytes.ok_or_else(|| {
+    let (audio_file, audio_bytes) = audio_file.ok_or_else(|| {
         ApiError::invalid_request(
             "`file` is required",
             Some("file"),
             Some("missing_required_parameter"),
         )
     })?;
+    if audio_bytes == 0 {
+        return Err(ApiError::invalid_request(
+            "uploaded audio file is empty",
+            Some("file"),
+            Some("invalid_file"),
+        ));
+    }
+    let audio_path = audio_file.path().to_path_buf();
     tracing::debug!(
         model = %model,
         language = ?language,
         response_format = ?response_format,
-        audio_bytes = audio_bytes.len(),
+        audio_bytes,
         "transcription request received"
     );
     let options = AsrOptions {
@@ -362,11 +400,10 @@ async fn create_transcription(
         ..Default::default()
     };
     let transcript = if use_segments {
-        asr.transcribe_audio_bytes_with_segments(audio_bytes, options)
+        asr.transcribe_audio_file_with_segments(audio_path, options)
             .await?
     } else {
-        asr.transcribe_audio_bytes_with(audio_bytes, options)
-            .await?
+        asr.transcribe_audio_file_with(audio_path, options).await?
     };
     tracing::info!(format = ?response_format, "transcription request completed");
 
@@ -497,6 +534,38 @@ async fn read_text_field(
             Some("invalid_multipart_field"),
         )
     })
+}
+
+async fn write_multipart_file_to_temp_file(
+    mut field: axum::extract::multipart::Field<'_>,
+    param: &'static str,
+) -> Result<(NamedTempFile, u64), ApiError> {
+    let audio_file = TempFileBuilder::new()
+        .prefix("orchion-upload-")
+        .tempfile()
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let mut writer = tokio::fs::File::create(audio_file.path())
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let mut bytes_written = 0_u64;
+
+    while let Some(chunk) = field.chunk().await.map_err(|error| {
+        ApiError::invalid_request(error.to_string(), Some(param), Some("invalid_file"))
+    })? {
+        writer
+            .write_all(&chunk)
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        bytes_written += u64::try_from(chunk.len()).map_err(|error| {
+            ApiError::internal(format!("uploaded file chunk size overflowed u64: {error}"))
+        })?;
+    }
+    writer
+        .flush()
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+
+    Ok((audio_file, bytes_written))
 }
 
 #[cfg(test)]

@@ -48,6 +48,64 @@ fn speech_preset_voice_maps_to_tts_voice() {
 }
 
 #[test]
+fn speech_omitted_language_maps_to_auto_tts_voice() {
+    let request = SpeechRequest {
+        model: "qwen3-tts-0.6b-custom-voice".to_string(),
+        input: "Hello".to_string(),
+        voice: "ryan".to_string(),
+        response_format: Some(SpeechFormat::Wav),
+        speed: 1.0,
+        language: None,
+        reference_audio: None,
+        reference_text: None,
+        voice_prompt: None,
+        seed: None,
+        temperature: None,
+        top_k: None,
+        top_p: None,
+        repetition_penalty: None,
+        max_length: None,
+    };
+
+    assert_eq!(
+        request.to_tts_voice().unwrap(),
+        TtsVoice::Preset {
+            speaker: TtsSpeaker::Ryan,
+            language: TtsLanguage::Auto,
+        }
+    );
+}
+
+#[test]
+fn speech_auto_language_maps_to_auto_tts_voice() {
+    let request = SpeechRequest {
+        model: "qwen3-tts-0.6b-custom-voice".to_string(),
+        input: "Hello".to_string(),
+        voice: "ryan".to_string(),
+        response_format: Some(SpeechFormat::Wav),
+        speed: 1.0,
+        language: Some("auto".to_string()),
+        reference_audio: None,
+        reference_text: None,
+        voice_prompt: None,
+        seed: None,
+        temperature: None,
+        top_k: None,
+        top_p: None,
+        repetition_penalty: None,
+        max_length: None,
+    };
+
+    assert_eq!(
+        request.to_tts_voice().unwrap(),
+        TtsVoice::Preset {
+            speaker: TtsSpeaker::Ryan,
+            language: TtsLanguage::Auto,
+        }
+    );
+}
+
+#[test]
 fn speech_clone_voice_requires_reference_audio() {
     let request = SpeechRequest {
         model: "qwen3-tts-0.6b-base".to_string(),
