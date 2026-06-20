@@ -30,12 +30,19 @@ pub fn router(state: Arc<AppState>) -> Router {
 
 pub fn router_with_ui_routes(state: Arc<AppState>, ui_routes: Router<Arc<AppState>>) -> Router {
     let max_upload_size = state.config.server.max_upload_size;
-    Router::new()
+    let mut router = Router::new()
         .route("/", get(root_redirect))
         .route("/healthz", get(healthz))
-        .route("/v1/models", get(list_models))
-        .route("/v1/audio/speech", post(create_speech))
-        .route("/v1/audio/transcriptions", post(create_transcription))
+        .route("/v1/models", get(list_models));
+
+    if state.config.services.tts.enabled {
+        router = router.route("/v1/audio/speech", post(create_speech));
+    }
+    if state.config.services.asr.enabled {
+        router = router.route("/v1/audio/transcriptions", post(create_transcription));
+    }
+
+    router
         .merge(ui_routes)
         .merge(docs::swagger_ui())
         .layer(DefaultBodyLimit::max(max_upload_size))
@@ -64,29 +71,31 @@ async fn list_models(
     headers: HeaderMap,
 ) -> Result<Json<ModelList>, ApiError> {
     authorize(&state, &headers)?;
-    let mut data = Vec::with_capacity(
-        state.config.models.asr.available.len() + state.config.models.tts.available.len(),
-    );
-    data.extend(
-        state
-            .config
-            .models
-            .asr
-            .available
-            .iter()
-            .copied()
-            .map(ModelObject::new),
-    );
-    data.extend(
-        state
-            .config
-            .models
-            .tts
-            .available
-            .iter()
-            .copied()
-            .map(ModelObject::new),
-    );
+    let mut data = Vec::new();
+    if state.config.services.asr.enabled {
+        data.extend(
+            state
+                .config
+                .services
+                .asr
+                .available_models
+                .iter()
+                .copied()
+                .map(ModelObject::new),
+        );
+    }
+    if state.config.services.tts.enabled {
+        data.extend(
+            state
+                .config
+                .services
+                .tts
+                .available_models
+                .iter()
+                .copied()
+                .map(ModelObject::new),
+        );
+    }
     Ok(Json(ModelList {
         object: "list",
         data,
@@ -284,7 +293,7 @@ async fn create_speech_from_request(
     let format = request
         .response_format
         .map(Ok)
-        .unwrap_or_else(|| SpeechFormat::try_from(state.config.defaults.tts.format.as_str()))?;
+        .unwrap_or_else(|| SpeechFormat::try_from(state.config.services.tts.format.as_str()))?;
     let voice = request.to_tts_voice()?;
     let synthesis_started = Instant::now();
     tracing::debug!("speech synthesis started");

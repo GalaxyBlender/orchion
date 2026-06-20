@@ -11,7 +11,7 @@ use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tower::ServiceExt;
 
 #[tokio::test]
@@ -47,6 +47,81 @@ async fn models_endpoint_returns_configured_models() {
     assert!(body["data"].as_array().unwrap().iter().all(|model| {
         model["object"] == "model" && model["created"] == 0 && model["owned_by"] == "orchion"
     }));
+}
+
+#[tokio::test]
+async fn models_endpoint_excludes_disabled_services() {
+    let response = router(test_state_with_services(None, true, false))
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    let ids = model_ids(&body);
+    assert_eq!(ids, vec!["qwen3-asr-0.6b", "qwen3-asr-1.7b"]);
+}
+
+#[tokio::test]
+async fn models_endpoint_is_empty_when_all_services_are_disabled() {
+    let response = router(test_state_with_services(None, false, false))
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["object"], "list");
+    assert!(body["data"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn speech_route_is_absent_when_tts_is_disabled() {
+    let response = router(test_state_with_services(None, true, false))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/speech")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{
+                        "model":"qwen3-tts-0.6b-custom-voice",
+                        "input":"hello",
+                        "voice":"alloy"
+                    }"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn transcription_route_is_absent_when_asr_is_disabled() {
+    let response = router(test_state_with_services(None, false, true))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/transcriptions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -415,6 +490,15 @@ async fn json_body(response: axum::response::Response) -> Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+fn model_ids(body: &Value) -> Vec<&str> {
+    body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|model| model["id"].as_str().unwrap())
+        .collect()
+}
+
 async fn text_body(response: axum::response::Response) -> String {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     String::from_utf8(bytes.to_vec()).unwrap()
@@ -449,7 +533,12 @@ fn multipart_body(
 }
 
 fn wav_bytes() -> Vec<u8> {
-    let samples = [0_i16; 128];
+    let samples = (0..2_400)
+        .map(|index| {
+            let phase = index as f32 / 24_000.0 * 440.0 * std::f32::consts::TAU;
+            (phase.sin() * f32::from(i16::MAX) * 0.25) as i16
+        })
+        .collect::<Vec<_>>();
     let data_len = (samples.len() * 2) as u32;
     let mut bytes = Vec::with_capacity(44 + data_len as usize);
     bytes.extend_from_slice(b"RIFF");
@@ -472,15 +561,39 @@ fn wav_bytes() -> Vec<u8> {
 }
 
 fn test_state(api_key: Option<&str>) -> Arc<AppState> {
+    test_state_with_services(api_key, true, true)
+}
+
+fn test_state_with_services(
+    api_key: Option<&str>,
+    asr_enabled: bool,
+    tts_enabled: bool,
+) -> Arc<AppState> {
     let mut config = ServerConfig::default_for_exe(std::path::Path::new("/tmp/orchion-server"));
     config.auth.api_key = api_key.map(str::to_string);
-    config.models.asr.available = vec![AsrModel::Qwen3Asr06B, AsrModel::Qwen3Asr17B];
-    config.models.tts.available = vec![
+    config.services.asr.enabled = asr_enabled;
+    config.services.tts.enabled = tts_enabled;
+    config.services.asr.available_models = vec![AsrModel::Qwen3Asr06B, AsrModel::Qwen3Asr17B];
+    config.services.asr.idle_timeout = Duration::from_secs(600);
+    config.services.asr.max_loaded = 2;
+    config.services.tts.available_models = vec![
         TtsModel::Qwen3Tts06BCustomVoice,
         TtsModel::Qwen3Tts17BVoiceDesign,
     ];
-    let asr_models = AsrModelCache::new(config.models.asr.clone(), config.models.dir.clone());
-    let tts_models = TtsModelCache::new(config.models.tts.clone(), config.models.dir.clone());
+    config.services.tts.idle_timeout = Duration::from_secs(600);
+    config.services.tts.max_loaded = 2;
+    let asr_models = AsrModelCache::new(
+        config.services.asr.available_models.clone(),
+        config.services.asr.idle_timeout,
+        config.services.asr.max_loaded,
+        config.models.dir.clone(),
+    );
+    let tts_models = TtsModelCache::new(
+        config.services.tts.available_models.clone(),
+        config.services.tts.idle_timeout,
+        config.services.tts.max_loaded,
+        config.models.dir.clone(),
+    );
     let global_models = GlobalModelCacheLimiter::new(config.models.max_loaded);
     Arc::new(AppState {
         config,

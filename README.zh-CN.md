@@ -73,7 +73,7 @@ curl http://127.0.0.1:9090/v1/audio/transcriptions \
 
 字段：
 
-- `model`：必须是 `models.tts.available` 中的 TTS 模型，例如 `qwen3-tts-0.6b-custom-voice`。
+- `model`：必须是 `services.tts.available_models` 中的 TTS 模型，例如 `qwen3-tts-0.6b-custom-voice`。
 - `input`：需要合成的文本。
 - `voice`：内置说话人名称，例如 `ryan`。
 - `language`：可选，合成语言，例如 `english`、`zh`。
@@ -99,7 +99,7 @@ curl http://127.0.0.1:9090/v1/audio/speech \
 
 字段：
 
-- `model`：必须是 `models.tts.available` 中的音色克隆模型，例如 `qwen3-tts-0.6b-custom-voice`。
+- `model`：必须是 `services.tts.available_models` 中的音色克隆模型，例如 `qwen3-tts-0.6b-custom-voice`。
 - `input`：需要合成的文本。
 - `voice`：固定传 `clone`。
 - `reference_audio`：参考音频文件字段，例如 `-F reference_audio=@reference.wav`。
@@ -125,7 +125,7 @@ curl http://127.0.0.1:9090/v1/audio/speech \
 
 字段：
 
-- `model`：必须是 `models.tts.available` 中支持音色设计的模型，例如 `qwen3-tts-1.7b-voice-design`。
+- `model`：必须是 `services.tts.available_models` 中支持音色设计的模型，例如 `qwen3-tts-1.7b-voice-design`。
 - `input`：需要合成的文本。
 - `voice`：固定传 `design`。
 - `voice_prompt`：音色描述文本。
@@ -146,7 +146,7 @@ curl http://127.0.0.1:9090/v1/audio/speech \
   --output designed.wav
 ```
 
-语音合成输出支持 `wav`、`mp3`、`aac`、`opus`、`flac` 和 `pcm`。如果请求未传 `response_format`，服务会使用 `config.toml` 中 `[defaults.tts] format` 的值，默认是 `wav`。`speed` 必须保持为 `1.0`，因为暂未暴露语速控制。
+语音合成输出支持 `wav`、`mp3`、`aac`、`opus`、`flac` 和 `pcm`。如果请求未传 `response_format`，服务会使用 `config.toml` 中 `[services.tts] format` 的值，默认是 `wav`。`speed` 必须保持为 `1.0`，因为暂未暴露语速控制。
 
 Qwen3 TTS 请求还支持 `seed`、`temperature`、`top_k`、`top_p`、`repetition_penalty` 和 `max_length`。如果未传 `seed`，Orchion 默认使用 `42`。其他采样字段未传时保持上游默认值。
 
@@ -156,7 +156,7 @@ Qwen3 TTS 请求还支持 `seed`、`temperature`、`top_k`、`top_p`、`repetiti
 curl http://127.0.0.1:9090/v1/models
 ```
 
-响应保持 OpenAI model list 形状：`object` 为 `list`，`data` 中每个模型对象包含 `id`、`object`、`created` 和 `owned_by`。列表来自 `config.toml` 中的 `models.asr.available` 和 `models.tts.available`。
+响应保持 OpenAI model list 形状：`object` 为 `list`，`data` 中每个模型对象包含 `id`、`object`、`created` 和 `owned_by`。列表来自 `config.toml` 中的 `services.asr.available_models` 和 `services.tts.available_models`。`services.asr.enabled` 和 `services.tts.enabled` 控制模型下载和路由暴露；已禁用服务不会出现在 `/v1/models` 中。
 
 如果配置了 `[auth] api_key`，所有 `/v1/*` 请求都需要传入 `Authorization: Bearer <api_key>`。
 
@@ -235,17 +235,19 @@ dir = "models"
 source = "auto"
 max_loaded = 2
 
-[models.asr]
-default = "qwen3-asr-0.6b"
+[services.asr]
+enabled = true
+default_model = "qwen3-asr-0.6b"
 device = "auto"
-available = ["qwen3-asr-0.6b", "qwen3-asr-1.7b"]
+available_models = ["qwen3-asr-0.6b", "qwen3-asr-1.7b"]
 idle_timeout = "10m"
 max_loaded = 1
 
-[models.tts]
-default = "qwen3-tts-0.6b-custom-voice"
+[services.tts]
+enabled = true
+default_model = "qwen3-tts-0.6b-custom-voice"
 device = "auto"
-available = [
+available_models = [
   "qwen3-tts-0.6b-base",
   "qwen3-tts-0.6b-custom-voice",
   "qwen3-tts-1.7b-base",
@@ -254,21 +256,21 @@ available = [
 ]
 idle_timeout = "10m"
 max_loaded = 1
+format = "wav"
 
 [auth]
 # api_key = "change-me"
-
-[defaults.tts]
-format = "wav"
 ```
 
-`models.asr.available` 和 `models.tts.available` 是服务端允许使用的模型列表。首次启动可能会把 allowlist 中的全部模型文件下载到 `models.dir`；本地开发时如果不需要示例里的所有模型，可以精简 `models.*.available`。模型会在请求指定时懒加载。请求不在 allowlist 中的模型会被拒绝。`idle_timeout` 会卸载空闲模型。
+`services.asr.available_models` 和 `services.tts.available_models` 是服务端允许使用的模型列表。首次启动可能会把 allowlist 中的全部模型文件下载到 `models.dir`；本地开发时如果不需要示例里的所有模型，可以精简 `services.*.available_models`。模型会在请求指定时懒加载。请求不在 allowlist 中的模型会被拒绝。`idle_timeout` 会卸载空闲模型。
+
+`services.asr.enabled` 和 `services.tts.enabled` 控制模型下载和路由暴露。已禁用服务不会出现在 `/v1/models` 中。
 
 下载后的模型使用 `model-hub` 的仓库原生目录布局，位于 `models.dir` 下，例如 `models/Qwen/Qwen3-ASR-0.6B`。Orchion 会在下载和模型准备完成后写入 `.orchion-ready.json`，后续启动时结合该 manifest 和必要本地文件检查来跳过重复下载。
 
-`models.max_loaded` 限制 ASR 和 TTS 加起来的总驻留模型数。`models.asr.max_loaded` 和 `models.tts.max_loaded` 分别限制单个类别的驻留模型数。任一限制达到上限时，会按最近最少使用策略卸载已驻留模型。设置 `models.max_loaded = 1` 后，ASR/TTS 会在全局范围内切换驻留；如果对应类别已被卸载，请求会等待模型重新加载，但这不是并发推理请求数限制。
+`models.max_loaded` 限制 ASR 和 TTS 加起来的总驻留模型数。`services.asr.max_loaded` 和 `services.tts.max_loaded` 分别限制单个类别的驻留模型数。任一限制达到上限时，会按最近最少使用策略卸载已驻留模型。设置 `models.max_loaded = 1` 后，ASR/TTS 会在全局范围内切换驻留；如果对应类别已被卸载，请求会等待模型重新加载，但这不是并发推理请求数限制。
 
-`models.asr.device` 和 `models.tts.device` 分别控制 ASR/TTS 的运行设备。省略该字段或设置为 `auto` 时，会优先选择 CUDA，其次 Metal，最后 CPU；如果可见多张 CUDA 显卡，`auto` 会在模型加载时选择当前剩余显存最多的 CUDA 设备。显式值支持 `cpu`、`metal`/`metal0`、`cuda`、`cuda0`、`cuda:0`、`cuda1` 和 `cuda:1`。
+`services.asr.device` 和 `services.tts.device` 分别控制 ASR/TTS 的运行设备。省略该字段或设置为 `auto` 时，会优先选择 CUDA，其次 Metal，最后 CPU；如果可见多张 CUDA 显卡，`auto` 会在模型加载时选择当前剩余显存最多的 CUDA 设备。显式值支持 `cpu`、`metal`/`metal0`、`cuda`、`cuda0`、`cuda:0`、`cuda1` 和 `cuda:1`。
 
 `[auth] api_key` 是可选配置。设置为非空值后，所有 `/v1/*` 路由都要求 `Authorization: Bearer <api_key>`；`/healthz` 和 `/docs` 保持公开。
 

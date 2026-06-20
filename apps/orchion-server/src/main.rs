@@ -40,16 +40,17 @@ async fn run() -> anyhow::Result<()> {
     let bind = config.server.bind;
     tracing::debug!(
         %bind,
-        asr_model = ?config.models.asr,
-        tts_model = ?config.models.tts,
+        asr_service = ?config.services.asr,
+        tts_service = ?config.services.tts,
         "server config loaded"
     );
     tracing::debug!(
         config_path = %config.config_path.display(),
         models_dir = %config.models.dir.display(),
         max_upload_size = config.server.max_upload_size,
-        model_source = ?config.models.source,
-        default_tts_format = %config.defaults.tts.format,
+        models_source = ?config.models.source,
+        models_max_loaded = config.models.max_loaded,
+        default_tts_format = %config.services.tts.format,
         "server config details loaded"
     );
     let state = AppState::load(config)

@@ -73,7 +73,7 @@ Preset voice synthesis uses JSON and passes a built-in speaker name as `voice`.
 
 Fields:
 
-- `model`: a TTS model from `models.tts.available`, such as `qwen3-tts-0.6b-custom-voice`.
+- `model`: a TTS model from `services.tts.available_models`, such as `qwen3-tts-0.6b-custom-voice`.
 - `input`: text to synthesize.
 - `voice`: built-in speaker name, such as `ryan`.
 - `language`: optional synthesis language, such as `english` or `zh`.
@@ -99,7 +99,7 @@ Voice clone uses the same endpoint with `multipart/form-data` and uploads refere
 
 Fields:
 
-- `model`: a voice-clone-capable model from `models.tts.available`, such as `qwen3-tts-0.6b-custom-voice`.
+- `model`: a voice-clone-capable model from `services.tts.available_models`, such as `qwen3-tts-0.6b-custom-voice`.
 - `input`: text to synthesize.
 - `voice`: must be `clone`.
 - `reference_audio`: reference audio file field, such as `-F reference_audio=@reference.wav`.
@@ -125,7 +125,7 @@ Voice design uses JSON, passes `design` as `voice`, and describes the generated 
 
 Fields:
 
-- `model`: a voice-design-capable model from `models.tts.available`, such as `qwen3-tts-1.7b-voice-design`.
+- `model`: a voice-design-capable model from `services.tts.available_models`, such as `qwen3-tts-1.7b-voice-design`.
 - `input`: text to synthesize.
 - `voice`: must be `design`.
 - `voice_prompt`: text description of the voice.
@@ -146,7 +146,7 @@ curl http://127.0.0.1:9090/v1/audio/speech \
   --output designed.wav
 ```
 
-Supported speech output formats are `wav`, `mp3`, `aac`, `opus`, `flac`, and `pcm`. If `response_format` is omitted, the server uses `[defaults.tts] format` from `config.toml`, which defaults to `wav`. `speed` must remain `1.0` because speed control is not exposed yet.
+Supported speech output formats are `wav`, `mp3`, `aac`, `opus`, `flac`, and `pcm`. If `response_format` is omitted, the server uses `[services.tts] format` from `config.toml`, which defaults to `wav`. `speed` must remain `1.0` because speed control is not exposed yet.
 
 Qwen3 TTS requests also accept `seed`, `temperature`, `top_k`, `top_p`, `repetition_penalty`, and `max_length`. If `seed` is omitted, Orchion uses `42` by default. Other sampling fields keep upstream defaults unless provided.
 
@@ -156,7 +156,7 @@ Qwen3 TTS requests also accept `seed`, `temperature`, `top_k`, `top_p`, `repetit
 curl http://127.0.0.1:9090/v1/models
 ```
 
-The response follows the OpenAI model list shape: `object` is `list`, and `data` contains model objects with `id`, `object`, `created`, and `owned_by`. The list is built from `models.asr.available` and `models.tts.available` in `config.toml`.
+The response follows the OpenAI model list shape: `object` is `list`, and `data` contains model objects with `id`, `object`, `created`, and `owned_by`. The list is built from `services.asr.available_models` and `services.tts.available_models` in `config.toml`. `services.asr.enabled` and `services.tts.enabled` control model downloads and route exposure; disabled services are omitted from `/v1/models`.
 
 If `[auth] api_key` is configured, pass it as `Authorization: Bearer <api_key>` for every `/v1/*` request.
 
@@ -235,17 +235,19 @@ dir = "models"
 source = "auto"
 max_loaded = 2
 
-[models.asr]
-default = "qwen3-asr-0.6b"
+[services.asr]
+enabled = true
+default_model = "qwen3-asr-0.6b"
 device = "auto"
-available = ["qwen3-asr-0.6b", "qwen3-asr-1.7b"]
+available_models = ["qwen3-asr-0.6b", "qwen3-asr-1.7b"]
 idle_timeout = "10m"
 max_loaded = 1
 
-[models.tts]
-default = "qwen3-tts-0.6b-custom-voice"
+[services.tts]
+enabled = true
+default_model = "qwen3-tts-0.6b-custom-voice"
 device = "auto"
-available = [
+available_models = [
   "qwen3-tts-0.6b-base",
   "qwen3-tts-0.6b-custom-voice",
   "qwen3-tts-1.7b-base",
@@ -254,21 +256,21 @@ available = [
 ]
 idle_timeout = "10m"
 max_loaded = 1
+format = "wav"
 
 [auth]
 # api_key = "change-me"
-
-[defaults.tts]
-format = "wav"
 ```
 
-`models.asr.available` and `models.tts.available` define the server allowlists. First startup can download all allowlisted model files into `models.dir`; trim `models.*.available` for local development if you do not need every example model. Models are loaded lazily when requested. Requests for models outside the allowlist are rejected. `idle_timeout` unloads inactive models.
+`services.asr.available_models` and `services.tts.available_models` define the server allowlists. First startup can download all allowlisted model files into `models.dir`; trim `services.*.available_models` for local development if you do not need every example model. Models are loaded lazily when requested. Requests for models outside the allowlist are rejected. `idle_timeout` unloads inactive models.
+
+`services.asr.enabled` and `services.tts.enabled` control model downloads and route exposure. Disabled services are omitted from `/v1/models`.
 
 Downloaded models use the `model-hub` native repository layout under `models.dir`, for example `models/Qwen/Qwen3-ASR-0.6B`. Orchion writes `.orchion-ready.json` after download and model preparation complete, then uses that manifest plus required local files to skip repeated downloads on later startup.
 
-`models.max_loaded` limits the total resident ASR and TTS models together. `models.asr.max_loaded` and `models.tts.max_loaded` limit each category separately. When any limit is full, the least recently used resident model is evicted. Setting `models.max_loaded = 1` makes ASR and TTS switch residency globally; a request may wait while the evicted category is loaded again, but this does not limit concurrent inference requests.
+`models.max_loaded` limits the total resident ASR and TTS models together. `services.asr.max_loaded` and `services.tts.max_loaded` limit each category separately. When any limit is full, the least recently used resident model is evicted. Setting `models.max_loaded = 1` makes ASR and TTS switch residency globally; a request may wait while the evicted category is loaded again, but this does not limit concurrent inference requests.
 
-`models.asr.device` and `models.tts.device` control runtime placement independently. Omitted fields or `auto` prefer CUDA, then Metal, then CPU. When multiple CUDA devices are visible, `auto` chooses the CUDA GPU with the most free memory at model load time. Explicit values include `cpu`, `metal`/`metal0`, `cuda`, `cuda0`, `cuda:0`, `cuda1`, and `cuda:1`.
+`services.asr.device` and `services.tts.device` control runtime placement independently. Omitted fields or `auto` prefer CUDA, then Metal, then CPU. When multiple CUDA devices are visible, `auto` chooses the CUDA GPU with the most free memory at model load time. Explicit values include `cpu`, `metal`/`metal0`, `cuda`, `cuda0`, `cuda:0`, `cuda1`, and `cuda:1`.
 
 `[auth] api_key` is optional. When it is set to a non-empty value, every `/v1/*` route requires `Authorization: Bearer <api_key>`; `/healthz` and `/docs` remain public.
 

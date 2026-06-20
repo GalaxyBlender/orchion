@@ -26,8 +26,8 @@ pub struct ServerConfig {
     pub config_path: PathBuf,
     pub server: ServerSection,
     pub models: ModelsSection,
+    pub services: ServicesSection,
     pub auth: AuthSection,
-    pub defaults: DefaultsSection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,32 +41,38 @@ pub struct ModelsSection {
     pub dir: PathBuf,
     pub source: ModelSource,
     pub max_loaded: usize,
-    pub asr: ModelRegistrySection<AsrModel>,
-    pub tts: ModelRegistrySection<TtsModel>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModelRegistrySection<M> {
-    pub default: M,
-    pub available: Vec<M>,
+pub struct ServicesSection {
+    pub asr: ModelServiceSection<AsrModel>,
+    pub tts: TtsServiceSection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelServiceSection<M> {
+    pub enabled: bool,
+    pub default_model: M,
+    pub available_models: Vec<M>,
     pub idle_timeout: Duration,
     pub max_loaded: usize,
     pub device: DevicePreference,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TtsServiceSection {
+    pub enabled: bool,
+    pub default_model: TtsModel,
+    pub available_models: Vec<TtsModel>,
+    pub idle_timeout: Duration,
+    pub max_loaded: usize,
+    pub device: DevicePreference,
+    pub format: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthSection {
     pub api_key: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DefaultsSection {
-    pub tts: TtsDefaults,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TtsDefaults {
-    pub format: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -102,7 +108,7 @@ pub enum ConfigError {
         section: &'static str,
         value: String,
     },
-    #[error("default {category} model `{default}` must be included in {section}.available")]
+    #[error("default {category} model `{default}` must be included in {section}.available_models")]
     DefaultModelUnavailable {
         category: &'static str,
         section: &'static str,
@@ -124,27 +130,27 @@ impl ServerConfig {
                 dir: exe_dir.join("models"),
                 source: ModelSource::Auto,
                 max_loaded: 2,
-                asr: ModelRegistrySection {
-                    default: AsrModel::Qwen3Asr06B,
-                    available: vec![AsrModel::Qwen3Asr06B],
-                    idle_timeout: Duration::from_secs(600),
-                    max_loaded: 1,
-                    device: DevicePreference::Auto,
-                },
-                tts: ModelRegistrySection {
-                    default: TtsModel::Qwen3Tts06BCustomVoice,
-                    available: vec![TtsModel::Qwen3Tts06BCustomVoice],
-                    idle_timeout: Duration::from_secs(600),
-                    max_loaded: 1,
-                    device: DevicePreference::Auto,
-                },
             },
-            auth: AuthSection { api_key: None },
-            defaults: DefaultsSection {
-                tts: TtsDefaults {
+            services: ServicesSection {
+                asr: ModelServiceSection {
+                    enabled: true,
+                    default_model: AsrModel::Qwen3Asr06B,
+                    available_models: vec![AsrModel::Qwen3Asr06B],
+                    idle_timeout: Duration::from_secs(600),
+                    max_loaded: 1,
+                    device: DevicePreference::Auto,
+                },
+                tts: TtsServiceSection {
+                    enabled: true,
+                    default_model: TtsModel::Qwen3Tts06BCustomVoice,
+                    available_models: vec![TtsModel::Qwen3Tts06BCustomVoice],
+                    idle_timeout: Duration::from_secs(600),
+                    max_loaded: 1,
+                    device: DevicePreference::Auto,
                     format: "wav".to_string(),
                 },
             },
+            auth: AuthSection { api_key: None },
         }
     }
 
@@ -200,19 +206,14 @@ impl ServerConfig {
                 }
                 config.models.max_loaded = max_loaded;
             }
-            if let Some(asr) = models.asr {
-                config.models.asr = parse_asr_registry(asr, config.models.asr)?;
-            }
-            if let Some(tts) = models.tts {
-                config.models.tts = parse_tts_registry(tts, config.models.tts)?;
-            }
         }
 
-        if let Some(defaults) = raw.defaults {
-            if let Some(tts) = defaults.tts {
-                if let Some(format) = tts.format {
-                    config.defaults.tts.format = format;
-                }
+        if let Some(services) = raw.services {
+            if let Some(asr) = services.asr {
+                config.services.asr = parse_asr_service(asr, config.services.asr)?;
+            }
+            if let Some(tts) = services.tts {
+                config.services.tts = parse_tts_service(tts, config.services.tts)?;
             }
         }
 
@@ -231,84 +232,96 @@ impl ServerConfig {
     }
 }
 
-fn parse_asr_registry(
-    raw: RawModelRegistry,
-    mut registry: ModelRegistrySection<AsrModel>,
-) -> Result<ModelRegistrySection<AsrModel>, ConfigError> {
-    let available = raw.available;
-    if let Some(default) = raw.default {
-        registry.default = parse_asr_model(&default)?;
+fn parse_asr_service(
+    raw: RawModelService,
+    mut service: ModelServiceSection<AsrModel>,
+) -> Result<ModelServiceSection<AsrModel>, ConfigError> {
+    let available_models = raw.available_models;
+    if let Some(enabled) = raw.enabled {
+        service.enabled = enabled;
     }
-    if let Some(available) = available {
-        registry.available = available
+    if let Some(default_model) = raw.default_model {
+        service.default_model = parse_asr_model(&default_model)?;
+    }
+    if let Some(available_models) = available_models {
+        service.available_models = available_models
             .iter()
             .map(String::as_str)
             .map(parse_asr_model)
             .collect::<Result<Vec<_>, _>>()?;
-    } else {
-        registry.available = vec![registry.default];
     }
     if let Some(device) = raw.device {
-        registry.device = parse_device_preference("models.asr", &device)?;
+        service.device = parse_device_preference("services.asr", &device)?;
     }
-    apply_registry_limits(
-        "models.asr",
+    apply_service_limits(
+        "services.asr",
         raw.idle_timeout,
         raw.max_loaded,
-        &mut registry,
+        &mut service.idle_timeout,
+        &mut service.max_loaded,
     )?;
-    ensure_default_available(
-        "ASR",
-        "models.asr",
-        registry.default.cache_key(),
-        registry.available.contains(&registry.default),
-    )?;
-    Ok(registry)
+    if service.enabled {
+        ensure_default_available(
+            "ASR",
+            "services.asr",
+            service.default_model.cache_key(),
+            service.available_models.contains(&service.default_model),
+        )?;
+    }
+    Ok(service)
 }
 
-fn parse_tts_registry(
-    raw: RawModelRegistry,
-    mut registry: ModelRegistrySection<TtsModel>,
-) -> Result<ModelRegistrySection<TtsModel>, ConfigError> {
-    let available = raw.available;
-    if let Some(default) = raw.default {
-        registry.default = parse_tts_model(&default)?;
+fn parse_tts_service(
+    raw: RawTtsService,
+    mut service: TtsServiceSection,
+) -> Result<TtsServiceSection, ConfigError> {
+    let available_models = raw.available_models;
+    if let Some(enabled) = raw.enabled {
+        service.enabled = enabled;
     }
-    if let Some(available) = available {
-        registry.available = available
+    if let Some(default_model) = raw.default_model {
+        service.default_model = parse_tts_model(&default_model)?;
+    }
+    if let Some(available_models) = available_models {
+        service.available_models = available_models
             .iter()
             .map(String::as_str)
             .map(parse_tts_model)
             .collect::<Result<Vec<_>, _>>()?;
-    } else {
-        registry.available = vec![registry.default];
     }
     if let Some(device) = raw.device {
-        registry.device = parse_device_preference("models.tts", &device)?;
+        service.device = parse_device_preference("services.tts", &device)?;
     }
-    apply_registry_limits(
-        "models.tts",
+    if let Some(format) = raw.format {
+        service.format = format;
+    }
+    apply_service_limits(
+        "services.tts",
         raw.idle_timeout,
         raw.max_loaded,
-        &mut registry,
+        &mut service.idle_timeout,
+        &mut service.max_loaded,
     )?;
-    ensure_default_available(
-        "TTS",
-        "models.tts",
-        registry.default.cache_key(),
-        registry.available.contains(&registry.default),
-    )?;
-    Ok(registry)
+    if service.enabled {
+        ensure_default_available(
+            "TTS",
+            "services.tts",
+            service.default_model.cache_key(),
+            service.available_models.contains(&service.default_model),
+        )?;
+    }
+    Ok(service)
 }
 
-fn apply_registry_limits<M>(
+fn apply_service_limits(
     section: &'static str,
     idle_timeout: Option<String>,
     max_loaded: Option<usize>,
-    registry: &mut ModelRegistrySection<M>,
+    service_idle_timeout: &mut Duration,
+    service_max_loaded: &mut usize,
 ) -> Result<(), ConfigError> {
     if let Some(idle_timeout) = idle_timeout {
-        registry.idle_timeout = parse_duration(&idle_timeout)?;
+        *service_idle_timeout = parse_duration(&idle_timeout)?;
     }
     if let Some(max_loaded) = max_loaded {
         if max_loaded == 0 {
@@ -317,7 +330,7 @@ fn apply_registry_limits<M>(
                 value: max_loaded,
             });
         }
-        registry.max_loaded = max_loaded;
+        *service_max_loaded = max_loaded;
     }
     Ok(())
 }
@@ -485,8 +498,8 @@ fn normalize_identifier(value: &str) -> String {
 struct RawConfig {
     server: Option<RawServer>,
     models: Option<RawModels>,
+    services: Option<RawServices>,
     auth: Option<RawAuth>,
-    defaults: Option<RawDefaults>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -502,15 +515,21 @@ struct RawModels {
     dir: Option<PathBuf>,
     source: Option<String>,
     max_loaded: Option<usize>,
-    asr: Option<RawModelRegistry>,
-    tts: Option<RawModelRegistry>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawModelRegistry {
-    default: Option<String>,
-    available: Option<Vec<String>>,
+struct RawServices {
+    asr: Option<RawModelService>,
+    tts: Option<RawTtsService>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawModelService {
+    enabled: Option<bool>,
+    default_model: Option<String>,
+    available_models: Option<Vec<String>>,
     idle_timeout: Option<String>,
     max_loaded: Option<usize>,
     device: Option<String>,
@@ -518,18 +537,18 @@ struct RawModelRegistry {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawTtsService {
+    enabled: Option<bool>,
+    default_model: Option<String>,
+    available_models: Option<Vec<String>>,
+    idle_timeout: Option<String>,
+    max_loaded: Option<usize>,
+    device: Option<String>,
+    format: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawAuth {
     api_key: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawDefaults {
-    tts: Option<RawTtsDefaults>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawTtsDefaults {
-    format: Option<String>,
 }

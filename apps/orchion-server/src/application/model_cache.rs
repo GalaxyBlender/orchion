@@ -1,4 +1,3 @@
-use crate::settings::ModelRegistrySection;
 use orchion::{Asr, AsrModel, ModelDownloader, ModelSpec, Tts, TtsModel};
 use std::collections::HashMap;
 use std::future::Future;
@@ -153,16 +152,21 @@ where
     M: ModelSpec + std::hash::Hash,
     E: Clone,
 {
-    pub fn new(registry: ModelRegistrySection<M>, dir: PathBuf) -> Self {
+    pub fn new(
+        available_models: Vec<M>,
+        idle_timeout: Duration,
+        max_loaded: usize,
+        dir: PathBuf,
+    ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(ModelCacheState {
-                available: registry.available,
+                available: available_models,
                 loaded: HashMap::new(),
                 loading: HashMap::new(),
             })),
             dir,
-            idle_timeout: registry.idle_timeout,
-            max_loaded: registry.max_loaded,
+            idle_timeout,
+            max_loaded,
         }
     }
 
@@ -310,36 +314,30 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    fn registry(max_loaded: usize, idle_timeout: Duration) -> ModelRegistrySection<AsrModel> {
-        ModelRegistrySection {
-            default: AsrModel::Qwen3Asr06B,
-            available: vec![AsrModel::Qwen3Asr06B, AsrModel::Qwen3Asr17B],
+    fn asr_cache(max_loaded: usize, idle_timeout: Duration) -> ModelCache<AsrModel, usize> {
+        ModelCache::new(
+            vec![AsrModel::Qwen3Asr06B, AsrModel::Qwen3Asr17B],
             idle_timeout,
             max_loaded,
-            device: orchion::DevicePreference::Auto,
-        }
+            PathBuf::from("models"),
+        )
     }
 
-    fn tts_registry(max_loaded: usize, idle_timeout: Duration) -> ModelRegistrySection<TtsModel> {
-        ModelRegistrySection {
-            default: TtsModel::Qwen3Tts06BCustomVoice,
-            available: vec![TtsModel::Qwen3Tts06BCustomVoice],
+    fn tts_cache(max_loaded: usize, idle_timeout: Duration) -> ModelCache<TtsModel, usize> {
+        ModelCache::new(
+            vec![TtsModel::Qwen3Tts06BCustomVoice],
             idle_timeout,
             max_loaded,
-            device: orchion::DevicePreference::Auto,
-        }
+            PathBuf::from("models"),
+        )
     }
 
     #[tokio::test]
     async fn rejects_unavailable_model_without_loading() {
         let cache = ModelCache::<AsrModel, usize>::new(
-            ModelRegistrySection {
-                default: AsrModel::Qwen3Asr06B,
-                available: vec![AsrModel::Qwen3Asr06B],
-                idle_timeout: Duration::from_secs(60),
-                max_loaded: 1,
-                device: orchion::DevicePreference::Auto,
-            },
+            vec![AsrModel::Qwen3Asr06B],
+            Duration::from_secs(60),
+            1,
             PathBuf::from("models"),
         );
         let loads = Arc::new(AtomicUsize::new(0));
@@ -361,10 +359,7 @@ mod tests {
 
     #[tokio::test]
     async fn returns_loaded_model_from_cache() {
-        let cache = ModelCache::<AsrModel, usize>::new(
-            registry(2, Duration::from_secs(60)),
-            PathBuf::from("models"),
-        );
+        let cache = asr_cache(2, Duration::from_secs(60));
         let loads = Arc::new(AtomicUsize::new(0));
 
         let first = load_counted(&cache, AsrModel::Qwen3Asr06B, &loads).await;
@@ -377,10 +372,7 @@ mod tests {
 
     #[tokio::test]
     async fn evicts_least_recently_used_model_when_full() {
-        let cache = ModelCache::<AsrModel, usize>::new(
-            registry(1, Duration::from_secs(60)),
-            PathBuf::from("models"),
-        );
+        let cache = asr_cache(1, Duration::from_secs(60));
         let loads = Arc::new(AtomicUsize::new(0));
 
         assert_eq!(
@@ -400,10 +392,7 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_idle_unloads_inactive_models() {
-        let cache = ModelCache::<AsrModel, usize>::new(
-            registry(2, Duration::from_millis(1)),
-            PathBuf::from("models"),
-        );
+        let cache = asr_cache(2, Duration::from_millis(1));
         let loads = Arc::new(AtomicUsize::new(0));
 
         assert_eq!(
@@ -421,14 +410,8 @@ mod tests {
 
     #[tokio::test]
     async fn global_limiter_evicts_lru_across_model_categories() {
-        let asr_cache = ModelCache::<AsrModel, usize>::new(
-            registry(2, Duration::from_secs(60)),
-            PathBuf::from("models"),
-        );
-        let tts_cache = ModelCache::<TtsModel, usize>::new(
-            tts_registry(2, Duration::from_secs(60)),
-            PathBuf::from("models"),
-        );
+        let asr_cache = asr_cache(2, Duration::from_secs(60));
+        let tts_cache = tts_cache(2, Duration::from_secs(60));
         let limiter = GlobalModelCacheLimiter::new(1);
         let asr_loads = Arc::new(AtomicUsize::new(0));
         let tts_loads = Arc::new(AtomicUsize::new(0));
@@ -478,14 +461,8 @@ mod tests {
 
     #[tokio::test]
     async fn global_limiter_returns_loaded_model_without_waiting_for_cold_load() {
-        let asr_cache = ModelCache::<AsrModel, usize>::new(
-            registry(2, Duration::from_secs(60)),
-            PathBuf::from("models"),
-        );
-        let tts_cache = ModelCache::<TtsModel, usize>::new(
-            tts_registry(2, Duration::from_secs(60)),
-            PathBuf::from("models"),
-        );
+        let asr_cache = asr_cache(2, Duration::from_secs(60));
+        let tts_cache = tts_cache(2, Duration::from_secs(60));
         let limiter = GlobalModelCacheLimiter::new(2);
         let loads = Arc::new(AtomicUsize::new(0));
 
