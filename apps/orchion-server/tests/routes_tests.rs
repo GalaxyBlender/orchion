@@ -3,7 +3,7 @@ use axum::http::{Request, StatusCode, header::AUTHORIZATION};
 use http_body_util::BodyExt;
 use orchion::{AsrModel, TtsModel};
 use orchion_server::config::ServerConfig;
-use orchion_server::model_cache::{AsrModelCache, TtsModelCache};
+use orchion_server::model_cache::{AsrModelCache, GlobalModelCacheLimiter, TtsModelCache};
 use orchion_server::routes::router;
 use orchion_server::state::AppState;
 use serde_json::Value;
@@ -202,9 +202,11 @@ fn test_state(api_key: Option<&str>) -> Arc<AppState> {
     ];
     let asr_models = AsrModelCache::new(config.models.asr.clone(), config.models.dir.clone());
     let tts_models = TtsModelCache::new(config.models.tts.clone(), config.models.dir.clone());
+    let global_models = GlobalModelCacheLimiter::new(config.models.max_loaded);
     Arc::new(AppState {
         config,
         asr_models,
         tts_models,
+        global_models,
     })
 }

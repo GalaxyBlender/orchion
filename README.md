@@ -228,6 +228,7 @@ max_upload_size = "30M"
 [models]
 dir = "models"
 source = "auto"
+max_loaded = 2
 
 [models.asr]
 default = "qwen3-asr-0.6b"
@@ -256,7 +257,9 @@ max_loaded = 1
 format = "wav"
 ```
 
-`models.asr.available` and `models.tts.available` define the server allowlists. First startup can download all allowlisted model files into `models.dir`; trim `models.*.available` for local development if you do not need every example model. Models are loaded lazily when requested. Requests for models outside the allowlist are rejected. `idle_timeout` unloads inactive models, and `max_loaded` evicts the least recently used loaded model when the cache is full.
+`models.asr.available` and `models.tts.available` define the server allowlists. First startup can download all allowlisted model files into `models.dir`; trim `models.*.available` for local development if you do not need every example model. Models are loaded lazily when requested. Requests for models outside the allowlist are rejected. `idle_timeout` unloads inactive models.
+
+`models.max_loaded` limits the total resident ASR and TTS models together. `models.asr.max_loaded` and `models.tts.max_loaded` limit each category separately. When any limit is full, the least recently used resident model is evicted. Setting `models.max_loaded = 1` makes ASR and TTS switch residency globally; a request may wait while the evicted category is loaded again, but this does not limit concurrent inference requests.
 
 `models.asr.device` and `models.tts.device` control runtime placement independently. Omitted fields or `auto` prefer CUDA, then Metal, then CPU. When multiple CUDA devices are visible, `auto` chooses the CUDA GPU with the most free memory at model load time. Explicit values include `cpu`, `metal`/`metal0`, `cuda`, `cuda0`, `cuda:0`, `cuda1`, and `cuda:1`.
 

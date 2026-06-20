@@ -18,6 +18,7 @@ fn defaults_are_executable_relative() {
     );
     assert_eq!(config.models.dir, exe_path.parent().unwrap().join("models"));
     assert_eq!(config.models.source, ModelSource::Auto);
+    assert_eq!(config.models.max_loaded, 2);
     assert_eq!(config.models.asr.default, AsrModel::Qwen3Asr06B);
     assert_eq!(config.models.asr.available, vec![AsrModel::Qwen3Asr06B]);
     assert_eq!(config.models.asr.idle_timeout, Duration::from_secs(600));
@@ -46,6 +47,7 @@ max_upload_size = "64M"
 [models]
 dir = "cache/models"
 source = "modelscope"
+max_loaded = 3
 
 [models.asr]
 default = "qwen3-asr-1.7b"
@@ -77,6 +79,7 @@ format = "wav"
         exe_path.parent().unwrap().join("cache/models")
     );
     assert_eq!(config.models.source, ModelSource::ModelScope);
+    assert_eq!(config.models.max_loaded, 3);
     assert_eq!(config.models.asr.default, AsrModel::Qwen3Asr17B);
     assert_eq!(
         config.models.asr.available,
@@ -178,6 +181,21 @@ max_loaded = 0
     .unwrap_err();
 
     assert!(error.to_string().contains("max_loaded"));
+}
+
+#[test]
+fn invalid_global_model_cache_limit_is_rejected() {
+    let exe_path = std::path::Path::new("/tmp/orchion-server");
+    let error = ServerConfig::from_toml_str(
+        r#"
+[models]
+max_loaded = 0
+"#,
+        exe_path,
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("invalid models.max_loaded"));
 }
 
 #[test]

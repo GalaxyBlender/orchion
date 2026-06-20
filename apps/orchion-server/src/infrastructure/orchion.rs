@@ -1,4 +1,6 @@
-use crate::application::model_cache::{AsrModelCache, TtsModelCache, ensure_available_models};
+use crate::application::model_cache::{
+    AsrModelCache, GlobalModelCacheLimiter, TtsModelCache, ensure_available_models,
+};
 use crate::settings::ServerConfig;
 use anyhow::Context;
 use orchion::{Asr, ModelDownloader, Tts};
@@ -10,6 +12,7 @@ pub struct AppState {
     pub config: ServerConfig,
     pub asr_models: AsrModelCache,
     pub tts_models: TtsModelCache,
+    pub global_models: GlobalModelCacheLimiter,
 }
 
 impl AppState {
@@ -33,10 +36,12 @@ impl AppState {
         .context("download TTS models")?;
         let asr_models = AsrModelCache::new(config.models.asr.clone(), config.models.dir.clone());
         let tts_models = TtsModelCache::new(config.models.tts.clone(), config.models.dir.clone());
+        let global_models = GlobalModelCacheLimiter::new(config.models.max_loaded);
         let state = Arc::new(Self {
             config,
             asr_models,
             tts_models,
+            global_models,
         });
         state.spawn_idle_cleanup();
         tracing::info!(asr = asr_count, tts = tts_count, "model cache ready");
@@ -45,25 +50,35 @@ impl AppState {
 
     pub async fn asr(&self, model: orchion::AsrModel) -> anyhow::Result<Option<Asr>> {
         let device = self.config.models.asr.device;
-        self.asr_models
-            .get_or_load(model, |model, path| async move {
-                tracing::info!(model = ?model, device = %device, "loading ASR model");
-                Asr::load_with_device(model, path, device)
-                    .await
-                    .context("load ASR model")
-            })
+        self.global_models
+            .get_or_load(
+                &self.asr_models,
+                &self.tts_models,
+                model,
+                |model, path| async move {
+                    tracing::info!(model = ?model, device = %device, "loading ASR model");
+                    Asr::load_with_device(model, path, device)
+                        .await
+                        .context("load ASR model")
+                },
+            )
             .await
     }
 
     pub async fn tts(&self, model: orchion::TtsModel) -> anyhow::Result<Option<Tts>> {
         let device = self.config.models.tts.device;
-        self.tts_models
-            .get_or_load(model, |model, path| async move {
-                tracing::info!(model = ?model, device = %device, "loading TTS model");
-                Tts::load_with_device(model, path, device)
-                    .await
-                    .context("load TTS model")
-            })
+        self.global_models
+            .get_or_load(
+                &self.tts_models,
+                &self.asr_models,
+                model,
+                |model, path| async move {
+                    tracing::info!(model = ?model, device = %device, "loading TTS model");
+                    Tts::load_with_device(model, path, device)
+                        .await
+                        .context("load TTS model")
+                },
+            )
             .await
     }
 

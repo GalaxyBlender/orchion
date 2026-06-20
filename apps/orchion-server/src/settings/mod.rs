@@ -40,6 +40,7 @@ pub struct ServerSection {
 pub struct ModelsSection {
     pub dir: PathBuf,
     pub source: ModelSource,
+    pub max_loaded: usize,
     pub asr: ModelRegistrySection<AsrModel>,
     pub tts: ModelRegistrySection<TtsModel>,
 }
@@ -122,6 +123,7 @@ impl ServerConfig {
             models: ModelsSection {
                 dir: exe_dir.join("models"),
                 source: ModelSource::Auto,
+                max_loaded: 2,
                 asr: ModelRegistrySection {
                     default: AsrModel::Qwen3Asr06B,
                     available: vec![AsrModel::Qwen3Asr06B],
@@ -188,6 +190,15 @@ impl ServerConfig {
             }
             if let Some(source) = models.source {
                 config.models.source = parse_model_source(&source)?;
+            }
+            if let Some(max_loaded) = models.max_loaded {
+                if max_loaded == 0 {
+                    return Err(ConfigError::InvalidMaxLoaded {
+                        section: "models",
+                        value: max_loaded,
+                    });
+                }
+                config.models.max_loaded = max_loaded;
             }
             if let Some(asr) = models.asr {
                 config.models.asr = parse_asr_registry(asr, config.models.asr)?;
@@ -490,6 +501,7 @@ struct RawServer {
 struct RawModels {
     dir: Option<PathBuf>,
     source: Option<String>,
+    max_loaded: Option<usize>,
     asr: Option<RawModelRegistry>,
     tts: Option<RawModelRegistry>,
 }

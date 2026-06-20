@@ -228,6 +228,7 @@ max_upload_size = "30M"
 [models]
 dir = "models"
 source = "auto"
+max_loaded = 2
 
 [models.asr]
 default = "qwen3-asr-0.6b"
@@ -256,7 +257,9 @@ max_loaded = 1
 format = "wav"
 ```
 
-`models.asr.available` 和 `models.tts.available` 是服务端允许使用的模型列表。首次启动可能会把 allowlist 中的全部模型文件下载到 `models.dir`；本地开发时如果不需要示例里的所有模型，可以精简 `models.*.available`。模型会在请求指定时懒加载。请求不在 allowlist 中的模型会被拒绝。`idle_timeout` 会卸载空闲模型，`max_loaded` 会在缓存满时按最近最少使用策略卸载已加载模型。
+`models.asr.available` 和 `models.tts.available` 是服务端允许使用的模型列表。首次启动可能会把 allowlist 中的全部模型文件下载到 `models.dir`；本地开发时如果不需要示例里的所有模型，可以精简 `models.*.available`。模型会在请求指定时懒加载。请求不在 allowlist 中的模型会被拒绝。`idle_timeout` 会卸载空闲模型。
+
+`models.max_loaded` 限制 ASR 和 TTS 加起来的总驻留模型数。`models.asr.max_loaded` 和 `models.tts.max_loaded` 分别限制单个类别的驻留模型数。任一限制达到上限时，会按最近最少使用策略卸载已驻留模型。设置 `models.max_loaded = 1` 后，ASR/TTS 会在全局范围内切换驻留；如果对应类别已被卸载，请求会等待模型重新加载，但这不是并发推理请求数限制。
 
 `models.asr.device` 和 `models.tts.device` 分别控制 ASR/TTS 的运行设备。省略该字段或设置为 `auto` 时，会优先选择 CUDA，其次 Metal，最后 CPU；如果可见多张 CUDA 显卡，`auto` 会在模型加载时选择当前剩余显存最多的 CUDA 设备。显式值支持 `cpu`、`metal`/`metal0`、`cuda`、`cuda0`、`cuda:0`、`cuda1` 和 `cuda:1`。
 

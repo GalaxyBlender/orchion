@@ -5,6 +5,7 @@ max_upload_size = "30M"
 [models]
 dir = "models"
 source = "auto"
+max_loaded = 2
 
 [models.asr]
 default = "qwen3-asr-0.6b"
