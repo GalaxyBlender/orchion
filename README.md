@@ -37,10 +37,15 @@ cargo run -p orchion-server --features cuda -- --config apps/orchion-server/conf
 
 `orchion-server` defaults to CPU. Use `--features metal` on macOS, or `--features cuda` on Linux/Windows with a supported CUDA stack. The repository includes `apps/orchion-server/config.toml` as a development config.
 
+### WebUI
+
+Open the React WebUI at `/ui` on the server for ASR/TTS operations, parameter previews, model inspection, and local settings. Debug builds serve `web/dist`; if it is missing, run `bun install` and `bun run build` from `web/`. For frontend iteration, run `bun run dev` from `web/`. Release builds run Bun from `apps/orchion-server/build.rs`, build the SPA, and embed assets in the server binary via `OUT_DIR/ui-dist`. API key and form preferences are stored in browser `localStorage`. Warning: API keys are stored in the browser profile via `localStorage`; do not use or save them on shared or untrusted browsers.
+
 ### Routes
 
 - `GET /healthz`: health check.
 - `GET /v1/models`: OpenAI-style list of configured models.
+- `GET /ui`: React WebUI for ASR/TTS operations, parameter previews, model inspection, and local settings.
 - `POST /v1/audio/transcriptions`: OpenAI-style multipart ASR request.
 - `POST /v1/audio/speech`: OpenAI-style TTS request.
 - `GET /docs`: Swagger UI.

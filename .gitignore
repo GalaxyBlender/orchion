@@ -1,4 +1,6 @@
 /target/
 /data/
 /docs/superpowers/
+/web/node_modules/
+/web/dist/
 .env

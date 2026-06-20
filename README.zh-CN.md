@@ -37,9 +37,14 @@ cargo run -p orchion-server --features cuda -- --config apps/orchion-server/conf
 
 `orchion-server` 默认使用 CPU。macOS 可使用 `--features metal`，Linux/Windows 且 CUDA 环境可用时可使用 `--features cuda`。仓库内置了 `apps/orchion-server/config.toml` 作为开发配置。
 
+### WebUI
+
+在服务器的 `/ui` 打开 React WebUI，可用于 ASR/TTS 操作、参数预览、模型检查和本地设置。Debug 构建会服务 `web/dist`；如果目录缺失，请在 `web/` 下运行 `bun install` 和 `bun run build`。前端迭代可在 `web/` 下运行 `bun run dev`。Release 构建会从 `apps/orchion-server/build.rs` 运行 Bun、构建 SPA，并通过 `OUT_DIR/ui-dist` 将资源嵌入服务端二进制。API key 和表单偏好会存储在浏览器 `localStorage`。警告：API key 会通过 `localStorage` 存储在浏览器配置档案中；不要在共享或不可信浏览器中使用或保存 API key。
+
 ### 路由
 
 - `GET /healthz`：健康检查。
+- `GET /ui`：用于 ASR/TTS 操作、参数预览、模型检查和本地设置的 React WebUI。
 - `GET /v1/models`：OpenAI 风格的可用模型列表。
 - `POST /v1/audio/transcriptions`：OpenAI 风格 multipart ASR 请求。
 - `POST /v1/audio/speech`：OpenAI 风格 TTS 请求。

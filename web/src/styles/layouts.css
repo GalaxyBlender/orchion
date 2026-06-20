@@ -1,0 +1,140 @@
+/* Layout System */
+
+/* Main App Layout Grid */
+.app-layout {
+  display: grid;
+  grid-template-columns: 240px 1fr;
+  min-height: 100vh;
+  transition: grid-template-columns var(--duration-normal) var(--ease-out);
+}
+
+.app-layout.collapsed {
+  grid-template-columns: 72px 1fr;
+}
+
+/* Sidebar Wrapper */
+.sidebar-wrapper {
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  z-index: var(--z-sticky);
+  border-right: 1px solid var(--color-border-subtle);
+  background: hsla(var(--color-bg-base-hsl), 0.7);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+}
+
+/* Main Content Area */
+.app-content {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  padding: var(--space-6) var(--space-8);
+  overflow-y: auto;
+}
+
+/* Topbar for mobile view */
+.topbar-wrapper {
+  display: none;
+}
+
+/* Page Containers */
+.page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-6);
+  width: 100%;
+}
+
+.page-header {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.page-title-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-4);
+}
+
+.page-title {
+  font-size: var(--text-3xl);
+  font-weight: var(--font-bold);
+  color: var(--color-text-primary);
+}
+
+.page-description {
+  font-size: var(--text-md);
+  color: var(--color-text-secondary);
+  max-width: 800px;
+}
+
+.page-content {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-6);
+}
+
+/* Responsive Grids */
+.grid {
+  display: grid;
+  gap: var(--gap-md);
+}
+
+.grid-cols-1 { grid-template-columns: repeat(1, minmax(0, 1fr)); }
+.grid-cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.grid-cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+
+/* Stack layouts */
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-md);
+}
+
+.hstack {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: var(--gap-md);
+}
+
+/* Responsive adaptations */
+@media (max-width: 1024px) {
+  .app-layout {
+    grid-template-columns: 72px 1fr;
+  }
+}
+
+@media (max-width: 768px) {
+  .app-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .topbar-wrapper {
+    display: block;
+    position: sticky;
+    top: 0;
+    z-index: var(--z-sticky);
+  }
+
+  .sidebar-wrapper {
+    position: fixed;
+    top: 0;
+    left: -240px;
+    width: 240px;
+    transition: transform var(--duration-normal) var(--ease-out);
+    box-shadow: var(--shadow-xl);
+  }
+
+  .sidebar-wrapper.mobile-open {
+    transform: translateX(240px);
+  }
+
+  .app-content {
+    padding: var(--space-4) var(--space-4);
+  }
+}

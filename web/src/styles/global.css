@@ -1,0 +1,51 @@
+/* Global Styles */
+html {
+  font-size: 16px;
+  background-color: var(--color-bg-base);
+  color-scheme: dark;
+}
+
+body {
+  font-family: var(--font-sans);
+  color: var(--color-text-primary);
+  background-color: var(--color-bg-base);
+  background-image: 
+    radial-gradient(circle at 10% 20%, hsla(var(--color-accent-hsl), 0.08), transparent 40vw),
+    radial-gradient(circle at 90% 80%, hsla(var(--color-accent-blue-hsl), 0.05), transparent 40vw);
+  background-attachment: fixed;
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-weight: var(--font-bold);
+  line-height: var(--leading-tight);
+  color: var(--color-text-primary);
+  letter-spacing: -0.025em;
+}
+
+a {
+  color: var(--color-accent-blue);
+  text-decoration: none;
+  transition: var(--transition-colors);
+}
+
+a:hover {
+  color: var(--color-accent);
+}
+
+/* Accessibility skip link */
+.skip-link {
+  position: absolute;
+  top: -40px;
+  left: 0;
+  background: var(--color-accent);
+  color: var(--color-bg-base);
+  padding: var(--space-2) var(--space-4);
+  z-index: var(--z-command);
+  transition: top var(--duration-fast) ease;
+}
+
+.skip-link:focus {
+  top: 0;
+}
