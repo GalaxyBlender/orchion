@@ -159,6 +159,26 @@ export interface FileDropZoneProps {
   className?: string;
 }
 
+const fileMatchesAccept = (file: File, accept?: string) => {
+  if (!accept) {
+    return true;
+  }
+
+  return accept.split(",").some((rawType) => {
+    const type = rawType.trim().toLowerCase();
+    if (!type) {
+      return false;
+    }
+    if (type.startsWith(".")) {
+      return file.name.toLowerCase().endsWith(type);
+    }
+    if (type.endsWith("/*")) {
+      return file.type.toLowerCase().startsWith(type.slice(0, -1));
+    }
+    return file.type.toLowerCase() === type;
+  });
+};
+
 export const FileDropZone: React.FC<FileDropZoneProps> = ({
   accept,
   selectedFile,
@@ -187,14 +207,20 @@ export const FileDropZone: React.FC<FileDropZoneProps> = ({
     setDragActive(false);
 
     if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-      onFileSelect(e.dataTransfer.files[0]);
+      const file = e.dataTransfer.files[0];
+      if (fileMatchesAccept(file, accept)) {
+        onFileSelect(file);
+      }
     }
   };
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     e.preventDefault();
     if (e.target.files && e.target.files[0]) {
-      onFileSelect(e.target.files[0]);
+      const file = e.target.files[0];
+      if (fileMatchesAccept(file, accept)) {
+        onFileSelect(file);
+      }
     }
   };
 

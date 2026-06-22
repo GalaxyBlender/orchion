@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { NavLink, useLocation } from "react-router-dom";
 import { useTranslation } from "react-i18next";
-import { Mic, Volume2, Database, Settings, Globe, ChevronLeft, ChevronRight, Wifi, WifiOff, ScanText } from "lucide-react";
+import { Mic, Volume2, Database, Settings, Globe, ChevronLeft, ChevronRight, Wifi, WifiOff, ScanText, FileText } from "lucide-react";
 import { Badge } from "./Badge";
 import { Button } from "./Button";
 import { setLanguageSelection, currentLanguageSelection } from "@/shared/i18n";
@@ -61,6 +61,12 @@ export const Sidebar: React.FC<SidebarProps> = ({
       label: t("shell.nav.ocr.label", "OCR"),
       meta: t("shell.nav.ocr.meta", "document vision"),
       icon: <ScanText size={18} />
+    },
+    {
+      to: "/pdf",
+      label: t("shell.nav.pdf.label", "PDF"),
+      meta: t("shell.nav.pdf.meta", "page images"),
+      icon: <FileText size={18} />
     },
     {
       to: "/models",

@@ -47,14 +47,15 @@ export const AppLayout: React.FC = () => {
         setCommandPaletteOpen((prev) => !prev);
       }
       
-      // Page shortcuts: Cmd/Ctrl + 1/2/3/4/5
-      if ((e.metaKey || e.ctrlKey) && ["1", "2", "3", "4", "5"].includes(e.key)) {
+      // Page shortcuts: Cmd/Ctrl + 1/2/3/4/5/6
+      if ((e.metaKey || e.ctrlKey) && ["1", "2", "3", "4", "5", "6"].includes(e.key)) {
         e.preventDefault();
         if (e.key === "1") navigate("/asr");
         if (e.key === "2") navigate("/tts");
         if (e.key === "3") navigate("/ocr");
-        if (e.key === "4") navigate("/models");
-        if (e.key === "5") navigate("/settings");
+        if (e.key === "4") navigate("/pdf");
+        if (e.key === "5") navigate("/models");
+        if (e.key === "6") navigate("/settings");
       }
     };
 

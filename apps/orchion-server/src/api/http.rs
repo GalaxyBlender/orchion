@@ -3,13 +3,14 @@ use crate::api::openai::{
     SpeechFormat, SpeechRequest, TranscriptionFormat, TranscriptionJson, TranscriptionVerboseJson,
     content_type_for,
 };
+use crate::api::pdf::{self, PdfRenderRequest};
 use crate::api::srt::format_srt;
 use crate::api::{docs, ui};
 use crate::infrastructure::orchion::AppState;
 use crate::settings::{parse_asr_model, parse_tts_model};
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, FromRequest, Multipart, Request, State};
-use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, LOCATION};
+use axum::http::header::{AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_TYPE, LOCATION};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -36,7 +37,8 @@ pub fn router_with_ui_routes(state: Arc<AppState>, ui_routes: Router<Arc<AppStat
     let mut router = Router::new()
         .route("/", get(root_redirect))
         .route("/healthz", get(healthz))
-        .route("/v1/models", get(list_models));
+        .route("/v1/models", get(list_models))
+        .route("/v1/pdf/images", post(create_pdf_images));
 
     if state.config.services.tts.enabled {
         router = router.route("/v1/audio/speech", post(create_speech));
@@ -105,17 +107,9 @@ async fn list_models(
         );
     }
     if state.config.services.ocr.active() {
-        data.extend(
-            state
-                .config
-                .services
-                .ocr
-                .available_models
-                .iter()
-                .map(|id| {
-                    ModelObject::from_id(id.as_str(), ModelType::Ocr, Some(ModelSubtype::Standard))
-                }),
-        );
+        data.extend(state.config.services.ocr.available_models.iter().map(|id| {
+            ModelObject::from_id(id.as_str(), ModelType::Ocr, Some(ModelSubtype::Standard))
+        }));
         data.extend(
             state
                 .config
@@ -659,6 +653,99 @@ async fn create_ocr(
         )
             .into_response(),
     })
+}
+
+async fn create_pdf_images(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> Result<Response, ApiError> {
+    authorize(&state, &headers)?;
+    let upload = read_pdf_images_request(multipart).await?;
+    let PdfImagesRequest { pdf_file, request } = upload;
+    let rendered = tokio::task::spawn_blocking(move || {
+        let rendered = pdf::render_pdf_to_zip(request);
+        drop(pdf_file);
+        rendered
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))??;
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, HeaderValue::from_static("application/zip"))
+        .header(
+            CONTENT_DISPOSITION,
+            HeaderValue::from_static("attachment; filename=pdf-images.zip"),
+        )
+        .header("x-pdf-page-count", rendered.page_count.to_string())
+        .header("x-pdf-image-count", rendered.file_count.to_string())
+        .body(Body::from(rendered.bytes))
+        .map_err(|error| ApiError::internal(error.to_string()))
+}
+
+struct PdfImagesRequest {
+    pdf_file: NamedTempFile,
+    request: PdfRenderRequest,
+}
+
+async fn read_pdf_images_request(mut multipart: Multipart) -> Result<PdfImagesRequest, ApiError> {
+    let mut pdf_file = None;
+    let mut response_format = None;
+    let mut pages = None;
+    let mut scale = None;
+
+    while let Some(field) = multipart.next_field().await.map_err(|error| {
+        ApiError::invalid_request(error.to_string(), None, Some("invalid_multipart"))
+    })? {
+        let name = field.name().unwrap_or_default().to_string();
+        match name.as_str() {
+            "file" => {
+                let content_type = field.content_type().map(ToOwned::to_owned);
+                let file_name = field.file_name().map(ToOwned::to_owned);
+                if !pdf::is_pdf_upload(content_type.as_deref(), file_name.as_deref()) {
+                    return Err(ApiError::invalid_request(
+                        "uploaded file must be a PDF",
+                        Some("file"),
+                        Some("invalid_file"),
+                    ));
+                }
+                pdf_file = Some(write_multipart_file_to_temp_file(field, "file").await?);
+            }
+            "response_format" => {
+                response_format = Some(read_text_field(field, "response_format").await?);
+            }
+            "pages" => pages = Some(read_text_field(field, "pages").await?),
+            "scale" => scale = Some(read_text_field(field, "scale").await?),
+            _ => {
+                let _ = field.text().await;
+            }
+        }
+    }
+
+    let (pdf_file, pdf_bytes) = pdf_file.ok_or_else(|| {
+        ApiError::invalid_request(
+            "`file` is required",
+            Some("file"),
+            Some("missing_required_parameter"),
+        )
+    })?;
+    if pdf_bytes == 0 {
+        return Err(ApiError::invalid_request(
+            "uploaded PDF file is empty",
+            Some("file"),
+            Some("invalid_file"),
+        ));
+    }
+
+    let request = PdfRenderRequest {
+        pdf_path: pdf_file.path().to_path_buf(),
+        format: pdf::parse_pdf_image_format(response_format.as_deref())?,
+        pages: pdf::parse_page_selection(pages.as_deref())?,
+        scale: pdf::parse_scale(scale.as_deref())?,
+    };
+
+    Ok(PdfImagesRequest { pdf_file, request })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1237,6 +1324,93 @@ mod tests {
         assert_eq!(body["error"]["param"], "model");
     }
 
+    #[tokio::test]
+    async fn pdf_images_route_requires_file() {
+        let boundary = "orchion-pdf-images-missing-file";
+        let body = multipart_body(boundary, &[("response_format", "png")], None);
+
+        let response = post_pdf_images(test_state(false, false), boundary, body).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["code"], "missing_required_parameter");
+        assert_eq!(body["error"]["param"], "file");
+    }
+
+    #[tokio::test]
+    async fn pdf_images_route_rejects_empty_file() {
+        let boundary = "orchion-pdf-images-empty-file";
+        let body = multipart_body(boundary, &[], Some(("file", "empty.pdf", b"")));
+
+        let response = post_pdf_images(test_state(false, false), boundary, body).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["code"], "invalid_file");
+        assert_eq!(body["error"]["param"], "file");
+    }
+
+    #[tokio::test]
+    async fn pdf_images_route_rejects_non_pdf_file() {
+        let boundary = "orchion-pdf-images-non-pdf-file";
+        let body = multipart_body(boundary, &[], Some(("file", "document.png", b"image")));
+
+        let response = post_pdf_images(test_state(false, false), boundary, body).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["code"], "invalid_file");
+        assert_eq!(body["error"]["param"], "file");
+    }
+
+    #[tokio::test]
+    async fn pdf_images_route_rejects_invalid_response_format() {
+        let boundary = "orchion-pdf-images-invalid-format";
+        let body = multipart_body(
+            boundary,
+            &[("response_format", "gif")],
+            Some(("file", "document.pdf", b"%PDF-1.7\n")),
+        );
+
+        let response = post_pdf_images(test_state(false, false), boundary, body).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["param"], "response_format");
+    }
+
+    #[tokio::test]
+    async fn pdf_images_route_rejects_invalid_pages() {
+        let boundary = "orchion-pdf-images-invalid-pages";
+        let body = multipart_body(
+            boundary,
+            &[("pages", "2-1")],
+            Some(("file", "document.pdf", b"%PDF-1.7\n")),
+        );
+
+        let response = post_pdf_images(test_state(false, false), boundary, body).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["param"], "pages");
+    }
+
+    #[tokio::test]
+    async fn pdf_images_route_rejects_invalid_scale() {
+        let boundary = "orchion-pdf-images-invalid-scale";
+        let body = multipart_body(
+            boundary,
+            &[("scale", "4.1")],
+            Some(("file", "document.pdf", b"%PDF-1.7\n")),
+        );
+
+        let response = post_pdf_images(test_state(false, false), boundary, body).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["param"], "scale");
+    }
+
     #[test]
     fn resolve_ocr_service_choice_rejects_ambiguous_explicit_model() {
         let mut state = test_state(true, true);
@@ -1497,6 +1671,23 @@ mod tests {
             .unwrap()
     }
 
+    async fn post_pdf_images(state: Arc<AppState>, boundary: &str, body: Vec<u8>) -> Response {
+        router_with_ui_routes(state, Router::new())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/pdf/images")
+                    .header(
+                        CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
     async fn json_body(response: Response) -> Value {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
@@ -1517,10 +1708,15 @@ mod tests {
             body.extend_from_slice(b"\r\n");
         }
         if let Some((field_name, file_name, file_bytes)) = file {
+            let content_type = if file_name.to_ascii_lowercase().ends_with(".pdf") {
+                "application/pdf"
+            } else {
+                "image/png"
+            };
             body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
             body.extend_from_slice(
                 format!(
-                    "Content-Disposition: form-data; name=\"{field_name}\"; filename=\"{file_name}\"\r\nContent-Type: image/png\r\n\r\n"
+                    "Content-Disposition: form-data; name=\"{field_name}\"; filename=\"{file_name}\"\r\nContent-Type: {content_type}\r\n\r\n"
                 )
                 .as_bytes(),
             );

@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useMemo } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
 import { useTranslation } from "react-i18next";
-import { Search, Navigation, Settings, ShieldAlert, Sparkles, ScanText } from "lucide-react";
+import { Search, Navigation, Settings, ShieldAlert, Sparkles, ScanText, FileText } from "lucide-react";
 import { resetPersistentState } from "@/shared/storage/persistentState";
 import { useToast } from "./Toast";
 
@@ -66,12 +66,20 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ isOpen, onClose 
         shortcut: "⌘3"
       },
       {
+        id: "nav-pdf",
+        title: t("shell.commandPalette.navPdf", "Go to PDF Images"),
+        icon: <FileText size={16} />,
+        category: "nav",
+        action: () => { navigate("/pdf"); onClose(); },
+        shortcut: "⌘4"
+      },
+      {
         id: "nav-models",
         title: t("shell.commandPalette.navModels", "Go to Model Catalog"),
         icon: <Navigation size={16} />,
         category: "nav",
         action: () => { navigate("/models"); onClose(); },
-        shortcut: "⌘4"
+        shortcut: "⌘5"
       },
       {
         id: "nav-settings",
@@ -79,7 +87,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ isOpen, onClose 
         icon: <Settings size={16} />,
         category: "nav",
         action: () => { navigate("/settings"); onClose(); },
-        shortcut: "⌘5"
+        shortcut: "⌘6"
       },
       {
         id: "action-reset",

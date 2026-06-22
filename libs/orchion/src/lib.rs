@@ -26,6 +26,9 @@ pub use orchion_audio::{
 #[cfg(feature = "download-all")]
 pub use orchion_download::{DownloadSource, ModelDownloader};
 
+#[cfg(feature = "docs")]
+pub use orchion_docs as docs;
+
 #[cfg(feature = "asr-qwen3")]
 pub use asr::Asr;
 

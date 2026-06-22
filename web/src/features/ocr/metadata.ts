@@ -7,9 +7,9 @@ export const ocrTaskOptions: OcrTask[] = ["ocr", "table", "formula", "chart", "s
 export const ocrParameterMetadata: ParameterMetadata[] = [
   {
     name: "file",
-    label: "Document file",
+    label: "Image file",
     defaultValue: "",
-    description: "Image or PDF file to recognize.",
+    description: "Image file to recognize.",
     required: true,
     supported: true,
   },

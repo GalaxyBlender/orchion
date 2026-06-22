@@ -202,7 +202,7 @@ export function OcrPage() {
             <Card.Body className="stack gap-md">
               <FormField label={t("ocr.metadata.file.0")} description={t("ocr.fileDescription")}>
                 <FileDropZone
-                  accept="image/*,.pdf"
+                  accept="image/*"
                   selectedFile={file}
                   onFileSelect={handleFileSelect}
                   dropZoneText={t("ocr.dropZoneText")}
