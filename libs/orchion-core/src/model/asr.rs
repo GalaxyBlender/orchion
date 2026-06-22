@@ -30,6 +30,10 @@ impl ModelSpec for AsrModel {
     fn modelscope_repo(self) -> &'static str {
         self.huggingface_repo()
     }
+
+    fn required_files(self) -> &'static [&'static str] {
+        &["config.json", "tokenizer.json"]
+    }
 }
 
 impl FromStr for AsrModel {

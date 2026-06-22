@@ -1,0 +1,35 @@
+[package]
+name = "orchion-ocr"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.95"
+description = "OCR runtime adapter for Orchion"
+license = "MIT"
+repository = "https://github.com/xuan/orchion"
+
+[features]
+default = []
+ocr = ["dep:oar-ocr", "oar-ocr/download-binaries"]
+ocr-vl = ["dep:candle-core", "dep:htmd", "dep:oar-ocr", "dep:oar-ocr-vl", "oar-ocr/download-binaries", "oar-ocr-vl/download-binaries"]
+cpu = []
+metal = ["oar-ocr?/webgpu", "oar-ocr-vl?/metal"]
+cuda = ["oar-ocr?/cuda", "oar-ocr-vl?/cuda"]
+
+[dependencies]
+anyhow = "1"
+candle-core = { version = "0.10.2", default-features = false, optional = true }
+htmd = { version = "0.5.4", optional = true }
+image = "0.25.10"
+oar-ocr = { version = "0.7.1", default-features = false, optional = true }
+oar-ocr-vl = { version = "0.7.1", default-features = false, optional = true }
+orchion-core = { path = "../orchion-core" }
+thiserror = "2"
+tokio = { version = "1", features = ["rt"] }
+tracing = "0.1"
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

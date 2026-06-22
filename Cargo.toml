@@ -9,6 +9,7 @@ members = [
     "libs/orchion-audio",
     "libs/orchion-audio-vad",
     "libs/orchion-download",
+    "libs/orchion-ocr",
     "libs/orchion-qwen3",
     "libs/orchion",
     "apps/orchion-server",

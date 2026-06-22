@@ -10,15 +10,12 @@ pub enum OrchionError {
     #[error("download failed for {repo} from {source_name}: {message}")]
     Download {
         source_name: &'static str,
-        repo: &'static str,
+        repo: String,
         message: String,
     },
 
     #[error("all download sources failed for {repo}: {messages}")]
-    DownloadFallbackExhausted {
-        repo: &'static str,
-        messages: String,
-    },
+    DownloadFallbackExhausted { repo: String, messages: String },
 
     #[error("cache directory is incomplete: {path}")]
     IncompleteCache { path: PathBuf },

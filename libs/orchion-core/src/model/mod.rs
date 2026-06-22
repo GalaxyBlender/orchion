@@ -2,15 +2,35 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 mod asr;
+mod id;
+mod ocr;
 mod tts;
 
 pub use asr::AsrModel;
+pub use id::{ModelId, ParseModelIdError};
+pub use ocr::{KnownOcrModel, OcrModelKind};
 pub use tts::TtsModel;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ModelCategory {
     Asr,
     Tts,
+    Ocr,
+    OcrVl,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ModelHubAssetKind {
+    RequiredFile,
+    PaddleOcrDictionary { output_file: &'static str },
+    ModelScopeFile { output_file: &'static str },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ModelHubAsset {
+    pub repo: &'static str,
+    pub file: &'static str,
+    pub kind: ModelHubAssetKind,
 }
 
 impl ModelCategory {
@@ -18,6 +38,8 @@ impl ModelCategory {
         match self {
             Self::Asr => "asr",
             Self::Tts => "tts",
+            Self::Ocr => "ocr",
+            Self::OcrVl => "ocr-vl",
         }
     }
 }
@@ -33,6 +55,14 @@ pub trait ModelSpec: Copy + fmt::Debug + Eq + Send + 'static {
     fn cache_key(self) -> &'static str;
     fn huggingface_repo(self) -> &'static str;
     fn modelscope_repo(self) -> &'static str;
+
+    fn required_files(self) -> &'static [&'static str] {
+        &["config.json"]
+    }
+
+    fn hub_assets(self) -> &'static [ModelHubAsset] {
+        &[]
+    }
 
     fn cache_path(self, cache_dir: impl AsRef<Path>) -> PathBuf {
         self.huggingface_repo()
