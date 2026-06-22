@@ -1,10 +1,12 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header, header::AUTHORIZATION};
 use http_body_util::BodyExt;
-use orchion::{AsrModel, TtsModel};
+use orchion::{AsrModel, ModelId, TtsModel};
 use orchion_server::api::ui;
 use orchion_server::config::ServerConfig;
-use orchion_server::model_cache::{AsrModelCache, GlobalModelCacheLimiter, TtsModelCache};
+use orchion_server::model_cache::{
+    AsrModelCache, GlobalModelCacheLimiter, OcrModelCache, OcrVlModelCache, TtsModelCache,
+};
 use orchion_server::routes::{router, router_with_ui_routes};
 use orchion_server::state::AppState;
 use serde_json::Value;
@@ -83,6 +85,60 @@ async fn models_endpoint_is_empty_when_all_services_are_disabled() {
     let body = json_body(response).await;
     assert_eq!(body["object"], "list");
     assert!(body["data"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn models_endpoint_includes_active_ocr_model_ids() {
+    let response = router(test_state_with_ocr_services(None))
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    let ids = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|model| model["id"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert!(ids.contains(&"PaddlePaddle/PP-OCRv6_tiny".to_string()));
+    assert!(ids.contains(&"PaddlePaddle/PaddleOCR-VL-1.6".to_string()));
+}
+
+#[tokio::test]
+async fn models_endpoint_includes_configured_ocr_layout_model_ids() {
+    let mut state = test_state_with_ocr_services(None);
+    let state_mut = Arc::get_mut(&mut state).unwrap();
+    let layout_model = ModelId::parse("PaddlePaddle/PP-DocLayoutV3").unwrap();
+    state_mut.config.services.ocr.layout_available_models = vec![layout_model.clone()];
+    state_mut.config.services.ocr_vl.layout_available_models = vec![layout_model];
+
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    let ids = model_ids(&body);
+    assert!(ids.contains(&"PaddlePaddle/PP-DocLayoutV3"));
+    assert_eq!(
+        ids.iter()
+            .filter(|id| **id == "PaddlePaddle/PP-DocLayoutV3")
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -449,12 +505,49 @@ async fn multipart_speech_accepts_uploaded_voice_clone_audio() {
 }
 
 #[tokio::test]
+async fn multipart_speech_rejects_unknown_model_before_reference_audio_decode() {
+    let boundary = "orchion-unknown-model-before-audio";
+    let body = multipart_body(
+        boundary,
+        &[
+            ("model", "not-a-model"),
+            ("input", "hello"),
+            ("voice", "clone"),
+            ("reference_text", "hello"),
+            ("response_format", "wav"),
+        ],
+        "reference_audio",
+        "reference.wav",
+        b"not an audio file",
+    );
+    let response = router(test_state(None))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/speech")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert_eq!(body["error"]["code"], "model_not_available");
+    assert_eq!(body["error"]["param"], "model");
+}
+
+#[tokio::test]
 async fn multipart_speech_rejects_invalid_reference_audio_before_inference() {
     let boundary = "orchion-invalid-reference-audio";
     let body = multipart_body(
         boundary,
         &[
-            ("model", "not-a-model"),
+            ("model", "qwen3-tts-0.6b-custom-voice"),
             ("input", "hello"),
             ("voice", "clone"),
             ("reference_text", "hello"),
@@ -564,6 +657,22 @@ fn test_state(api_key: Option<&str>) -> Arc<AppState> {
     test_state_with_services(api_key, true, true)
 }
 
+fn test_state_with_ocr_services(api_key: Option<&str>) -> Arc<AppState> {
+    let mut state = test_state_with_services(api_key, false, false);
+    let state_mut = Arc::get_mut(&mut state).unwrap();
+    state_mut.config.services.ocr.enabled = true;
+    state_mut.config.services.ocr.default_model =
+        Some(ModelId::parse("PaddlePaddle/PP-OCRv6_tiny").unwrap());
+    state_mut.config.services.ocr.available_models =
+        vec![ModelId::parse("PaddlePaddle/PP-OCRv6_tiny").unwrap()];
+    state_mut.config.services.ocr_vl.enabled = true;
+    state_mut.config.services.ocr_vl.default_model =
+        Some(ModelId::parse("PaddlePaddle/PaddleOCR-VL-1.6").unwrap());
+    state_mut.config.services.ocr_vl.available_models =
+        vec![ModelId::parse("PaddlePaddle/PaddleOCR-VL-1.6").unwrap()];
+    state
+}
+
 fn test_state_with_services(
     api_key: Option<&str>,
     asr_enabled: bool,
@@ -583,15 +692,31 @@ fn test_state_with_services(
     config.services.tts.idle_timeout = Duration::from_secs(600);
     config.services.tts.max_loaded = 2;
     let asr_models = AsrModelCache::new(
+        "asr",
         config.services.asr.available_models.clone(),
         config.services.asr.idle_timeout,
         config.services.asr.max_loaded,
         config.models.dir.clone(),
     );
     let tts_models = TtsModelCache::new(
+        "tts",
         config.services.tts.available_models.clone(),
         config.services.tts.idle_timeout,
         config.services.tts.max_loaded,
+        config.models.dir.clone(),
+    );
+    let ocr_models = OcrModelCache::new(
+        "ocr",
+        Vec::new(),
+        config.services.ocr.idle_timeout,
+        config.services.ocr.max_loaded,
+        config.models.dir.clone(),
+    );
+    let ocr_vl_models = OcrVlModelCache::new(
+        "ocr-vl",
+        Vec::new(),
+        config.services.ocr_vl.idle_timeout,
+        config.services.ocr_vl.max_loaded,
         config.models.dir.clone(),
     );
     let global_models = GlobalModelCacheLimiter::new(config.models.max_loaded);
@@ -599,6 +724,8 @@ fn test_state_with_services(
         config,
         asr_models,
         tts_models,
+        ocr_models,
+        ocr_vl_models,
         global_models,
     })
 }

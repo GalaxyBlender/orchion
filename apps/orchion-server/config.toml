@@ -1,9 +1,9 @@
 [server]
-bind = "127.0.0.1:9090"
-max_upload_size = "30M"
+bind = "0.0.0.0:9090"
+max_upload_size = "100M"
 
 [models]
-dir = "models"
+dir = "../../data/models"
 source = "auto"
 max_loaded = 2
 
@@ -29,6 +29,37 @@ available_models = [
 idle_timeout = "10m"
 max_loaded = 1
 format = "wav"
+
+[services.ocr]
+enabled = true
+default_model = "PaddlePaddle/PP-OCRv6_tiny"
+available_models = [
+  "PaddlePaddle/PP-OCRv5_mobile",
+  "PaddlePaddle/PP-OCRv5_server",
+  "PaddlePaddle/PP-OCRv6_tiny",
+  "PaddlePaddle/PP-OCRv6_small",
+  "PaddlePaddle/PP-OCRv6_medium"
+]
+layout_default_model = "PaddlePaddle/PP-DocLayoutV3"
+layout_available_models = ["PaddlePaddle/PP-DocLayoutV3"]
+device = "auto"
+idle_timeout = "10m"
+max_loaded = 1
+format = "json"
+
+[services.ocr-vl]
+enabled = true
+default_model = "PaddlePaddle/PaddleOCR-VL-1.6"
+available_models = [
+  "PaddlePaddle/PaddleOCR-VL-1.5",
+  "PaddlePaddle/PaddleOCR-VL-1.6",
+]
+layout_default_model = "PaddlePaddle/PP-DocLayoutV3"
+layout_available_models = ["PaddlePaddle/PP-DocLayoutV3"]
+device = "auto"
+idle_timeout = "10m"
+max_loaded = 1
+format = "markdown"
 
 [auth]
 # api_key = "change-me"

@@ -1,4 +1,7 @@
-use orchion::{AsrModel, DevicePreference, DownloadSource, ModelSpec, TtsModel};
+use orchion::{
+    AsrModel, DevicePreference, DownloadSource, ModelId, ModelSpec, OcrResponseFormat, TtsModel,
+};
+use orchion_core::{KnownOcrModel, OcrModelKind};
 use serde::Deserialize;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -47,6 +50,8 @@ pub struct ModelsSection {
 pub struct ServicesSection {
     pub asr: ModelServiceSection<AsrModel>,
     pub tts: TtsServiceSection,
+    pub ocr: OcrServiceSection,
+    pub ocr_vl: OcrVlServiceSection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +73,46 @@ pub struct TtsServiceSection {
     pub max_loaded: usize,
     pub device: DevicePreference,
     pub format: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OcrServiceSection {
+    pub enabled: bool,
+    pub default_model: Option<ModelId>,
+    pub available_models: Vec<ModelId>,
+    pub layout_default_model: Option<ModelId>,
+    pub layout_available_models: Vec<ModelId>,
+    pub idle_timeout: Duration,
+    pub max_loaded: usize,
+    pub device: DevicePreference,
+    pub format: OcrResponseFormat,
+}
+
+impl OcrServiceSection {
+    #[must_use]
+    pub fn active(&self) -> bool {
+        self.enabled && !self.available_models.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OcrVlServiceSection {
+    pub enabled: bool,
+    pub default_model: Option<ModelId>,
+    pub available_models: Vec<ModelId>,
+    pub layout_default_model: Option<ModelId>,
+    pub layout_available_models: Vec<ModelId>,
+    pub idle_timeout: Duration,
+    pub max_loaded: usize,
+    pub device: DevicePreference,
+    pub format: OcrResponseFormat,
+}
+
+impl OcrVlServiceSection {
+    #[must_use]
+    pub fn active(&self) -> bool {
+        self.enabled && !self.available_models.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +153,24 @@ pub enum ConfigError {
         section: &'static str,
         value: String,
     },
+    #[error("invalid {section} model id `{value}`; expected vendor/name")]
+    InvalidModelId {
+        section: &'static str,
+        value: String,
+    },
+    #[error("invalid {section} `{value}`; expected json, text, markdown, or html")]
+    InvalidOcrFormat {
+        section: &'static str,
+        value: String,
+    },
+    #[error("{section} is enabled but available_models is empty")]
+    ServiceEnabledWithoutModels { section: &'static str },
+    #[error("invalid {section} model `{model}`: expected {expected}")]
+    InvalidOcrModelKind {
+        section: &'static str,
+        model: String,
+        expected: &'static str,
+    },
     #[error("default {category} model `{default}` must be included in {section}.available_models")]
     DefaultModelUnavailable {
         category: &'static str,
@@ -133,7 +196,7 @@ impl ServerConfig {
             },
             services: ServicesSection {
                 asr: ModelServiceSection {
-                    enabled: true,
+                    enabled: false,
                     default_model: AsrModel::Qwen3Asr06B,
                     available_models: vec![AsrModel::Qwen3Asr06B],
                     idle_timeout: Duration::from_secs(600),
@@ -141,13 +204,35 @@ impl ServerConfig {
                     device: DevicePreference::Auto,
                 },
                 tts: TtsServiceSection {
-                    enabled: true,
+                    enabled: false,
                     default_model: TtsModel::Qwen3Tts06BCustomVoice,
                     available_models: vec![TtsModel::Qwen3Tts06BCustomVoice],
                     idle_timeout: Duration::from_secs(600),
                     max_loaded: 1,
                     device: DevicePreference::Auto,
                     format: "wav".to_string(),
+                },
+                ocr: OcrServiceSection {
+                    enabled: false,
+                    default_model: None,
+                    available_models: Vec::new(),
+                    layout_default_model: None,
+                    layout_available_models: Vec::new(),
+                    idle_timeout: Duration::from_secs(600),
+                    max_loaded: 1,
+                    device: DevicePreference::Auto,
+                    format: OcrResponseFormat::Json,
+                },
+                ocr_vl: OcrVlServiceSection {
+                    enabled: false,
+                    default_model: None,
+                    available_models: Vec::new(),
+                    layout_default_model: None,
+                    layout_available_models: Vec::new(),
+                    idle_timeout: Duration::from_secs(600),
+                    max_loaded: 1,
+                    device: DevicePreference::Auto,
+                    format: OcrResponseFormat::Markdown,
                 },
             },
             auth: AuthSection { api_key: None },
@@ -214,6 +299,12 @@ impl ServerConfig {
             }
             if let Some(tts) = services.tts {
                 config.services.tts = parse_tts_service(tts, config.services.tts)?;
+            }
+            if let Some(ocr) = services.ocr {
+                config.services.ocr = parse_ocr_service(ocr, config.services.ocr)?;
+            }
+            if let Some(ocr_vl) = services.ocr_vl {
+                config.services.ocr_vl = parse_ocr_vl_service(ocr_vl, config.services.ocr_vl)?;
             }
         }
 
@@ -311,6 +402,229 @@ fn parse_tts_service(
         )?;
     }
     Ok(service)
+}
+
+fn parse_ocr_service(
+    raw: RawOcrService,
+    mut service: OcrServiceSection,
+) -> Result<OcrServiceSection, ConfigError> {
+    let available_models = raw.available_models;
+    let layout_available_models = raw.layout_available_models;
+    if let Some(enabled) = raw.enabled {
+        service.enabled = enabled;
+    }
+    if let Some(default_model) = raw.default_model {
+        service.default_model = Some(parse_model_id(
+            "services.ocr.default_model",
+            &default_model,
+        )?);
+    }
+    if let Some(available_models) = available_models {
+        service.available_models =
+            parse_model_ids("services.ocr.available_models", &available_models)?;
+    }
+    if let Some(layout_default_model) = raw.layout_default_model {
+        service.layout_default_model = Some(parse_model_id(
+            "services.ocr.layout_default_model",
+            &layout_default_model,
+        )?);
+    }
+    if let Some(layout_available_models) = layout_available_models {
+        service.layout_available_models = parse_model_ids(
+            "services.ocr.layout_available_models",
+            &layout_available_models,
+        )?;
+    }
+    if let Some(device) = raw.device {
+        service.device = parse_device_preference("services.ocr", &device)?;
+    }
+    if let Some(format) = raw.format {
+        service.format = parse_ocr_format("services.ocr.format", &format)?;
+    }
+    apply_service_limits(
+        "services.ocr",
+        raw.idle_timeout,
+        raw.max_loaded,
+        &mut service.idle_timeout,
+        &mut service.max_loaded,
+    )?;
+    validate_ocr_service(
+        "OCR",
+        "services.ocr",
+        service.enabled,
+        service.default_model.as_ref(),
+        &service.available_models,
+        validate_traditional_ocr_model,
+    )?;
+    validate_ocr_layout_config(
+        "OCR layout",
+        "services.ocr.layout_available_models",
+        service.enabled,
+        service.layout_default_model.as_ref(),
+        &service.layout_available_models,
+    )?;
+    Ok(service)
+}
+
+fn parse_ocr_vl_service(
+    raw: RawOcrVlService,
+    mut service: OcrVlServiceSection,
+) -> Result<OcrVlServiceSection, ConfigError> {
+    let available_models = raw.available_models;
+    let layout_available_models = raw.layout_available_models;
+    if let Some(enabled) = raw.enabled {
+        service.enabled = enabled;
+    }
+    if let Some(default_model) = raw.default_model {
+        service.default_model = Some(parse_model_id(
+            "services.ocr-vl.default_model",
+            &default_model,
+        )?);
+    }
+    if let Some(available_models) = available_models {
+        service.available_models =
+            parse_model_ids("services.ocr-vl.available_models", &available_models)?;
+    }
+    if let Some(layout_default_model) = raw.layout_default_model {
+        service.layout_default_model = Some(parse_model_id(
+            "services.ocr-vl.layout_default_model",
+            &layout_default_model,
+        )?);
+    }
+    if let Some(layout_available_models) = layout_available_models {
+        service.layout_available_models = parse_model_ids(
+            "services.ocr-vl.layout_available_models",
+            &layout_available_models,
+        )?;
+    }
+    if let Some(device) = raw.device {
+        service.device = parse_device_preference("services.ocr-vl", &device)?;
+    }
+    if let Some(format) = raw.format {
+        service.format = parse_ocr_format("services.ocr-vl.format", &format)?;
+    }
+    apply_service_limits(
+        "services.ocr-vl",
+        raw.idle_timeout,
+        raw.max_loaded,
+        &mut service.idle_timeout,
+        &mut service.max_loaded,
+    )?;
+    validate_ocr_service(
+        "OCR-VL",
+        "services.ocr-vl",
+        service.enabled,
+        service.default_model.as_ref(),
+        &service.available_models,
+        validate_ocr_vl_model,
+    )?;
+    validate_ocr_layout_config(
+        "OCR-VL layout",
+        "services.ocr-vl.layout_available_models",
+        service.enabled,
+        service.layout_default_model.as_ref(),
+        &service.layout_available_models,
+    )?;
+    Ok(service)
+}
+
+fn validate_ocr_service(
+    category: &'static str,
+    section: &'static str,
+    enabled: bool,
+    default_model: Option<&ModelId>,
+    available_models: &[ModelId],
+    validate_model: fn(&'static str, &ModelId) -> Result<(), ConfigError>,
+) -> Result<(), ConfigError> {
+    if !enabled {
+        return Ok(());
+    }
+    if available_models.is_empty() {
+        return Err(ConfigError::ServiceEnabledWithoutModels { section });
+    }
+    if let Some(default_model) = default_model {
+        ensure_default_available(
+            category,
+            section,
+            default_model.as_str(),
+            available_models.contains(default_model),
+        )?;
+    }
+    for model in available_models {
+        validate_model(section, model)?;
+    }
+    Ok(())
+}
+
+fn validate_traditional_ocr_model(
+    section: &'static str,
+    model: &ModelId,
+) -> Result<(), ConfigError> {
+    match known_ocr_model(section, model)?.kind() {
+        OcrModelKind::TraditionalOcr => Ok(()),
+        OcrModelKind::Layout | OcrModelKind::OcrVl => Err(ConfigError::InvalidOcrModelKind {
+            section,
+            model: model.to_string(),
+            expected: "traditional OCR model",
+        }),
+    }
+}
+
+fn validate_ocr_layout_config(
+    category: &'static str,
+    section: &'static str,
+    enabled: bool,
+    default_model: Option<&ModelId>,
+    available_models: &[ModelId],
+) -> Result<(), ConfigError> {
+    if !enabled {
+        return Ok(());
+    }
+    if let Some(default_model) = default_model {
+        ensure_default_available(
+            category,
+            section,
+            default_model.as_str(),
+            available_models.contains(default_model),
+        )?;
+    }
+    for model in available_models {
+        validate_layout_model(section, model)?;
+    }
+    Ok(())
+}
+
+fn validate_ocr_vl_model(section: &'static str, model: &ModelId) -> Result<(), ConfigError> {
+    match known_ocr_model(section, model)?.kind() {
+        OcrModelKind::OcrVl => Ok(()),
+        OcrModelKind::TraditionalOcr | OcrModelKind::Layout => {
+            Err(ConfigError::InvalidOcrModelKind {
+                section,
+                model: model.to_string(),
+                expected: "OCR-VL model",
+            })
+        }
+    }
+}
+
+fn validate_layout_model(section: &'static str, model: &ModelId) -> Result<(), ConfigError> {
+    let known = known_ocr_model(section, model)?;
+    if known == KnownOcrModel::PpDocLayoutV3 {
+        return Ok(());
+    }
+    Err(ConfigError::InvalidOcrModelKind {
+        section,
+        model: model.to_string(),
+        expected: "PaddlePaddle/PP-DocLayoutV3",
+    })
+}
+
+fn known_ocr_model(section: &'static str, model: &ModelId) -> Result<KnownOcrModel, ConfigError> {
+    KnownOcrModel::from_model_id(model).map_err(|_| ConfigError::InvalidOcrModelKind {
+        section,
+        model: model.to_string(),
+        expected: "supported OCR model",
+    })
 }
 
 fn apply_service_limits(
@@ -459,6 +773,33 @@ pub fn parse_tts_model(value: &str) -> Result<TtsModel, ConfigError> {
     }
 }
 
+fn parse_model_ids(section: &'static str, values: &[String]) -> Result<Vec<ModelId>, ConfigError> {
+    values
+        .iter()
+        .map(|value| parse_model_id(section, value))
+        .collect()
+}
+
+fn parse_model_id(section: &'static str, value: &str) -> Result<ModelId, ConfigError> {
+    ModelId::parse(value).map_err(|_| ConfigError::InvalidModelId {
+        section,
+        value: value.to_string(),
+    })
+}
+
+fn parse_ocr_format(section: &'static str, value: &str) -> Result<OcrResponseFormat, ConfigError> {
+    match value {
+        "json" => Ok(OcrResponseFormat::Json),
+        "text" => Ok(OcrResponseFormat::Text),
+        "markdown" => Ok(OcrResponseFormat::Markdown),
+        "html" => Ok(OcrResponseFormat::Html),
+        _ => Err(ConfigError::InvalidOcrFormat {
+            section,
+            value: value.to_string(),
+        }),
+    }
+}
+
 fn parse_model_source(value: &str) -> Result<ModelSource, ConfigError> {
     match normalize_identifier(value).as_str() {
         "auto" => Ok(ModelSource::Auto),
@@ -522,6 +863,9 @@ struct RawModels {
 struct RawServices {
     asr: Option<RawModelService>,
     tts: Option<RawTtsService>,
+    ocr: Option<RawOcrService>,
+    #[serde(rename = "ocr-vl")]
+    ocr_vl: Option<RawOcrVlService>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -541,6 +885,34 @@ struct RawTtsService {
     enabled: Option<bool>,
     default_model: Option<String>,
     available_models: Option<Vec<String>>,
+    idle_timeout: Option<String>,
+    max_loaded: Option<usize>,
+    device: Option<String>,
+    format: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOcrService {
+    enabled: Option<bool>,
+    default_model: Option<String>,
+    available_models: Option<Vec<String>>,
+    layout_default_model: Option<String>,
+    layout_available_models: Option<Vec<String>>,
+    idle_timeout: Option<String>,
+    max_loaded: Option<usize>,
+    device: Option<String>,
+    format: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOcrVlService {
+    enabled: Option<bool>,
+    default_model: Option<String>,
+    available_models: Option<Vec<String>>,
+    layout_default_model: Option<String>,
+    layout_available_models: Option<Vec<String>>,
     idle_timeout: Option<String>,
     max_loaded: Option<usize>,
     device: Option<String>,

@@ -2,7 +2,8 @@ use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use orchion::{
-    AsrSegment, AudioOutputFormat, ModelSpec, TtsLanguage, TtsOptions, TtsSpeaker, TtsVoice,
+    AsrSegment, AudioOutputFormat, ModelSpec, OcrResponseFormat, TtsLanguage, TtsOptions,
+    TtsSpeaker, TtsVoice,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use std::path::PathBuf;
@@ -121,6 +122,15 @@ impl ModelObject {
             owned_by: "orchion",
         }
     }
+
+    pub fn from_id(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            object: "model",
+            created: 0,
+            owned_by: "orchion",
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -155,8 +165,8 @@ impl From<orchion::OrchionError> for ApiError {
             orchion::OrchionError::UnsupportedCapability { capability, .. } => {
                 Self::invalid_request(
                     format!("selected model does not support {capability}"),
-                    Some("voice"),
-                    Some("unsupported_voice"),
+                    Some("model"),
+                    Some("unsupported_capability"),
                 )
             }
             orchion::OrchionError::InvalidAudio { reason } => {
@@ -433,6 +443,59 @@ pub struct TranscriptionVerboseJson {
     pub segments: Option<Vec<AsrSegment>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OcrApiFormat {
+    #[default]
+    Json,
+    Text,
+    Markdown,
+    Html,
+}
+
+impl TryFrom<&str> for OcrApiFormat {
+    type Error = ApiError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "json" => Ok(Self::Json),
+            "text" => Ok(Self::Text),
+            "markdown" => Ok(Self::Markdown),
+            "html" => Ok(Self::Html),
+            _ => Err(ApiError::invalid_request(
+                "unsupported OCR response format; supported formats are json, text, markdown, and html",
+                Some("response_format"),
+                Some("unsupported_response_format"),
+            )),
+        }
+    }
+}
+
+impl From<OcrApiFormat> for OcrResponseFormat {
+    fn from(format: OcrApiFormat) -> Self {
+        match format {
+            OcrApiFormat::Json => Self::Json,
+            OcrApiFormat::Text => Self::Text,
+            OcrApiFormat::Markdown => Self::Markdown,
+            OcrApiFormat::Html => Self::Html,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct OcrJsonResponse {
+    pub model: String,
+    pub format: OcrApiFormat,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub markdown: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub html: Option<String>,
+    pub regions: Vec<orchion::OcrRegion>,
+    pub layout_blocks: Vec<orchion::OcrLayoutBlock>,
+    pub usage: orchion::OcrUsage,
+}
+
 #[must_use]
 pub fn content_type_for(format: SpeechFormat) -> &'static str {
     AudioOutputFormat::from(format).content_type()
@@ -502,6 +565,26 @@ fn normalize_identifier(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ocr_response_format_accepts_json_text_markdown_html() {
+        assert_eq!(OcrApiFormat::try_from("json").unwrap(), OcrApiFormat::Json);
+        assert_eq!(OcrApiFormat::try_from("text").unwrap(), OcrApiFormat::Text);
+        assert_eq!(
+            OcrApiFormat::try_from("markdown").unwrap(),
+            OcrApiFormat::Markdown
+        );
+        assert_eq!(OcrApiFormat::try_from("html").unwrap(), OcrApiFormat::Html);
+    }
+
+    #[test]
+    fn ocr_response_format_rejects_unknown_values() {
+        let error = OcrApiFormat::try_from("verbose_json").unwrap_err();
+        assert_eq!(
+            error.error.code.as_deref(),
+            Some("unsupported_response_format")
+        );
+    }
 
     #[test]
     fn transcription_format_accepts_srt() {

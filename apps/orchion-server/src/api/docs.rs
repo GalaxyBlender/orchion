@@ -1,15 +1,17 @@
 use crate::api::openai::{
-    ErrorBody, ModelList, SpeechRequest, TranscriptionJson, TranscriptionVerboseJson,
+    ErrorBody, ModelList, OcrApiFormat, OcrJsonResponse, SpeechRequest, TranscriptionJson,
+    TranscriptionVerboseJson,
 };
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(healthz_doc, list_models_doc, create_speech_doc, create_transcription_doc),
-    components(schemas(SpeechRequest, ErrorBody, ModelList, TranscriptionJson, TranscriptionVerboseJson)),
+    paths(healthz_doc, list_models_doc, create_speech_doc, create_transcription_doc, create_ocr_doc),
+    components(schemas(SpeechRequest, ErrorBody, ModelList, TranscriptionJson, TranscriptionVerboseJson, OcrJsonResponse, OcrApiFormat)),
     tags(
         (name = "audio", description = "OpenAI-compatible audio APIs"),
+        (name = "ocr", description = "OCR and OCR-VL APIs"),
         (name = "models", description = "OpenAI-compatible model APIs")
     )
 )]
@@ -17,6 +19,20 @@ struct ApiDoc;
 
 pub fn swagger_ui() -> SwaggerUi {
     SwaggerUi::new("/docs").url("/openapi/v1.json", ApiDoc::openapi())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn openapi_includes_ocr_path_and_schemas() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+
+        assert!(spec["paths"]["/v1/ocr"]["post"].is_object());
+        assert!(spec["components"]["schemas"]["OcrJsonResponse"].is_object());
+        assert!(spec["components"]["schemas"]["OcrApiFormat"].is_object());
+    }
 }
 
 #[utoipa::path(
@@ -70,3 +86,22 @@ async fn create_speech_doc() {}
 )]
 #[allow(dead_code)]
 async fn create_transcription_doc() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/ocr",
+    request_body(
+        content = String,
+        content_type = "multipart/form-data",
+        description = "POST /v1/ocr accepts multipart/form-data with file, optional model, response_format, task, layout_model, and max_tokens fields. Response formats are json, text, markdown, and html. Model IDs use {vendor}/{name}. Traditional metal maps to CoreML; OCR-VL metal maps to Candle Metal."
+    ),
+    responses(
+        (status = 200, description = "OCR response. JSON requests return OcrJsonResponse; text requests return text/plain; markdown requests return text/markdown; html requests return text/html.", body = OcrJsonResponse),
+        (status = 400, description = "OpenAI-compatible error", body = ErrorBody),
+        (status = 401, description = "OpenAI-compatible error", body = ErrorBody),
+        (status = 500, description = "OpenAI-compatible error", body = ErrorBody)
+    ),
+    tag = "ocr"
+)]
+#[allow(dead_code)]
+async fn create_ocr_doc() {}

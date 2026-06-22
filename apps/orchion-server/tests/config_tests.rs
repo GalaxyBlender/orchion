@@ -1,5 +1,5 @@
-use orchion::{AsrModel, DevicePreference, TtsModel};
-use orchion_server::config::{ModelSource, ServerConfig};
+use orchion::{AsrModel, DevicePreference, ModelId, OcrResponseFormat, TtsModel};
+use orchion_server::config::{ConfigError, ModelSource, ServerConfig};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
@@ -19,7 +19,7 @@ fn defaults_are_executable_relative() {
     assert_eq!(config.models.dir, exe_path.parent().unwrap().join("models"));
     assert_eq!(config.models.source, ModelSource::Auto);
     assert_eq!(config.models.max_loaded, 2);
-    assert!(config.services.asr.enabled);
+    assert!(!config.services.asr.enabled);
     assert_eq!(config.services.asr.default_model, AsrModel::Qwen3Asr06B);
     assert_eq!(
         config.services.asr.available_models,
@@ -28,7 +28,7 @@ fn defaults_are_executable_relative() {
     assert_eq!(config.services.asr.idle_timeout, Duration::from_secs(600));
     assert_eq!(config.services.asr.max_loaded, 1);
     assert_eq!(config.services.asr.device, DevicePreference::Auto);
-    assert!(config.services.tts.enabled);
+    assert!(!config.services.tts.enabled);
     assert_eq!(
         config.services.tts.default_model,
         TtsModel::Qwen3Tts06BCustomVoice
@@ -40,8 +40,317 @@ fn defaults_are_executable_relative() {
     assert_eq!(config.services.tts.idle_timeout, Duration::from_secs(600));
     assert_eq!(config.services.tts.max_loaded, 1);
     assert_eq!(config.services.tts.device, DevicePreference::Auto);
+    assert!(!config.services.ocr.enabled);
+    assert_eq!(config.services.ocr.default_model, None);
+    assert!(config.services.ocr.available_models.is_empty());
+    assert_eq!(config.services.ocr.layout_default_model, None);
+    assert!(config.services.ocr.layout_available_models.is_empty());
+    assert_eq!(config.services.ocr.idle_timeout, Duration::from_secs(600));
+    assert_eq!(config.services.ocr.max_loaded, 1);
+    assert_eq!(config.services.ocr.device, DevicePreference::Auto);
+    assert_eq!(config.services.ocr.format, OcrResponseFormat::Json);
+    assert!(!config.services.ocr.active());
+    assert!(!config.services.ocr_vl.enabled);
+    assert_eq!(config.services.ocr_vl.default_model, None);
+    assert!(config.services.ocr_vl.available_models.is_empty());
+    assert_eq!(config.services.ocr_vl.layout_default_model, None);
+    assert!(config.services.ocr_vl.layout_available_models.is_empty());
+    assert_eq!(
+        config.services.ocr_vl.idle_timeout,
+        Duration::from_secs(600)
+    );
+    assert_eq!(config.services.ocr_vl.max_loaded, 1);
+    assert_eq!(config.services.ocr_vl.device, DevicePreference::Auto);
+    assert_eq!(config.services.ocr_vl.format, OcrResponseFormat::Markdown);
+    assert!(!config.services.ocr_vl.active());
     assert_eq!(config.auth.api_key, None);
     assert_eq!(config.server.max_upload_size, 30 * 1024 * 1024);
+}
+
+#[test]
+fn enabled_ocr_requires_available_models() {
+    let exe_path = std::path::Path::new("/tmp/orchion-server");
+    let error = ServerConfig::from_toml_str(
+        r#"
+[services.ocr]
+enabled = true
+"#,
+        exe_path,
+    )
+    .unwrap_err();
+
+    match error {
+        ConfigError::ServiceEnabledWithoutModels { section } => {
+            assert_eq!(section, "services.ocr");
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn active_ocr_default_must_be_available_models_member() {
+    let exe_path = std::path::Path::new("/tmp/orchion-server");
+    let error = ServerConfig::from_toml_str(
+        r#"
+[services.ocr]
+enabled = true
+default_model = "PaddlePaddle/PP-OCRv6_small"
+available_models = ["PaddlePaddle/PP-OCRv6_tiny"]
+"#,
+        exe_path,
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("services.ocr.available_models"));
+    assert!(matches!(error, ConfigError::DefaultModelUnavailable { .. }));
+}
+
+#[test]
+fn invalid_ocr_model_id_is_rejected() {
+    let exe_path = std::path::Path::new("/tmp/orchion-server");
+    let error = ServerConfig::from_toml_str(
+        r#"
+[services.ocr-vl]
+enabled = true
+default_model = "bad id with spaces"
+available_models = ["PaddlePaddle/PaddleOCR-VL-1.6"]
+"#,
+        exe_path,
+    )
+    .unwrap_err();
+
+    match error {
+        ConfigError::InvalidModelId { section, value } => {
+            assert_eq!(section, "services.ocr-vl.default_model");
+            assert_eq!(value, "bad id with spaces");
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn ocr_html_response_format_is_parsed() {
+    let exe_path = std::path::Path::new("/tmp/orchion-server");
+    let config = ServerConfig::from_toml_str(
+        r#"
+[services.ocr]
+format = "html"
+"#,
+        exe_path,
+    )
+    .unwrap();
+
+    assert_eq!(config.services.ocr.format, OcrResponseFormat::Html);
+}
+
+#[test]
+fn ocr_vl_toml_overrides_are_parsed() {
+    let exe_path = std::path::Path::new("/tmp/orchion-server");
+    let config = ServerConfig::from_toml_str(
+        r#"
+[services.ocr-vl]
+enabled = true
+default_model = "PaddlePaddle/PaddleOCR-VL-1.6"
+available_models = ["PaddlePaddle/PaddleOCR-VL-1.5", "PaddlePaddle/PaddleOCR-VL-1.6"]
+layout_default_model = "PaddlePaddle/PP-DocLayoutV3"
+layout_available_models = ["PaddlePaddle/PP-DocLayoutV3"]
+idle_timeout = "2m"
+max_loaded = 1
+device = "cpu"
+format = "text"
+"#,
+        exe_path,
+    )
+    .unwrap();
+
+    assert!(config.services.ocr_vl.active());
+    assert_eq!(
+        config.services.ocr_vl.default_model,
+        Some(ModelId::parse("PaddlePaddle/PaddleOCR-VL-1.6").unwrap())
+    );
+    assert_eq!(
+        config.services.ocr_vl.available_models,
+        vec![
+            ModelId::parse("PaddlePaddle/PaddleOCR-VL-1.5").unwrap(),
+            ModelId::parse("PaddlePaddle/PaddleOCR-VL-1.6").unwrap(),
+        ]
+    );
+    assert_eq!(
+        config.services.ocr_vl.layout_default_model,
+        Some(ModelId::parse("PaddlePaddle/PP-DocLayoutV3").unwrap())
+    );
+    assert_eq!(
+        config.services.ocr_vl.layout_available_models,
+        vec![ModelId::parse("PaddlePaddle/PP-DocLayoutV3").unwrap()]
+    );
+    assert_eq!(
+        config.services.ocr_vl.idle_timeout,
+        Duration::from_secs(120)
+    );
+    assert_eq!(config.services.ocr_vl.device, DevicePreference::Cpu);
+    assert_eq!(config.services.ocr_vl.format, OcrResponseFormat::Text);
+}
+
+#[test]
+fn active_ocr_rejects_ocr_vl_models() {
+    let exe_path = std::path::Path::new("/tmp/orchion-server");
+    let error = ServerConfig::from_toml_str(
+        r#"
+[services.ocr]
+enabled = true
+available_models = ["PaddlePaddle/PaddleOCR-VL-1.6"]
+"#,
+        exe_path,
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, ConfigError::InvalidOcrModelKind { .. }));
+    assert!(error.to_string().contains("traditional OCR model"));
+}
+
+#[test]
+fn flat_layout_fields_are_parsed_for_ocr_and_ocr_vl() {
+    let exe_path = std::path::Path::new("/tmp/orchion-server");
+    let config = ServerConfig::from_toml_str(
+        r#"
+[services.ocr]
+enabled = true
+default_model = "PaddlePaddle/PP-OCRv6_tiny"
+available_models = ["PaddlePaddle/PP-OCRv6_tiny"]
+layout_default_model = "PaddlePaddle/PP-DocLayoutV3"
+layout_available_models = ["PaddlePaddle/PP-DocLayoutV3"]
+
+[services.ocr-vl]
+enabled = true
+default_model = "PaddlePaddle/PaddleOCR-VL-1.6"
+available_models = ["PaddlePaddle/PaddleOCR-VL-1.6"]
+layout_default_model = "PaddlePaddle/PP-DocLayoutV3"
+layout_available_models = ["PaddlePaddle/PP-DocLayoutV3"]
+"#,
+        exe_path,
+    )
+    .unwrap();
+
+    let layout_model = ModelId::parse("PaddlePaddle/PP-DocLayoutV3").unwrap();
+    assert_eq!(
+        config.services.ocr.layout_default_model.as_ref(),
+        Some(&layout_model)
+    );
+    assert_eq!(
+        config.services.ocr.layout_available_models,
+        vec![layout_model.clone()]
+    );
+    assert_eq!(
+        config.services.ocr_vl.layout_default_model.as_ref(),
+        Some(&layout_model)
+    );
+    assert_eq!(
+        config.services.ocr_vl.layout_available_models,
+        vec![layout_model]
+    );
+}
+
+#[test]
+fn active_ocr_rejects_layout_model_in_main_available_models() {
+    let exe_path = std::path::Path::new("/tmp/orchion-server");
+    let error = ServerConfig::from_toml_str(
+        r#"
+[services.ocr]
+enabled = true
+available_models = ["PaddlePaddle/PP-OCRv6_tiny", "PaddlePaddle/PP-DocLayoutV3"]
+"#,
+        exe_path,
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, ConfigError::InvalidOcrModelKind { .. }));
+    assert!(error.to_string().contains("traditional OCR model"));
+}
+
+#[test]
+fn active_ocr_accepts_layout_available_models_and_default() {
+    let exe_path = std::path::Path::new("/tmp/orchion-server");
+    let config = ServerConfig::from_toml_str(
+        r#"
+[services.ocr]
+enabled = true
+default_model = "PaddlePaddle/PP-OCRv6_tiny"
+available_models = ["PaddlePaddle/PP-OCRv6_tiny"]
+layout_default_model = "PaddlePaddle/PP-DocLayoutV3"
+layout_available_models = ["PaddlePaddle/PP-DocLayoutV3"]
+"#,
+        exe_path,
+    )
+    .unwrap();
+
+    let layout_model = ModelId::parse("PaddlePaddle/PP-DocLayoutV3").unwrap();
+    assert_eq!(
+        config.services.ocr.layout_default_model.as_ref(),
+        Some(&layout_model)
+    );
+    assert_eq!(
+        config.services.ocr.layout_available_models,
+        vec![layout_model]
+    );
+}
+
+#[test]
+fn active_ocr_vl_rejects_traditional_models() {
+    let exe_path = std::path::Path::new("/tmp/orchion-server");
+    let error = ServerConfig::from_toml_str(
+        r#"
+[services.ocr-vl]
+enabled = true
+available_models = ["PaddlePaddle/PP-OCRv6_tiny"]
+"#,
+        exe_path,
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, ConfigError::InvalidOcrModelKind { .. }));
+    assert!(error.to_string().contains("OCR-VL model"));
+}
+
+#[test]
+fn active_ocr_vl_rejects_wrong_layout_model() {
+    let exe_path = std::path::Path::new("/tmp/orchion-server");
+    let error = ServerConfig::from_toml_str(
+        r#"
+[services.ocr-vl]
+enabled = true
+available_models = ["PaddlePaddle/PaddleOCR-VL-1.6"]
+layout_default_model = "PaddlePaddle/PP-OCRv6_tiny"
+layout_available_models = ["PaddlePaddle/PP-OCRv6_tiny"]
+"#,
+        exe_path,
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, ConfigError::InvalidOcrModelKind { .. }));
+    assert!(error.to_string().contains("PaddlePaddle/PP-DocLayoutV3"));
+}
+
+#[test]
+fn active_ocr_vl_layout_default_must_be_available_models_member() {
+    let exe_path = std::path::Path::new("/tmp/orchion-server");
+    let error = ServerConfig::from_toml_str(
+        r#"
+[services.ocr-vl]
+enabled = true
+available_models = ["PaddlePaddle/PaddleOCR-VL-1.6"]
+layout_default_model = "PaddlePaddle/PP-DocLayoutV3"
+layout_available_models = []
+"#,
+        exe_path,
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, ConfigError::DefaultModelUnavailable { .. }));
+    assert!(
+        error
+            .to_string()
+            .contains("services.ocr-vl.layout_available_models")
+    );
 }
 
 #[test]
