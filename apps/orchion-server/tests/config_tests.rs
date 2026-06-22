@@ -368,16 +368,16 @@ max_loaded = 3
 
 [services.asr]
 enabled = true
-default_model = "qwen3-asr-1.7b"
-available_models = ["qwen3-asr-0.6b", "qwen3-asr-1.7b"]
+default_model = "Qwen/Qwen3-ASR-1.7B"
+available_models = ["Qwen/Qwen3-ASR-0.6B", "Qwen/Qwen3-ASR-1.7B"]
 idle_timeout = "5m"
 max_loaded = 2
 device = "cuda0"
 
 [services.tts]
 enabled = true
-default_model = "qwen3-tts-1.7b-voice-design"
-available_models = ["qwen3-tts-0.6b-custom-voice", "qwen3-tts-1.7b-voice-design"]
+default_model = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+available_models = ["Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice", "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"]
 idle_timeout = "30s"
 max_loaded = 1
 device = "cuda:1"
@@ -481,8 +481,8 @@ fn enabled_service_default_must_be_available_models_member() {
         r#"
 [services.asr]
 enabled = true
-default_model = "qwen3-asr-1.7b"
-available_models = ["qwen3-asr-0.6b"]
+default_model = "Qwen/Qwen3-ASR-1.7B"
+available_models = ["Qwen/Qwen3-ASR-0.6B"]
 "#,
         exe_path,
     )
@@ -498,8 +498,8 @@ fn disabled_service_can_keep_default_outside_available_models() {
         r#"
 [services.asr]
 enabled = false
-default_model = "qwen3-asr-1.7b"
-available_models = ["qwen3-asr-0.6b"]
+default_model = "Qwen/Qwen3-ASR-1.7B"
+available_models = ["Qwen/Qwen3-ASR-0.6B"]
 "#,
         exe_path,
     )
@@ -589,6 +589,30 @@ available_models = ["not-a-model"]
 }
 
 #[test]
+fn legacy_asr_and_tts_aliases_are_rejected() {
+    let exe_path = std::path::Path::new("/tmp/orchion-server");
+    let error = ServerConfig::from_toml_str(
+        r#"
+[services.asr]
+available_models = ["qwen3-asr-0.6b"]
+"#,
+        exe_path,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("unknown ASR model"));
+
+    let error = ServerConfig::from_toml_str(
+        r#"
+[services.tts]
+available_models = ["qwen3-tts-0.6b-custom-voice"]
+"#,
+        exe_path,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("unknown TTS model"));
+}
+
+#[test]
 fn tts_voice_and_language_are_request_only() {
     let exe_path = std::path::Path::new("/tmp/orchion-server");
     let error = ServerConfig::from_toml_str(
@@ -611,7 +635,7 @@ fn old_model_service_sections_are_rejected() {
     let error = ServerConfig::from_toml_str(
         r#"
 [models.asr]
-default = "qwen3-asr-0.6b"
+default = "Qwen/Qwen3-ASR-0.6B"
 "#,
         exe_path,
     )

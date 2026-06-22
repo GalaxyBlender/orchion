@@ -57,7 +57,7 @@ Open the React WebUI at `/ui` on the server for ASR, TTS, OCR/OCR-VL operations,
 
 ```sh
 curl http://127.0.0.1:9090/v1/audio/transcriptions \
-  -F model=qwen3-asr-0.6b \
+  -F model=Qwen/Qwen3-ASR-0.6B \
   -F file=@audio.mp3 \
   -F response_format=verbose_json \
   -F "timestamp_granularities[]=segment"
@@ -75,7 +75,7 @@ Preset voice synthesis uses JSON and passes a built-in speaker name as `voice`.
 
 Fields:
 
-- `model`: a TTS model from `services.tts.available_models`, such as `qwen3-tts-0.6b-custom-voice`.
+- `model`: a TTS model from `services.tts.available_models`, such as `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice`.
 - `input`: text to synthesize.
 - `voice`: built-in speaker name, such as `ryan`.
 - `language`: optional synthesis language, such as `english` or `zh`.
@@ -86,7 +86,7 @@ Fields:
 curl http://127.0.0.1:9090/v1/audio/speech \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "qwen3-tts-0.6b-custom-voice",
+    "model": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
     "input": "Hello from Orchion.",
     "voice": "ryan",
     "seed": 42,
@@ -101,7 +101,7 @@ Voice clone uses the same endpoint with `multipart/form-data` and uploads refere
 
 Fields:
 
-- `model`: a voice-clone-capable model from `services.tts.available_models`, such as `qwen3-tts-0.6b-custom-voice`.
+- `model`: a voice-clone-capable model from `services.tts.available_models`, such as `Qwen/Qwen3-TTS-12Hz-0.6B-Base`.
 - `input`: text to synthesize.
 - `voice`: must be `clone`.
 - `reference_audio`: reference audio file field, such as `-F reference_audio=@reference.wav`.
@@ -111,7 +111,7 @@ Fields:
 
 ```sh
 curl http://127.0.0.1:9090/v1/audio/speech \
-  -F model=qwen3-tts-0.6b-custom-voice \
+  -F model=Qwen/Qwen3-TTS-12Hz-0.6B-Base \
   -F input='Read this with the reference voice.' \
   -F voice=clone \
   -F reference_audio=@reference.wav \
@@ -127,7 +127,7 @@ Voice design uses JSON, passes `design` as `voice`, and describes the generated 
 
 Fields:
 
-- `model`: a voice-design-capable model from `services.tts.available_models`, such as `qwen3-tts-1.7b-voice-design`.
+- `model`: a voice-design-capable model from `services.tts.available_models`, such as `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`.
 - `input`: text to synthesize.
 - `voice`: must be `design`.
 - `voice_prompt`: text description of the voice.
@@ -138,7 +138,7 @@ Fields:
 curl http://127.0.0.1:9090/v1/audio/speech \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "qwen3-tts-1.7b-voice-design",
+    "model": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
     "input": "Read this with a designed voice.",
     "voice": "design",
     "voice_prompt": "A calm narrator with a warm studio tone.",
@@ -267,22 +267,22 @@ max_loaded = 2
 
 [services.asr]
 enabled = true
-default_model = "qwen3-asr-0.6b"
+default_model = "Qwen/Qwen3-ASR-0.6B"
 device = "auto"
-available_models = ["qwen3-asr-0.6b", "qwen3-asr-1.7b"]
+available_models = ["Qwen/Qwen3-ASR-0.6B", "Qwen/Qwen3-ASR-1.7B"]
 idle_timeout = "10m"
 max_loaded = 1
 
 [services.tts]
 enabled = true
-default_model = "qwen3-tts-0.6b-custom-voice"
+default_model = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
 device = "auto"
 available_models = [
-  "qwen3-tts-0.6b-base",
-  "qwen3-tts-0.6b-custom-voice",
-  "qwen3-tts-1.7b-base",
-  "qwen3-tts-1.7b-custom-voice",
-  "qwen3-tts-1.7b-voice-design",
+  "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+  "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+  "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+  "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+  "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
 ]
 idle_timeout = "10m"
 max_loaded = 1

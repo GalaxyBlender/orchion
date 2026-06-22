@@ -9,22 +9,22 @@ max_loaded = 2
 
 [services.asr]
 enabled = true
-default_model = "qwen3-asr-0.6b"
+default_model = "Qwen/Qwen3-ASR-0.6B"
 device = "auto"
-available_models = ["qwen3-asr-0.6b", "qwen3-asr-1.7b"]
+available_models = ["Qwen/Qwen3-ASR-0.6B", "Qwen/Qwen3-ASR-1.7B"]
 idle_timeout = "10m"
 max_loaded = 1
 
 [services.tts]
 enabled = true
-default_model = "qwen3-tts-0.6b-custom-voice"
+default_model = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
 device = "auto"
 available_models = [
-  "qwen3-tts-0.6b-base",
-  "qwen3-tts-0.6b-custom-voice",
-  "qwen3-tts-1.7b-base",
-  "qwen3-tts-1.7b-custom-voice",
-  "qwen3-tts-1.7b-voice-design",
+  "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+  "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+  "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+  "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+  "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
 ]
 idle_timeout = "10m"
 max_loaded = 1

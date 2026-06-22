@@ -52,7 +52,6 @@ impl fmt::Display for ModelCategory {
 
 pub trait ModelSpec: Copy + fmt::Debug + Eq + Send + 'static {
     fn category(self) -> ModelCategory;
-    fn cache_key(self) -> &'static str;
     fn huggingface_repo(self) -> &'static str;
     fn modelscope_repo(self) -> &'static str;
 
@@ -71,10 +70,6 @@ pub trait ModelSpec: Copy + fmt::Debug + Eq + Send + 'static {
                 path.join(segment)
             })
     }
-}
-
-pub(crate) fn normalize_identifier(value: &str) -> String {
-    value.trim().to_ascii_lowercase().replace('_', "-")
 }
 
 #[cfg(test)]

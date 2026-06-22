@@ -355,7 +355,7 @@ fn parse_asr_service(
         ensure_default_available(
             "ASR",
             "services.asr",
-            service.default_model.cache_key(),
+            service.default_model.huggingface_repo(),
             service.available_models.contains(&service.default_model),
         )?;
     }
@@ -397,7 +397,7 @@ fn parse_tts_service(
         ensure_default_available(
             "TTS",
             "services.tts",
-            service.default_model.cache_key(),
+            service.default_model.huggingface_repo(),
             service.available_models.contains(&service.default_model),
         )?;
     }
@@ -749,28 +749,15 @@ fn parse_upload_size(value: &str) -> Result<usize, ConfigError> {
 }
 
 pub fn parse_asr_model(value: &str) -> Result<AsrModel, ConfigError> {
-    match normalize_identifier(value).as_str() {
-        "qwen3-asr-0.6b" | "qwen/qwen3-asr-0.6b" => Ok(AsrModel::Qwen3Asr06B),
-        "qwen3-asr-1.7b" | "qwen/qwen3-asr-1.7b" => Ok(AsrModel::Qwen3Asr17B),
-        _ => Err(ConfigError::UnknownAsrModel(value.to_string())),
-    }
+    value
+        .parse()
+        .map_err(|_| ConfigError::UnknownAsrModel(value.to_string()))
 }
 
 pub fn parse_tts_model(value: &str) -> Result<TtsModel, ConfigError> {
-    match normalize_identifier(value).as_str() {
-        "qwen3-tts-0.6b-base" | "qwen/qwen3-tts-12hz-0.6b-base" => Ok(TtsModel::Qwen3Tts06BBase),
-        "qwen3-tts-0.6b-custom-voice" | "qwen/qwen3-tts-12hz-0.6b-customvoice" => {
-            Ok(TtsModel::Qwen3Tts06BCustomVoice)
-        }
-        "qwen3-tts-1.7b-base" | "qwen/qwen3-tts-12hz-1.7b-base" => Ok(TtsModel::Qwen3Tts17BBase),
-        "qwen3-tts-1.7b-custom-voice" | "qwen/qwen3-tts-12hz-1.7b-customvoice" => {
-            Ok(TtsModel::Qwen3Tts17BCustomVoice)
-        }
-        "qwen3-tts-1.7b-voice-design" | "qwen/qwen3-tts-12hz-1.7b-voicedesign" => {
-            Ok(TtsModel::Qwen3Tts17BVoiceDesign)
-        }
-        _ => Err(ConfigError::UnknownTtsModel(value.to_string())),
-    }
+    value
+        .parse()
+        .map_err(|_| ConfigError::UnknownTtsModel(value.to_string()))
 }
 
 fn parse_model_ids(section: &'static str, values: &[String]) -> Result<Vec<ModelId>, ConfigError> {

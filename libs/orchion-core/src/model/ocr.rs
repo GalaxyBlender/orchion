@@ -221,10 +221,6 @@ impl ModelSpec for KnownOcrModel {
         }
     }
 
-    fn cache_key(self) -> &'static str {
-        self.id()
-    }
-
     fn huggingface_repo(self) -> &'static str {
         self.id()
     }

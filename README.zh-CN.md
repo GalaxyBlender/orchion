@@ -57,7 +57,7 @@ cargo run -p orchion-server --features cuda -- --config apps/orchion-server/conf
 
 ```sh
 curl http://127.0.0.1:9090/v1/audio/transcriptions \
-  -F model=qwen3-asr-0.6b \
+  -F model=Qwen/Qwen3-ASR-0.6B \
   -F file=@audio.mp3 \
   -F response_format=verbose_json \
   -F "timestamp_granularities[]=segment"
@@ -75,7 +75,7 @@ curl http://127.0.0.1:9090/v1/audio/transcriptions \
 
 字段：
 
-- `model`：必须是 `services.tts.available_models` 中的 TTS 模型，例如 `qwen3-tts-0.6b-custom-voice`。
+- `model`：必须是 `services.tts.available_models` 中的 TTS 模型，例如 `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice`。
 - `input`：需要合成的文本。
 - `voice`：内置说话人名称，例如 `ryan`。
 - `language`：可选，合成语言，例如 `english`、`zh`。
@@ -86,7 +86,7 @@ curl http://127.0.0.1:9090/v1/audio/transcriptions \
 curl http://127.0.0.1:9090/v1/audio/speech \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "qwen3-tts-0.6b-custom-voice",
+    "model": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
     "input": "Hello from Orchion.",
     "voice": "ryan",
     "seed": 42,
@@ -101,7 +101,7 @@ curl http://127.0.0.1:9090/v1/audio/speech \
 
 字段：
 
-- `model`：必须是 `services.tts.available_models` 中的音色克隆模型，例如 `qwen3-tts-0.6b-custom-voice`。
+- `model`：必须是 `services.tts.available_models` 中支持音色克隆的模型，例如 `Qwen/Qwen3-TTS-12Hz-0.6B-Base`。
 - `input`：需要合成的文本。
 - `voice`：固定传 `clone`。
 - `reference_audio`：参考音频文件字段，例如 `-F reference_audio=@reference.wav`。
@@ -111,7 +111,7 @@ curl http://127.0.0.1:9090/v1/audio/speech \
 
 ```sh
 curl http://127.0.0.1:9090/v1/audio/speech \
-  -F model=qwen3-tts-0.6b-custom-voice \
+  -F model=Qwen/Qwen3-TTS-12Hz-0.6B-Base \
   -F input='Read this with the reference voice.' \
   -F voice=clone \
   -F reference_audio=@reference.wav \
@@ -127,7 +127,7 @@ curl http://127.0.0.1:9090/v1/audio/speech \
 
 字段：
 
-- `model`：必须是 `services.tts.available_models` 中支持音色设计的模型，例如 `qwen3-tts-1.7b-voice-design`。
+- `model`：必须是 `services.tts.available_models` 中支持音色设计的模型，例如 `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`。
 - `input`：需要合成的文本。
 - `voice`：固定传 `design`。
 - `voice_prompt`：音色描述文本。
@@ -138,7 +138,7 @@ curl http://127.0.0.1:9090/v1/audio/speech \
 curl http://127.0.0.1:9090/v1/audio/speech \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "qwen3-tts-1.7b-voice-design",
+    "model": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
     "input": "Read this with a designed voice.",
     "voice": "design",
     "voice_prompt": "A calm narrator with a warm studio tone.",
@@ -267,22 +267,22 @@ max_loaded = 2
 
 [services.asr]
 enabled = true
-default_model = "qwen3-asr-0.6b"
+default_model = "Qwen/Qwen3-ASR-0.6B"
 device = "auto"
-available_models = ["qwen3-asr-0.6b", "qwen3-asr-1.7b"]
+available_models = ["Qwen/Qwen3-ASR-0.6B", "Qwen/Qwen3-ASR-1.7B"]
 idle_timeout = "10m"
 max_loaded = 1
 
 [services.tts]
 enabled = true
-default_model = "qwen3-tts-0.6b-custom-voice"
+default_model = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
 device = "auto"
 available_models = [
-  "qwen3-tts-0.6b-base",
-  "qwen3-tts-0.6b-custom-voice",
-  "qwen3-tts-1.7b-base",
-  "qwen3-tts-1.7b-custom-voice",
-  "qwen3-tts-1.7b-voice-design",
+  "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+  "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+  "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+  "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+  "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
 ]
 idle_timeout = "10m"
 max_loaded = 1

@@ -312,7 +312,7 @@ where
                 .min_by_key(|(_, loaded)| loaded.last_used)
                 .map(|(model, loaded)| TrackedLoadedModel {
                     cache_id: self.cache_id,
-                    key: model.cache_key().to_string(),
+                    key: model.huggingface_repo().to_string(),
                     last_used: loaded.last_used,
                 })
         })
@@ -324,7 +324,7 @@ where
             let Some(model) = state
                 .loaded
                 .keys()
-                .find(|model| model.cache_key() == key)
+                .find(|model| model.huggingface_repo() == key)
                 .copied()
             else {
                 return false;
