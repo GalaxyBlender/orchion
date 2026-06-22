@@ -1,4 +1,4 @@
-import { apiUrl } from "@/shared/api/client";
+import { apiCurlUrl } from "@/shared/api/client";
 import type { ApiSettings } from "@/shared/api/types";
 import type { TtsJsonBody, TtsPayload, TtsRequestInput } from "./types";
 
@@ -106,7 +106,7 @@ export function summarizeTtsRequest(input: TtsRequestInput, text: TtsSummaryText
 
 export function buildTtsCurl(settings: ApiSettings, input: TtsRequestInput): string {
   const payload = buildTtsPayload(input);
-  const lines = [`curl -X POST ${quote(apiUrl(settings, endpointPath))}`];
+  const lines = [`curl -X POST ${quote(apiCurlUrl(settings, endpointPath))}`];
   const apiKey = settings.apiKey.trim();
 
   if (apiKey !== "") {

@@ -238,6 +238,7 @@ export const FileDropZone: React.FC<FileDropZoneProps> = ({
             </div>
           </div>
           <Button
+            type="button"
             variant="ghost"
             size="sm"
             className="btn-icon-only text-danger"

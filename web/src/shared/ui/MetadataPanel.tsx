@@ -129,6 +129,7 @@ export interface MetadataPanelProps {
 }
 
 export const MetadataPanel: React.FC<MetadataPanelProps> = ({ metadataList }) => {
+  const { t } = useTranslation();
   const [search, setSearch] = useState("");
   const [openItem, setOpenItem] = useState<string | null>(null);
 
@@ -148,7 +149,7 @@ export const MetadataPanel: React.FC<MetadataPanelProps> = ({ metadataList }) =>
   return (
     <div className="card card-elevated overflow-hidden">
       <div className="card-header stack gap-sm" style={{ display: "flex", flexDirection: "column", gap: "var(--space-2)" }}>
-        <h3 className="card-title">Parameter Notes</h3>
+        <h3 className="card-title">{t("common.parameterNotes", "Parameter Notes")}</h3>
         
         {/* Search bar inside header */}
         <div
@@ -168,7 +169,7 @@ export const MetadataPanel: React.FC<MetadataPanelProps> = ({ metadataList }) =>
           <input
             type="text"
             className="text-xs"
-            placeholder="Search parameters..."
+            placeholder={t("common.parameterSearchPlaceholder", "Search parameters...")}
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             style={{
@@ -185,7 +186,7 @@ export const MetadataPanel: React.FC<MetadataPanelProps> = ({ metadataList }) =>
       
       <div className="stack gap-0" style={{ display: "flex", flexDirection: "column", gap: "0" }}>
         {filteredList.length === 0 ? (
-          <div className="p-4 text-center text-sm text-muted">No parameters found.</div>
+          <div className="p-4 text-center text-sm text-muted">{t("common.noParametersFound", "No parameters found.")}</div>
         ) : (
           filteredList.map((meta) => (
             <MetadataItem

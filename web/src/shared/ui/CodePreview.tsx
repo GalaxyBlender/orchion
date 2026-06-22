@@ -3,6 +3,7 @@ import { Copy, Check } from "lucide-react";
 import { Button } from "./Button";
 import { useToast } from "./Toast";
 import { useTranslation } from "react-i18next";
+import { copyTextToClipboard } from "@/shared/clipboard";
 
 export interface CodePreviewProps {
   children: string;
@@ -19,7 +20,7 @@ export const CodePreview: React.FC<CodePreviewProps> = ({
 
   const handleCopy = async () => {
     try {
-      await navigator.clipboard.writeText(children);
+      await copyTextToClipboard(children);
       setCopied(true);
       toast.success(t("common.copied", "Copied to clipboard!"));
       setTimeout(() => setCopied(false), 2000);
@@ -33,6 +34,7 @@ export const CodePreview: React.FC<CodePreviewProps> = ({
       <div className="hstack justify-between">
         {label && <span className="card-eyebrow">{label}</span>}
         <Button
+          type="button"
           variant="ghost"
           size="sm"
           onClick={handleCopy}

@@ -5,7 +5,7 @@ import { useModels } from "@/features/models/useModels";
 import type { ModelObject } from "@/shared/api/types";
 import { loadPersistentState } from "@/shared/storage/persistentState";
 import { Card, Button, Badge, Alert, StateView } from "@/shared/ui";
-import { Mic, Volume2, Cpu, RefreshCw, Layers } from "lucide-react";
+import { Mic, Volume2, Cpu, RefreshCw, ScanText } from "lucide-react";
 
 export function ModelsPage() {
   const { t } = useTranslation();
@@ -41,15 +41,18 @@ export function ModelsPage() {
       </header>
 
       {/* Mini overview cards */}
-      <div className="grid grid-cols-3 gap-md">
+      <div className="grid gap-md" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))" }}>
         <Card variant="glass">
-          <Card.Header eyebrow="ASR Models" title={catalog.classified.asr.length.toString()} />
+          <Card.Header eyebrow={t("models.asrModels")} title={catalog.classified.asr.length.toString()} />
         </Card>
         <Card variant="glass">
-          <Card.Header eyebrow="TTS Models" title={catalog.classified.tts.length.toString()} />
+          <Card.Header eyebrow={t("models.ttsModels")} title={catalog.classified.tts.length.toString()} />
         </Card>
         <Card variant="glass">
-          <Card.Header eyebrow="Total Models" title={catalog.models.length.toString()} />
+          <Card.Header eyebrow={t("models.ocrModels")} title={catalog.classified.ocr.length.toString()} />
+        </Card>
+        <Card variant="glass">
+          <Card.Header eyebrow={t("models.totalModels")} title={catalog.models.length.toString()} />
         </Card>
       </div>
 
@@ -72,7 +75,7 @@ export function ModelsPage() {
         <>
           <div className="grid grid-cols-2 gap-md">
             <Card>
-              <Card.Header eyebrow={t("models.classified")} title="ASR Models" />
+              <Card.Header eyebrow={t("models.classified")} title={t("models.asrModels")} />
               <Card.Body>
                 <ModelGroup
                   emptyText={t("models.noAsr")}
@@ -84,13 +87,25 @@ export function ModelsPage() {
             </Card>
 
             <Card>
-              <Card.Header eyebrow={t("models.classified")} title="TTS Models" />
+              <Card.Header eyebrow={t("models.classified")} title={t("models.ttsModels")} />
               <Card.Body>
                 <ModelGroup
                   emptyText={t("models.noTts")}
                   icon={<Volume2 size={16} className="text-accent-blue" />}
                   models={catalog.classified.tts}
                   badgeVariant="accent-blue"
+                />
+              </Card.Body>
+            </Card>
+
+            <Card>
+              <Card.Header eyebrow={t("models.classified")} title={t("models.ocrModels")} />
+              <Card.Body>
+                <ModelGroup
+                  emptyText={t("models.noOcr")}
+                  icon={<ScanText size={16} className="text-accent" />}
+                  models={catalog.classified.ocr}
+                  badgeVariant="accent"
                 />
               </Card.Body>
             </Card>

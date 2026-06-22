@@ -54,7 +54,7 @@ export function useModels(settings: ApiSettings): UseModelsState {
     return () => {
       isCurrent = false;
     };
-  }, [settings.serverBaseUrl, settings.apiKey, reloadToken]);
+  }, [settings.apiKey, reloadToken]);
 
   return { models, classified: classifyModels(models), isLoading, error, reload };
 }

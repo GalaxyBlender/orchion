@@ -9,6 +9,7 @@ import { apiUrl, authHeaders } from "@/shared/api/client";
 import { parseNetworkError, parseApiError } from "@/shared/api/errors";
 import { ApiRequestError } from "@/shared/api/types";
 import { buildApiError, readResponsePayload, type SubmissionError } from "@/shared/api/apiHelpers";
+import { copyTextToClipboard } from "@/shared/clipboard";
 import {
   loadPersistentState,
   savePersistentState,
@@ -146,7 +147,7 @@ export function AsrPage() {
 
   const handleCopyResult = async () => {
     try {
-      await navigator.clipboard.writeText(result);
+      await copyTextToClipboard(result);
       toast.success(t("common.copied", "Copied to clipboard!"));
     } catch {
       toast.error(t("common.error", "Failed to copy"));
@@ -359,6 +360,7 @@ export function AsrPage() {
         <Card.Header eyebrow={t("asr.responseEyebrow")} title={t("asr.responseTitle")}>
           {result && (
             <Button
+              type="button"
               variant="ghost"
               size="sm"
               icon={<Clipboard size={14} />}

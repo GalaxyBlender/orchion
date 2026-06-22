@@ -1,11 +1,20 @@
 import { parseApiError, parseNetworkError } from "./errors";
 import type { ApiSettings, ModelList } from "./types";
 
-export function apiUrl(settings: ApiSettings, path: string): string {
-  const base = settings.serverBaseUrl.trim().replace(/\/+$/, "");
+export function apiUrl(_settings: ApiSettings, path: string): string {
   const normalizedPath = path.startsWith("/") ? path : `/${path}`;
 
-  return base === "" ? normalizedPath : `${base}${normalizedPath}`;
+  return normalizedPath;
+}
+
+export function apiCurlUrl(settings: ApiSettings, path: string): string {
+  const normalizedPath = apiUrl(settings, path);
+
+  if (typeof window === "undefined") {
+    return `http://127.0.0.1:9090${normalizedPath}`;
+  }
+
+  return new URL(normalizedPath, window.location.origin).toString();
 }
 
 export function authHeaders(settings: ApiSettings): HeadersInit {

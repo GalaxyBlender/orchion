@@ -1,10 +1,11 @@
 import type { ModelObject } from "@/shared/api/types";
 
-export type ModelKind = "asr" | "tts" | "other";
+export type ModelKind = "asr" | "tts" | "ocr" | "other";
 
 export interface ClassifiedModels {
   asr: ModelObject[];
   tts: ModelObject[];
+  ocr: ModelObject[];
   other: ModelObject[];
   all: ModelObject[];
 }
@@ -25,6 +26,15 @@ export function modelKind(model: ModelObject | string): ModelKind {
     return "tts";
   }
 
+  if (
+    normalizedModelId.includes("ocr") ||
+    normalizedModelId.includes("paddleocr") ||
+    normalizedModelId.includes("pp-ocr") ||
+    normalizedModelId.includes("doclayout")
+  ) {
+    return "ocr";
+  }
+
   return "other";
 }
 
@@ -32,6 +42,7 @@ export function classifyModels(models: ModelObject[]): ClassifiedModels {
   const classified: ClassifiedModels = {
     asr: [],
     tts: [],
+    ocr: [],
     other: [],
     all: [...models],
   };

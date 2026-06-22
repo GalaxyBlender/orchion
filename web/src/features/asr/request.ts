@@ -1,4 +1,4 @@
-import { apiUrl } from "@/shared/api/client";
+import { apiCurlUrl } from "@/shared/api/client";
 import type { ApiSettings } from "@/shared/api/types";
 import type { AsrRequestInput } from "./types";
 
@@ -66,7 +66,7 @@ export function summarizeAsrRequest(input: AsrRequestInput, text: AsrSummaryText
 }
 
 export function buildAsrCurl(settings: ApiSettings, input: AsrRequestInput): string {
-  const parts = ["curl", "-X", "POST", quote(apiUrl(settings, endpointPath))];
+  const parts = ["curl", "-X", "POST", quote(apiCurlUrl(settings, endpointPath))];
   const apiKey = settings.apiKey.trim();
   const fields: Array<[string, string]> = [
     ["model", input.model.trim()],

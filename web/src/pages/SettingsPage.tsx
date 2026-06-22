@@ -62,6 +62,11 @@ export function SettingsPage() {
     toast.success(t("settings.resetTts", "TTS settings reset"));
   };
 
+  const resetOcr = () => {
+    resetSection({ ocr: cloneDefaultPersistentState().ocr });
+    toast.success(t("settings.resetOcr", "OCR settings reset"));
+  };
+
   const resetUi = () => {
     setLanguageSelection("auto");
     setLanguageSelectionState("auto");
@@ -77,7 +82,7 @@ export function SettingsPage() {
     setTimeout(() => window.location.reload(), 500);
   };
 
-  function resetSection(section: Pick<Partial<PersistentState>, "asr" | "tts" | "ui">): void {
+  function resetSection(section: Pick<Partial<PersistentState>, "asr" | "tts" | "ocr" | "ui">): void {
     setPersistentState((currentState) => {
       const nextState: PersistentState = { ...currentState, ...section };
       savePersistentState(nextState);
@@ -101,17 +106,6 @@ export function SettingsPage() {
           </Alert>
 
           <div className="grid grid-cols-2 gap-md">
-            <FormField label={t("settings.serverLabel")} description={t("settings.serverDescription")}>
-              <Input
-                autoComplete="url"
-                id="settings-server-base-url"
-                name="serverBaseUrl"
-                onChange={updateSettings}
-                placeholder="http://localhost:3000"
-                value={settings.serverBaseUrl}
-              />
-            </FormField>
-
             <FormField label={t("settings.apiKeyLabel")} description={t("settings.apiKeyDescription")}>
               <Input
                 autoComplete="off"
@@ -123,7 +117,7 @@ export function SettingsPage() {
               />
             </FormField>
 
-            <FormField label={t("settings.languageLabel")} description={t("settings.languageDescription")} className="grid-cols-span-2">
+            <FormField label={t("settings.languageLabel")} description={t("settings.languageDescription")}>
               <Select id="settings-language" name="language" onChange={updateLanguage} value={languageSelection}>
                 <option value="auto">{t("settings.languageAuto")}</option>
                 <option value="en">{t("settings.languageEnglish")}</option>
@@ -142,10 +136,11 @@ export function SettingsPage() {
             <div className="result-block stack gap-sm">
               <span className="card-eyebrow">{t("settings.summaryLabel")}</span>
               <ul className="stack gap-xs text-sm list-disc pl-4 text-muted">
-                <li>{t("settings.server", { value: settings.serverBaseUrl || t("settings.defaultServer") })}</li>
+                <li>{t("settings.server", { value: currentServerOrigin() })}</li>
                 <li>{t("settings.apiKey", { value: settings.apiKey ? t("settings.apiKeyConfigured") : t("settings.apiKeyNotConfigured") })}</li>
                 <li>{t("settings.asrModel", { value: persistentState.asr.model || t("common.blank") })}</li>
                 <li>{t("settings.ttsModel", { value: persistentState.tts.model || t("common.blank") })}</li>
+                <li>{t("settings.ocrModel", { value: persistentState.ocr.model || t("common.blank") })}</li>
                 <li>{t("settings.activePage", { value: persistentState.ui.activePage })}</li>
                 <li>{t("settings.languageSummary", { value: languageSelection === "auto" ? t("settings.languageAuto") : languageSelection })}</li>
               </ul>
@@ -160,6 +155,7 @@ export function SettingsPage() {
             <div className="hstack gap-sm flex-wrap">
               <Button variant="secondary" size="sm" onClick={resetAsr}>{t("settings.resetAsr")}</Button>
               <Button variant="secondary" size="sm" onClick={resetTts}>{t("settings.resetTts")}</Button>
+              <Button variant="secondary" size="sm" onClick={resetOcr}>{t("settings.resetOcr")}</Button>
               <Button variant="secondary" size="sm" onClick={resetUi}>{t("settings.resetUi")}</Button>
               <Button variant="danger" size="sm" onClick={resetAll}>{t("settings.resetAll")}</Button>
             </div>
@@ -173,14 +169,22 @@ export function SettingsPage() {
           <div className="result-block stack gap-sm">
             <span className="card-eyebrow">{t("settings.defaultsLabel")}</span>
             <ul className="stack gap-xs text-sm list-disc pl-4 text-muted">
-              <li>{t("settings.server", { value: defaultPersistentState.settings.serverBaseUrl || t("settings.defaultServer") })}</li>
               <li>{t("settings.apiKey", { value: defaultPersistentState.settings.apiKey || t("common.blank") })}</li>
               <li>{t("settings.defaultAsrFormat", { value: defaultPersistentState.asr.responseFormat })}</li>
               <li>{t("settings.defaultTtsVoice", { value: defaultPersistentState.tts.speaker })}</li>
+              <li>{t("settings.defaultOcrFormat", { value: defaultPersistentState.ocr.responseFormat })}</li>
             </ul>
           </div>
         </Card.Body>
       </Card>
     </div>
   );
+}
+
+function currentServerOrigin(): string {
+  if (typeof window === "undefined") {
+    return "/";
+  }
+
+  return window.location.origin;
 }

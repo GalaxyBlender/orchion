@@ -20,6 +20,7 @@ export const TopBar: React.FC<TopBarProps> = ({
     const path = location.pathname;
     if (path.includes("/asr")) return t("shell.nav.asr.label", "ASR");
     if (path.includes("/tts")) return t("shell.nav.tts.label", "TTS");
+    if (path.includes("/ocr")) return t("shell.nav.ocr.label", "OCR");
     if (path.includes("/models")) return t("shell.nav.models.label", "Models");
     if (path.includes("/settings")) return t("shell.nav.settings.label", "Settings");
     return "Orchion";
