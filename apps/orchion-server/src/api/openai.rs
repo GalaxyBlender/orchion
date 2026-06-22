@@ -105,30 +105,65 @@ pub struct ModelList {
     pub data: Vec<ModelObject>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelType {
+    Asr,
+    Tts,
+    Ocr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelSubtype {
+    Standard,
+    Vl,
+    Layout,
+    PresetVoice,
+    VoiceClone,
+    VoiceDesign,
+}
+
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ModelObject {
     pub id: String,
     pub object: &'static str,
     pub created: u64,
     pub owned_by: &'static str,
+    #[serde(rename = "type")]
+    pub model_type: ModelType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subtype: Option<ModelSubtype>,
 }
 
 impl ModelObject {
-    pub fn new(model: impl ModelSpec) -> Self {
+    pub fn new(
+        model: impl ModelSpec,
+        model_type: ModelType,
+        subtype: Option<ModelSubtype>,
+    ) -> Self {
         Self {
-            id: model.cache_key().to_string(),
+            id: model.huggingface_repo().to_string(),
             object: "model",
             created: 0,
             owned_by: "orchion",
+            model_type,
+            subtype,
         }
     }
 
-    pub fn from_id(id: impl Into<String>) -> Self {
+    pub fn from_id(
+        id: impl Into<String>,
+        model_type: ModelType,
+        subtype: Option<ModelSubtype>,
+    ) -> Self {
         Self {
             id: id.into(),
             object: "model",
             created: 0,
             owned_by: "orchion",
+            model_type,
+            subtype,
         }
     }
 }

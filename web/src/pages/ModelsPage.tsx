@@ -104,7 +104,31 @@ export function ModelsPage() {
                 <ModelGroup
                   emptyText={t("models.noOcr")}
                   icon={<ScanText size={16} className="text-accent" />}
-                  models={catalog.classified.ocr}
+                  models={catalog.classified.ocrStandard}
+                  badgeVariant="accent"
+                />
+              </Card.Body>
+            </Card>
+
+            <Card>
+              <Card.Header eyebrow={t("models.classified")} title={t("models.ocrVlModels")} />
+              <Card.Body>
+                <ModelGroup
+                  emptyText={t("models.noOcrVl")}
+                  icon={<ScanText size={16} className="text-accent" />}
+                  models={catalog.classified.ocrVl}
+                  badgeVariant="accent"
+                />
+              </Card.Body>
+            </Card>
+
+            <Card>
+              <Card.Header eyebrow={t("models.classified")} title={t("models.ocrLayoutModels")} />
+              <Card.Body>
+                <ModelGroup
+                  emptyText={t("models.noOcrLayout")}
+                  icon={<ScanText size={16} className="text-accent" />}
+                  models={catalog.classified.ocrLayout}
                   badgeVariant="accent"
                 />
               </Card.Body>

@@ -40,15 +40,44 @@ async fn models_endpoint_returns_configured_models() {
     assert_eq!(
         ids,
         vec![
-            "qwen3-asr-0.6b",
-            "qwen3-asr-1.7b",
-            "qwen3-tts-0.6b-custom-voice",
-            "qwen3-tts-1.7b-voice-design",
+            "Qwen/Qwen3-ASR-0.6B",
+            "Qwen/Qwen3-ASR-1.7B",
+            "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+            "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+            "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
         ]
     );
     assert!(body["data"].as_array().unwrap().iter().all(|model| {
         model["object"] == "model" && model["created"] == 0 && model["owned_by"] == "orchion"
     }));
+    assert_eq!(model_type(&body, "Qwen/Qwen3-ASR-0.6B"), "asr");
+    assert_eq!(model_subtype(&body, "Qwen/Qwen3-ASR-0.6B"), None);
+    assert_eq!(model_type(&body, "Qwen/Qwen3-ASR-1.7B"), "asr");
+    assert_eq!(model_subtype(&body, "Qwen/Qwen3-ASR-1.7B"), None);
+    assert_eq!(
+        model_type(&body, "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"),
+        "tts"
+    );
+    assert_eq!(
+        model_subtype(&body, "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"),
+        Some("preset_voice")
+    );
+    assert_eq!(
+        model_type(&body, "Qwen/Qwen3-TTS-12Hz-0.6B-Base"),
+        "tts"
+    );
+    assert_eq!(
+        model_subtype(&body, "Qwen/Qwen3-TTS-12Hz-0.6B-Base"),
+        Some("voice_clone")
+    );
+    assert_eq!(
+        model_type(&body, "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"),
+        "tts"
+    );
+    assert_eq!(
+        model_subtype(&body, "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"),
+        Some("voice_design")
+    );
 }
 
 #[tokio::test]
@@ -66,7 +95,7 @@ async fn models_endpoint_excludes_disabled_services() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = json_body(response).await;
     let ids = model_ids(&body);
-    assert_eq!(ids, vec!["qwen3-asr-0.6b", "qwen3-asr-1.7b"]);
+    assert_eq!(ids, vec!["Qwen/Qwen3-ASR-0.6B", "Qwen/Qwen3-ASR-1.7B"]);
 }
 
 #[tokio::test]
@@ -109,6 +138,16 @@ async fn models_endpoint_includes_active_ocr_model_ids() {
         .collect::<Vec<_>>();
     assert!(ids.contains(&"PaddlePaddle/PP-OCRv6_tiny".to_string()));
     assert!(ids.contains(&"PaddlePaddle/PaddleOCR-VL-1.6".to_string()));
+    assert_eq!(model_type(&body, "PaddlePaddle/PP-OCRv6_tiny"), "ocr");
+    assert_eq!(
+        model_subtype(&body, "PaddlePaddle/PP-OCRv6_tiny"),
+        Some("standard")
+    );
+    assert_eq!(model_type(&body, "PaddlePaddle/PaddleOCR-VL-1.6"), "ocr");
+    assert_eq!(
+        model_subtype(&body, "PaddlePaddle/PaddleOCR-VL-1.6"),
+        Some("vl")
+    );
 }
 
 #[tokio::test]
@@ -139,6 +178,14 @@ async fn models_endpoint_includes_configured_ocr_layout_model_ids() {
             .count(),
         1
     );
+    assert_eq!(
+        model_type(&body, "PaddlePaddle/PP-DocLayoutV3"),
+        "ocr"
+    );
+    assert_eq!(
+        model_subtype(&body, "PaddlePaddle/PP-DocLayoutV3"),
+        Some("layout")
+    );
 }
 
 #[tokio::test]
@@ -151,7 +198,7 @@ async fn speech_route_is_absent_when_tts_is_disabled() {
                 .header("content-type", "application/json")
                 .body(Body::from(
                     r#"{
-                        "model":"qwen3-tts-0.6b-custom-voice",
+                        "model":"Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
                         "input":"hello",
                         "voice":"alloy"
                     }"#,
@@ -448,7 +495,7 @@ async fn json_speech_rejects_voice_clone() {
                 .header("content-type", "application/json")
                 .body(Body::from(
                     r#"{
-                        "model":"qwen3-tts-0.6b-custom-voice",
+                        "model":"Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
                         "input":"hello",
                         "voice":"clone",
                         "reference_audio":"/server/reference.wav",
@@ -547,7 +594,7 @@ async fn multipart_speech_rejects_invalid_reference_audio_before_inference() {
     let body = multipart_body(
         boundary,
         &[
-            ("model", "qwen3-tts-0.6b-custom-voice"),
+            ("model", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"),
             ("input", "hello"),
             ("voice", "clone"),
             ("reference_text", "hello"),
@@ -590,6 +637,27 @@ fn model_ids(body: &Value) -> Vec<&str> {
         .iter()
         .map(|model| model["id"].as_str().unwrap())
         .collect()
+}
+
+fn model_type<'a>(body: &'a Value, expected_id: &str) -> &'a str {
+    body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["id"] == expected_id)
+        .unwrap_or_else(|| panic!("model `{expected_id}` was not returned"))["type"]
+        .as_str()
+        .unwrap()
+}
+
+fn model_subtype<'a>(body: &'a Value, expected_id: &str) -> Option<&'a str> {
+    body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["id"] == expected_id)
+        .unwrap_or_else(|| panic!("model `{expected_id}` was not returned"))["subtype"]
+        .as_str()
 }
 
 async fn text_body(response: axum::response::Response) -> String {
@@ -687,6 +755,7 @@ fn test_state_with_services(
     config.services.asr.max_loaded = 2;
     config.services.tts.available_models = vec![
         TtsModel::Qwen3Tts06BCustomVoice,
+        TtsModel::Qwen3Tts06BBase,
         TtsModel::Qwen3Tts17BVoiceDesign,
     ];
     config.services.tts.idle_timeout = Duration::from_secs(600);

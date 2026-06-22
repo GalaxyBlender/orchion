@@ -33,6 +33,41 @@ mod tests {
         assert!(spec["components"]["schemas"]["OcrJsonResponse"].is_object());
         assert!(spec["components"]["schemas"]["OcrApiFormat"].is_object());
     }
+
+    #[test]
+    fn openapi_includes_model_type_schema() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let model_object = &spec["components"]["schemas"]["ModelObject"];
+
+        assert_eq!(
+            model_object["properties"]["type"]["$ref"],
+            "#/components/schemas/ModelType"
+        );
+        assert_eq!(
+            spec["components"]["schemas"]["ModelType"]["enum"],
+            serde_json::json!(["asr", "tts", "ocr"])
+        );
+        let subtype_schema = &model_object["properties"]["subtype"];
+        let subtype_ref = subtype_schema["$ref"].as_str().or_else(|| {
+            ["anyOf", "allOf", "oneOf"].iter().find_map(|key| {
+                subtype_schema[*key]
+                    .as_array()
+                    .and_then(|schemas| schemas.iter().find_map(|schema| schema["$ref"].as_str()))
+            })
+        });
+        assert_eq!(subtype_ref, Some("#/components/schemas/ModelSubtype"));
+        assert_eq!(
+            spec["components"]["schemas"]["ModelSubtype"]["enum"],
+            serde_json::json!([
+                "standard",
+                "vl",
+                "layout",
+                "preset_voice",
+                "voice_clone",
+                "voice_design"
+            ])
+        );
+    }
 }
 
 #[utoipa::path(

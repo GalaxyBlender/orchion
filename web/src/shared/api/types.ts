@@ -1,3 +1,13 @@
+export type ModelType = "asr" | "tts" | "ocr";
+
+export type ModelSubtype =
+  | "standard"
+  | "vl"
+  | "layout"
+  | "preset_voice"
+  | "voice_clone"
+  | "voice_design";
+
 export interface ApiSettings {
   serverBaseUrl: string;
   apiKey: string;
@@ -5,6 +15,8 @@ export interface ApiSettings {
 
 export interface ModelObject {
   id: string;
+  type?: ModelType;
+  subtype?: ModelSubtype;
   object?: string;
   created?: number;
   owned_by?: string;

@@ -1,6 +1,7 @@
 use crate::api::openai::{
-    ApiError, ModelList, ModelObject, OcrApiFormat, OcrJsonResponse, SpeechFormat, SpeechRequest,
-    TranscriptionFormat, TranscriptionJson, TranscriptionVerboseJson, content_type_for,
+    ApiError, ModelList, ModelObject, ModelSubtype, ModelType, OcrApiFormat, OcrJsonResponse,
+    SpeechFormat, SpeechRequest, TranscriptionFormat, TranscriptionJson, TranscriptionVerboseJson,
+    content_type_for,
 };
 use crate::api::srt::format_srt;
 use crate::api::{docs, ui};
@@ -86,7 +87,7 @@ async fn list_models(
                 .available_models
                 .iter()
                 .copied()
-                .map(ModelObject::new),
+                .map(|model| ModelObject::new(model, ModelType::Asr, None)),
         );
     }
     if state.config.services.tts.enabled {
@@ -98,7 +99,9 @@ async fn list_models(
                 .available_models
                 .iter()
                 .copied()
-                .map(ModelObject::new),
+                .map(|model| {
+                    ModelObject::new(model, ModelType::Tts, Some(tts_model_subtype(model)))
+                }),
         );
     }
     if state.config.services.ocr.active() {
@@ -109,7 +112,9 @@ async fn list_models(
                 .ocr
                 .available_models
                 .iter()
-                .map(|id| ModelObject::from_id(id.as_str())),
+                .map(|id| {
+                    ModelObject::from_id(id.as_str(), ModelType::Ocr, Some(ModelSubtype::Standard))
+                }),
         );
         data.extend(
             state
@@ -118,7 +123,9 @@ async fn list_models(
                 .ocr
                 .layout_available_models
                 .iter()
-                .map(|id| ModelObject::from_id(id.as_str())),
+                .map(|id| {
+                    ModelObject::from_id(id.as_str(), ModelType::Ocr, Some(ModelSubtype::Layout))
+                }),
         );
     }
     if state.config.services.ocr_vl.active() {
@@ -129,7 +136,9 @@ async fn list_models(
                 .ocr_vl
                 .available_models
                 .iter()
-                .map(|id| ModelObject::from_id(id.as_str())),
+                .map(|id| {
+                    ModelObject::from_id(id.as_str(), ModelType::Ocr, Some(ModelSubtype::Vl))
+                }),
         );
         data.extend(
             state
@@ -138,7 +147,9 @@ async fn list_models(
                 .ocr_vl
                 .layout_available_models
                 .iter()
-                .map(|id| ModelObject::from_id(id.as_str())),
+                .map(|id| {
+                    ModelObject::from_id(id.as_str(), ModelType::Ocr, Some(ModelSubtype::Layout))
+                }),
         );
     }
     dedupe_model_objects(&mut data);
@@ -146,6 +157,16 @@ async fn list_models(
         object: "list",
         data,
     }))
+}
+
+fn tts_model_subtype(model: orchion::TtsModel) -> ModelSubtype {
+    if model.supports_preset_speakers() {
+        ModelSubtype::PresetVoice
+    } else if model.supports_voice_design() {
+        ModelSubtype::VoiceDesign
+    } else {
+        ModelSubtype::VoiceClone
+    }
 }
 
 fn dedupe_model_objects(models: &mut Vec<ModelObject>) {

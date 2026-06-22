@@ -33,12 +33,13 @@ export function OcrPage() {
   const abortControllerRef = useRef<AbortController | null>(null);
   const settings = persistentState.settings;
   const models = useModels(settings);
-  const ocrModelIds = models.classified.ocr
-    .map((model) => model.id)
-    .filter((modelId) => !isLayoutModelId(modelId));
+  const ocrModelIds = useMemo(
+    () => [...models.classified.ocrStandard, ...models.classified.ocrVl].map((model) => model.id),
+    [models.classified.ocrStandard, models.classified.ocrVl],
+  );
   const layoutModelIds = useMemo(
-    () => models.classified.ocr.map((model) => model.id).filter(isLayoutModelId),
-    [models.classified.ocr],
+    () => models.classified.ocrLayout.map((model) => model.id),
+    [models.classified.ocrLayout],
   );
 
   const previewInput = useMemo(() => buildRequestInput(form, file ?? previewFile), [file, form]);
@@ -360,10 +361,6 @@ export function OcrPage() {
 
 function buildRequestInput(form: OcrFormState, selectedFile: File): OcrRequestInput {
   return { ...form, file: selectedFile };
-}
-
-function isLayoutModelId(modelId: string): boolean {
-  return modelId.toLowerCase().includes("doclayout");
 }
 
 function ocrStateToForm(state: PersistentOcrState): OcrFormState {

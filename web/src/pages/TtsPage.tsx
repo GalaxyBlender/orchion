@@ -43,7 +43,16 @@ export function TtsPage() {
   const settings = persistentState.settings;
   const models = useModels(settings);
   const allTtsModelIds = useMemo(() => models.classified.tts.map((model) => model.id), [models.classified.tts]);
-  const recommendedTtsModelIds = useMemo(() => ttsModelIdsForMode(allTtsModelIds, form.mode), [allTtsModelIds, form.mode]);
+  const recommendedTtsModelIds = useMemo(() => {
+    switch (form.mode) {
+      case "preset":
+        return models.classified.ttsPresetVoice.map((model) => model.id);
+      case "clone":
+        return models.classified.ttsVoiceClone.map((model) => model.id);
+      case "design":
+        return models.classified.ttsVoiceDesign.map((model) => model.id);
+    }
+  }, [form.mode, models.classified.ttsPresetVoice, models.classified.ttsVoiceClone, models.classified.ttsVoiceDesign]);
   const recommendedTtsModelSet = useMemo(() => new Set(recommendedTtsModelIds), [recommendedTtsModelIds]);
   
   const previewInput = useMemo(() => buildRequestInput(form, referenceAudio, true), [form, referenceAudio]);
@@ -669,19 +678,6 @@ function localizedTtsOptions(name: string, options: readonly string[] | undefine
     return options.map((option) => option || t("tts.autoLanguage"));
   }
   return [...options];
-}
-
-function ttsModelIdsForMode(modelIds: readonly string[], mode: TtsMode): string[] {
-  return modelIds.filter((modelId) => {
-    const normalized = modelId.toLowerCase();
-    if (mode === "preset") {
-      return normalized.includes("custom-voice");
-    }
-    if (mode === "design") {
-      return normalized.includes("voice-design");
-    }
-    return normalized.includes("base") && !normalized.includes("custom-voice") && !normalized.includes("voice-design");
-  });
 }
 
 async function buildAudioResult(response: Response, responseFormat: TtsResponseFormat): Promise<AudioResult> {
