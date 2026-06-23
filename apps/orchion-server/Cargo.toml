@@ -13,7 +13,7 @@ cuda = ["orchion/cuda"]
 
 [dependencies]
 anyhow = "1"
-axum = { version = "0.8", features = ["json", "multipart"] }
+axum = { version = "0.8", features = ["json", "multipart", "ws"] }
 clap = { version = "4", features = ["derive"] }
 http = "1"
 include_dir = "0.7"

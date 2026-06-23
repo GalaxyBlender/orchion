@@ -13,6 +13,7 @@ default_model = "Qwen/Qwen3-ASR-0.6B"
 device = "auto"
 available_models = ["Qwen/Qwen3-ASR-0.6B", "Qwen/Qwen3-ASR-1.7B"]
 idle_timeout = "10m"
+stream_chunk_size = 2.0
 max_loaded = 1
 
 [services.tts]

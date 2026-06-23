@@ -1,4 +1,4 @@
-use crate::api::http_audio::{create_speech, create_transcription};
+use crate::api::http_audio::{create_speech, create_transcription, create_transcription_ws};
 use crate::api::http_models::list_models;
 use crate::api::http_ocr::create_ocr;
 use crate::api::http_pdf_images::create_pdf_images;
@@ -30,7 +30,12 @@ pub fn router_with_ui_routes(state: Arc<AppState>, ui_routes: Router<Arc<AppStat
         router = router.route("/v1/audio/speech", post(create_speech));
     }
     if state.config().services.asr.enabled {
-        router = router.route("/v1/audio/transcriptions", post(create_transcription));
+        router = router
+            .route("/v1/audio/transcriptions", post(create_transcription))
+            .route(
+                "/v1/audio/transcriptions/stream",
+                get(create_transcription_ws),
+            );
     }
     if state.config().services.ocr.active() || state.config().services.ocr_vl.active() {
         router = router.route("/v1/ocr", post(create_ocr));
@@ -136,6 +141,38 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn websocket_transcription_route_uses_stream_suffix() {
+        let state = test_state_with_config(false, false, |config| {
+            config.services.asr.enabled = true;
+        });
+
+        let old_response = router_with_ui_routes(state.clone(), Router::new())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/audio/transcriptions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let stream_response = router_with_ui_routes(state, Router::new())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/audio/transcriptions/stream")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(old_response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_ne!(stream_response.status(), StatusCode::NOT_FOUND);
+        assert_ne!(stream_response.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
 
     #[tokio::test]

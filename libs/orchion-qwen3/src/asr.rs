@@ -12,9 +12,8 @@ pub struct Asr {
 }
 
 pub struct AsrStream {
-    asr: Asr,
-    samples: Vec<f32>,
-    options: AsrOptions,
+    engine: Arc<Mutex<qwen3_asr::AsrInference>>,
+    state: Option<qwen3_asr::StreamingState>,
 }
 
 impl Asr {
@@ -122,11 +121,21 @@ impl Asr {
 
     pub async fn start_streaming_with(&self, options: AsrStreamingOptions) -> Result<AsrStream> {
         validate_streaming_options(&options)?;
-        let asr_options = streaming_options_into_transcribe_options(options);
+        let upstream_options = streaming_options_into_upstream_options(options);
+        let engine = Arc::clone(&self.engine);
+        let state = crate::blocking::run({
+            let engine = Arc::clone(&engine);
+            move || {
+                let engine = engine.lock().map_err(|error| OrchionError::Inference {
+                    source: anyhow::anyhow!(error.to_string()),
+                })?;
+                Ok(engine.init_streaming(upstream_options))
+            }
+        })
+        .await?;
         Ok(AsrStream {
-            asr: self.clone(),
-            samples: Vec::new(),
-            options: asr_options,
+            engine,
+            state: Some(state),
         })
     }
 }
@@ -138,14 +147,46 @@ impl AsrStream {
         sample_rate: u32,
     ) -> Result<Option<AsrTranscript>> {
         let prepared = prepare_asr_samples(samples, sample_rate)?.into_owned();
-        self.samples.extend(prepared);
-        Ok(None)
+        let engine = Arc::clone(&self.engine);
+        let mut state = self.take_state()?;
+        let (state, transcript) = crate::blocking::run(move || {
+            let engine = engine.lock().map_err(|error| OrchionError::Inference {
+                source: anyhow::anyhow!(error.to_string()),
+            })?;
+            let transcript = engine
+                .feed_audio(&mut state, &prepared)
+                .map_err(|source| OrchionError::Inference {
+                    source: anyhow::Error::new(source),
+                })?
+                .map(transcript_from_upstream);
+            Ok((state, transcript))
+        })
+        .await?;
+        self.state = Some(state);
+        Ok(transcript)
     }
 
-    pub async fn finish(self) -> Result<AsrTranscript> {
-        self.asr
-            .transcribe_samples_with(&self.samples, ASR_SAMPLE_RATE, self.options)
-            .await
+    pub async fn finish(mut self) -> Result<AsrTranscript> {
+        let engine = Arc::clone(&self.engine);
+        let mut state = self.take_state()?;
+        crate::blocking::run(move || {
+            let engine = engine.lock().map_err(|error| OrchionError::Inference {
+                source: anyhow::anyhow!(error.to_string()),
+            })?;
+            engine
+                .finish_streaming(&mut state)
+                .map(transcript_from_upstream)
+                .map_err(|source| OrchionError::Inference {
+                    source: anyhow::Error::new(source),
+                })
+        })
+        .await
+    }
+
+    fn take_state(&mut self) -> Result<qwen3_asr::StreamingState> {
+        self.state.take().ok_or_else(|| OrchionError::InvalidAudio {
+            reason: "streaming session has already finished".to_string(),
+        })
     }
 }
 
@@ -171,14 +212,37 @@ fn validate_streaming_options(options: &AsrStreamingOptions) -> Result<()> {
             reason: "streaming chunk_size_sec must be finite and greater than zero".to_string(),
         });
     }
+    let chunk_size_samples = (options.chunk_size_sec * ASR_SAMPLE_RATE as f32) as usize;
+    if chunk_size_samples == 0 {
+        return Err(OrchionError::InvalidAudio {
+            reason: "streaming chunk_size_sec must produce at least one sample".to_string(),
+        });
+    }
+    if options.max_new_tokens_streaming == 0 {
+        return Err(OrchionError::InvalidAudio {
+            reason: "streaming max_new_tokens_streaming must be greater than zero".to_string(),
+        });
+    }
+    if options.max_new_tokens_final == 0 {
+        return Err(OrchionError::InvalidAudio {
+            reason: "streaming max_new_tokens_final must be greater than zero".to_string(),
+        });
+    }
     Ok(())
 }
 
-fn streaming_options_into_transcribe_options(options: AsrStreamingOptions) -> AsrOptions {
-    AsrOptions {
-        language: options.language,
-        max_new_tokens: options.max_new_tokens_final,
-    }
+fn streaming_options_into_upstream_options(
+    options: AsrStreamingOptions,
+) -> qwen3_asr::StreamingOptions {
+    let mut upstream = qwen3_asr::StreamingOptions::default();
+    upstream.language = options.language;
+    upstream.chunk_size_sec = options.chunk_size_sec;
+    upstream.unfixed_chunk_num = options.unfixed_chunk_num;
+    upstream.unfixed_token_num = options.unfixed_token_num;
+    upstream.max_new_tokens_streaming = options.max_new_tokens_streaming;
+    upstream.max_new_tokens_final = options.max_new_tokens_final;
+    upstream.initial_text = options.initial_text;
+    upstream
 }
 
 #[cfg(test)]
@@ -203,6 +267,44 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_streaming_options(&options).is_err());
+    }
+
+    #[test]
+    fn streaming_options_reject_zero_token_limits() {
+        let streaming_tokens = AsrStreamingOptions {
+            max_new_tokens_streaming: 0,
+            ..Default::default()
+        };
+        let final_tokens = AsrStreamingOptions {
+            max_new_tokens_final: 0,
+            ..Default::default()
+        };
+
+        assert!(validate_streaming_options(&streaming_tokens).is_err());
+        assert!(validate_streaming_options(&final_tokens).is_err());
+    }
+
+    #[test]
+    fn streaming_options_convert_to_upstream_streaming_options() {
+        let options = AsrStreamingOptions {
+            language: Some("zh".to_string()),
+            chunk_size_sec: 1.5,
+            unfixed_chunk_num: 3,
+            unfixed_token_num: 7,
+            max_new_tokens_streaming: 48,
+            max_new_tokens_final: 256,
+            initial_text: Some("previous context".to_string()),
+        };
+
+        let upstream = streaming_options_into_upstream_options(options);
+
+        assert_eq!(upstream.language.as_deref(), Some("zh"));
+        assert_eq!(upstream.chunk_size_sec, 1.5);
+        assert_eq!(upstream.unfixed_chunk_num, 3);
+        assert_eq!(upstream.unfixed_token_num, 7);
+        assert_eq!(upstream.max_new_tokens_streaming, 48);
+        assert_eq!(upstream.max_new_tokens_final, 256);
+        assert_eq!(upstream.initial_text.as_deref(), Some("previous context"));
     }
 
     #[test]

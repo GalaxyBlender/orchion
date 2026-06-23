@@ -24,7 +24,7 @@ impl From<ModelSource> for DownloadSource {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ServerConfig {
     pub config_path: PathBuf,
     pub server: ServerSection,
@@ -46,12 +46,23 @@ pub struct ModelsSection {
     pub max_loaded: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ServicesSection {
-    pub asr: ModelServiceSection<AsrModel>,
+    pub asr: AsrServiceSection,
     pub tts: TtsServiceSection,
     pub ocr: OcrServiceSection,
     pub ocr_vl: OcrVlServiceSection,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AsrServiceSection {
+    pub enabled: bool,
+    pub default_model: AsrModel,
+    pub available_models: Vec<AsrModel>,
+    pub idle_timeout: Duration,
+    pub max_loaded: usize,
+    pub device: DevicePreference,
+    pub stream_chunk_size: f32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +158,10 @@ pub enum ConfigError {
     #[error("invalid {section}.max_loaded `{value}`: value must be greater than zero")]
     InvalidMaxLoaded { section: &'static str, value: usize },
     #[error(
+        "invalid {section}.stream_chunk_size `{value}`: value must be finite and greater than zero"
+    )]
+    InvalidChunkSize { section: &'static str, value: f32 },
+    #[error(
         "invalid {section}.device `{value}`; expected auto, cpu, metal, metal0, cuda, cuda0, cuda:0, ..."
     )]
     InvalidDevice {
@@ -195,13 +210,14 @@ impl ServerConfig {
                 max_loaded: 2,
             },
             services: ServicesSection {
-                asr: ModelServiceSection {
+                asr: AsrServiceSection {
                     enabled: false,
                     default_model: default_asr_model(),
                     available_models: vec![default_asr_model()],
                     idle_timeout: Duration::from_secs(600),
                     max_loaded: 1,
                     device: DevicePreference::Auto,
+                    stream_chunk_size: 2.0,
                 },
                 tts: TtsServiceSection {
                     enabled: false,
@@ -325,8 +341,8 @@ impl ServerConfig {
 
 fn parse_asr_service(
     raw: RawModelService,
-    mut service: ModelServiceSection<AsrModel>,
-) -> Result<ModelServiceSection<AsrModel>, ConfigError> {
+    mut service: AsrServiceSection,
+) -> Result<AsrServiceSection, ConfigError> {
     let available_models = raw.available_models;
     if let Some(enabled) = raw.enabled {
         service.enabled = enabled;
@@ -343,6 +359,15 @@ fn parse_asr_service(
     }
     if let Some(device) = raw.device {
         service.device = parse_device_preference("services.asr", &device)?;
+    }
+    if let Some(stream_chunk_size) = raw.stream_chunk_size {
+        if !stream_chunk_size.is_finite() || stream_chunk_size <= 0.0 {
+            return Err(ConfigError::InvalidChunkSize {
+                section: "services.asr",
+                value: stream_chunk_size,
+            });
+        }
+        service.stream_chunk_size = stream_chunk_size;
     }
     apply_service_limits(
         "services.asr",
@@ -858,6 +883,7 @@ struct RawModelService {
     idle_timeout: Option<String>,
     max_loaded: Option<usize>,
     device: Option<String>,
+    stream_chunk_size: Option<f32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -904,4 +930,30 @@ struct RawOcrVlService {
 #[serde(deny_unknown_fields)]
 struct RawAuth {
     api_key: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn asr_stream_chunk_size_defaults_to_two_seconds() {
+        let config = ServerConfig::default_for_exe(Path::new("/tmp/orchion-server"));
+
+        assert_eq!(config.services.asr.stream_chunk_size, 2.0);
+    }
+
+    #[test]
+    fn asr_stream_chunk_size_loads_from_config() {
+        let config = ServerConfig::from_toml_str(
+            r#"
+            [services.asr]
+            stream_chunk_size = 1.5
+            "#,
+            Path::new("/tmp/orchion-server"),
+        )
+        .unwrap();
+
+        assert_eq!(config.services.asr.stream_chunk_size, 1.5);
+    }
 }

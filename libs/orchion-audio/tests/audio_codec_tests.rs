@@ -1,8 +1,14 @@
-use orchion_audio::{AudioOutputFormat, FfmpegAudioCodec, decode_audio_bytes, encode_tts_audio};
+use orchion_audio::{
+    AudioInputFormat, AudioOutputFormat, FfmpegAudioCodec, StreamingAudioDecoder,
+    decode_audio_bytes, decode_pcm_s16le_bytes, encode_tts_audio,
+};
 use orchion_core::{ASR_SAMPLE_RATE, OrchionError, TtsAudio};
-use std::io::Cursor;
-use std::path::PathBuf;
-use std::process::Command;
+use std::fs;
+use std::io::{Cursor, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 #[test]
 fn audio_output_format_parses_openai_values() {
@@ -20,6 +26,57 @@ fn audio_output_format_parses_openai_values() {
         assert_eq!(format, expected);
         assert_eq!(format.content_type(), content_type);
     }
+}
+
+#[test]
+fn audio_input_format_parses_streaming_values() {
+    assert_eq!(
+        "pcm_s16le".parse::<AudioInputFormat>().unwrap(),
+        AudioInputFormat::PcmS16Le
+    );
+    assert_eq!(
+        "webm_opus".parse::<AudioInputFormat>().unwrap(),
+        AudioInputFormat::WebmOpus
+    );
+    assert_eq!(
+        "mp3".parse::<AudioInputFormat>().unwrap(),
+        AudioInputFormat::Mp3
+    );
+    assert_eq!(
+        "wav".parse::<AudioInputFormat>().unwrap(),
+        AudioInputFormat::Wav
+    );
+    assert_eq!(
+        "auto".parse::<AudioInputFormat>().unwrap(),
+        AudioInputFormat::Auto
+    );
+    assert_eq!(
+        "m4a".parse::<AudioInputFormat>().unwrap(),
+        AudioInputFormat::M4a
+    );
+    assert_eq!(
+        "aac".parse::<AudioInputFormat>().unwrap(),
+        AudioInputFormat::Aac
+    );
+    assert_eq!(
+        "flac".parse::<AudioInputFormat>().unwrap(),
+        AudioInputFormat::Flac
+    );
+    assert_eq!(
+        "ogg".parse::<AudioInputFormat>().unwrap(),
+        AudioInputFormat::Ogg
+    );
+    assert_eq!(
+        "opus".parse::<AudioInputFormat>().unwrap(),
+        AudioInputFormat::Ogg
+    );
+}
+
+#[test]
+fn decode_pcm_s16le_bytes_rejects_partial_sample() {
+    let error = decode_pcm_s16le_bytes(&[0]).unwrap_err();
+
+    assert!(matches!(error, OrchionError::InvalidAudio { reason } if reason.contains("pcm_s16le")));
 }
 
 #[tokio::test]
@@ -99,6 +156,153 @@ async fn encoded_pcm_is_s16le_without_container() {
     assert_eq!(encoded.bytes.len(), 10);
 }
 
+#[tokio::test]
+async fn streaming_decoder_decodes_mp3_chunks_to_asr_pcm() {
+    if !ffmpeg_available() {
+        return;
+    }
+    let audio = TtsAudio::new(sine_samples(24_000), 24_000);
+    let encoded = encode_tts_audio(&audio, AudioOutputFormat::Mp3)
+        .await
+        .unwrap();
+    let mut decoder = StreamingAudioDecoder::new_for_asr(AudioInputFormat::Mp3, None)
+        .await
+        .unwrap();
+    let mut samples = Vec::new();
+
+    for chunk in encoded.bytes.chunks(257) {
+        let decoded = decoder.push(chunk).await.unwrap();
+        assert_eq!(decoded.sample_rate, ASR_SAMPLE_RATE);
+        samples.extend(decoded.samples);
+    }
+    let decoded = decoder.finish().await.unwrap();
+    assert_eq!(decoded.sample_rate, ASR_SAMPLE_RATE);
+    samples.extend(decoded.samples);
+
+    assert!(!samples.is_empty());
+}
+
+#[tokio::test]
+async fn streaming_decoder_decodes_webm_opus_chunks_to_asr_pcm() {
+    if !ffmpeg_available() {
+        return;
+    }
+    let audio = TtsAudio::new(sine_samples(24_000), 24_000);
+    let encoded = encode_tts_audio(&audio, AudioOutputFormat::Opus)
+        .await
+        .unwrap();
+    let mut decoder = StreamingAudioDecoder::new_for_asr(AudioInputFormat::WebmOpus, None)
+        .await
+        .unwrap();
+    let mut samples = Vec::new();
+
+    for chunk in encoded.bytes.chunks(257) {
+        let decoded = decoder.push(chunk).await.unwrap();
+        assert_eq!(decoded.sample_rate, ASR_SAMPLE_RATE);
+        samples.extend(decoded.samples);
+    }
+    let decoded = decoder.finish().await.unwrap();
+    assert_eq!(decoded.sample_rate, ASR_SAMPLE_RATE);
+    samples.extend(decoded.samples);
+
+    assert!(!samples.is_empty());
+}
+
+#[tokio::test]
+async fn streaming_decoder_decodes_wav_chunks_to_asr_pcm() {
+    if !ffmpeg_available() {
+        return;
+    }
+    let audio = TtsAudio::new(sine_samples(24_000), 24_000);
+    let encoded = encode_tts_audio(&audio, AudioOutputFormat::Wav)
+        .await
+        .unwrap();
+    let mut decoder = StreamingAudioDecoder::new_for_asr(AudioInputFormat::Wav, None)
+        .await
+        .unwrap();
+    let mut samples = Vec::new();
+
+    for chunk in encoded.bytes.chunks(257) {
+        let decoded = decoder.push(chunk).await.unwrap();
+        assert_eq!(decoded.sample_rate, ASR_SAMPLE_RATE);
+        samples.extend(decoded.samples);
+    }
+    let decoded = decoder.finish().await.unwrap();
+    assert_eq!(decoded.sample_rate, ASR_SAMPLE_RATE);
+    samples.extend(decoded.samples);
+
+    assert!(!samples.is_empty());
+}
+
+#[tokio::test]
+async fn streaming_decoder_decodes_m4a_chunks_to_asr_pcm() {
+    if !ffmpeg_available() {
+        return;
+    }
+    let audio = TtsAudio::new(sine_samples(24_000), 24_000);
+    let encoded = encode_m4a_for_test(&audio);
+    let mut decoder = StreamingAudioDecoder::new_for_asr(AudioInputFormat::M4a, None)
+        .await
+        .unwrap();
+    let mut samples = Vec::new();
+
+    for chunk in encoded.chunks(257) {
+        let decoded = decoder.push(chunk).await.unwrap();
+        assert_eq!(decoded.sample_rate, ASR_SAMPLE_RATE);
+        samples.extend(decoded.samples);
+    }
+    let decoded = decoder.finish().await.unwrap();
+    assert_eq!(decoded.sample_rate, ASR_SAMPLE_RATE);
+    samples.extend(decoded.samples);
+
+    assert!(!samples.is_empty());
+}
+
+#[tokio::test]
+async fn streaming_decoder_decodes_regular_m4a_file_chunks_to_asr_pcm() {
+    if !ffmpeg_available() {
+        return;
+    }
+    let audio = TtsAudio::new(sine_samples(24_000), 24_000);
+    let encoded = encode_regular_m4a_file_for_test(&audio);
+    let mut decoder = StreamingAudioDecoder::new_for_asr(AudioInputFormat::M4a, None)
+        .await
+        .unwrap();
+    let mut samples = Vec::new();
+
+    for chunk in encoded.chunks(257) {
+        let decoded = decoder.push(chunk).await.unwrap();
+        assert_eq!(decoded.sample_rate, ASR_SAMPLE_RATE);
+        samples.extend(decoded.samples);
+    }
+    let decoded = decoder.finish().await.unwrap();
+    assert_eq!(decoded.sample_rate, ASR_SAMPLE_RATE);
+    samples.extend(decoded.samples);
+
+    assert!(!samples.is_empty());
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn streaming_decoder_rejects_non_empty_input_with_empty_ffmpeg_output() {
+    let fake_ffmpeg = fake_successful_ffmpeg_without_output();
+    let mut decoder = StreamingAudioDecoder::new_for_asr_with_binary(
+        AudioInputFormat::M4a,
+        None,
+        fake_ffmpeg.clone(),
+    )
+    .await
+    .unwrap();
+
+    decoder.push(b"not empty").await.unwrap();
+    let error = decoder.finish().await.unwrap_err();
+    fs::remove_file(fake_ffmpeg).unwrap();
+
+    assert!(
+        matches!(error, OrchionError::InvalidAudio { reason } if reason.contains("empty sample buffer"))
+    );
+}
+
 fn ffmpeg_available() -> bool {
     Command::new("ffmpeg")
         .arg("-version")
@@ -125,4 +329,130 @@ fn wav_bytes() -> Vec<u8> {
         writer.finalize().unwrap();
     }
     cursor.into_inner()
+}
+
+fn sine_samples(sample_rate: u32) -> Vec<f32> {
+    (0..sample_rate)
+        .map(|index| {
+            let phase = index as f32 / sample_rate as f32 * 440.0 * std::f32::consts::TAU;
+            phase.sin() * 0.25
+        })
+        .collect()
+}
+
+fn encode_m4a_for_test(audio: &TtsAudio) -> Vec<u8> {
+    let input = audio
+        .samples
+        .iter()
+        .flat_map(|sample| {
+            let sample = (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16;
+            sample.to_le_bytes()
+        })
+        .collect::<Vec<_>>();
+    let mut child = Command::new(Path::new("ffmpeg"))
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "s16le",
+            "-ar",
+            &audio.sample_rate.to_string(),
+            "-ac",
+            "1",
+            "-i",
+            "pipe:0",
+            "-acodec",
+            "aac",
+            "-movflags",
+            "frag_keyframe+empty_moov",
+            "-f",
+            "mp4",
+            "pipe:1",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    std::thread::spawn(move || stdin.write_all(&input).unwrap());
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "ffmpeg m4a encode failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+fn encode_regular_m4a_file_for_test(audio: &TtsAudio) -> Vec<u8> {
+    let input = audio
+        .samples
+        .iter()
+        .flat_map(|sample| {
+            let sample = (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16;
+            sample.to_le_bytes()
+        })
+        .collect::<Vec<_>>();
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "orchion-test-{}-{}.m4a",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut child = Command::new(Path::new("ffmpeg"))
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "s16le",
+            "-ar",
+            &audio.sample_rate.to_string(),
+            "-ac",
+            "1",
+            "-i",
+            "pipe:0",
+            "-acodec",
+            "aac",
+            path.to_string_lossy().as_ref(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    std::thread::spawn(move || stdin.write_all(&input).unwrap());
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "ffmpeg regular m4a encode failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bytes = std::fs::read(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    bytes
+}
+
+#[cfg(unix)]
+fn fake_successful_ffmpeg_without_output() -> PathBuf {
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "orchion-fake-ffmpeg-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::write(&path, "#!/bin/sh\ncat >/dev/null\nexit 0\n").unwrap();
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&path, permissions).unwrap();
+    path
 }

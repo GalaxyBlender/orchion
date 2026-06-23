@@ -1,13 +1,22 @@
-import { type ChangeEvent, type FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { type FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import type { TFunction } from "i18next";
 import { useTranslation } from "react-i18next";
 import { asrLanguageOptions, asrParameterMetadata, asrResponseFormats, asrTimestampGranularityOptions } from "@/features/asr/metadata";
 import { buildAsrCurl, buildAsrFormData, summarizeAsrRequest } from "@/features/asr/request";
-import type { AsrFormState, AsrRequestInput, AsrResponseFormat } from "@/features/asr/types";
+import {
+  asrStreamEndpointPath,
+  buildAsrStreamStartMessage,
+  buildAsrStreamUrl,
+  detectMicrophoneSupportIssue,
+  detectAsrStreamInputFormat,
+  formatAsrStreamResult,
+  parseAsrStreamEvent,
+  preferredMicrophoneMimeType,
+} from "@/features/asr/streaming";
+import type { AsrFormState, AsrMode, AsrRequestInput, AsrResponseFormat, AsrStreamEvent, AsrStreamInputFormat, AsrStreamInputMode } from "@/features/asr/types";
 import { useModels } from "@/features/models/useModels";
 import { apiUrl, authHeaders } from "@/shared/api/client";
-import { parseNetworkError, parseApiError } from "@/shared/api/errors";
-import { ApiRequestError } from "@/shared/api/types";
+import { parseApiError } from "@/shared/api/errors";
 import { buildApiError, readResponsePayload, type SubmissionError } from "@/shared/api/apiHelpers";
 import { copyTextToClipboard } from "@/shared/clipboard";
 import {
@@ -16,11 +25,15 @@ import {
   type PersistentAsrState,
   type PersistentState,
 } from "@/shared/storage/persistentState";
-import { Card, FormField, Input, Select, TextArea, Button, Alert, StateView, ModelStatus, CodePreview, FileDropZone, useToast, MetadataPanel, SuggestionInput } from "@/shared/ui";
-import { Sparkles, Play, Clipboard } from "lucide-react";
+import { Card, FormField, Input, Select, TextArea, Button, Alert, StateView, ModelStatus, CodePreview, FileDropZone, useToast, MetadataPanel, SuggestionInput, Tabs } from "@/shared/ui";
+import { Play, Clipboard, Mic, Square } from "lucide-react";
 
 const endpointPath = "/v1/audio/transcriptions";
 const previewFile = new File([""], "preview-audio-placeholder.wav", { type: "audio/wav" });
+const streamFileChunkSize = 64 * 1024;
+const asrStreamResponseFormats: AsrResponseFormat[] = ["json"];
+
+type AsrStreamStatus = "idle" | "connecting" | "streaming" | "finishing";
 
 export function AsrPage() {
   const { t } = useTranslation();
@@ -32,7 +45,18 @@ export function AsrPage() {
   const [submitError, setSubmitError] = useState<SubmissionError | null>(null);
   const [result, setResult] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [mode, setMode] = useState<AsrMode>("file");
+  const [streamInputMode, setStreamInputMode] = useState<AsrStreamInputMode>("microphone");
+  const [streamFile, setStreamFile] = useState<File | null>(null);
+  const [streamStatus, setStreamStatus] = useState<AsrStreamStatus>("idle");
+  const [partialTranscript, setPartialTranscript] = useState("");
+  const [finalTranscript, setFinalTranscript] = useState("");
   const abortControllerRef = useRef<AbortController | null>(null);
+  const webSocketRef = useRef<WebSocket | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const streamEndedRef = useRef(false);
+  const streamStopRequestedRef = useRef(false);
   const settings = persistentState.settings;
   const models = useModels(settings);
   const asrModelIds = models.classified.asr.map((model) => model.id);
@@ -54,12 +78,63 @@ export function AsrPage() {
   );
   
   const curlPreview = useMemo(() => buildAsrCurl(settings, previewInput), [previewInput, settings]);
+  const streamConnectionPreview = useMemo(() => `WebSocket ${buildAsrStreamUrl()}`, []);
+  const streamRequestSummary = useMemo(
+    () => [
+      t("asr.stream.summary.endpoint", { endpoint: asrStreamEndpointPath, defaultValue: "WebSocket: {{endpoint}}" }),
+      t("asr.summary.model", { model: form.model.trim() || "-" }),
+      t("asr.summary.responseFormat", { format: "json" }),
+      streamInputMode === "microphone"
+        ? t("asr.stream.summary.microphone", "Input: live microphone audio")
+        : t("asr.stream.summary.file", { file: streamFile?.name ?? "-", defaultValue: "Streaming file: {{file}}" }),
+    ],
+    [form.model, form.responseFormat, streamFile?.name, streamInputMode, t],
+  );
+
+  const responseFormatOptions = mode === "stream" ? asrStreamResponseFormats : asrResponseFormats;
+  const isStreaming = streamStatus !== "idle";
+
+  const modeTabs = useMemo(
+    () => [
+      { id: "file", label: t("asr.modes.file.0", "File transcription") },
+      { id: "stream", label: t("asr.modes.stream.0", "Live transcription") },
+    ],
+    [t],
+  );
+
+  const streamInputTabs = useMemo(
+    () => [
+      { id: "microphone", label: t("asr.stream.input.microphone", "Live recording") },
+      { id: "file", label: t("asr.stream.input.file", "Streaming file") },
+    ],
+    [t],
+  );
 
   useEffect(() => {
     return () => {
       abortControllerRef.current?.abort();
+      closeStreamResources();
     };
   }, []);
+
+  const updateMode = (nextMode: AsrMode) => {
+    setMode(nextMode);
+    setValidationError("");
+    setSubmitError(null);
+    setResult("");
+    clearStreamResult();
+    if (nextMode === "stream" && !isStreamingResponseFormat(form.responseFormat)) {
+      updateForm("responseFormat", "json");
+    }
+  };
+
+  const updateStreamInputMode = (nextMode: AsrStreamInputMode) => {
+    setStreamInputMode(nextMode);
+    setValidationError("");
+    setSubmitError(null);
+    setResult("");
+    clearStreamResult();
+  };
 
   const updateForm = <K extends keyof AsrFormState>(field: K, value: AsrFormState[K]) => {
     setValidationError("");
@@ -86,8 +161,19 @@ export function AsrPage() {
     setFile(selectedFile);
   };
 
+  const handleStreamFileSelect = (selectedFile: File | null) => {
+    setValidationError("");
+    setSubmitError(null);
+    setResult("");
+    clearStreamResult();
+    setStreamFile(selectedFile);
+  };
+
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    if (mode !== "file") {
+      return;
+    }
     setSubmitError(null);
     setResult("");
 
@@ -139,6 +225,232 @@ export function AsrPage() {
   const handleCancelSubmit = () => {
     abortControllerRef.current?.abort();
   };
+
+  const handleStartStream = async () => {
+    setSubmitError(null);
+    setResult("");
+    clearStreamResult();
+
+    const model = form.model.trim();
+    if (model === "") {
+      showValidationError(t("asr.missingModel"));
+      return;
+    }
+    closeStreamResources();
+
+    if (streamInputMode === "file") {
+      if (!streamFile) {
+        showValidationError(t("asr.stream.missingFile", "Select an audio file to stream."));
+        return;
+      }
+      const inputAudioFormat = detectAsrStreamInputFormat(streamFile);
+      if (!inputAudioFormat) {
+        showValidationError(t("asr.stream.unsupportedFile", "Streaming file input supports wav, mp3, webm/opus, m4a, aac, flac, and ogg."));
+        return;
+      }
+      const selectedStreamFile = streamFile;
+      openTranscriptionStream(inputAudioFormat, (socket) => {
+        void sendStreamFile(socket, selectedStreamFile);
+      });
+      return;
+    }
+
+    const microphoneSupportIssue = detectMicrophoneSupportIssue();
+    if (microphoneSupportIssue) {
+      showValidationError(t(`asr.stream.microphoneSupport.${microphoneSupportIssue}`));
+      return;
+    }
+
+    try {
+      const mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mimeType = preferredMicrophoneMimeType();
+      const recorder = new MediaRecorder(mediaStream, mimeType ? { mimeType } : undefined);
+      mediaStreamRef.current = mediaStream;
+      mediaRecorderRef.current = recorder;
+      recorder.ondataavailable = (event) => {
+        if (event.data.size === 0) {
+          return;
+        }
+        void event.data.arrayBuffer().then((buffer) => {
+          const socket = webSocketRef.current;
+          if (socket?.readyState === WebSocket.OPEN) {
+            socket.send(buffer);
+          }
+        });
+      };
+      recorder.onstop = () => {
+        mediaRecorderRef.current = null;
+        mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+        mediaStreamRef.current = null;
+        const socket = webSocketRef.current;
+        if (streamStopRequestedRef.current && socket?.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({ type: "end" }));
+          setStreamStatus("finishing");
+        }
+      };
+      openTranscriptionStream("auto", () => {
+        if (recorder.state === "inactive") {
+          recorder.start(500);
+        }
+      });
+    } catch (caughtError) {
+      closeStreamResources();
+      setStreamStatus("idle");
+      setSubmitError(buildApiError(caughtError));
+      toast.error(t("common.error", "Transcription failed"));
+    }
+  };
+
+  const handleStopStream = () => {
+    streamStopRequestedRef.current = true;
+    const recorder = mediaRecorderRef.current;
+    if (recorder && recorder.state !== "inactive") {
+      recorder.stop();
+      setStreamStatus("finishing");
+      return;
+    }
+    stopRecordingResources();
+    const socket = webSocketRef.current;
+    if (socket?.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: "end" }));
+      setStreamStatus("finishing");
+      return;
+    }
+    closeStreamResources();
+    setStreamStatus("idle");
+  };
+
+  const openTranscriptionStream = (
+    inputAudioFormat: AsrStreamInputFormat,
+    onReady: (socket: WebSocket) => void,
+  ) => {
+    streamEndedRef.current = false;
+    streamStopRequestedRef.current = false;
+    setValidationError("");
+    setStreamStatus("connecting");
+
+    const socket = new WebSocket(buildAsrStreamUrl());
+    webSocketRef.current = socket;
+    socket.onopen = () => {
+      socket.send(
+        buildAsrStreamStartMessage({
+          form,
+          inputAudioFormat,
+          apiKey: settings.apiKey,
+        }),
+      );
+    };
+    socket.onmessage = (event) => {
+      if (webSocketRef.current !== socket) {
+        return;
+      }
+      if (typeof event.data === "string") {
+        try {
+          handleStreamEvent(parseAsrStreamEvent(event.data), socket, onReady);
+        } catch {
+          handleStreamFailure(t("asr.stream.invalidEvent", "Streaming response was not valid JSON."));
+        }
+      }
+    };
+    socket.onerror = () => {
+      if (webSocketRef.current !== socket) {
+        return;
+      }
+      handleStreamFailure(t("asr.stream.connectionError", "Streaming connection failed."));
+    };
+    socket.onclose = () => {
+      if (webSocketRef.current !== socket) {
+        return;
+      }
+      if (!streamEndedRef.current) {
+        handleStreamFailure(t("asr.stream.closed", "Streaming connection closed before a final result."));
+      }
+    };
+  };
+
+  const handleStreamEvent = (
+    event: AsrStreamEvent,
+    socket: WebSocket,
+    onReady: (socket: WebSocket) => void,
+  ) => {
+    switch (event.type) {
+      case "ready":
+        setStreamStatus("streaming");
+        onReady(socket);
+        return;
+      case "partial":
+        setPartialTranscript(event.text);
+        setResult(formatAsrStreamResult(event));
+        return;
+      case "final":
+        streamEndedRef.current = true;
+        setPartialTranscript("");
+        setFinalTranscript(event.text);
+        setResult(formatAsrStreamResult(event));
+        setStreamStatus("idle");
+        closeStreamResources();
+        toast.success(t("common.success", "Transcription completed successfully!"));
+        return;
+      case "error":
+        streamEndedRef.current = true;
+        setSubmitError({ type: "api", message: event.error.message, detail: event.error });
+        setStreamStatus("idle");
+        closeStreamResources();
+        toast.error(t("common.error", "Transcription failed"));
+        return;
+    }
+  };
+
+  const sendStreamFile = async (socket: WebSocket, selectedFile: File) => {
+    try {
+      for (let offset = 0; offset < selectedFile.size; offset += streamFileChunkSize) {
+        if (streamStopRequestedRef.current || socket.readyState !== WebSocket.OPEN) {
+          return;
+        }
+        const chunk = selectedFile.slice(offset, offset + streamFileChunkSize);
+        socket.send(await chunk.arrayBuffer());
+      }
+      if (!streamStopRequestedRef.current && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: "end" }));
+        setStreamStatus("finishing");
+      }
+    } catch (caughtError) {
+      handleStreamFailure(caughtError instanceof Error ? caughtError.message : String(caughtError));
+    }
+  };
+
+  const handleStreamFailure = (message: string) => {
+    streamEndedRef.current = true;
+    closeStreamResources();
+    setStreamStatus("idle");
+    setSubmitError({ type: "network", message });
+    toast.error(t("common.error", "Transcription failed"));
+  };
+
+  function clearStreamResult(): void {
+    setPartialTranscript("");
+    setFinalTranscript("");
+  }
+
+  function closeStreamResources(): void {
+    stopRecordingResources();
+    const socket = webSocketRef.current;
+    if (socket && socket.readyState !== WebSocket.CLOSED) {
+      streamEndedRef.current = true;
+      socket.close();
+    }
+    webSocketRef.current = null;
+  }
+
+  function stopRecordingResources(): void {
+    const recorder = mediaRecorderRef.current;
+    if (recorder && recorder.state !== "inactive") {
+      recorder.stop();
+    }
+    mediaRecorderRef.current = null;
+    mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+    mediaStreamRef.current = null;
+  }
 
   const showValidationError = (message: string) => {
     setValidationError(message);
@@ -203,19 +515,24 @@ export function AsrPage() {
             gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))"
           }}
         >
-          {/* Main upload and configuration panel */}
-          <Card variant="glass">
-            <Card.Header eyebrow={t("asr.uploadPanelEyebrow")} title={t("asr.uploadPanelTitle")} />
-            <Card.Body className="stack gap-md">
-              <FormField label={t("asr.metadata.file.0")} description={t("asr.fileDescription")}>
-                <FileDropZone
-                  accept="audio/*"
-                  selectedFile={file}
-                  onFileSelect={handleFileSelect}
-                  dropZoneText={t("asr.dropZoneText", "Drag & drop an audio file here, or click to select")}
-                  dropZoneActiveText={t("asr.dropZoneActive", "Drop the audio file here...")}
-                />
-              </FormField>
+            {/* Main upload and configuration panel */}
+            <Card variant="glass">
+              <Card.Header eyebrow={t("asr.uploadPanelEyebrow")} title={t("asr.uploadPanelTitle")} />
+              <Card.Body className="stack gap-md">
+              <Tabs tabs={modeTabs} activeTab={mode} onChange={(id) => updateMode(id as AsrMode)} />
+              <p className="text-xs text-muted mt-[-8px]">{t(`asr.modes.${mode}.1`, mode === "file" ? "Upload an audio file and run one transcription request." : "Use WebSocket streaming for live partial and final results.")}</p>
+
+              {mode === "file" && (
+                <FormField label={t("asr.metadata.file.0")} description={t("asr.fileDescription")}>
+                  <FileDropZone
+                    accept="audio/*"
+                    selectedFile={file}
+                    onFileSelect={handleFileSelect}
+                    dropZoneText={t("asr.dropZoneText", "Drag & drop an audio file here, or click to select")}
+                    dropZoneActiveText={t("asr.dropZoneActive", "Drop the audio file here...")}
+                  />
+                </FormField>
+              )}
 
               <FormField label={t("asr.metadata.model.0")} description={t("asr.modelDescription")}>
                 <SuggestionInput
@@ -257,7 +574,7 @@ export function AsrPage() {
                     onChange={(event) => updateForm("responseFormat", event.target.value as AsrResponseFormat)}
                     value={form.responseFormat}
                   >
-                    {asrResponseFormats.map((format) => (
+                    {responseFormatOptions.map((format) => (
                       <option key={format} value={format}>
                         {format}
                       </option>
@@ -265,6 +582,30 @@ export function AsrPage() {
                   </Select>
                 </FormField>
               </div>
+
+              {mode === "stream" && (
+                <div className="stack gap-md">
+                  <Alert variant="info" title={t("asr.stream.noticeTitle", "Streaming API")}> 
+                    {t("asr.stream.notice", "Live ASR uses WebSocket streaming and returns JSON events with text payloads.")}
+                  </Alert>
+                  <Tabs tabs={streamInputTabs} activeTab={streamInputMode} onChange={(id) => updateStreamInputMode(id as AsrStreamInputMode)} />
+                  {streamInputMode === "file" ? (
+                    <FormField label={t("asr.stream.fileLabel", "Streaming audio file")} description={t("asr.stream.fileDescription", "Supported streaming formats: wav, mp3, webm/opus, m4a, aac, flac, and ogg.")}>
+                      <FileDropZone
+                        accept=".wav,.mp3,.webm,.m4a,.aac,.flac,.ogg,.opus,audio/wav,audio/x-wav,audio/mpeg,audio/webm,audio/mp4,audio/aac,audio/flac,audio/ogg,audio/opus"
+                        selectedFile={streamFile}
+                        onFileSelect={handleStreamFileSelect}
+                        dropZoneText={t("asr.stream.dropZoneText", "Select a supported audio file to stream")}
+                        dropZoneActiveText={t("asr.dropZoneActive", "Drop the audio file here...")}
+                      />
+                    </FormField>
+                  ) : (
+                    <Alert variant="info" title={t("asr.stream.microphoneTitle", "Microphone recording")}> 
+                      {t("asr.stream.microphoneDescription", "The browser records webm/opus chunks and sends them to the streaming endpoint.")}
+                    </Alert>
+                  )}
+                </div>
+              )}
 
               <FormField label={t("asr.metadata.prompt.0")} description={t("asr.promptDescription")}>
                 <TextArea
@@ -303,25 +644,29 @@ export function AsrPage() {
               </div>
 
               <div className="pt-2 stack gap-sm">
-                <Button
-                  variant="primary"
-                  size="lg"
-                  type="submit"
-                  loading={isSubmitting}
-                  icon={<Play size={18} />}
-                  fullWidth
-                >
-                  {t("asr.submit")}
-                </Button>
-                {isSubmitting && (
+                {mode === "file" ? (
+                  <>
+                    <Button
+                      variant={isSubmitting ? "danger" : "primary"}
+                      size="lg"
+                      type={isSubmitting ? "button" : "submit"}
+                      icon={isSubmitting ? <Square size={18} /> : <Play size={18} />}
+                      fullWidth
+                      onClick={isSubmitting ? handleCancelSubmit : undefined}
+                    >
+                      {isSubmitting ? t("common.cancel") : t("asr.submit")}
+                    </Button>
+                  </>
+                ) : (
                   <Button
-                    variant="danger"
-                    size="md"
+                    variant={isStreaming ? "danger" : "primary"}
+                    size="lg"
                     type="button"
-                    className="btn-cancel-request"
-                    onClick={handleCancelSubmit}
+                    icon={isStreaming ? <Square size={18} /> : <Mic size={18} />}
+                    fullWidth
+                    onClick={isStreaming ? handleStopStream : handleStartStream}
                   >
-                    {t("common.cancel")}
+                    {isStreaming ? t("asr.stream.stop", "Stop streaming") : t("asr.stream.start", "Start streaming")}
                   </Button>
                 )}
               </div>
@@ -341,12 +686,14 @@ export function AsrPage() {
                 <div className="result-block stack gap-sm">
                   <span className="card-eyebrow">{t("asr.summaryLabel")}</span>
                   <ul className="stack gap-xs text-sm list-disc pl-4 text-muted">
-                    {requestSummary.map((line) => (
+                    {(mode === "stream" ? streamRequestSummary : requestSummary).map((line) => (
                       <li key={line}>{line}</li>
                     ))}
                   </ul>
                 </div>
-                <CodePreview label={t("common.curlPreview")}>{curlPreview}</CodePreview>
+                <CodePreview label={mode === "stream" ? t("asr.stream.connection", "Streaming connection") : t("common.curlPreview")}>
+                  {mode === "stream" ? streamConnectionPreview : curlPreview}
+                </CodePreview>
               </Card.Body>
             </Card>
 
@@ -354,6 +701,37 @@ export function AsrPage() {
           </div>
         </div>
       </form>
+
+      {mode === "stream" && (
+        <Card variant="elevated">
+          <Card.Header eyebrow={t("asr.stream.responseEyebrow", "Live result")} title={t("asr.stream.responseTitle", "Streaming transcription")} />
+          <Card.Body className="stack gap-md">
+            <div className="result-block stack gap-sm">
+              <span className="card-eyebrow">{t("asr.stream.status", "Status")}</span>
+              <p className="text-sm text-muted">{streamStatusLabel(streamStatus, t)}</p>
+            </div>
+            {partialTranscript && (
+              <div className="result-block stack gap-sm">
+                <span className="card-eyebrow">{t("asr.stream.partial", "Partial")}</span>
+                <p className="text-sm">{partialTranscript}</p>
+              </div>
+            )}
+            {finalTranscript && (
+              <div className="result-block stack gap-sm">
+                <span className="card-eyebrow">{t("asr.stream.final", "Final")}</span>
+                <p className="text-sm">{finalTranscript}</p>
+              </div>
+            )}
+            {!partialTranscript && !finalTranscript && (
+              <StateView
+                type="empty"
+                title={t("asr.stream.emptyTitle", "No streaming transcript yet")}
+                description={t("asr.stream.empty", "Start recording or stream a file to see partial results.")}
+              />
+            )}
+          </Card.Body>
+        </Card>
+      )}
 
       {/* Response Panel */}
       <Card variant="elevated">
@@ -436,6 +814,23 @@ async function formatResponse(response: Response, responseFormat: AsrResponseFor
 
 function selectedTimestampGranularity(values: readonly string[]): string {
   return values.includes("segment") ? "segment" : "";
+}
+
+function isStreamingResponseFormat(format: AsrResponseFormat): boolean {
+  return format === "json";
+}
+
+function streamStatusLabel(status: AsrStreamStatus, t: TFunction): string {
+  switch (status) {
+    case "connecting":
+      return t("asr.stream.statusConnecting", "Connecting");
+    case "streaming":
+      return t("asr.stream.statusStreaming", "Streaming");
+    case "finishing":
+      return t("asr.stream.statusFinishing", "Finishing");
+    case "idle":
+      return t("asr.stream.statusIdle", "Idle");
+  }
 }
 
 function timestampGranularityLabel(granularity: string, t: TFunction): string {
