@@ -16,7 +16,7 @@ import {
   type PersistentTtsState,
 } from "@/shared/storage/persistentState";
 import { Card, FormField, Input, Select, TextArea, Button, Alert, StateView, ModelStatus, CodePreview, FileDropZone, useToast, MetadataPanel, Tabs, Slider, SuggestionInput } from "@/shared/ui";
-import { Play, Download, Clipboard } from "lucide-react";
+import { Play, Download, Clipboard, Square } from "lucide-react";
 
 const endpointPath = "/v1/audio/speech";
 const previewReferenceAudioName = "reference-audio-placeholder.wav";
@@ -489,26 +489,15 @@ export function TtsPage() {
 
               <div className="pt-2 stack gap-sm">
                 <Button
-                  variant="primary"
+                  variant={isSubmitting ? "danger" : "primary"}
                   size="lg"
-                  type="submit"
-                  loading={isSubmitting}
-                  icon={<Play size={18} />}
+                  type={isSubmitting ? "button" : "submit"}
+                  icon={isSubmitting ? <Square size={18} /> : <Play size={18} />}
                   fullWidth
+                  onClick={isSubmitting ? handleCancelSubmit : undefined}
                 >
-                  {t("tts.submit")}
+                  {isSubmitting ? t("common.cancel") : t("tts.submit")}
                 </Button>
-                {isSubmitting && (
-                  <Button
-                    variant="danger"
-                    size="md"
-                    type="button"
-                    className="btn-cancel-request"
-                    onClick={handleCancelSubmit}
-                  >
-                    {t("common.cancel")}
-                  </Button>
-                )}
               </div>
             </Card.Body>
           </Card>

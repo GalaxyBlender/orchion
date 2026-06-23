@@ -1,12 +1,9 @@
-import React, { useEffect, useState } from "react";
+import React from "react";
 import { NavLink, useLocation } from "react-router-dom";
 import { useTranslation } from "react-i18next";
-import { Mic, Volume2, Database, Settings, Globe, ChevronLeft, ChevronRight, Wifi, WifiOff, ScanText, FileText } from "lucide-react";
-import { Badge } from "./Badge";
+import { Mic, Volume2, Database, Settings, Globe, ChevronLeft, ChevronRight, ScanText, FileText } from "lucide-react";
 import { Button } from "./Button";
 import { setLanguageSelection, currentLanguageSelection } from "@/shared/i18n";
-import { loadPersistentState } from "@/shared/storage/persistentState";
-import { fetchModels } from "@/shared/api/client";
 
 interface SidebarProps {
   collapsed: boolean;
@@ -21,27 +18,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
 }) => {
   const { t } = useTranslation();
   const location = useLocation();
-  const [latency, setLatency] = useState<number | null>(null);
-  const [isOnline, setIsOnline] = useState<boolean>(true);
-
-  // Check backend health status periodically
-  useEffect(() => {
-    const checkServer = async () => {
-      const state = loadPersistentState();
-      const start = Date.now();
-      try {
-        await fetchModels(state.settings);
-        setLatency(Date.now() - start);
-        setIsOnline(true);
-      } catch {
-        setIsOnline(false);
-      }
-    };
-
-    checkServer();
-    const interval = setInterval(checkServer, 10000);
-    return () => clearInterval(interval);
-  }, []);
 
   const navItems = [
     {
@@ -175,28 +151,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
             </select>
           </div>
         )}
-
-        {/* Server Connection status */}
-        <div className="hstack gap-sm text-xs border-t border-subtle pt-3" style={{ borderTop: "1px solid var(--color-border-subtle)", paddingTop: "var(--space-3)", display: "flex", alignItems: "center", gap: "var(--space-2)" }}>
-          {isOnline ? (
-            <>
-              <Wifi size={14} className="text-success" />
-              {!collapsed && (
-                <span className="text-success font-semibold">
-                  {t("common.online", "Online")}
-                  {latency !== null && <span className="text-tertiary text-mono" style={{ marginLeft: "var(--space-1)" }}>({latency}ms)</span>}
-                </span>
-              )}
-            </>
-          ) : (
-            <>
-              <WifiOff size={14} className="text-danger" />
-              {!collapsed && (
-                <span className="text-danger font-semibold">{t("common.offline", "Offline")}</span>
-              )}
-            </>
-          )}
-        </div>
 
         {collapsed && (
           <Button

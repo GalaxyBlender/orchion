@@ -15,7 +15,7 @@ import {
   type PersistentState,
 } from "@/shared/storage/persistentState";
 import { Alert, Button, Card, CodePreview, FileDropZone, FormField, Input, MetadataPanel, ModelStatus, Select, StateView, SuggestionInput, useToast } from "@/shared/ui";
-import { Clipboard, FileText, Play } from "lucide-react";
+import { Clipboard, FileText, Play, Square } from "lucide-react";
 
 const endpointPath = "/v1/ocr";
 const previewFile = new File([""], "preview-document-placeholder.png", { type: "image/png" });
@@ -286,15 +286,17 @@ export function OcrPage() {
                 />
               </FormField>
 
-              <div className="hstack gap-sm flex-wrap">
-                <Button type="submit" loading={isSubmitting} icon={<Play size={16} />} iconPosition="left">
-                  {isSubmitting ? t("ocr.submitting") : t("ocr.submit")}
+              <div className="pt-2 stack gap-sm">
+                <Button
+                  variant={isSubmitting ? "danger" : "primary"}
+                  size="lg"
+                  type={isSubmitting ? "button" : "submit"}
+                  icon={isSubmitting ? <Square size={18} /> : <Play size={18} />}
+                  fullWidth
+                  onClick={isSubmitting ? handleCancelSubmit : undefined}
+                >
+                  {isSubmitting ? t("common.cancel") : t("ocr.submit")}
                 </Button>
-                {isSubmitting && (
-                  <Button type="button" variant="secondary" onClick={handleCancelSubmit}>
-                    {t("common.cancel")}
-                  </Button>
-                )}
               </div>
             </Card.Body>
           </Card>

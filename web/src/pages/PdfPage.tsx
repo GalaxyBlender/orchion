@@ -9,7 +9,7 @@ import { buildApiError, readResponsePayload, type SubmissionError } from "@/shar
 import { parseApiError } from "@/shared/api/errors";
 import { loadPersistentState, type PersistentState } from "@/shared/storage/persistentState";
 import { Alert, Button, Card, CodePreview, FileDropZone, FormField, Input, MetadataPanel, Select, StateView, useToast } from "@/shared/ui";
-import { Download, FileArchive, Play } from "lucide-react";
+import { Download, FileArchive, Play, Square } from "lucide-react";
 
 const previewFile = new File([""], "preview-document-placeholder.pdf", { type: "application/pdf" });
 
@@ -241,15 +241,17 @@ export function PdfPage() {
                 />
               </FormField>
 
-              <div className="hstack gap-sm flex-wrap">
-                <Button type="submit" loading={isSubmitting} icon={<Play size={16} />} iconPosition="left">
-                  {isSubmitting ? t("pdf.submitting", "Converting...") : t("pdf.submit", "Convert PDF")}
+              <div className="pt-2 stack gap-sm">
+                <Button
+                  variant={isSubmitting ? "danger" : "primary"}
+                  size="lg"
+                  type={isSubmitting ? "button" : "submit"}
+                  icon={isSubmitting ? <Square size={18} /> : <Play size={18} />}
+                  fullWidth
+                  onClick={isSubmitting ? handleCancelSubmit : undefined}
+                >
+                  {isSubmitting ? t("common.cancel") : t("pdf.submit", "Convert PDF")}
                 </Button>
-                {isSubmitting && (
-                  <Button type="button" variant="secondary" onClick={handleCancelSubmit}>
-                    {t("common.cancel")}
-                  </Button>
-                )}
               </div>
             </Card.Body>
           </Card>
