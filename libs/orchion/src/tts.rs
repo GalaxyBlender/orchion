@@ -24,12 +24,12 @@ impl Tts {
     #[cfg(feature = "download-all")]
     pub async fn load_or_download(model: TtsModel, cache_dir: impl AsRef<Path>) -> Result<Self> {
         let model_dir = orchion_download::ModelDownloader::default()
-            .download(model, cache_dir)
+            .download(model.clone(), cache_dir)
             .await?;
         Self::load(model, model_dir).await
     }
 
-    pub const fn model(&self) -> TtsModel {
+    pub fn model(&self) -> TtsModel {
         self.inner.model()
     }
 

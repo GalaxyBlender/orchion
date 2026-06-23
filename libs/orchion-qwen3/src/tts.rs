@@ -51,8 +51,8 @@ impl Tts {
         .await
     }
 
-    pub const fn model(&self) -> TtsModel {
-        self.model
+    pub fn model(&self) -> TtsModel {
+        self.model.clone()
     }
 
     pub async fn synthesize(&self, text: impl AsRef<str>, voice: TtsVoice) -> Result<TtsAudio> {
@@ -66,63 +66,9 @@ impl Tts {
         voice: TtsVoice,
         options: TtsOptions,
     ) -> Result<TtsAudio> {
-        ensure_voice_supported(self.model, &voice)?;
-        let text = text.as_ref().to_string();
-        let text_len = text.chars().count();
-        let engine = Arc::clone(&self.engine);
-        crate::blocking::run(move || {
-            let started = Instant::now();
-            let engine = engine.lock().map_err(|error| OrchionError::Inference {
-                source: anyhow::anyhow!(error.to_string()),
-            })?;
-            let audio = match voice {
-                TtsVoice::Preset { speaker, language } => engine
-                    .synthesize_with_voice(
-                        text.as_str(),
-                        speaker_to_upstream(speaker),
-                        language_to_upstream(language),
-                        Some(options_to_upstream(options)),
-                    )
-                    .map_err(|source| OrchionError::Inference { source }),
-                TtsVoice::Clone {
-                    reference_audio,
-                    reference_text,
-                    language,
-                } => {
-                    let audio = qwen3_tts::AudioBuffer::load(&reference_audio)
-                        .map_err(|source| OrchionError::Inference { source })?;
-                    let prompt = engine
-                        .create_voice_clone_prompt(&audio, Some(reference_text.as_str()))
-                        .map_err(|source| OrchionError::Inference { source })?;
-                    validate_voice_clone_icl_prompt(&prompt)?;
-                    engine
-                        .synthesize_voice_clone(
-                            text.as_str(),
-                            &prompt,
-                            language_to_upstream(language),
-                            Some(options_to_upstream(options)),
-                        )
-                        .map_err(|source| OrchionError::Inference { source })
-                }
-                TtsVoice::Design { prompt, language } => engine
-                    .synthesize_voice_design(
-                        text.as_str(),
-                        prompt.as_str(),
-                        language_to_upstream(language),
-                        Some(options_to_upstream(options)),
-                    )
-                    .map_err(|source| OrchionError::Inference { source }),
-            }?;
-            tracing::debug!(
-                text_chars = text_len,
-                samples = audio.samples.len(),
-                sample_rate = audio.sample_rate,
-                elapsed_ms = started.elapsed().as_millis(),
-                "TTS synthesis completed"
-            );
-            Ok(audio_from_upstream(audio))
-        })
-        .await
+        self.synthesize_upstream(text, voice, options)
+            .await
+            .map(audio_from_upstream)
     }
 
     pub async fn synthesize_to_file(
@@ -149,7 +95,7 @@ impl Tts {
         voice: TtsVoice,
         options: TtsOptions,
     ) -> Result<qwen3_tts::AudioBuffer> {
-        ensure_voice_supported(self.model, &voice)?;
+        ensure_voice_supported(&self.model, &voice)?;
         let text = text.as_ref().to_string();
         let text_len = text.chars().count();
         let engine = Arc::clone(&self.engine);
@@ -325,9 +271,12 @@ mod tests {
 
     #[test]
     fn model_capability_checks_match_voice_variants() {
+        let preset_model = TtsModel::parse("Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice").unwrap();
+        let clone_model = TtsModel::parse("Qwen/Qwen3-TTS-12Hz-0.6B-Base").unwrap();
+
         assert!(
             ensure_voice_supported(
-                TtsModel::Qwen3Tts06BCustomVoice,
+                &preset_model,
                 &TtsVoice::Preset {
                     speaker: TtsSpeaker::Ryan,
                     language: TtsLanguage::English,
@@ -337,7 +286,7 @@ mod tests {
         );
         assert!(
             ensure_voice_supported(
-                TtsModel::Qwen3Tts06BBase,
+                &clone_model,
                 &TtsVoice::Preset {
                     speaker: TtsSpeaker::Ryan,
                     language: TtsLanguage::English,
@@ -355,7 +304,7 @@ mod tests {
     #[test]
     fn exposes_explicit_device_loader_api() {
         let future = Tts::load_with_device(
-            TtsModel::Qwen3Tts06BCustomVoice,
+            TtsModel::parse("Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice").unwrap(),
             "models/qwen3-tts-0.6b-custom-voice",
             orchion_core::DevicePreference::Cpu,
         );

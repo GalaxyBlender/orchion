@@ -114,7 +114,7 @@ fn run_ocr_blocking(
         #[cfg(any(not(feature = "ocr"), not(feature = "ocr-vl")))]
         (_, LoadedOcrRuntime::Unsupported { model, capability }) => {
             Err(OrchionError::UnsupportedCapability {
-                model: model.id(),
+                model: model.id().to_string(),
                 capability,
             })
         }

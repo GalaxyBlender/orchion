@@ -52,8 +52,8 @@ impl Asr {
         .await
     }
 
-    pub const fn model(&self) -> AsrModel {
-        self.model
+    pub fn model(&self) -> AsrModel {
+        self.model.clone()
     }
 
     pub async fn transcribe_file(&self, path: impl AsRef<Path>) -> Result<AsrTranscript> {
@@ -216,7 +216,7 @@ mod tests {
     #[test]
     fn exposes_explicit_device_loader_api() {
         let future = Asr::load_with_device(
-            AsrModel::Qwen3Asr06B,
+            AsrModel::parse("Qwen/Qwen3-ASR-0.6B").unwrap(),
             "models/qwen3-asr-0.6b",
             orchion_core::DevicePreference::Cpu,
         );

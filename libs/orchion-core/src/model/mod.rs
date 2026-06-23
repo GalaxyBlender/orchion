@@ -50,20 +50,20 @@ impl fmt::Display for ModelCategory {
     }
 }
 
-pub trait ModelSpec: Copy + fmt::Debug + Eq + Send + 'static {
-    fn category(self) -> ModelCategory;
-    fn huggingface_repo(self) -> &'static str;
-    fn modelscope_repo(self) -> &'static str;
+pub trait ModelSpec: Clone + fmt::Debug + Eq + Send + Sync + 'static {
+    fn category(&self) -> ModelCategory;
+    fn huggingface_repo(&self) -> &str;
+    fn modelscope_repo(&self) -> &str;
 
-    fn required_files(self) -> &'static [&'static str] {
+    fn required_files(&self) -> &'static [&'static str] {
         &["config.json"]
     }
 
-    fn hub_assets(self) -> &'static [ModelHubAsset] {
+    fn hub_assets(&self) -> &'static [ModelHubAsset] {
         &[]
     }
 
-    fn cache_path(self, cache_dir: impl AsRef<Path>) -> PathBuf {
+    fn cache_path(&self, cache_dir: impl AsRef<Path>) -> PathBuf {
         self.huggingface_repo()
             .split('/')
             .fold(cache_dir.as_ref().to_path_buf(), |path, segment| {
@@ -78,10 +78,14 @@ mod tests {
 
     #[test]
     fn model_cache_paths_are_repository_scoped() {
-        let path = AsrModel::Qwen3Asr06B.cache_path("models");
+        let path = AsrModel::parse("Qwen/Qwen3-ASR-0.6B")
+            .unwrap()
+            .cache_path("models");
         assert!(path.ends_with("Qwen/Qwen3-ASR-0.6B"));
 
-        let path = TtsModel::Qwen3Tts06BCustomVoice.cache_path("models");
+        let path = TtsModel::parse("Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")
+            .unwrap()
+            .cache_path("models");
         assert!(path.ends_with("Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"));
     }
 }

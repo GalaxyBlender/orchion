@@ -2,7 +2,7 @@ use crate::api::openai::{
     ErrorBody, ModelList, OcrApiFormat, OcrJsonResponse, SpeechRequest, TranscriptionJson,
     TranscriptionVerboseJson,
 };
-use orchion_docs::PdfImageFormat;
+use orchion::docs::PdfImageFormat;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 

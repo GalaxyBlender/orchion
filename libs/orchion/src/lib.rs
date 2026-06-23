@@ -11,10 +11,10 @@ pub mod ocr;
 
 pub use orchion_core::{
     ASR_SAMPLE_RATE, AsrModel, AsrOptions, AsrSegment, AsrStreamingOptions,
-    AsrTimestampGranularity, AsrTranscript, DevicePreference, ModelCategory, ModelId, ModelSpec,
-    OcrLayoutBlock, OcrOptions, OcrPoint, OcrRegion, OcrResponseFormat, OcrResult, OcrTask,
-    OcrUsage, OrchionError, Result, TtsAudio, TtsLanguage, TtsModel, TtsOptions, TtsSpeaker,
-    TtsVoice, ensure_voice_supported, prepare_asr_samples,
+    AsrTimestampGranularity, AsrTranscript, DevicePreference, KnownOcrModel, ModelCategory,
+    ModelId, ModelSpec, OcrLayoutBlock, OcrModelKind, OcrOptions, OcrPoint, OcrRegion,
+    OcrResponseFormat, OcrResult, OcrTask, OcrUsage, OrchionError, Result, TtsAudio, TtsLanguage,
+    TtsModel, TtsOptions, TtsSpeaker, TtsVoice, ensure_voice_supported, prepare_asr_samples,
 };
 
 #[cfg(feature = "audio-ffmpeg")]

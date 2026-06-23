@@ -37,6 +37,33 @@ impl KnownOcrModel {
         }
     }
 
+    pub fn from_traditional_model_id(id: &ModelId) -> Result<Self> {
+        let model = Self::from_model_id(id)?;
+        if model.is_traditional_ocr() {
+            Ok(model)
+        } else {
+            Err(invalid_ocr_model_kind(id, "traditional OCR model"))
+        }
+    }
+
+    pub fn from_ocr_vl_model_id(id: &ModelId) -> Result<Self> {
+        let model = Self::from_model_id(id)?;
+        if model.is_ocr_vl() {
+            Ok(model)
+        } else {
+            Err(invalid_ocr_model_kind(id, "OCR-VL model"))
+        }
+    }
+
+    pub fn from_layout_model_id(id: &ModelId) -> Result<Self> {
+        let model = Self::from_model_id(id)?;
+        if model.is_layout_model() {
+            Ok(model)
+        } else {
+            Err(invalid_ocr_model_kind(id, "PaddlePaddle/PP-DocLayoutV3"))
+        }
+    }
+
     pub const fn id(self) -> &'static str {
         match self {
             Self::PpOcrV5Mobile => "PaddlePaddle/PP-OCRv5_mobile",
@@ -60,6 +87,18 @@ impl KnownOcrModel {
             Self::PpDocLayoutV3 => OcrModelKind::Layout,
             Self::PaddleOcrVl15 | Self::PaddleOcrVl16 => OcrModelKind::OcrVl,
         }
+    }
+
+    pub const fn is_traditional_ocr(self) -> bool {
+        matches!(self.kind(), OcrModelKind::TraditionalOcr)
+    }
+
+    pub const fn is_layout_model(self) -> bool {
+        matches!(self.kind(), OcrModelKind::Layout)
+    }
+
+    pub const fn is_ocr_vl(self) -> bool {
+        matches!(self.kind(), OcrModelKind::OcrVl)
     }
 
     pub const fn supports_markdown(self) -> bool {
@@ -100,6 +139,12 @@ impl KnownOcrModel {
             Self::PpOcrV6Small | Self::PpOcrV6Medium => Some("ppocrv6_dict.txt"),
             _ => None,
         }
+    }
+}
+
+fn invalid_ocr_model_kind(id: &ModelId, expected: &'static str) -> OrchionError {
+    OrchionError::ModelLoad {
+        source: anyhow::anyhow!("OCR model `{id}` is not a {expected}"),
     }
 }
 
@@ -214,22 +259,22 @@ const PP_DOCLAYOUTV3_ASSETS: &[ModelHubAsset] = &[ModelHubAsset {
 }];
 
 impl ModelSpec for KnownOcrModel {
-    fn category(self) -> ModelCategory {
-        match self.kind() {
+    fn category(&self) -> ModelCategory {
+        match (*self).kind() {
             OcrModelKind::TraditionalOcr | OcrModelKind::Layout => ModelCategory::Ocr,
             OcrModelKind::OcrVl => ModelCategory::OcrVl,
         }
     }
 
-    fn huggingface_repo(self) -> &'static str {
-        self.id()
+    fn huggingface_repo(&self) -> &str {
+        (*self).id()
     }
 
-    fn modelscope_repo(self) -> &'static str {
-        self.id()
+    fn modelscope_repo(&self) -> &str {
+        (*self).id()
     }
 
-    fn required_files(self) -> &'static [&'static str] {
+    fn required_files(&self) -> &'static [&'static str] {
         match self {
             Self::PpOcrV5Mobile => &[],
             Self::PpOcrV5Server => &["ppocrv5_dict.txt"],
@@ -245,7 +290,7 @@ impl ModelSpec for KnownOcrModel {
         }
     }
 
-    fn hub_assets(self) -> &'static [ModelHubAsset] {
+    fn hub_assets(&self) -> &'static [ModelHubAsset] {
         match self {
             Self::PpOcrV5Mobile => PP_OCRV5_MOBILE_ASSETS,
             Self::PpOcrV5Server => PP_OCRV5_SERVER_ASSETS,
@@ -277,6 +322,28 @@ mod tests {
         let model = KnownOcrModel::from_model_id(&id).unwrap();
         assert_eq!(model.kind(), OcrModelKind::TraditionalOcr);
         assert!(!model.supports_markdown());
+    }
+
+    #[test]
+    fn resolves_ocr_models_by_expected_capability() {
+        let traditional = ModelId::parse("PaddlePaddle/PP-OCRv6_tiny").unwrap();
+        let ocr_vl = ModelId::parse("PaddlePaddle/PaddleOCR-VL-1.6").unwrap();
+        let layout = ModelId::parse("PaddlePaddle/PP-DocLayoutV3").unwrap();
+
+        assert_eq!(
+            KnownOcrModel::from_traditional_model_id(&traditional).unwrap(),
+            KnownOcrModel::PpOcrV6Tiny
+        );
+        assert_eq!(
+            KnownOcrModel::from_ocr_vl_model_id(&ocr_vl).unwrap(),
+            KnownOcrModel::PaddleOcrVl16
+        );
+        assert_eq!(
+            KnownOcrModel::from_layout_model_id(&layout).unwrap(),
+            KnownOcrModel::PpDocLayoutV3
+        );
+        assert!(KnownOcrModel::from_layout_model_id(&traditional).is_err());
+        assert!(KnownOcrModel::from_ocr_vl_model_id(&layout).is_err());
     }
 
     #[test]

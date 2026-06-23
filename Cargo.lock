@@ -3314,8 +3314,6 @@ dependencies = [
  "http-body-util",
  "include_dir",
  "orchion",
- "orchion-core",
- "orchion-docs",
  "serde",
  "serde_json",
  "tar",

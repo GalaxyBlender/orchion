@@ -22,7 +22,8 @@ async fn main() -> Result<()> {
             reason: source.to_string(),
         })?;
 
-    let asr = Asr::load_or_download(AsrModel::Qwen3Asr06B, cache_dir).await?;
+    let model = AsrModel::parse("Qwen/Qwen3-ASR-0.6B").expect("example model id is valid");
+    let asr = Asr::load_or_download(model, cache_dir).await?;
     let mut stream = asr.start_streaming().await?;
     for chunk in samples.chunks(sample_rate as usize) {
         if let Some(partial) = stream.feed(chunk, sample_rate).await? {

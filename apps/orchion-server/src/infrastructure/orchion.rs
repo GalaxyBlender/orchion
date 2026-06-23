@@ -4,24 +4,23 @@ use crate::application::model_cache::{
 };
 use crate::settings::ServerConfig;
 use anyhow::Context;
-use orchion::{Asr, ModelDownloader, ModelId, Ocr, Tts};
-use orchion_core::KnownOcrModel;
+use orchion::{Asr, KnownOcrModel, ModelDownloader, ModelId, Ocr, Tts};
 use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub config: ServerConfig,
-    pub asr_models: AsrModelCache,
-    pub tts_models: TtsModelCache,
-    pub ocr_models: OcrModelCache,
-    pub ocr_vl_models: OcrVlModelCache,
-    pub global_models: GlobalModelCacheLimiter,
+    config: ServerConfig,
+    asr_models: AsrModelCache,
+    tts_models: TtsModelCache,
+    ocr_models: OcrModelCache,
+    ocr_vl_models: OcrVlModelCache,
+    global_models: GlobalModelCacheLimiter,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orchion_core::KnownOcrModel;
+    use orchion::KnownOcrModel;
 
     #[tokio::test]
     async fn disabled_ocr_services_skip_empty_caches() {
@@ -63,8 +62,20 @@ mod tests {
 
         let state = AppState::load(config).await.unwrap();
 
-        assert!(state.ocr_models.idle_timeout() > std::time::Duration::ZERO);
-        assert!(state.ocr_vl_models.idle_timeout() > std::time::Duration::ZERO);
+        assert!(
+            state
+                .ocr(KnownOcrModel::PpOcrV6Tiny)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            state
+                .ocr_vl(KnownOcrModel::PaddleOcrVl16)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -129,18 +140,7 @@ impl AppState {
         let downloader = ModelDownloader::new(config.models.source.into());
         let ocr_active = config.services.ocr.active();
         let ocr_vl_active = config.services.ocr_vl.active();
-        let ocr_available_models = if ocr_active {
-            resolve_known_ocr_models(&config.services.ocr.available_models)
-                .context("resolve configured OCR models")?
-        } else {
-            Vec::new()
-        };
-        let ocr_vl_available_models = if ocr_vl_active {
-            resolve_known_ocr_models(&config.services.ocr_vl.available_models)
-                .context("resolve configured OCR-VL models")?
-        } else {
-            Vec::new()
-        };
+        let resolved_ocr_models = resolve_configured_ocr_models(&config)?;
         let asr_count = if config.services.asr.enabled {
             ensure_available_models(
                 "ASR",
@@ -183,7 +183,7 @@ impl AppState {
             ensure_available_models(
                 "OCR",
                 &downloader,
-                &ocr_available_models,
+                &resolved_ocr_models.ocr,
                 &config.models.dir,
             )
             .await
@@ -209,7 +209,7 @@ impl AppState {
             let ocr_vl_count = ensure_available_models(
                 "OCR-VL",
                 &downloader,
-                &ocr_vl_available_models,
+                &resolved_ocr_models.ocr_vl,
                 &config.models.dir,
             )
             .await
@@ -219,6 +219,28 @@ impl AppState {
             tracing::trace!("OCR-VL model download check skipped because service is inactive");
             0
         };
+        let state = Arc::new(Self::build(config, resolved_ocr_models));
+        state.spawn_idle_cleanup();
+        tracing::info!(
+            asr = asr_count,
+            tts = tts_count,
+            ocr = ocr_count,
+            ocr_vl = ocr_vl_count,
+            "model cache ready"
+        );
+        Ok(state)
+    }
+
+    pub fn from_prepared_config(config: ServerConfig) -> anyhow::Result<Self> {
+        let resolved_ocr_models = resolve_configured_ocr_models(&config)?;
+        Ok(Self::build(config, resolved_ocr_models))
+    }
+
+    pub const fn config(&self) -> &ServerConfig {
+        &self.config
+    }
+
+    fn build(config: ServerConfig, resolved_ocr_models: ResolvedOcrModels) -> Self {
         let asr_models = AsrModelCache::new(
             "asr",
             config.services.asr.available_models.clone(),
@@ -235,36 +257,27 @@ impl AppState {
         );
         let ocr_models = OcrModelCache::new(
             "ocr",
-            ocr_available_models,
+            resolved_ocr_models.ocr,
             config.services.ocr.idle_timeout,
             config.services.ocr.max_loaded,
             config.models.dir.clone(),
         );
         let ocr_vl_models = OcrVlModelCache::new(
             "ocr-vl",
-            ocr_vl_available_models,
+            resolved_ocr_models.ocr_vl,
             config.services.ocr_vl.idle_timeout,
             config.services.ocr_vl.max_loaded,
             config.models.dir.clone(),
         );
         let global_models = GlobalModelCacheLimiter::new(config.models.max_loaded);
-        let state = Arc::new(Self {
+        Self {
             config,
             asr_models,
             tts_models,
             ocr_models,
             ocr_vl_models,
             global_models,
-        });
-        state.spawn_idle_cleanup();
-        tracing::info!(
-            asr = asr_count,
-            tts = tts_count,
-            ocr = ocr_count,
-            ocr_vl = ocr_vl_count,
-            "model cache ready"
-        );
-        Ok(state)
+        }
     }
 
     pub async fn asr(&self, model: orchion::AsrModel) -> anyhow::Result<Option<Asr>> {
@@ -443,6 +456,33 @@ impl AppState {
     }
 }
 
+struct ResolvedOcrModels {
+    ocr: Vec<KnownOcrModel>,
+    ocr_vl: Vec<KnownOcrModel>,
+}
+
+fn resolve_configured_ocr_models(config: &ServerConfig) -> anyhow::Result<ResolvedOcrModels> {
+    let ocr = if config.services.ocr.active() {
+        resolve_ocr_models(
+            &config.services.ocr.available_models,
+            KnownOcrModel::from_traditional_model_id,
+        )
+        .context("resolve configured OCR models")?
+    } else {
+        Vec::new()
+    };
+    let ocr_vl = if config.services.ocr_vl.active() {
+        resolve_ocr_models(
+            &config.services.ocr_vl.available_models,
+            KnownOcrModel::from_ocr_vl_model_id,
+        )
+        .context("resolve configured OCR-VL models")?
+    } else {
+        Vec::new()
+    };
+    Ok(ResolvedOcrModels { ocr, ocr_vl })
+}
+
 enum ActiveModelCaches<'a> {
     Empty([&'a dyn CacheTracker; 0]),
     One([&'a dyn CacheTracker; 1]),
@@ -463,12 +503,14 @@ impl<'a> ActiveModelCaches<'a> {
     }
 }
 
-fn resolve_known_ocr_models(models: &[ModelId]) -> anyhow::Result<Vec<KnownOcrModel>> {
+fn resolve_ocr_models(
+    models: &[ModelId],
+    resolve: fn(&ModelId) -> orchion::Result<KnownOcrModel>,
+) -> anyhow::Result<Vec<KnownOcrModel>> {
     models
         .iter()
         .map(|model| {
-            KnownOcrModel::from_model_id(model)
-                .with_context(|| format!("resolve configured OCR model `{model}`"))
+            resolve(model).with_context(|| format!("resolve configured OCR model `{model}`"))
         })
         .collect()
 }
@@ -480,12 +522,9 @@ fn resolve_layout_models(
     models
         .iter()
         .map(|model| {
-            let known = KnownOcrModel::from_model_id(model)
+            KnownOcrModel::from_layout_model_id(model)
                 .with_context(|| format!("resolve OCR layout model `{model}`"))?;
-            if known != KnownOcrModel::PpDocLayoutV3 {
-                anyhow::bail!("layout model `{model}` must be `PaddlePaddle/PP-DocLayoutV3`");
-            }
-            Ok(known)
+            Ok(KnownOcrModel::PpDocLayoutV3)
         })
         .collect::<anyhow::Result<Vec<_>>>()
         .context(context)

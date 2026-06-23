@@ -85,23 +85,23 @@ pub enum TtsVoice {
     },
 }
 
-pub fn ensure_voice_supported(model: TtsModel, voice: &TtsVoice) -> Result<()> {
+pub fn ensure_voice_supported(model: &TtsModel, voice: &TtsVoice) -> Result<()> {
     match voice {
         TtsVoice::Preset { .. } if !model.supports_preset_speakers() => {
             Err(OrchionError::UnsupportedCapability {
-                model: model.huggingface_repo(),
+                model: model.huggingface_repo().to_string(),
                 capability: "preset speakers",
             })
         }
         TtsVoice::Clone { .. } if !model.supports_voice_cloning() => {
             Err(OrchionError::UnsupportedCapability {
-                model: model.huggingface_repo(),
+                model: model.huggingface_repo().to_string(),
                 capability: "voice cloning",
             })
         }
         TtsVoice::Design { .. } if !model.supports_voice_design() => {
             Err(OrchionError::UnsupportedCapability {
-                model: model.huggingface_repo(),
+                model: model.huggingface_repo().to_string(),
                 capability: "voice design",
             })
         }
@@ -115,9 +115,12 @@ mod tests {
 
     #[test]
     fn model_capability_checks_match_voice_variants() {
+        let preset_model = TtsModel::parse("Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice").unwrap();
+        let clone_model = TtsModel::parse("Qwen/Qwen3-TTS-12Hz-0.6B-Base").unwrap();
+
         assert!(
             ensure_voice_supported(
-                TtsModel::Qwen3Tts06BCustomVoice,
+                &preset_model,
                 &TtsVoice::Preset {
                     speaker: TtsSpeaker::Ryan,
                     language: TtsLanguage::English,
@@ -127,7 +130,7 @@ mod tests {
         );
         assert!(
             ensure_voice_supported(
-                TtsModel::Qwen3Tts06BBase,
+                &clone_model,
                 &TtsVoice::Preset {
                     speaker: TtsSpeaker::Ryan,
                     language: TtsLanguage::English,

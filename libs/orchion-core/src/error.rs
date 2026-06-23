@@ -37,7 +37,7 @@ pub enum OrchionError {
 
     #[error("model {model} does not support {capability}")]
     UnsupportedCapability {
-        model: &'static str,
+        model: String,
         capability: &'static str,
     },
 

@@ -4,9 +4,6 @@ use http_body_util::BodyExt;
 use orchion::{AsrModel, ModelId, TtsModel};
 use orchion_server::api::ui;
 use orchion_server::config::ServerConfig;
-use orchion_server::model_cache::{
-    AsrModelCache, GlobalModelCacheLimiter, OcrModelCache, OcrVlModelCache, TtsModelCache,
-};
 use orchion_server::routes::{router, router_with_ui_routes};
 use orchion_server::state::AppState;
 use serde_json::Value;
@@ -62,10 +59,7 @@ async fn models_endpoint_returns_configured_models() {
         model_subtype(&body, "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"),
         Some("preset_voice")
     );
-    assert_eq!(
-        model_type(&body, "Qwen/Qwen3-TTS-12Hz-0.6B-Base"),
-        "tts"
-    );
+    assert_eq!(model_type(&body, "Qwen/Qwen3-TTS-12Hz-0.6B-Base"), "tts");
     assert_eq!(
         model_subtype(&body, "Qwen/Qwen3-TTS-12Hz-0.6B-Base"),
         Some("voice_clone")
@@ -152,11 +146,11 @@ async fn models_endpoint_includes_active_ocr_model_ids() {
 
 #[tokio::test]
 async fn models_endpoint_includes_configured_ocr_layout_model_ids() {
-    let mut state = test_state_with_ocr_services(None);
-    let state_mut = Arc::get_mut(&mut state).unwrap();
     let layout_model = ModelId::parse("PaddlePaddle/PP-DocLayoutV3").unwrap();
-    state_mut.config.services.ocr.layout_available_models = vec![layout_model.clone()];
-    state_mut.config.services.ocr_vl.layout_available_models = vec![layout_model];
+    let state = test_state_with_ocr_services_config(None, |config| {
+        config.services.ocr.layout_available_models = vec![layout_model.clone()];
+        config.services.ocr_vl.layout_available_models = vec![layout_model];
+    });
 
     let response = router(state)
         .oneshot(
@@ -178,10 +172,7 @@ async fn models_endpoint_includes_configured_ocr_layout_model_ids() {
             .count(),
         1
     );
-    assert_eq!(
-        model_type(&body, "PaddlePaddle/PP-DocLayoutV3"),
-        "ocr"
-    );
+    assert_eq!(model_type(&body, "PaddlePaddle/PP-DocLayoutV3"), "ocr");
     assert_eq!(
         model_subtype(&body, "PaddlePaddle/PP-DocLayoutV3"),
         Some("layout")
@@ -726,19 +717,26 @@ fn test_state(api_key: Option<&str>) -> Arc<AppState> {
 }
 
 fn test_state_with_ocr_services(api_key: Option<&str>) -> Arc<AppState> {
-    let mut state = test_state_with_services(api_key, false, false);
-    let state_mut = Arc::get_mut(&mut state).unwrap();
-    state_mut.config.services.ocr.enabled = true;
-    state_mut.config.services.ocr.default_model =
-        Some(ModelId::parse("PaddlePaddle/PP-OCRv6_tiny").unwrap());
-    state_mut.config.services.ocr.available_models =
-        vec![ModelId::parse("PaddlePaddle/PP-OCRv6_tiny").unwrap()];
-    state_mut.config.services.ocr_vl.enabled = true;
-    state_mut.config.services.ocr_vl.default_model =
-        Some(ModelId::parse("PaddlePaddle/PaddleOCR-VL-1.6").unwrap());
-    state_mut.config.services.ocr_vl.available_models =
-        vec![ModelId::parse("PaddlePaddle/PaddleOCR-VL-1.6").unwrap()];
-    state
+    test_state_with_ocr_services_config(api_key, |_| {})
+}
+
+fn test_state_with_ocr_services_config(
+    api_key: Option<&str>,
+    configure: impl FnOnce(&mut ServerConfig),
+) -> Arc<AppState> {
+    test_state_with_services_config(api_key, false, false, |config| {
+        config.services.ocr.enabled = true;
+        config.services.ocr.default_model =
+            Some(ModelId::parse("PaddlePaddle/PP-OCRv6_tiny").unwrap());
+        config.services.ocr.available_models =
+            vec![ModelId::parse("PaddlePaddle/PP-OCRv6_tiny").unwrap()];
+        config.services.ocr_vl.enabled = true;
+        config.services.ocr_vl.default_model =
+            Some(ModelId::parse("PaddlePaddle/PaddleOCR-VL-1.6").unwrap());
+        config.services.ocr_vl.available_models =
+            vec![ModelId::parse("PaddlePaddle/PaddleOCR-VL-1.6").unwrap()];
+        configure(config);
+    })
 }
 
 fn test_state_with_services(
@@ -746,57 +744,42 @@ fn test_state_with_services(
     asr_enabled: bool,
     tts_enabled: bool,
 ) -> Arc<AppState> {
+    test_state_with_services_config(api_key, asr_enabled, tts_enabled, |_| {})
+}
+
+fn test_state_with_services_config(
+    api_key: Option<&str>,
+    asr_enabled: bool,
+    tts_enabled: bool,
+    configure: impl FnOnce(&mut ServerConfig),
+) -> Arc<AppState> {
     let mut config = ServerConfig::default_for_exe(std::path::Path::new("/tmp/orchion-server"));
     config.auth.api_key = api_key.map(str::to_string);
     config.services.asr.enabled = asr_enabled;
     config.services.tts.enabled = tts_enabled;
-    config.services.asr.available_models = vec![AsrModel::Qwen3Asr06B, AsrModel::Qwen3Asr17B];
+    config.services.asr.available_models = vec![
+        asr_model("Qwen/Qwen3-ASR-0.6B"),
+        asr_model("Qwen/Qwen3-ASR-1.7B"),
+    ];
     config.services.asr.idle_timeout = Duration::from_secs(600);
     config.services.asr.max_loaded = 2;
     config.services.tts.available_models = vec![
-        TtsModel::Qwen3Tts06BCustomVoice,
-        TtsModel::Qwen3Tts06BBase,
-        TtsModel::Qwen3Tts17BVoiceDesign,
+        tts_model("Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"),
+        tts_model("Qwen/Qwen3-TTS-12Hz-0.6B-Base"),
+        tts_model("Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"),
     ];
     config.services.tts.idle_timeout = Duration::from_secs(600);
     config.services.tts.max_loaded = 2;
-    let asr_models = AsrModelCache::new(
-        "asr",
-        config.services.asr.available_models.clone(),
-        config.services.asr.idle_timeout,
-        config.services.asr.max_loaded,
-        config.models.dir.clone(),
-    );
-    let tts_models = TtsModelCache::new(
-        "tts",
-        config.services.tts.available_models.clone(),
-        config.services.tts.idle_timeout,
-        config.services.tts.max_loaded,
-        config.models.dir.clone(),
-    );
-    let ocr_models = OcrModelCache::new(
-        "ocr",
-        Vec::new(),
-        config.services.ocr.idle_timeout,
-        config.services.ocr.max_loaded,
-        config.models.dir.clone(),
-    );
-    let ocr_vl_models = OcrVlModelCache::new(
-        "ocr-vl",
-        Vec::new(),
-        config.services.ocr_vl.idle_timeout,
-        config.services.ocr_vl.max_loaded,
-        config.models.dir.clone(),
-    );
-    let global_models = GlobalModelCacheLimiter::new(config.models.max_loaded);
-    Arc::new(AppState {
-        config,
-        asr_models,
-        tts_models,
-        ocr_models,
-        ocr_vl_models,
-        global_models,
-    })
+    configure(&mut config);
+    Arc::new(AppState::from_prepared_config(config).unwrap())
+}
+
+fn asr_model(value: &str) -> AsrModel {
+    AsrModel::parse(value).unwrap()
+}
+
+fn tts_model(value: &str) -> TtsModel {
+    TtsModel::parse(value).unwrap()
 }
 
 fn create_test_dist(test_name: &str, marker: &str) -> PathBuf {

@@ -5,8 +5,9 @@ async fn main() -> Result<()> {
     let cache_dir = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "models".to_string());
+    let model = AsrModel::parse("Qwen/Qwen3-ASR-0.6B").expect("example model id is valid");
     let path = ModelDownloader::default()
-        .download(AsrModel::Qwen3Asr06B, cache_dir)
+        .download(model, cache_dir)
         .await?;
     println!("downloaded model to {}", path.display());
     Ok(())

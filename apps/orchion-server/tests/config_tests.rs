@@ -3,6 +3,14 @@ use orchion_server::config::{ConfigError, ModelSource, ServerConfig};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
+fn asr_model(value: &str) -> AsrModel {
+    AsrModel::parse(value).unwrap()
+}
+
+fn tts_model(value: &str) -> TtsModel {
+    TtsModel::parse(value).unwrap()
+}
+
 #[test]
 fn defaults_are_executable_relative() {
     let exe_path = std::path::Path::new("/tmp/orchion/bin/orchion-server");
@@ -20,10 +28,13 @@ fn defaults_are_executable_relative() {
     assert_eq!(config.models.source, ModelSource::Auto);
     assert_eq!(config.models.max_loaded, 2);
     assert!(!config.services.asr.enabled);
-    assert_eq!(config.services.asr.default_model, AsrModel::Qwen3Asr06B);
+    assert_eq!(
+        config.services.asr.default_model,
+        asr_model("Qwen/Qwen3-ASR-0.6B")
+    );
     assert_eq!(
         config.services.asr.available_models,
-        vec![AsrModel::Qwen3Asr06B]
+        vec![asr_model("Qwen/Qwen3-ASR-0.6B")]
     );
     assert_eq!(config.services.asr.idle_timeout, Duration::from_secs(600));
     assert_eq!(config.services.asr.max_loaded, 1);
@@ -31,11 +42,11 @@ fn defaults_are_executable_relative() {
     assert!(!config.services.tts.enabled);
     assert_eq!(
         config.services.tts.default_model,
-        TtsModel::Qwen3Tts06BCustomVoice
+        tts_model("Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")
     );
     assert_eq!(
         config.services.tts.available_models,
-        vec![TtsModel::Qwen3Tts06BCustomVoice]
+        vec![tts_model("Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")]
     );
     assert_eq!(config.services.tts.idle_timeout, Duration::from_secs(600));
     assert_eq!(config.services.tts.max_loaded, 1);
@@ -398,10 +409,16 @@ api_key = "test-secret"
     assert_eq!(config.models.source, ModelSource::ModelScope);
     assert_eq!(config.models.max_loaded, 3);
     assert!(config.services.asr.enabled);
-    assert_eq!(config.services.asr.default_model, AsrModel::Qwen3Asr17B);
+    assert_eq!(
+        config.services.asr.default_model,
+        asr_model("Qwen/Qwen3-ASR-1.7B")
+    );
     assert_eq!(
         config.services.asr.available_models,
-        vec![AsrModel::Qwen3Asr06B, AsrModel::Qwen3Asr17B]
+        vec![
+            asr_model("Qwen/Qwen3-ASR-0.6B"),
+            asr_model("Qwen/Qwen3-ASR-1.7B"),
+        ]
     );
     assert_eq!(config.services.asr.idle_timeout, Duration::from_secs(300));
     assert_eq!(config.services.asr.max_loaded, 2);
@@ -409,13 +426,13 @@ api_key = "test-secret"
     assert!(config.services.tts.enabled);
     assert_eq!(
         config.services.tts.default_model,
-        TtsModel::Qwen3Tts17BVoiceDesign
+        tts_model("Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign")
     );
     assert_eq!(
         config.services.tts.available_models,
         vec![
-            TtsModel::Qwen3Tts06BCustomVoice,
-            TtsModel::Qwen3Tts17BVoiceDesign,
+            tts_model("Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"),
+            tts_model("Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"),
         ]
     );
     assert_eq!(config.services.tts.idle_timeout, Duration::from_secs(30));
@@ -506,10 +523,13 @@ available_models = ["Qwen/Qwen3-ASR-0.6B"]
     .unwrap();
 
     assert!(!config.services.asr.enabled);
-    assert_eq!(config.services.asr.default_model, AsrModel::Qwen3Asr17B);
+    assert_eq!(
+        config.services.asr.default_model,
+        asr_model("Qwen/Qwen3-ASR-1.7B")
+    );
     assert_eq!(
         config.services.asr.available_models,
-        vec![AsrModel::Qwen3Asr06B]
+        vec![asr_model("Qwen/Qwen3-ASR-0.6B")]
     );
 }
 
@@ -574,7 +594,7 @@ max_upload_size = "huge"
 }
 
 #[test]
-fn unknown_model_name_is_rejected() {
+fn invalid_asr_model_id_is_rejected() {
     let exe_path = std::path::Path::new("/tmp/orchion-server");
     let error = ServerConfig::from_toml_str(
         r#"
@@ -585,11 +605,11 @@ available_models = ["not-a-model"]
     )
     .unwrap_err();
 
-    assert!(error.to_string().contains("unknown ASR model"));
+    assert!(error.to_string().contains("invalid ASR model id"));
 }
 
 #[test]
-fn legacy_asr_and_tts_aliases_are_rejected() {
+fn invalid_short_asr_and_tts_model_ids_are_rejected() {
     let exe_path = std::path::Path::new("/tmp/orchion-server");
     let error = ServerConfig::from_toml_str(
         r#"
@@ -599,7 +619,7 @@ available_models = ["qwen3-asr-0.6b"]
         exe_path,
     )
     .unwrap_err();
-    assert!(error.to_string().contains("unknown ASR model"));
+    assert!(error.to_string().contains("invalid ASR model id"));
 
     let error = ServerConfig::from_toml_str(
         r#"
@@ -609,7 +629,28 @@ available_models = ["qwen3-tts-0.6b-custom-voice"]
         exe_path,
     )
     .unwrap_err();
-    assert!(error.to_string().contains("unknown TTS model"));
+    assert!(error.to_string().contains("invalid TTS model id"));
+}
+
+#[test]
+fn custom_asr_and_tts_model_ids_are_accepted() {
+    let exe_path = std::path::Path::new("/tmp/orchion-server");
+    let config = ServerConfig::from_toml_str(
+        r#"
+[services.asr]
+default_model = "Acme/New-ASR"
+available_models = ["Acme/New-ASR"]
+
+[services.tts]
+default_model = "Acme/New-TTS"
+available_models = ["Acme/New-TTS"]
+"#,
+        exe_path,
+    )
+    .unwrap();
+
+    assert_eq!(config.services.asr.default_model.as_str(), "Acme/New-ASR");
+    assert_eq!(config.services.tts.default_model.as_str(), "Acme/New-TTS");
 }
 
 #[test]

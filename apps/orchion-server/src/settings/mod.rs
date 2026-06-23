@@ -1,7 +1,7 @@
 use orchion::{
-    AsrModel, DevicePreference, DownloadSource, ModelId, ModelSpec, OcrResponseFormat, TtsModel,
+    AsrModel, DevicePreference, DownloadSource, KnownOcrModel, ModelId, ModelSpec,
+    OcrResponseFormat, TtsModel,
 };
-use orchion_core::{KnownOcrModel, OcrModelKind};
 use serde::Deserialize;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -138,10 +138,10 @@ pub enum ConfigError {
     InvalidUploadSize { value: String, message: String },
     #[error("unknown model source `{0}`; expected auto, huggingface, or modelscope")]
     UnknownModelSource(String),
-    #[error("unknown ASR model `{0}`")]
-    UnknownAsrModel(String),
-    #[error("unknown TTS model `{0}`")]
-    UnknownTtsModel(String),
+    #[error("invalid ASR model id `{0}`; expected vendor/name")]
+    InvalidAsrModelId(String),
+    #[error("invalid TTS model id `{0}`; expected vendor/name")]
+    InvalidTtsModelId(String),
     #[error("invalid duration `{value}`: {message}")]
     InvalidDuration { value: String, message: String },
     #[error("invalid {section}.max_loaded `{value}`: value must be greater than zero")]
@@ -197,16 +197,16 @@ impl ServerConfig {
             services: ServicesSection {
                 asr: ModelServiceSection {
                     enabled: false,
-                    default_model: AsrModel::Qwen3Asr06B,
-                    available_models: vec![AsrModel::Qwen3Asr06B],
+                    default_model: default_asr_model(),
+                    available_models: vec![default_asr_model()],
                     idle_timeout: Duration::from_secs(600),
                     max_loaded: 1,
                     device: DevicePreference::Auto,
                 },
                 tts: TtsServiceSection {
                     enabled: false,
-                    default_model: TtsModel::Qwen3Tts06BCustomVoice,
-                    available_models: vec![TtsModel::Qwen3Tts06BCustomVoice],
+                    default_model: default_tts_model(),
+                    available_models: vec![default_tts_model()],
                     idle_timeout: Duration::from_secs(600),
                     max_loaded: 1,
                     device: DevicePreference::Auto,
@@ -560,14 +560,13 @@ fn validate_traditional_ocr_model(
     section: &'static str,
     model: &ModelId,
 ) -> Result<(), ConfigError> {
-    match known_ocr_model(section, model)?.kind() {
-        OcrModelKind::TraditionalOcr => Ok(()),
-        OcrModelKind::Layout | OcrModelKind::OcrVl => Err(ConfigError::InvalidOcrModelKind {
+    KnownOcrModel::from_traditional_model_id(model)
+        .map(|_| ())
+        .map_err(|_| ConfigError::InvalidOcrModelKind {
             section,
             model: model.to_string(),
             expected: "traditional OCR model",
-        }),
-    }
+        })
 }
 
 fn validate_ocr_layout_config(
@@ -595,36 +594,23 @@ fn validate_ocr_layout_config(
 }
 
 fn validate_ocr_vl_model(section: &'static str, model: &ModelId) -> Result<(), ConfigError> {
-    match known_ocr_model(section, model)?.kind() {
-        OcrModelKind::OcrVl => Ok(()),
-        OcrModelKind::TraditionalOcr | OcrModelKind::Layout => {
-            Err(ConfigError::InvalidOcrModelKind {
-                section,
-                model: model.to_string(),
-                expected: "OCR-VL model",
-            })
-        }
-    }
+    KnownOcrModel::from_ocr_vl_model_id(model)
+        .map(|_| ())
+        .map_err(|_| ConfigError::InvalidOcrModelKind {
+            section,
+            model: model.to_string(),
+            expected: "OCR-VL model",
+        })
 }
 
 fn validate_layout_model(section: &'static str, model: &ModelId) -> Result<(), ConfigError> {
-    let known = known_ocr_model(section, model)?;
-    if known == KnownOcrModel::PpDocLayoutV3 {
-        return Ok(());
-    }
-    Err(ConfigError::InvalidOcrModelKind {
-        section,
-        model: model.to_string(),
-        expected: "PaddlePaddle/PP-DocLayoutV3",
-    })
-}
-
-fn known_ocr_model(section: &'static str, model: &ModelId) -> Result<KnownOcrModel, ConfigError> {
-    KnownOcrModel::from_model_id(model).map_err(|_| ConfigError::InvalidOcrModelKind {
-        section,
-        model: model.to_string(),
-        expected: "supported OCR model",
-    })
+    KnownOcrModel::from_layout_model_id(model)
+        .map(|_| ())
+        .map_err(|_| ConfigError::InvalidOcrModelKind {
+            section,
+            model: model.to_string(),
+            expected: "PaddlePaddle/PP-DocLayoutV3",
+        })
 }
 
 fn apply_service_limits(
@@ -751,13 +737,21 @@ fn parse_upload_size(value: &str) -> Result<usize, ConfigError> {
 pub fn parse_asr_model(value: &str) -> Result<AsrModel, ConfigError> {
     value
         .parse()
-        .map_err(|_| ConfigError::UnknownAsrModel(value.to_string()))
+        .map_err(|_| ConfigError::InvalidAsrModelId(value.to_string()))
 }
 
 pub fn parse_tts_model(value: &str) -> Result<TtsModel, ConfigError> {
     value
         .parse()
-        .map_err(|_| ConfigError::UnknownTtsModel(value.to_string()))
+        .map_err(|_| ConfigError::InvalidTtsModelId(value.to_string()))
+}
+
+fn default_asr_model() -> AsrModel {
+    AsrModel::parse("Qwen/Qwen3-ASR-0.6B").expect("default ASR model id is valid")
+}
+
+fn default_tts_model() -> TtsModel {
+    TtsModel::parse("Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice").expect("default TTS model id is valid")
 }
 
 fn parse_model_ids(section: &'static str, values: &[String]) -> Result<Vec<ModelId>, ConfigError> {

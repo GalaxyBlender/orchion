@@ -9,7 +9,9 @@ async fn main() -> Result<()> {
     let output_path = args.next().unwrap_or_else(|| "output.wav".to_string());
     let cache_dir = args.next().unwrap_or_else(|| "models".to_string());
 
-    let tts = Tts::load_or_download(TtsModel::Qwen3Tts06BCustomVoice, cache_dir).await?;
+    let model =
+        TtsModel::parse("Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice").expect("example model id is valid");
+    let tts = Tts::load_or_download(model, cache_dir).await?;
     tts.synthesize_to_file(
         text,
         TtsVoice::Preset {

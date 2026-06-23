@@ -132,12 +132,12 @@ impl ModelDownloader {
         let cache_dir = cache_dir.as_ref();
         let target = model.cache_path(cache_dir);
 
-        if is_ready_cache(model, &target).await? {
+        if is_ready_cache(&model, &target).await? {
             tracing::debug!(model = ?model, path = %target.display(), "model cache ready");
             return Ok(target);
         }
 
-        if !uses_hub_download(model) {
+        if !uses_hub_download(&model) {
             unreachable!("direct asset downloads are not implemented yet");
         }
 
@@ -156,13 +156,15 @@ impl ModelDownloader {
         let mut failures = Vec::new();
         for candidate in candidates {
             if !assets.is_empty() {
-                match download_hub_assets(model, candidate, assets, cache_dir, &target, client, env)
-                    .await
+                match download_hub_assets(
+                    &model, candidate, assets, cache_dir, &target, client, env,
+                )
+                .await
                 {
                     Ok(()) => {
-                        prepare_cached_model(model, &target, candidate.label()).await?;
-                        ensure_ready_cache_files(model, &target, candidate.label()).await?;
-                        write_ready_manifest(model, &target, candidate.label()).await?;
+                        prepare_cached_model(&model, &target, candidate.label()).await?;
+                        ensure_ready_cache_files(&model, &target, candidate.label()).await?;
+                        write_ready_manifest(&model, &target, candidate.label()).await?;
                         tracing::info!(
                             source = candidate.label(),
                             path = %target.display(),
@@ -199,9 +201,9 @@ impl ModelDownloader {
                 .await
             {
                 Ok(()) => {
-                    prepare_cached_model(model, &target, candidate.label()).await?;
-                    ensure_ready_cache_files(model, &target, candidate.label()).await?;
-                    write_ready_manifest(model, &target, candidate.label()).await?;
+                    prepare_cached_model(&model, &target, candidate.label()).await?;
+                    ensure_ready_cache_files(&model, &target, candidate.label()).await?;
+                    write_ready_manifest(&model, &target, candidate.label()).await?;
                     tracing::info!(
                         source = candidate.label(),
                         repo,
@@ -255,7 +257,7 @@ impl ModelDownloader {
     }
 }
 
-async fn is_ready_cache<M: ModelSpec>(model: M, target: &Path) -> Result<bool> {
+async fn is_ready_cache<M: ModelSpec>(model: &M, target: &Path) -> Result<bool> {
     let manifest = match tokio::fs::read_to_string(target.join(READY_MANIFEST_FILE)).await {
         Ok(manifest) => manifest,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -280,7 +282,7 @@ async fn is_ready_cache<M: ModelSpec>(model: M, target: &Path) -> Result<bool> {
     required_cache_files_exist(model, target).await
 }
 
-async fn required_cache_files_exist<M: ModelSpec>(model: M, target: &Path) -> Result<bool> {
+async fn required_cache_files_exist<M: ModelSpec>(model: &M, target: &Path) -> Result<bool> {
     for file_name in model.required_files() {
         if !cache_file_exists(model, target, file_name).await? {
             return Ok(false);
@@ -296,7 +298,7 @@ async fn required_cache_files_exist<M: ModelSpec>(model: M, target: &Path) -> Re
     Ok(true)
 }
 
-async fn hub_asset_files_exist<M: ModelSpec>(model: M, target: &Path) -> Result<bool> {
+async fn hub_asset_files_exist<M: ModelSpec>(model: &M, target: &Path) -> Result<bool> {
     let Some(cache_dir) = cache_root_from_target(target) else {
         return Ok(false);
     };
@@ -333,7 +335,7 @@ fn repo_cache_path(cache_dir: &Path, repo: &str) -> PathBuf {
 }
 
 async fn download_hub_assets<M: ModelSpec, C: DownloadClient>(
-    model: M,
+    model: &M,
     source: ResolvedSource,
     assets: &[orchion_core::ModelHubAsset],
     cache_dir: &Path,
@@ -428,7 +430,7 @@ fn asset_files_for_repo(
 }
 
 async fn ensure_ready_cache_files<M: ModelSpec>(
-    model: M,
+    model: &M,
     target: &Path,
     source_name: &'static str,
 ) -> Result<()> {
@@ -543,7 +545,11 @@ fn parse_yaml_scalar(value: &str) -> String {
     value.to_string()
 }
 
-async fn cache_file_exists<M: ModelSpec>(model: M, target: &Path, file_name: &str) -> Result<bool> {
+async fn cache_file_exists<M: ModelSpec>(
+    model: &M,
+    target: &Path,
+    file_name: &str,
+) -> Result<bool> {
     tokio::fs::try_exists(target.join(file_name))
         .await
         .map_err(|error| OrchionError::Download {
@@ -553,7 +559,7 @@ async fn cache_file_exists<M: ModelSpec>(model: M, target: &Path, file_name: &st
         })
 }
 
-async fn ocr_vl_weight_files_exist<M: ModelSpec>(model: M, target: &Path) -> Result<bool> {
+async fn ocr_vl_weight_files_exist<M: ModelSpec>(model: &M, target: &Path) -> Result<bool> {
     if cache_file_exists(model, target, "model.safetensors").await? {
         return Ok(true);
     }
@@ -587,7 +593,7 @@ async fn ocr_vl_weight_files_exist<M: ModelSpec>(model: M, target: &Path) -> Res
 }
 
 async fn write_ready_manifest<M: ModelSpec>(
-    model: M,
+    model: &M,
     target: &Path,
     source_name: &'static str,
 ) -> Result<()> {
@@ -613,7 +619,7 @@ async fn write_ready_manifest<M: ModelSpec>(
         })
 }
 
-fn uses_hub_download<M: ModelSpec>(_model: M) -> bool {
+fn uses_hub_download<M: ModelSpec>(_model: &M) -> bool {
     true
 }
 
@@ -673,7 +679,7 @@ trait DownloadClient {
     fn download<'a>(
         &'a self,
         source: ResolvedSource,
-        repo: &'static str,
+        repo: &'a str,
         cache_dir: &'a Path,
         target: &'a Path,
         files: Option<&'a [&'static str]>,
@@ -687,7 +693,7 @@ impl DownloadClient for LibraryDownloadClient {
     fn download<'a>(
         &'a self,
         source: ResolvedSource,
-        repo: &'static str,
+        repo: &'a str,
         cache_dir: &'a Path,
         _target: &'a Path,
         files: Option<&'a [&'static str]>,
@@ -699,7 +705,7 @@ impl DownloadClient for LibraryDownloadClient {
 
 async fn download_model_hub(
     source: ResolvedSource,
-    repo: &'static str,
+    repo: &str,
     cache_dir: &Path,
     files: Option<&[&'static str]>,
 ) -> Result<()> {
@@ -729,7 +735,7 @@ async fn download_model_hub(
 }
 
 async fn prepare_cached_model<M: ModelSpec>(
-    model: M,
+    model: &M,
     target: &Path,
     source_name: &'static str,
 ) -> Result<()> {
@@ -744,7 +750,7 @@ async fn prepare_cached_model<M: ModelSpec>(
 async fn ensure_asr_tokenizer_json(
     target: &Path,
     source_name: &'static str,
-    repo: &'static str,
+    repo: &str,
 ) -> Result<()> {
     if tokio::fs::try_exists(target.join("tokenizer.json"))
         .await
@@ -783,7 +789,7 @@ async fn read_cache_file(
     target: &Path,
     file_name: &'static str,
     source_name: &'static str,
-    repo: &'static str,
+    repo: &str,
 ) -> Result<String> {
     tokio::fs::read_to_string(target.join(file_name))
         .await
@@ -952,7 +958,7 @@ mod downloader_tests {
         fail_huggingface: bool,
         omit_asr_tokenizer_sources: bool,
         calls: Arc<Mutex<Vec<&'static str>>>,
-        repos: Arc<Mutex<Vec<&'static str>>>,
+        repos: Arc<Mutex<Vec<String>>>,
         file_filters: Arc<Mutex<Vec<Option<Vec<&'static str>>>>>,
     }
 
@@ -998,7 +1004,7 @@ mod downloader_tests {
         fn download<'a>(
             &'a self,
             source: ResolvedSource,
-            repo: &'static str,
+            repo: &'a str,
             _cache_dir: &'a Path,
             target: &'a Path,
             files: Option<&'a [&'static str]>,
@@ -1006,7 +1012,7 @@ mod downloader_tests {
         ) -> BoxFuture<'a, Result<()>> {
             Box::pin(async move {
                 self.calls.lock().unwrap().push(source.label());
-                self.repos.lock().unwrap().push(repo);
+                self.repos.lock().unwrap().push(repo.to_string());
                 self.file_filters
                     .lock()
                     .unwrap()
@@ -1082,7 +1088,7 @@ mod downloader_tests {
         let downloader = ModelDownloader::new(DownloadSource::Auto);
 
         let path = downloader
-            .download_with_client(AsrModel::Qwen3Asr06B, dir.path(), &client, &env)
+            .download_with_client(qwen_asr_06b(), dir.path(), &client, &env)
             .await
             .unwrap();
 
@@ -1106,7 +1112,7 @@ mod downloader_tests {
 
         let path = downloader
             .download_with_client_and_probe(
-                AsrModel::Qwen3Asr06B,
+                qwen_asr_06b(),
                 dir.path(),
                 &client,
                 &FakeProbe {
@@ -1139,23 +1145,11 @@ mod downloader_tests {
         let downloader = ModelDownloader::new(DownloadSource::Auto);
 
         downloader
-            .download_with_client_and_probe(
-                AsrModel::Qwen3Asr06B,
-                dir.path(),
-                &client,
-                &probe,
-                &env,
-            )
+            .download_with_client_and_probe(qwen_asr_06b(), dir.path(), &client, &probe, &env)
             .await
             .unwrap();
         downloader
-            .download_with_client_and_probe(
-                TtsModel::Qwen3Tts06BBase,
-                dir.path(),
-                &client,
-                &probe,
-                &env,
-            )
+            .download_with_client_and_probe(qwen_tts_base(), dir.path(), &client, &probe, &env)
             .await
             .unwrap();
 
@@ -1165,13 +1159,14 @@ mod downloader_tests {
     #[tokio::test]
     async fn ready_manifest_skips_download_when_required_files_exist() {
         let dir = tempfile::tempdir().unwrap();
-        let target = AsrModel::Qwen3Asr06B.cache_path(dir.path());
+        let model = qwen_asr_06b();
+        let target = model.cache_path(dir.path());
         tokio::fs::create_dir_all(&target).await.unwrap();
         tokio::fs::write(target.join("config.json"), "{}")
             .await
             .unwrap();
         write_asr_tokenizer_json(&target).await;
-        write_ready_manifest(&target, AsrModel::Qwen3Asr06B.huggingface_repo()).await;
+        write_ready_manifest(&target, model.huggingface_repo()).await;
 
         let client = FakeDownloadClient::default();
         let calls = Arc::clone(&client.calls);
@@ -1182,7 +1177,7 @@ mod downloader_tests {
         let downloader = ModelDownloader::default();
 
         let path = downloader
-            .download_with_client(AsrModel::Qwen3Asr06B, dir.path(), &client, &env)
+            .download_with_client(model, dir.path(), &client, &env)
             .await
             .unwrap();
 
@@ -1193,12 +1188,13 @@ mod downloader_tests {
     #[tokio::test]
     async fn ready_manifest_redownloads_when_required_file_is_missing() {
         let dir = tempfile::tempdir().unwrap();
-        let target = AsrModel::Qwen3Asr06B.cache_path(dir.path());
+        let model = qwen_asr_06b();
+        let target = model.cache_path(dir.path());
         tokio::fs::create_dir_all(&target).await.unwrap();
         tokio::fs::write(target.join("config.json"), "{}")
             .await
             .unwrap();
-        write_ready_manifest(&target, AsrModel::Qwen3Asr06B.huggingface_repo()).await;
+        write_ready_manifest(&target, model.huggingface_repo()).await;
 
         let client = FakeDownloadClient::default();
         let calls = Arc::clone(&client.calls);
@@ -1209,7 +1205,7 @@ mod downloader_tests {
         let downloader = ModelDownloader::default();
 
         let path = downloader
-            .download_with_client(AsrModel::Qwen3Asr06B, dir.path(), &client, &env)
+            .download_with_client(model, dir.path(), &client, &env)
             .await
             .unwrap();
 
@@ -1229,17 +1225,17 @@ mod downloader_tests {
                 .await
                 .unwrap();
         }
-        super::write_ready_manifest(model, &target, "test")
+        super::write_ready_manifest(&model, &target, "test")
             .await
             .unwrap();
 
-        assert!(!is_ready_cache(model, &target).await.unwrap());
+        assert!(!is_ready_cache(&model, &target).await.unwrap());
 
         tokio::fs::write(target.join("model-00001-of-00002.safetensors"), b"weights")
             .await
             .unwrap();
 
-        assert!(is_ready_cache(model, &target).await.unwrap());
+        assert!(is_ready_cache(&model, &target).await.unwrap());
     }
 
     #[tokio::test]
@@ -1257,7 +1253,7 @@ mod downloader_tests {
         };
         let downloader = ModelDownloader::default();
         let error = downloader
-            .download_with_client(AsrModel::Qwen3Asr06B, dir.path(), &client, &env)
+            .download_with_client(qwen_asr_06b(), dir.path(), &client, &env)
             .await
             .unwrap_err();
 
@@ -1284,7 +1280,7 @@ mod downloader_tests {
 
         assert_eq!(path, KnownOcrModel::PpOcrV5Mobile.cache_path(dir.path()));
         assert_eq!(&*calls.lock().unwrap(), &["modelscope"]);
-        assert_eq!(&*repos.lock().unwrap(), &["greatv/oar-ocr"]);
+        assert_eq!(&*repos.lock().unwrap(), &["greatv/oar-ocr".to_string()]);
         assert_eq!(
             &*file_filters.lock().unwrap(),
             &[Some(vec![
@@ -1304,7 +1300,7 @@ mod downloader_tests {
         assert!(registry_dir.join("ppocrv5_dict.txt").exists());
     }
 
-    async fn write_ready_manifest(target: &Path, repo: &'static str) {
+    async fn write_ready_manifest(target: &Path, repo: &str) {
         let manifest = serde_json::json!({
             "schema_version": 1,
             "repo_id": repo,
@@ -1313,6 +1309,14 @@ mod downloader_tests {
         tokio::fs::write(target.join(".orchion-ready.json"), manifest.to_string())
             .await
             .unwrap();
+    }
+
+    fn qwen_asr_06b() -> AsrModel {
+        AsrModel::parse("Qwen/Qwen3-ASR-0.6B").unwrap()
+    }
+
+    fn qwen_tts_base() -> TtsModel {
+        TtsModel::parse("Qwen/Qwen3-TTS-12Hz-0.6B-Base").unwrap()
     }
 
     async fn write_asr_tokenizer_json(target: &Path) {

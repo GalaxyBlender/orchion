@@ -52,11 +52,12 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn facade_exposes_public_model_id() {
-        let ocr = Ocr::load("PaddlePaddle/PaddleOCR-VL-1.6", "/tmp/orchion-test-models")
-            .await
-            .unwrap();
+    async fn facade_rejects_invalid_model_id_before_loading_runtime() {
+        let result = Ocr::load("not-a-model", "/tmp/orchion-test-models").await;
 
-        assert_eq!(ocr.model().as_str(), "PaddlePaddle/PaddleOCR-VL-1.6");
+        assert!(matches!(
+            result,
+            Err(orchion_core::OrchionError::ModelLoad { .. })
+        ));
     }
 }
