@@ -588,6 +588,16 @@ export function AsrPage() {
                   <Alert variant="info" title={t("asr.stream.noticeTitle", "Streaming API")}> 
                     {t("asr.stream.notice", "Live ASR uses WebSocket streaming and returns JSON events with text payloads.")}
                   </Alert>
+                  <div className="result-block stack gap-sm">
+                    <span className="card-eyebrow">{t("asr.stream.protocolTitle", "WebSocket protocol")}</span>
+                    <ul className="stack gap-xs text-sm list-disc pl-4 text-muted">
+                      <li>{t("asr.stream.protocolEndpoint", "Endpoint: GET /v1/audio/transcriptions/stream with WebSocket upgrade.")}</li>
+                      <li>{t("asr.stream.protocolStart", "First message: JSON { type: \"start\", model, input_audio_format, api_key?, language?, prompt?, chunk_size_sec? }.")}</li>
+                      <li>{t("asr.stream.protocolAudio", "Audio messages: binary chunks in the selected input_audio_format.")}</li>
+                      <li>{t("asr.stream.protocolEnd", "End message: JSON { type: \"end\" } after the final audio chunk.")}</li>
+                      <li>{t("asr.stream.protocolEvents", "Server events: ready, partial, final, or error JSON messages; transcript events contain text only.")}</li>
+                    </ul>
+                  </div>
                   <Tabs tabs={streamInputTabs} activeTab={streamInputMode} onChange={(id) => updateStreamInputMode(id as AsrStreamInputMode)} />
                   {streamInputMode === "file" ? (
                     <FormField label={t("asr.stream.fileLabel", "Streaming audio file")} description={t("asr.stream.fileDescription", "Supported streaming formats: wav, mp3, webm/opus, m4a, aac, flac, and ogg.")}>
