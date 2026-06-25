@@ -1,6 +1,6 @@
 [package]
 name = "orchion-core"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Domain types and errors for Orchion speech workflows"

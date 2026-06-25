@@ -3183,7 +3183,7 @@ dependencies = [
 
 [[package]]
 name = "orchion"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "orchion-audio",
  "orchion-audio-vad",
@@ -3198,7 +3198,7 @@ dependencies = [
 
 [[package]]
 name = "orchion-audio"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "hound",
  "orchion-core",
@@ -3207,7 +3207,7 @@ dependencies = [
 
 [[package]]
 name = "orchion-audio-vad"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "orchion-core",
  "wavekat-vad",
@@ -3215,7 +3215,7 @@ dependencies = [
 
 [[package]]
 name = "orchion-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -3226,7 +3226,7 @@ dependencies = [
 
 [[package]]
 name = "orchion-docs"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "image",
  "pdfium-render",
@@ -3238,7 +3238,7 @@ dependencies = [
 
 [[package]]
 name = "orchion-download"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "model-hub",
  "orchion-core",
@@ -3284,7 +3284,7 @@ dependencies = [
 
 [[package]]
 name = "orchion-ocr"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "candle-core 0.10.2",
@@ -3300,7 +3300,7 @@ dependencies = [
 
 [[package]]
 name = "orchion-qwen3"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "candle-core 0.9.2",
@@ -3313,7 +3313,7 @@ dependencies = [
 
 [[package]]
 name = "orchion-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",

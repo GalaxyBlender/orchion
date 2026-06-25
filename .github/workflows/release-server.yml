@@ -35,7 +35,7 @@ jobs:
           bun-version: latest
 
       - name: Build Metal server
-        run: cargo build --release -p orchion-server --features metal
+        run: ./scripts/build-macos-metal.sh
 
       - name: Package Metal server
         shell: bash
@@ -91,7 +91,7 @@ jobs:
         run: nvcc --version
 
       - name: Build CPU server
-        run: cargo build --release -p orchion-server --features cpu
+        run: ./scripts/build-linux-cpu.sh
 
       - name: Package CPU server
         shell: bash
@@ -114,9 +114,7 @@ jobs:
         run: nvcc --version
 
       - name: Build CUDA server
-        env:
-          CUDA_COMPUTE_CAP: "80"
-        run: cargo build --release -p orchion-server --features cuda
+        run: ./scripts/build-linux-cuda.sh
 
       - name: Package CUDA server
         shell: bash
@@ -157,7 +155,7 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
 
       - name: Build CPU server
-        run: cargo build --release -p orchion-server --features cpu
+        run: .\scripts\build-windows-cpu.cmd
 
       - name: Package CPU server
         shell: pwsh
@@ -182,10 +180,7 @@ jobs:
           log-file-suffix: windows-x86_64-cuda.txt
 
       - name: Build CUDA server
-        env:
-          CUDA_COMPUTE_CAP: "80"
-          NVCC_PREPEND_FLAGS: --compiler-options /Zc:preprocessor
-        run: cargo build --release -p orchion-server --features cuda
+        run: .\scripts\build-windows-cuda.cmd
 
       - name: Package CUDA server
         shell: pwsh

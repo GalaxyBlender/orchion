@@ -17,9 +17,4 @@ if not defined VS_VCVARS64 (
 call "%VS_VCVARS64%"
 if errorlevel 1 exit /b %errorlevel%
 
-set "CUDA_COMPUTE_CAP=80"
-set "CFLAGS=/MD"
-set "CXXFLAGS=/MD"
-set "NVCC_PREPEND_FLAGS=--compiler-options /Zc:preprocessor,/MD"
-
-cargo build --release -p orchion-server --features cuda
+cargo build --release -p orchion-server --features cpu
