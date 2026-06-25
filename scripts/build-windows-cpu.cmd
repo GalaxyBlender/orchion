@@ -17,4 +17,7 @@ if not defined VS_VCVARS64 (
 call "%VS_VCVARS64%"
 if errorlevel 1 exit /b %errorlevel%
 
+set "CFLAGS=/MD"
+set "CXXFLAGS=/MD"
+
 cargo build --release -p orchion-server --features cpu
