@@ -1,0 +1,36 @@
+[package]
+name = "orchion-client"
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+
+[features]
+default = ["models", "asr", "tts", "ocr", "pdf"]
+models = []
+asr = ["dep:futures-util", "dep:tokio-tungstenite", "tokio/net"]
+tts = []
+ocr = []
+pdf = []
+
+[dependencies]
+bytes = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "time"] }
+
+futures-util = { version = "0.3", optional = true }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
+wiremock = "0.6"
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
