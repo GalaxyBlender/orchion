@@ -19,20 +19,6 @@ pub enum ModelCategory {
     OcrVl,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ModelHubAssetKind {
-    RequiredFile,
-    PaddleOcrDictionary { output_file: &'static str },
-    ModelScopeFile { output_file: &'static str },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ModelHubAsset {
-    pub repo: &'static str,
-    pub file: &'static str,
-    pub kind: ModelHubAssetKind,
-}
-
 impl ModelCategory {
     pub const fn cache_segment(self) -> &'static str {
         match self {
@@ -57,10 +43,6 @@ pub trait ModelSpec: Clone + fmt::Debug + Eq + Send + Sync + 'static {
 
     fn required_files(&self) -> &'static [&'static str] {
         &["config.json"]
-    }
-
-    fn hub_assets(&self) -> &'static [ModelHubAsset] {
-        &[]
     }
 
     fn cache_path(&self, cache_dir: impl AsRef<Path>) -> PathBuf {

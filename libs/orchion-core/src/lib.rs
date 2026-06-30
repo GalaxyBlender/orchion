@@ -12,10 +12,10 @@ pub use asr::{
     AsrTranscript, prepare_asr_samples,
 };
 pub use device::{DevicePreference, ParseDevicePreferenceError};
-pub use error::{OrchionError, Result};
+pub use error::{DownloadFailure, OrchionError, Result};
 pub use model::{
-    AsrModel, KnownOcrModel, ModelCategory, ModelHubAsset, ModelHubAssetKind, ModelId, ModelSpec,
-    OcrModelKind, ParseModelIdError, TtsModel,
+    AsrModel, KnownOcrModel, ModelCategory, ModelId, ModelSpec, OcrModelKind, ParseModelIdError,
+    TtsModel,
 };
 pub use ocr::{
     OcrLayoutBlock, OcrOptions, OcrPoint, OcrRegion, OcrResponseFormat, OcrResult, OcrTask,

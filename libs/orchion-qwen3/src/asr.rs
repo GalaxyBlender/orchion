@@ -40,7 +40,7 @@ impl Asr {
             let engine =
                 qwen3_asr::AsrInference::load(&model_dir, resolved.device).map_err(|source| {
                     OrchionError::ModelLoad {
-                        source: anyhow::Error::new(source),
+                        message: source.to_string(),
                     }
                 })?;
             Ok(Self {
@@ -71,13 +71,13 @@ impl Asr {
                 path: PathBuf::from(&path),
             })?;
             let engine = engine.lock().map_err(|error| OrchionError::Inference {
-                source: anyhow::anyhow!(error.to_string()),
+                message: error.to_string(),
             })?;
             engine
                 .transcribe(path_text, transcribe_options_into_upstream(options))
                 .map(transcript_from_upstream)
                 .map_err(|source| OrchionError::Inference {
-                    source: anyhow::Error::new(source),
+                    message: source.to_string(),
                 })
         })
         .await
@@ -102,13 +102,13 @@ impl Asr {
         let engine = Arc::clone(&self.engine);
         crate::blocking::run(move || {
             let engine = engine.lock().map_err(|error| OrchionError::Inference {
-                source: anyhow::anyhow!(error.to_string()),
+                message: error.to_string(),
             })?;
             engine
                 .transcribe_samples(&prepared, transcribe_options_into_upstream(options))
                 .map(transcript_from_upstream)
                 .map_err(|source| OrchionError::Inference {
-                    source: anyhow::Error::new(source),
+                    message: source.to_string(),
                 })
         })
         .await
@@ -127,7 +127,7 @@ impl Asr {
             let engine = Arc::clone(&engine);
             move || {
                 let engine = engine.lock().map_err(|error| OrchionError::Inference {
-                    source: anyhow::anyhow!(error.to_string()),
+                    message: error.to_string(),
                 })?;
                 Ok(engine.init_streaming(upstream_options))
             }
@@ -151,12 +151,12 @@ impl AsrStream {
         let mut state = self.take_state()?;
         let (state, transcript) = crate::blocking::run(move || {
             let engine = engine.lock().map_err(|error| OrchionError::Inference {
-                source: anyhow::anyhow!(error.to_string()),
+                message: error.to_string(),
             })?;
             let transcript = engine
                 .feed_audio(&mut state, &prepared)
                 .map_err(|source| OrchionError::Inference {
-                    source: anyhow::Error::new(source),
+                    message: source.to_string(),
                 })?
                 .map(transcript_from_upstream);
             Ok((state, transcript))
@@ -171,13 +171,13 @@ impl AsrStream {
         let mut state = self.take_state()?;
         crate::blocking::run(move || {
             let engine = engine.lock().map_err(|error| OrchionError::Inference {
-                source: anyhow::anyhow!(error.to_string()),
+                message: error.to_string(),
             })?;
             engine
                 .finish_streaming(&mut state)
                 .map(transcript_from_upstream)
                 .map_err(|source| OrchionError::Inference {
-                    source: anyhow::Error::new(source),
+                    message: source.to_string(),
                 })
         })
         .await

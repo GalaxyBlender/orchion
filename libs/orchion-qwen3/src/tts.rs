@@ -41,8 +41,11 @@ impl Tts {
                 "TTS device selected"
             );
             tracing::debug!(device_debug, "TTS device details selected");
-            let engine = qwen3_tts::Qwen3TTS::from_pretrained(path_text, resolved.device)
-                .map_err(|source| OrchionError::ModelLoad { source })?;
+            let engine = qwen3_tts::Qwen3TTS::from_pretrained(path_text, resolved.device).map_err(
+                |source| OrchionError::ModelLoad {
+                    message: source.to_string(),
+                },
+            )?;
             Ok(Self {
                 model,
                 engine: Arc::new(Mutex::new(engine)),
@@ -84,7 +87,9 @@ impl Tts {
         crate::blocking::run(move || {
             audio
                 .save(output_path)
-                .map_err(|source| OrchionError::Inference { source })
+                .map_err(|source| OrchionError::Inference {
+                    message: source.to_string(),
+                })
         })
         .await
     }
@@ -102,7 +107,7 @@ impl Tts {
         crate::blocking::run(move || {
             let started = Instant::now();
             let engine = engine.lock().map_err(|error| OrchionError::Inference {
-                source: anyhow::anyhow!(error.to_string()),
+                message: error.to_string(),
             })?;
             let audio = match voice {
                 TtsVoice::Preset { speaker, language } => engine
@@ -112,17 +117,25 @@ impl Tts {
                         language_to_upstream(language),
                         Some(options_to_upstream(options)),
                     )
-                    .map_err(|source| OrchionError::Inference { source }),
+                    .map_err(|source| OrchionError::Inference {
+                        message: source.to_string(),
+                    }),
                 TtsVoice::Clone {
                     reference_audio,
                     reference_text,
                     language,
                 } => {
-                    let audio = qwen3_tts::AudioBuffer::load(&reference_audio)
-                        .map_err(|source| OrchionError::Inference { source })?;
+                    let audio =
+                        qwen3_tts::AudioBuffer::load(&reference_audio).map_err(|source| {
+                            OrchionError::Inference {
+                                message: source.to_string(),
+                            }
+                        })?;
                     let prompt = engine
                         .create_voice_clone_prompt(&audio, Some(reference_text.as_str()))
-                        .map_err(|source| OrchionError::Inference { source })?;
+                        .map_err(|source| OrchionError::Inference {
+                            message: source.to_string(),
+                        })?;
                     validate_voice_clone_icl_prompt(&prompt)?;
                     engine
                         .synthesize_voice_clone(
@@ -131,7 +144,9 @@ impl Tts {
                             language_to_upstream(language),
                             Some(options_to_upstream(options)),
                         )
-                        .map_err(|source| OrchionError::Inference { source })
+                        .map_err(|source| OrchionError::Inference {
+                            message: source.to_string(),
+                        })
                 }
                 TtsVoice::Design { prompt, language } => engine
                     .synthesize_voice_design(
@@ -140,7 +155,9 @@ impl Tts {
                         language_to_upstream(language),
                         Some(options_to_upstream(options)),
                     )
-                    .map_err(|source| OrchionError::Inference { source }),
+                    .map_err(|source| OrchionError::Inference {
+                        message: source.to_string(),
+                    }),
             }?;
             tracing::debug!(
                 text_chars = text_len,
@@ -203,7 +220,7 @@ fn audio_from_upstream(audio: qwen3_tts::AudioBuffer) -> TtsAudio {
 fn validate_voice_clone_icl_prompt(prompt: &qwen3_tts::VoiceClonePrompt) -> Result<()> {
     if let Some(ref_codes) = &prompt.ref_codes {
         let reference_frames = ref_codes.dim(0).map_err(|source| OrchionError::Inference {
-            source: anyhow::anyhow!(source),
+            message: source.to_string(),
         })?;
         validate_voice_clone_icl_frames(reference_frames)?;
     }

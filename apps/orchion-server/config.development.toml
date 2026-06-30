@@ -3,7 +3,7 @@ bind = "127.0.0.1:9090"
 max_upload_size = "100M"
 
 [models]
-dir = "models"
+dir = "../../data/models"
 source = "auto"
 max_loaded = 2
 

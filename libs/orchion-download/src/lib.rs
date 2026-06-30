@@ -1,4 +1,4 @@
-use orchion_core::{ModelCategory, ModelHubAssetKind, ModelSpec, OrchionError, Result};
+use orchion_core::{DownloadFailure, ModelCategory, ModelSpec, OrchionError, Result};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -29,6 +29,130 @@ enum ResolvedSource {
     HuggingFace,
     ModelScope,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ModelHubAssetKind {
+    RequiredFile,
+    PaddleOcrDictionary { output_file: &'static str },
+    ModelScopeFile { output_file: &'static str },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ModelHubAsset {
+    repo: &'static str,
+    file: &'static str,
+    kind: ModelHubAssetKind,
+}
+
+const PP_OCRV5_MOBILE_ASSETS: &[ModelHubAsset] = &[
+    ModelHubAsset {
+        repo: "greatv/oar-ocr",
+        file: "pp-ocrv5_mobile_det.onnx",
+        kind: ModelHubAssetKind::ModelScopeFile {
+            output_file: "pp-ocrv5_mobile_det.onnx",
+        },
+    },
+    ModelHubAsset {
+        repo: "greatv/oar-ocr",
+        file: "pp-ocrv5_mobile_rec.onnx",
+        kind: ModelHubAssetKind::ModelScopeFile {
+            output_file: "pp-ocrv5_mobile_rec.onnx",
+        },
+    },
+    ModelHubAsset {
+        repo: "greatv/oar-ocr",
+        file: "ppocrv5_dict.txt",
+        kind: ModelHubAssetKind::ModelScopeFile {
+            output_file: "ppocrv5_dict.txt",
+        },
+    },
+];
+
+const PP_OCRV5_SERVER_ASSETS: &[ModelHubAsset] = &[
+    ModelHubAsset {
+        repo: "PaddlePaddle/PP-OCRv5_server_det_onnx",
+        file: "inference.onnx",
+        kind: ModelHubAssetKind::RequiredFile,
+    },
+    ModelHubAsset {
+        repo: "PaddlePaddle/PP-OCRv5_server_rec_onnx",
+        file: "inference.onnx",
+        kind: ModelHubAssetKind::RequiredFile,
+    },
+    ModelHubAsset {
+        repo: "PaddlePaddle/PP-OCRv5_server_rec_onnx",
+        file: "inference.yml",
+        kind: ModelHubAssetKind::PaddleOcrDictionary {
+            output_file: "ppocrv5_dict.txt",
+        },
+    },
+];
+
+const PP_OCRV6_TINY_ASSETS: &[ModelHubAsset] = &[
+    ModelHubAsset {
+        repo: "PaddlePaddle/PP-OCRv6_tiny_det_onnx",
+        file: "inference.onnx",
+        kind: ModelHubAssetKind::RequiredFile,
+    },
+    ModelHubAsset {
+        repo: "PaddlePaddle/PP-OCRv6_tiny_rec_onnx",
+        file: "inference.onnx",
+        kind: ModelHubAssetKind::RequiredFile,
+    },
+    ModelHubAsset {
+        repo: "PaddlePaddle/PP-OCRv6_tiny_rec_onnx",
+        file: "inference.yml",
+        kind: ModelHubAssetKind::PaddleOcrDictionary {
+            output_file: "ppocrv6_tiny_dict.txt",
+        },
+    },
+];
+
+const PP_OCRV6_SMALL_ASSETS: &[ModelHubAsset] = &[
+    ModelHubAsset {
+        repo: "PaddlePaddle/PP-OCRv6_small_det_onnx",
+        file: "inference.onnx",
+        kind: ModelHubAssetKind::RequiredFile,
+    },
+    ModelHubAsset {
+        repo: "PaddlePaddle/PP-OCRv6_small_rec_onnx",
+        file: "inference.onnx",
+        kind: ModelHubAssetKind::RequiredFile,
+    },
+    ModelHubAsset {
+        repo: "PaddlePaddle/PP-OCRv6_small_rec_onnx",
+        file: "inference.yml",
+        kind: ModelHubAssetKind::PaddleOcrDictionary {
+            output_file: "ppocrv6_dict.txt",
+        },
+    },
+];
+
+const PP_OCRV6_MEDIUM_ASSETS: &[ModelHubAsset] = &[
+    ModelHubAsset {
+        repo: "PaddlePaddle/PP-OCRv6_medium_det_onnx",
+        file: "inference.onnx",
+        kind: ModelHubAssetKind::RequiredFile,
+    },
+    ModelHubAsset {
+        repo: "PaddlePaddle/PP-OCRv6_medium_rec_onnx",
+        file: "inference.onnx",
+        kind: ModelHubAssetKind::RequiredFile,
+    },
+    ModelHubAsset {
+        repo: "PaddlePaddle/PP-OCRv6_medium_rec_onnx",
+        file: "inference.yml",
+        kind: ModelHubAssetKind::PaddleOcrDictionary {
+            output_file: "ppocrv6_dict.txt",
+        },
+    },
+];
+
+const PP_DOCLAYOUTV3_ASSETS: &[ModelHubAsset] = &[ModelHubAsset {
+    repo: "PaddlePaddle/PP-DocLayoutV3_onnx",
+    file: "inference.onnx",
+    kind: ModelHubAssetKind::RequiredFile,
+}];
 
 impl ResolvedSource {
     const fn label(self) -> &'static str {
@@ -141,7 +265,7 @@ impl ModelDownloader {
             unreachable!("direct asset downloads are not implemented yet");
         }
 
-        let assets = model.hub_assets();
+        let assets = model_hub_assets(&model);
         let candidates = if uses_modelscope_file_assets(assets) {
             vec![ResolvedSource::ModelScope]
         } else {
@@ -180,7 +304,10 @@ impl ModelDownloader {
                             "model asset download failed"
                         );
                         let _ = tokio::fs::remove_dir_all(&target).await;
-                        failures.push(error.to_string());
+                        failures.push(DownloadFailure {
+                            source_name: candidate.label(),
+                            message: error.to_string(),
+                        });
                     }
                 }
                 continue;
@@ -221,14 +348,17 @@ impl ModelDownloader {
                         "model download failed"
                     );
                     let _ = tokio::fs::remove_dir_all(&target).await;
-                    failures.push(error.to_string());
+                    failures.push(DownloadFailure {
+                        source_name: candidate.label(),
+                        message: error.to_string(),
+                    });
                 }
             }
         }
 
         Err(OrchionError::DownloadFallbackExhausted {
             repo: model.huggingface_repo().to_string(),
-            messages: failures.join("; "),
+            failures,
         })
     }
 
@@ -302,7 +432,7 @@ async fn hub_asset_files_exist<M: ModelSpec>(model: &M, target: &Path) -> Result
     let Some(cache_dir) = cache_root_from_target(target) else {
         return Ok(false);
     };
-    for asset in model.hub_assets() {
+    for asset in model_hub_assets(model) {
         let asset_path = match asset.kind {
             ModelHubAssetKind::RequiredFile | ModelHubAssetKind::PaddleOcrDictionary { .. } => {
                 repo_cache_path(cache_dir, asset.repo).join(asset.file)
@@ -329,6 +459,18 @@ fn cache_root_from_target(target: &Path) -> Option<&Path> {
     target.parent().and_then(Path::parent)
 }
 
+fn model_hub_assets<M: ModelSpec>(model: &M) -> &'static [ModelHubAsset] {
+    match model.huggingface_repo() {
+        "PaddlePaddle/PP-OCRv5_mobile" => PP_OCRV5_MOBILE_ASSETS,
+        "PaddlePaddle/PP-OCRv5_server" => PP_OCRV5_SERVER_ASSETS,
+        "PaddlePaddle/PP-OCRv6_tiny" => PP_OCRV6_TINY_ASSETS,
+        "PaddlePaddle/PP-OCRv6_small" => PP_OCRV6_SMALL_ASSETS,
+        "PaddlePaddle/PP-OCRv6_medium" => PP_OCRV6_MEDIUM_ASSETS,
+        "PaddlePaddle/PP-DocLayoutV3" => PP_DOCLAYOUTV3_ASSETS,
+        _ => &[],
+    }
+}
+
 fn repo_cache_path(cache_dir: &Path, repo: &str) -> PathBuf {
     repo.split('/')
         .fold(cache_dir.to_path_buf(), |path, segment| path.join(segment))
@@ -337,7 +479,7 @@ fn repo_cache_path(cache_dir: &Path, repo: &str) -> PathBuf {
 async fn download_hub_assets<M: ModelSpec, C: DownloadClient>(
     model: &M,
     source: ResolvedSource,
-    assets: &[orchion_core::ModelHubAsset],
+    assets: &[ModelHubAsset],
     cache_dir: &Path,
     target: &Path,
     client: &C,
@@ -410,16 +552,13 @@ async fn download_hub_assets<M: ModelSpec, C: DownloadClient>(
     Ok(())
 }
 
-fn uses_modelscope_file_assets(assets: &[orchion_core::ModelHubAsset]) -> bool {
+fn uses_modelscope_file_assets(assets: &[ModelHubAsset]) -> bool {
     assets
         .iter()
         .any(|asset| matches!(asset.kind, ModelHubAssetKind::ModelScopeFile { .. }))
 }
 
-fn asset_files_for_repo(
-    assets: &[orchion_core::ModelHubAsset],
-    repo: &'static str,
-) -> Vec<&'static str> {
+fn asset_files_for_repo(assets: &[ModelHubAsset], repo: &'static str) -> Vec<&'static str> {
     let mut files = Vec::new();
     for asset in assets.iter().filter(|asset| asset.repo == repo) {
         if !files.contains(&asset.file) {

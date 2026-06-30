@@ -67,14 +67,14 @@ fn resolve_metal_device() -> Result<ResolvedDevice> {
             kind: ResolvedDeviceKind::Metal,
         })
         .map_err(|source| OrchionError::ModelLoad {
-            source: anyhow::Error::new(source),
+            message: source.to_string(),
         })
 }
 
 #[cfg(not(feature = "metal"))]
 fn resolve_metal_device() -> Result<ResolvedDevice> {
     Err(OrchionError::ModelLoad {
-        source: anyhow::anyhow!("Metal support is not compiled in"),
+        message: "Metal support is not compiled in".to_string(),
     })
 }
 
@@ -96,14 +96,14 @@ fn resolve_cuda_device(index: usize) -> Result<ResolvedDevice> {
             kind: ResolvedDeviceKind::Cuda(index),
         })
         .map_err(|source| OrchionError::ModelLoad {
-            source: anyhow::Error::new(source),
+            message: source.to_string(),
         })
 }
 
 #[cfg(not(feature = "cuda"))]
 fn resolve_cuda_device(_index: usize) -> Result<ResolvedDevice> {
     Err(OrchionError::ModelLoad {
-        source: anyhow::anyhow!("CUDA support is not compiled in"),
+        message: "CUDA support is not compiled in".to_string(),
     })
 }
 
@@ -168,12 +168,8 @@ mod tests {
     #[test]
     fn explicit_cuda_errors_when_not_compiled_in() {
         match resolve_device(DevicePreference::Cuda(None)) {
-            Err(OrchionError::ModelLoad { source }) => {
-                assert!(
-                    source
-                        .to_string()
-                        .contains("CUDA support is not compiled in")
-                );
+            Err(OrchionError::ModelLoad { message }) => {
+                assert!(message.contains("CUDA support is not compiled in"));
             }
             Err(other) => panic!("expected ModelLoad error, got {other:?}"),
             Ok(_) => panic!("expected explicit CUDA to fail without cuda feature"),
@@ -184,12 +180,8 @@ mod tests {
     #[test]
     fn explicit_metal_errors_when_not_compiled_in() {
         match resolve_device(DevicePreference::Metal) {
-            Err(OrchionError::ModelLoad { source }) => {
-                assert!(
-                    source
-                        .to_string()
-                        .contains("Metal support is not compiled in")
-                );
+            Err(OrchionError::ModelLoad { message }) => {
+                assert!(message.contains("Metal support is not compiled in"));
             }
             Err(other) => panic!("expected ModelLoad error, got {other:?}"),
             Ok(_) => panic!("expected explicit Metal to fail without metal feature"),

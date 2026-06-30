@@ -31,16 +31,16 @@ Orchion 目前聚焦 Qwen3 ASR/TTS 以及 OCR/OCR-VL 文档识别模型，同时
 ### 运行服务
 
 ```sh
-cargo run -p orchion-server -- --config apps/orchion-server/config.toml
-cargo run -p orchion-server --features metal -- --config apps/orchion-server/config.toml
-cargo run -p orchion-server --features cuda -- --config apps/orchion-server/config.toml
+cargo run -p orchion-server -- --config apps/orchion-server/config.development.toml
+cargo run -p orchion-server --features metal -- --config apps/orchion-server/config.development.toml
+cargo run -p orchion-server --features cuda -- --config apps/orchion-server/config.development.toml
 ```
 
 `orchion-server` 默认使用 CPU。macOS 可使用 `--features metal`，Linux/Windows 且 CUDA 环境可用时可使用 `--features cuda`。仓库内置了 `apps/orchion-server/config.toml` 作为开发配置。
 
 ### WebUI
 
-在服务器的 `/ui` 打开 React WebUI，可用于 ASR、TTS、OCR/OCR-VL 操作、参数预览、模型检查和本地设置。Debug 构建会服务 `web/dist`；如果目录缺失，请在 `web/` 下运行 `bun install` 和 `bun run build`。前端迭代可在 `web/` 下运行 `bun run dev`。Release 构建会从 `apps/orchion-server/build.rs` 运行 Bun、构建 SPA，并通过 `OUT_DIR/ui-dist` 将资源嵌入服务端二进制。API key 和表单偏好会存储在浏览器 `localStorage`。警告：API key 会通过 `localStorage` 存储在浏览器配置档案中；不要在共享或不可信浏览器中使用或保存 API key。WebUI 始终调用当前服务器地址，不再支持手动输入 API base URL。
+在服务器的 `/ui` 打开 React WebUI，可用于 ASR、TTS、OCR/OCR-VL 操作、参数预览、模型检查和本地设置。前端迭代可在 `web/` 下运行 `bun run dev`。API key 和表单偏好会存储在浏览器 `localStorage`。警告：API key 会通过 `localStorage` 存储在浏览器配置档案中；不要在共享或不可信浏览器中使用或保存 API key。WebUI 始终调用当前服务器地址，不再支持手动输入 API base URL。
 
 ### 路由
 

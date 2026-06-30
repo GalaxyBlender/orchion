@@ -1,5 +1,6 @@
 use crate::client::{decode_json, decode_text};
 use crate::{Client, ClientError};
+use orchion_core::{OcrLayoutBlock, OcrRegion, OcrUsage};
 use reqwest::multipart::{Form, Part};
 use serde::Deserialize;
 use std::path::Path;
@@ -212,10 +213,10 @@ pub struct OcrJsonResponse {
     pub markdown: Option<String>,
     pub html: Option<String>,
     #[serde(default)]
-    pub regions: Vec<serde_json::Value>,
+    pub regions: Vec<OcrRegion>,
     #[serde(default)]
-    pub layout_blocks: Vec<serde_json::Value>,
-    pub usage: serde_json::Value,
+    pub layout_blocks: Vec<OcrLayoutBlock>,
+    pub usage: OcrUsage,
 }
 
 /// OCR response format value returned by the JSON endpoint.

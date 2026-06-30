@@ -57,7 +57,11 @@ impl Default for OcrOptions {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "serde", derive(Serialize), serde(rename_all = "snake_case"))]
+#[cfg_attr(
+    feature = "serde",
+    derive(Serialize, Deserialize),
+    serde(rename_all = "snake_case")
+)]
 #[cfg_attr(feature = "schema", derive(ToSchema))]
 pub struct OcrRegion {
     pub text: String,
@@ -66,7 +70,11 @@ pub struct OcrRegion {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "serde", derive(Serialize), serde(rename_all = "snake_case"))]
+#[cfg_attr(
+    feature = "serde",
+    derive(Serialize, Deserialize),
+    serde(rename_all = "snake_case")
+)]
 #[cfg_attr(feature = "schema", derive(ToSchema))]
 pub struct OcrPoint {
     pub x: f32,
@@ -74,7 +82,11 @@ pub struct OcrPoint {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "serde", derive(Serialize), serde(rename_all = "snake_case"))]
+#[cfg_attr(
+    feature = "serde",
+    derive(Serialize, Deserialize),
+    serde(rename_all = "snake_case")
+)]
 #[cfg_attr(feature = "schema", derive(ToSchema))]
 pub struct OcrLayoutBlock {
     pub label: String,
@@ -83,7 +95,11 @@ pub struct OcrLayoutBlock {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "serde", derive(Serialize), serde(rename_all = "snake_case"))]
+#[cfg_attr(
+    feature = "serde",
+    derive(Serialize, Deserialize),
+    serde(rename_all = "snake_case")
+)]
 #[cfg_attr(feature = "schema", derive(ToSchema))]
 pub struct OcrUsage {
     pub input_pages: usize,
@@ -91,7 +107,11 @@ pub struct OcrUsage {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "serde", derive(Serialize), serde(rename_all = "snake_case"))]
+#[cfg_attr(
+    feature = "serde",
+    derive(Serialize, Deserialize),
+    serde(rename_all = "snake_case")
+)]
 #[cfg_attr(feature = "schema", derive(ToSchema))]
 pub struct OcrResult {
     pub model: ModelId,

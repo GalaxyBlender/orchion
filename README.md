@@ -31,16 +31,16 @@ The server crate lives at `apps/orchion-server` and exposes OpenAI-style audio a
 ### Run The Server
 
 ```sh
-cargo run -p orchion-server -- --config apps/orchion-server/config.toml
-cargo run -p orchion-server --features metal -- --config apps/orchion-server/config.toml
-cargo run -p orchion-server --features cuda -- --config apps/orchion-server/config.toml
+cargo run -p orchion-server -- --config apps/orchion-server/config.development.toml
+cargo run -p orchion-server --features metal -- --config apps/orchion-server/config.development.toml
+cargo run -p orchion-server --features cuda -- --config apps/orchion-server/config.development.toml
 ```
 
 `orchion-server` defaults to CPU. Use `--features metal` on macOS, or `--features cuda` on Linux/Windows with a supported CUDA stack. The repository includes `apps/orchion-server/config.toml` as a development config.
 
 ### WebUI
 
-Open the React WebUI at `/ui` on the server for ASR, TTS, OCR/OCR-VL operations, parameter previews, model inspection, and local settings. Debug builds serve `web/dist`; if it is missing, run `bun install` and `bun run build` from `web/`. For frontend iteration, run `bun run dev` from `web/`. Release builds run Bun from `apps/orchion-server/build.rs`, build the SPA, and embed assets in the server binary via `OUT_DIR/ui-dist`. API key and form preferences are stored in browser `localStorage`. Warning: API keys are stored in the browser profile via `localStorage`; do not use or save them on shared or untrusted browsers. The WebUI always calls the current server address and no longer supports a manually entered API base URL.
+Open the React WebUI at `/ui` on the server for ASR, TTS, OCR/OCR-VL operations, parameter previews, model inspection, and local settings. For frontend iteration, run `bun run dev` from `web/`. API key and form preferences are stored in browser `localStorage`. Warning: API keys are stored in the browser profile via `localStorage`; do not use or save them on shared or untrusted browsers. The WebUI always calls the current server address and no longer supports a manually entered API base URL.
 
 ### Routes
 

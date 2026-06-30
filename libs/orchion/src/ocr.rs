@@ -19,7 +19,7 @@ impl Ocr {
     ) -> Result<Self> {
         let id = ModelId::parse(model.as_ref()).map_err(|error| {
             orchion_core::OrchionError::ModelLoad {
-                source: error.into(),
+                message: error.to_string(),
             }
         })?;
         let known = KnownOcrModel::from_model_id(&id)?;

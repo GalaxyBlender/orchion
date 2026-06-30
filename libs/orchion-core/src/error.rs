@@ -2,6 +2,12 @@ use std::path::PathBuf;
 
 pub type Result<T> = std::result::Result<T, OrchionError>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadFailure {
+    pub source_name: &'static str,
+    pub message: String,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum OrchionError {
     #[error("invalid model source `{value}`; expected `auto`, `huggingface`, or `modelscope`")]
@@ -14,8 +20,11 @@ pub enum OrchionError {
         message: String,
     },
 
-    #[error("all download sources failed for {repo}: {messages}")]
-    DownloadFallbackExhausted { repo: String, messages: String },
+    #[error("all download sources failed for {repo}: {failures:?}")]
+    DownloadFallbackExhausted {
+        repo: String,
+        failures: Vec<DownloadFailure>,
+    },
 
     #[error("cache directory is incomplete: {path}")]
     IncompleteCache { path: PathBuf },
@@ -23,11 +32,11 @@ pub enum OrchionError {
     #[error("blocking task failed: {message}")]
     BlockingTask { message: String },
 
-    #[error("model load failed: {source}")]
-    ModelLoad { source: anyhow::Error },
+    #[error("model load failed: {message}")]
+    ModelLoad { message: String },
 
-    #[error("inference failed: {source}")]
-    Inference { source: anyhow::Error },
+    #[error("inference failed: {message}")]
+    Inference { message: String },
 
     #[error("invalid audio input: {reason}")]
     InvalidAudio { reason: String },

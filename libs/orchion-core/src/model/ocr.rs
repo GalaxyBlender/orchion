@@ -1,4 +1,4 @@
-use super::{ModelCategory, ModelHubAsset, ModelHubAssetKind, ModelId, ModelSpec};
+use super::{ModelCategory, ModelId, ModelSpec};
 use crate::{OrchionError, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -32,7 +32,7 @@ impl KnownOcrModel {
             "PaddlePaddle/PaddleOCR-VL-1.5" => Ok(Self::PaddleOcrVl15),
             "PaddlePaddle/PaddleOCR-VL-1.6" => Ok(Self::PaddleOcrVl16),
             other => Err(OrchionError::ModelLoad {
-                source: anyhow::anyhow!("unsupported OCR model `{other}`"),
+                message: format!("unsupported OCR model `{other}`"),
             }),
         }
     }
@@ -144,119 +144,9 @@ impl KnownOcrModel {
 
 fn invalid_ocr_model_kind(id: &ModelId, expected: &'static str) -> OrchionError {
     OrchionError::ModelLoad {
-        source: anyhow::anyhow!("OCR model `{id}` is not a {expected}"),
+        message: format!("OCR model `{id}` is not a {expected}"),
     }
 }
-
-const PP_OCRV5_MOBILE_ASSETS: &[ModelHubAsset] = &[
-    ModelHubAsset {
-        repo: "greatv/oar-ocr",
-        file: "pp-ocrv5_mobile_det.onnx",
-        kind: ModelHubAssetKind::ModelScopeFile {
-            output_file: "pp-ocrv5_mobile_det.onnx",
-        },
-    },
-    ModelHubAsset {
-        repo: "greatv/oar-ocr",
-        file: "pp-ocrv5_mobile_rec.onnx",
-        kind: ModelHubAssetKind::ModelScopeFile {
-            output_file: "pp-ocrv5_mobile_rec.onnx",
-        },
-    },
-    ModelHubAsset {
-        repo: "greatv/oar-ocr",
-        file: "ppocrv5_dict.txt",
-        kind: ModelHubAssetKind::ModelScopeFile {
-            output_file: "ppocrv5_dict.txt",
-        },
-    },
-];
-
-const PP_OCRV5_SERVER_ASSETS: &[ModelHubAsset] = &[
-    ModelHubAsset {
-        repo: "PaddlePaddle/PP-OCRv5_server_det_onnx",
-        file: "inference.onnx",
-        kind: ModelHubAssetKind::RequiredFile,
-    },
-    ModelHubAsset {
-        repo: "PaddlePaddle/PP-OCRv5_server_rec_onnx",
-        file: "inference.onnx",
-        kind: ModelHubAssetKind::RequiredFile,
-    },
-    ModelHubAsset {
-        repo: "PaddlePaddle/PP-OCRv5_server_rec_onnx",
-        file: "inference.yml",
-        kind: ModelHubAssetKind::PaddleOcrDictionary {
-            output_file: "ppocrv5_dict.txt",
-        },
-    },
-];
-
-const PP_OCRV6_TINY_ASSETS: &[ModelHubAsset] = &[
-    ModelHubAsset {
-        repo: "PaddlePaddle/PP-OCRv6_tiny_det_onnx",
-        file: "inference.onnx",
-        kind: ModelHubAssetKind::RequiredFile,
-    },
-    ModelHubAsset {
-        repo: "PaddlePaddle/PP-OCRv6_tiny_rec_onnx",
-        file: "inference.onnx",
-        kind: ModelHubAssetKind::RequiredFile,
-    },
-    ModelHubAsset {
-        repo: "PaddlePaddle/PP-OCRv6_tiny_rec_onnx",
-        file: "inference.yml",
-        kind: ModelHubAssetKind::PaddleOcrDictionary {
-            output_file: "ppocrv6_tiny_dict.txt",
-        },
-    },
-];
-
-const PP_OCRV6_SMALL_ASSETS: &[ModelHubAsset] = &[
-    ModelHubAsset {
-        repo: "PaddlePaddle/PP-OCRv6_small_det_onnx",
-        file: "inference.onnx",
-        kind: ModelHubAssetKind::RequiredFile,
-    },
-    ModelHubAsset {
-        repo: "PaddlePaddle/PP-OCRv6_small_rec_onnx",
-        file: "inference.onnx",
-        kind: ModelHubAssetKind::RequiredFile,
-    },
-    ModelHubAsset {
-        repo: "PaddlePaddle/PP-OCRv6_small_rec_onnx",
-        file: "inference.yml",
-        kind: ModelHubAssetKind::PaddleOcrDictionary {
-            output_file: "ppocrv6_dict.txt",
-        },
-    },
-];
-
-const PP_OCRV6_MEDIUM_ASSETS: &[ModelHubAsset] = &[
-    ModelHubAsset {
-        repo: "PaddlePaddle/PP-OCRv6_medium_det_onnx",
-        file: "inference.onnx",
-        kind: ModelHubAssetKind::RequiredFile,
-    },
-    ModelHubAsset {
-        repo: "PaddlePaddle/PP-OCRv6_medium_rec_onnx",
-        file: "inference.onnx",
-        kind: ModelHubAssetKind::RequiredFile,
-    },
-    ModelHubAsset {
-        repo: "PaddlePaddle/PP-OCRv6_medium_rec_onnx",
-        file: "inference.yml",
-        kind: ModelHubAssetKind::PaddleOcrDictionary {
-            output_file: "ppocrv6_dict.txt",
-        },
-    },
-];
-
-const PP_DOCLAYOUTV3_ASSETS: &[ModelHubAsset] = &[ModelHubAsset {
-    repo: "PaddlePaddle/PP-DocLayoutV3_onnx",
-    file: "inference.onnx",
-    kind: ModelHubAssetKind::RequiredFile,
-}];
 
 impl ModelSpec for KnownOcrModel {
     fn category(&self) -> ModelCategory {
@@ -287,18 +177,6 @@ impl ModelSpec for KnownOcrModel {
                 "tokenizer.json",
                 "chat_template.jinja",
             ],
-        }
-    }
-
-    fn hub_assets(&self) -> &'static [ModelHubAsset] {
-        match self {
-            Self::PpOcrV5Mobile => PP_OCRV5_MOBILE_ASSETS,
-            Self::PpOcrV5Server => PP_OCRV5_SERVER_ASSETS,
-            Self::PpOcrV6Tiny => PP_OCRV6_TINY_ASSETS,
-            Self::PpOcrV6Small => PP_OCRV6_SMALL_ASSETS,
-            Self::PpOcrV6Medium => PP_OCRV6_MEDIUM_ASSETS,
-            Self::PpDocLayoutV3 => PP_DOCLAYOUTV3_ASSETS,
-            _ => &[],
         }
     }
 }
@@ -344,39 +222,5 @@ mod tests {
         );
         assert!(KnownOcrModel::from_layout_model_id(&traditional).is_err());
         assert!(KnownOcrModel::from_ocr_vl_model_id(&layout).is_err());
-    }
-
-    #[test]
-    fn pp_ocrv5_mobile_uses_modelscope_oar_registry_assets() {
-        assert_eq!(
-            KnownOcrModel::PpOcrV5Mobile.required_files(),
-            &[] as &[&str]
-        );
-        assert_eq!(
-            KnownOcrModel::PpOcrV5Mobile.hub_assets(),
-            &[
-                ModelHubAsset {
-                    repo: "greatv/oar-ocr",
-                    file: "pp-ocrv5_mobile_det.onnx",
-                    kind: ModelHubAssetKind::ModelScopeFile {
-                        output_file: "pp-ocrv5_mobile_det.onnx"
-                    },
-                },
-                ModelHubAsset {
-                    repo: "greatv/oar-ocr",
-                    file: "pp-ocrv5_mobile_rec.onnx",
-                    kind: ModelHubAssetKind::ModelScopeFile {
-                        output_file: "pp-ocrv5_mobile_rec.onnx"
-                    },
-                },
-                ModelHubAsset {
-                    repo: "greatv/oar-ocr",
-                    file: "ppocrv5_dict.txt",
-                    kind: ModelHubAssetKind::ModelScopeFile {
-                        output_file: "ppocrv5_dict.txt"
-                    },
-                },
-            ]
-        );
     }
 }

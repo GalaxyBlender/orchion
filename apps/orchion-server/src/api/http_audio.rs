@@ -13,17 +13,21 @@ use axum::Json;
 use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{FromRequest, Multipart, Request, State};
-use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
+use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use orchion::{
     AsrOptions, AsrStreamingOptions, AsrTimestampGranularity, AudioInputFormat, AudioOutputFormat,
-    OrchionError, StreamingAudioDecoder, TtsAudio, decode_audio_bytes, encode_tts_audio,
+    OrchionError, StreamingAudioDecoder, TtsAudio, decode_audio_file, encode_tts_audio,
 };
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tempfile::{Builder as TempFileBuilder, NamedTempFile};
+use tokio::time::timeout;
+
+const TRANSCRIPTION_STREAM_START_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(super) async fn create_speech(
     State(state): State<Arc<AppState>>,
@@ -65,7 +69,7 @@ async fn create_speech_multipart(
     let mut response_format = None;
     let mut speed = None;
     let mut language = None;
-    let mut reference_audio = None;
+    let mut reference_audio_file = None;
     let mut reference_text = None;
     let mut seed = None;
     let mut temperature = None;
@@ -80,19 +84,8 @@ async fn create_speech_multipart(
         let name = field.name().unwrap_or_default().to_string();
         match name.as_str() {
             "reference_audio" => {
-                reference_audio = Some(
-                    field
-                        .bytes()
-                        .await
-                        .map_err(|error| {
-                            ApiError::invalid_request(
-                                error.to_string(),
-                                Some("reference_audio"),
-                                Some("invalid_file"),
-                            )
-                        })?
-                        .to_vec(),
-                );
+                reference_audio_file =
+                    Some(write_multipart_file_to_temp_file(field, "reference_audio").await?);
             }
             "model" => model = Some(read_text_field(field, "model").await?),
             "input" => input = Some(read_text_field(field, "input").await?),
@@ -130,13 +123,20 @@ async fn create_speech_multipart(
             Some("unsupported_voice_input"),
         ));
     }
-    let reference_audio = reference_audio.ok_or_else(|| {
+    let (reference_audio_file, reference_audio_size) = reference_audio_file.ok_or_else(|| {
         ApiError::invalid_request(
             "voice clone requires `reference_audio` file upload",
             Some("reference_audio"),
             Some("missing_required_parameter"),
         )
     })?;
+    if reference_audio_size == 0 {
+        return Err(ApiError::invalid_request(
+            "uploaded reference audio is empty",
+            Some("reference_audio"),
+            Some("invalid_file"),
+        ));
+    }
     let model = required_multipart_field(model, "model")?;
     let input = required_multipart_field(input, "input")?;
     let request = SpeechRequest {
@@ -158,7 +158,7 @@ async fn create_speech_multipart(
     };
     request.validate()?;
     parse_tts_model(&request.model).map_err(|_| ApiError::model_not_available(&request.model))?;
-    let reference_file = transcode_reference_audio_to_wav_file(reference_audio).await?;
+    let reference_file = transcode_reference_audio_to_wav_file(reference_audio_file.path()).await?;
     let reference_path = reference_file
         .path()
         .to_str()
@@ -174,9 +174,9 @@ async fn create_speech_multipart(
 }
 
 async fn transcode_reference_audio_to_wav_file(
-    reference_audio: Vec<u8>,
+    reference_audio: &Path,
 ) -> Result<NamedTempFile, ApiError> {
-    let decoded = decode_audio_bytes(reference_audio)
+    let decoded = decode_audio_file(reference_audio.to_path_buf())
         .await
         .map_err(reference_audio_error)?;
     let audio = TtsAudio::new(decoded.samples, decoded.sample_rate);
@@ -383,20 +383,11 @@ pub(super) async fn create_transcription_ws(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
-    let required_api_key = state.config().auth.api_key.clone();
-    let header_authorized =
-        transcription_stream_header_authorized(required_api_key.as_deref(), &headers);
-    Ok(ws.on_upgrade(move |socket| {
-        handle_transcription_ws(socket, state, required_api_key, header_authorized)
-    }))
+    authorize(&state, &headers)?;
+    Ok(ws.on_upgrade(move |socket| handle_transcription_ws(socket, state)))
 }
 
-async fn handle_transcription_ws(
-    mut socket: WebSocket,
-    state: Arc<AppState>,
-    required_api_key: Option<String>,
-    header_authorized: bool,
-) {
+async fn handle_transcription_ws(mut socket: WebSocket, state: Arc<AppState>) {
     let start = match receive_transcription_stream_start(&mut socket).await {
         Ok(start) => start,
         Err(error) => {
@@ -404,14 +395,6 @@ async fn handle_transcription_ws(
             return;
         }
     };
-    if let Err(error) = validate_transcription_stream_api_key(
-        required_api_key.as_deref(),
-        start.api_key.as_deref(),
-        header_authorized,
-    ) {
-        let _ = send_stream_error(&mut socket, error).await;
-        return;
-    }
     let model = start.model.clone();
     let requested = match parse_asr_model(&model) {
         Ok(model) => model,
@@ -513,29 +496,16 @@ async fn handle_transcription_ws(
     }
 }
 
-fn transcription_stream_header_authorized(
-    required_api_key: Option<&str>,
-    headers: &HeaderMap,
-) -> bool {
-    let Some(required_api_key) = required_api_key else {
-        return true;
-    };
-    headers
-        .get(AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .is_some_and(|token| token == required_api_key)
-}
-
+#[cfg(test)]
 fn validate_transcription_stream_api_key(
     required_api_key: Option<&str>,
-    message_api_key: Option<&str>,
+    _message_api_key: Option<&str>,
     header_authorized: bool,
 ) -> Result<(), ApiError> {
-    let Some(required_api_key) = required_api_key else {
+    if required_api_key.is_none() {
         return Ok(());
     };
-    if header_authorized || message_api_key == Some(required_api_key) {
+    if header_authorized {
         Ok(())
     } else {
         Err(ApiError::invalid_api_key())
@@ -545,7 +515,10 @@ fn validate_transcription_stream_api_key(
 async fn receive_transcription_stream_start(
     socket: &mut WebSocket,
 ) -> Result<TranscriptionStreamStart, ApiError> {
-    match socket.recv().await {
+    let message = timeout(TRANSCRIPTION_STREAM_START_TIMEOUT, socket.recv())
+        .await
+        .map_err(|_| transcription_stream_start_timeout_error())?;
+    match message {
         Some(Ok(Message::Text(text))) => parse_transcription_stream_start(text.as_str()),
         Some(Ok(_)) => Err(ApiError::invalid_request(
             "first websocket message must be a JSON start message",
@@ -563,6 +536,14 @@ async fn receive_transcription_stream_start(
             Some("missing_start_message"),
         )),
     }
+}
+
+fn transcription_stream_start_timeout_error() -> ApiError {
+    ApiError::invalid_request(
+        "websocket start message timed out",
+        Some("type"),
+        Some("start_message_timeout"),
+    )
 }
 
 async fn finish_transcription_stream(
@@ -1099,8 +1080,11 @@ mod tests {
     }
 
     #[test]
-    fn stream_start_api_key_authenticates_when_header_is_missing() {
-        validate_transcription_stream_api_key(Some("secret"), Some("secret"), false).unwrap();
+    fn stream_start_api_key_does_not_authenticate_without_header() {
+        let error = validate_transcription_stream_api_key(Some("secret"), Some("secret"), false)
+            .unwrap_err();
+
+        assert_eq!(error.error.code.as_deref(), Some("invalid_api_key"));
     }
 
     #[test]
@@ -1113,6 +1097,14 @@ mod tests {
     #[test]
     fn stream_start_api_key_skips_message_key_after_header_auth() {
         validate_transcription_stream_api_key(Some("secret"), None, true).unwrap();
+    }
+
+    #[test]
+    fn stream_start_timeout_error_uses_stable_code() {
+        let error = transcription_stream_start_timeout_error();
+
+        assert_eq!(error.error.param.as_deref(), Some("type"));
+        assert_eq!(error.error.code.as_deref(), Some("start_message_timeout"));
     }
 
     #[test]

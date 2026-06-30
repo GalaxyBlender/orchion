@@ -119,7 +119,7 @@ fn run_ocr_blocking(
             })
         }
         _ => Err(OrchionError::Inference {
-            source: anyhow::anyhow!("loaded OCR runtime does not match model `{}`", model.id()),
+            message: format!("loaded OCR runtime does not match model `{}`", model.id()),
         }),
     }
 }
@@ -289,11 +289,11 @@ fn run_traditional_ocr(
         .ocr
         .lock()
         .map_err(|error| OrchionError::Inference {
-            source: anyhow::anyhow!("OCR runtime lock poisoned: {error}"),
+            message: format!("OCR runtime lock poisoned: {error}"),
         })?;
     let mut pages = ocr.predict(vec![image]).map_err(inference_error)?;
     let page = pages.pop().ok_or_else(|| OrchionError::Inference {
-        source: anyhow::anyhow!("OCR returned no pages"),
+        message: "OCR returned no pages".to_string(),
     })?;
 
     let regions = page
@@ -329,7 +329,7 @@ fn run_layout_ocr(
     options: &OcrOptions,
 ) -> Result<OcrResult> {
     let structure = structure.lock().map_err(|error| OrchionError::Inference {
-        source: anyhow::anyhow!("OCR layout runtime lock poisoned: {error}"),
+        message: format!("OCR layout runtime lock poisoned: {error}"),
     })?;
     let result = structure.predict(image_path).map_err(inference_error)?;
 
@@ -374,12 +374,12 @@ fn run_vl_ocr(
 ) -> Result<OcrResult> {
     let image = image::open(image_path)
         .map_err(|error| OrchionError::Inference {
-            source: anyhow::anyhow!(error),
+            message: error.to_string(),
         })?
         .to_rgb8();
     let max_tokens = options.max_tokens.unwrap_or(DEFAULT_VL_MAX_TOKENS);
     let runtime = runtime.lock().map_err(|error| OrchionError::Inference {
-        source: anyhow::anyhow!("OCR-VL runtime lock poisoned: {error}"),
+        message: format!("OCR-VL runtime lock poisoned: {error}"),
     })?;
 
     if should_use_vl_layout_pipeline(options) {
@@ -396,7 +396,7 @@ fn run_vl_ocr(
         .into_iter()
         .next()
         .ok_or_else(|| OrchionError::Inference {
-            source: anyhow::anyhow!("OCR-VL returned no results"),
+            message: "OCR-VL returned no results".to_string(),
         })?
         .map_err(inference_error)?;
     Ok(base_result(
@@ -696,14 +696,14 @@ fn base_result(
 #[cfg(any(feature = "ocr", feature = "ocr-vl"))]
 fn model_load_error(error: impl Into<anyhow::Error>) -> OrchionError {
     OrchionError::ModelLoad {
-        source: error.into(),
+        message: error.into().to_string(),
     }
 }
 
 #[cfg(any(feature = "ocr", feature = "ocr-vl"))]
 fn inference_error(error: impl Into<anyhow::Error>) -> OrchionError {
     OrchionError::Inference {
-        source: error.into(),
+        message: error.into().to_string(),
     }
 }
 

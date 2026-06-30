@@ -13,6 +13,7 @@ use utoipa::ToSchema;
 pub struct ApiError {
     status: StatusCode,
     pub error: ErrorObject,
+    log_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -46,6 +47,7 @@ impl ApiError {
                 param: param.map(ToOwned::to_owned),
                 code: code.map(ToOwned::to_owned),
             },
+            log_message: None,
         }
     }
 
@@ -54,11 +56,12 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             error: ErrorObject {
-                message: message.into(),
+                message: "internal server error".to_string(),
                 error_type: "server_error",
                 param: None,
                 code: Some("internal_error".to_string()),
             },
+            log_message: Some(message.into()),
         }
     }
 
@@ -72,6 +75,7 @@ impl ApiError {
                 param: None,
                 code: Some("invalid_api_key".to_string()),
             },
+            log_message: None,
         }
     }
 
@@ -170,6 +174,7 @@ impl ModelObject {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let log_message = self.log_message.clone();
         let (status, body) = self.into_status_body();
         if status.is_server_error() {
             tracing::error!(
@@ -178,6 +183,7 @@ impl IntoResponse for ApiError {
                 code = ?body.error.code,
                 param = ?body.error.param,
                 message = %body.error.message,
+                detail = ?log_message,
                 "request failed"
             );
         } else {
@@ -648,5 +654,15 @@ mod tests {
         assert_eq!(value["segments"][0]["start"], 1.0);
         assert_eq!(value["segments"][0]["end"], 2.0);
         assert_eq!(value["segments"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn internal_errors_return_generic_message() {
+        let (_status, body) =
+            ApiError::internal("local path /tmp/orchion/model.bin").into_status_body();
+
+        assert_eq!(body.error.message, "internal server error");
+        assert!(!body.error.message.contains("/tmp/orchion"));
+        assert_eq!(body.error.code.as_deref(), Some("internal_error"));
     }
 }

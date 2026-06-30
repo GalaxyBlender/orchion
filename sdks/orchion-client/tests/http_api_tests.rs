@@ -184,10 +184,12 @@ async fn create_ocr_posts_multipart_and_decodes_json() {
 
     let response = client.ocr().recognize(request).await.unwrap();
 
-    assert!(matches!(
-        response,
-        OcrResponse::Json(body) if body.text == "invoice"
-    ));
+    let OcrResponse::Json(body) = response else {
+        panic!("expected JSON OCR response");
+    };
+
+    assert_eq!(body.text, "invoice");
+    assert_eq!(body.usage.input_pages, 1);
 
     let requests = server.received_requests().await.unwrap();
     assert!(
