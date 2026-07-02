@@ -1,7 +1,9 @@
 use orchion_core::{AsrModel, AsrOptions, AsrTranscript, DevicePreference, Result};
 use std::path::Path;
 
-#[cfg(feature = "vad-webrtc")]
+#[cfg(feature = "audio-vad")]
+use crate::audio_vad::{AudioVadSegment, AudioVadSegmenter};
+#[cfg(feature = "audio-vad")]
 use orchion_core::{ASR_SAMPLE_RATE, AsrSegment};
 
 #[cfg(feature = "audio-ffmpeg")]
@@ -15,10 +17,9 @@ pub struct Asr {
     inner: orchion_qwen3::Asr,
 }
 
-#[cfg(all(test, feature = "vad-webrtc"))]
+#[cfg(all(test, feature = "audio-vad"))]
 mod tests {
     use super::*;
-    use orchion_audio_vad::AudioSegment;
     use orchion_core::AsrSegment;
 
     #[test]
@@ -26,14 +27,14 @@ mod tests {
         let transcript = transcript_from_segment_results(
             vec![
                 (
-                    AudioSegment {
+                    AudioVadSegment {
                         start_sample: 16_000,
                         end_sample: 32_000,
                     },
                     segment_transcript(" hello ", "en", "raw one"),
                 ),
                 (
-                    AudioSegment {
+                    AudioVadSegment {
                         start_sample: 48_000,
                         end_sample: 64_000,
                     },
@@ -71,14 +72,14 @@ mod tests {
         let transcript = transcript_from_segment_results(
             vec![
                 (
-                    AudioSegment {
+                    AudioVadSegment {
                         start_sample: 0,
                         end_sample: 16_000,
                     },
                     segment_transcript("", "", ""),
                 ),
                 (
-                    AudioSegment {
+                    AudioVadSegment {
                         start_sample: 16_000,
                         end_sample: 32_000,
                     },
@@ -164,7 +165,7 @@ impl Asr {
             .await
     }
 
-    #[cfg(feature = "vad-webrtc")]
+    #[cfg(feature = "audio-vad")]
     pub async fn transcribe_samples_with_segments(
         &self,
         samples: &[f32],
@@ -172,7 +173,7 @@ impl Asr {
         options: AsrOptions,
     ) -> Result<AsrTranscript> {
         let prepared = orchion_core::prepare_asr_samples(samples, sample_rate)?;
-        let segmenter = orchion_audio_vad::WebRtcVadSegmenter::default();
+        let segmenter = AudioVadSegmenter::default();
         let audio_segments = segmenter.segment(&prepared, ASR_SAMPLE_RATE)?;
         if audio_segments.is_empty() {
             return Ok(empty_transcript(options.language));
@@ -256,7 +257,7 @@ impl Asr {
             })
     }
 
-    #[cfg(all(feature = "audio-ffmpeg", feature = "vad-webrtc"))]
+    #[cfg(all(feature = "audio-ffmpeg", feature = "audio-vad"))]
     pub async fn transcribe_audio_bytes_with_segments(
         &self,
         bytes: impl Into<Vec<u8>>,
@@ -282,7 +283,7 @@ impl Asr {
             })
     }
 
-    #[cfg(all(feature = "audio-ffmpeg", feature = "vad-webrtc"))]
+    #[cfg(all(feature = "audio-ffmpeg", feature = "audio-vad"))]
     pub async fn transcribe_audio_file_with_segments(
         &self,
         path: impl Into<PathBuf>,
@@ -320,10 +321,10 @@ impl Asr {
     }
 }
 
-#[cfg(feature = "vad-webrtc")]
+#[cfg(feature = "audio-vad")]
 #[allow(clippy::cast_precision_loss)]
 fn transcript_from_segment_results(
-    segment_results: Vec<(orchion_audio_vad::AudioSegment, AsrTranscript)>,
+    segment_results: Vec<(AudioVadSegment, AsrTranscript)>,
     sample_rate: u32,
     fallback_language: Option<String>,
 ) -> AsrTranscript {
@@ -372,7 +373,7 @@ fn transcript_from_segment_results(
     }
 }
 
-#[cfg(feature = "vad-webrtc")]
+#[cfg(feature = "audio-vad")]
 fn empty_transcript(language: Option<String>) -> AsrTranscript {
     AsrTranscript {
         text: String::new(),

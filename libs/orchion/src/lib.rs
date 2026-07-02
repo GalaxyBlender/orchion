@@ -3,6 +3,9 @@
 #[cfg(feature = "asr-qwen3")]
 pub mod asr;
 
+#[cfg(feature = "audio-vad")]
+pub mod audio_vad;
+
 #[cfg(feature = "tts-qwen3")]
 pub mod tts;
 
@@ -23,6 +26,9 @@ pub use orchion_audio::{
     StreamingAudioDecoder, decode_audio_bytes, decode_audio_file, decode_pcm_s16le_bytes,
     encode_tts_audio,
 };
+
+#[cfg(feature = "audio-vad")]
+pub use audio_vad::{AudioVadConfig, AudioVadMode, AudioVadSegment, AudioVadSegmenter};
 
 #[cfg(feature = "download-all")]
 pub use orchion_download::{DownloadSource, ModelDownloader};
