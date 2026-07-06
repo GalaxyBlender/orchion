@@ -28,7 +28,10 @@ pub use orchion_audio::{
 };
 
 #[cfg(feature = "audio-vad")]
-pub use audio_vad::{AudioVadConfig, AudioVadMode, AudioVadSegment, AudioVadSegmenter};
+pub use audio_vad::{
+    AudioVadConfig, AudioVadMode, AudioVadSegment, AudioVadSegmenter, AudioVadStreamingConfig,
+    AudioVadStreamingEndpoint, AudioVadStreamingEvent,
+};
 
 #[cfg(feature = "download-all")]
 pub use orchion_download::{DownloadSource, ModelDownloader};

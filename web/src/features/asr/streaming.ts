@@ -1,10 +1,27 @@
-import type { AsrFormState, AsrStreamEvent, AsrStreamInputFormat } from "./types";
+import type {
+  AsrFormState,
+  AsrCaptionEndpointingOptions,
+  AsrStreamCaptionPartialEvent,
+  AsrStreamEvent,
+  AsrStreamInputFormat,
+  AsrStreamOutputMode,
+} from "./types";
 
 export const asrStreamEndpointPath = "/v1/audio/transcriptions/stream";
+export const asrCaptionVadFrameDurationMs = 30;
+export const asrCaptionMaxCandidateMs = 60_000;
+export const asrCaptionMaxDisplaySegments = 300;
+
+export type AsrCaptionEndpointingValidationError =
+  | "invalid"
+  | "invalid_candidate_window"
+  | "invalid_rounded_window";
 
 export interface AsrStreamStartInput {
   form: AsrFormState;
   inputAudioFormat: AsrStreamInputFormat;
+  outputMode?: AsrStreamOutputMode;
+  endpointing?: AsrCaptionEndpointingOptions;
   apiKey: string;
 }
 
@@ -22,12 +39,18 @@ export function buildAsrStreamUrl(path: string = asrStreamEndpointPath): string 
 }
 
 export function buildAsrStreamStartMessage(input: AsrStreamStartInput): string {
-  const message: Record<string, string> = {
+  const message: Record<string, unknown> = {
     type: "start",
     model: input.form.model.trim(),
     response_format: streamResponseFormat(input.form.responseFormat),
     input_audio_format: input.inputAudioFormat,
   };
+  if (input.outputMode === "caption") {
+    message.mode = "caption";
+    if (input.endpointing) {
+      message.endpointing = input.endpointing;
+    }
+  }
   appendNonblank(message, "language", input.form.language);
   appendNonblank(message, "prompt", input.form.prompt);
   appendNonblank(message, "temperature", input.form.temperature);
@@ -38,6 +61,50 @@ export function buildAsrStreamStartMessage(input: AsrStreamStartInput): string {
 
 export function parseAsrStreamEvent(text: string): AsrStreamEvent {
   return JSON.parse(text) as AsrStreamEvent;
+}
+
+export function isAsrCaptionPartialEvent(event: AsrStreamEvent): event is AsrStreamCaptionPartialEvent {
+  return event.type === "partial" && "segment_id" in event;
+}
+
+export function validateAsrCaptionEndpointingOptions(
+  endpointing: AsrCaptionEndpointingOptions,
+): AsrCaptionEndpointingValidationError | null {
+  if (
+    !isNonnegativeInteger(endpointing.speech_padding_ms) ||
+    !isPositiveInteger(endpointing.min_speech_ms) ||
+    !isPositiveInteger(endpointing.min_silence_ms)
+  ) {
+    return "invalid";
+  }
+
+  const candidateMs = endpointing.speech_padding_ms + endpointing.min_speech_ms;
+  if (candidateMs > asrCaptionMaxCandidateMs) {
+    return "invalid_candidate_window";
+  }
+
+  const roundedMinSpeechMs = Math.ceil(endpointing.min_speech_ms / asrCaptionVadFrameDurationMs) * asrCaptionVadFrameDurationMs;
+  if (candidateMs < roundedMinSpeechMs) {
+    return "invalid_rounded_window";
+  }
+
+  return null;
+}
+
+export function upsertBoundedAsrCaptionSegments<T extends { id: number }>(
+  segments: readonly T[],
+  segment: T,
+  maxSegments: number = asrCaptionMaxDisplaySegments,
+): T[] {
+  const index = segments.findIndex((currentSegment) => currentSegment.id === segment.id);
+  const nextSegments = index === -1
+    ? [...segments, segment]
+    : segments.map((currentSegment, currentIndex) => (currentIndex === index ? segment : currentSegment));
+
+  if (nextSegments.length <= maxSegments) {
+    return nextSegments;
+  }
+  return nextSegments.slice(nextSegments.length - maxSegments);
 }
 
 export function detectAsrStreamInputFormat(file: File): AsrStreamInputFormat | null {
@@ -104,11 +171,19 @@ export function formatAsrStreamResult(event: AsrStreamEvent): string {
   return JSON.stringify(event, null, 2);
 }
 
-function appendNonblank(message: Record<string, string>, name: string, value: string): void {
+function appendNonblank(message: Record<string, unknown>, name: string, value: string): void {
   const trimmedValue = value.trim();
   if (trimmedValue !== "") {
     message[name] = trimmedValue;
   }
+}
+
+function isPositiveInteger(value: number): boolean {
+  return Number.isSafeInteger(value) && value > 0;
+}
+
+function isNonnegativeInteger(value: number): boolean {
+  return Number.isSafeInteger(value) && value >= 0;
 }
 
 function streamResponseFormat(_format: AsrFormState["responseFormat"]): "json" {

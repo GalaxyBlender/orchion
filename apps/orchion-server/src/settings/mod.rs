@@ -7,6 +7,9 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+pub const DEFAULT_ASR_STREAM_TARGET_SEGMENT: Duration = Duration::from_secs(12);
+pub const DEFAULT_ASR_STREAM_MAX_SEGMENT: Duration = Duration::from_secs(120);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelSource {
     Auto,
@@ -63,6 +66,8 @@ pub struct AsrServiceSection {
     pub max_loaded: usize,
     pub device: DevicePreference,
     pub stream_chunk_size: f32,
+    pub stream_target_segment: Duration,
+    pub stream_max_segment: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,6 +166,13 @@ pub enum ConfigError {
         "invalid {section}.stream_chunk_size `{value}`: value must be finite and greater than zero"
     )]
     InvalidChunkSize { section: &'static str, value: f32 },
+    #[error("invalid {section}.{field} `{value}`: {message}")]
+    InvalidStreamSegmentDuration {
+        section: &'static str,
+        field: &'static str,
+        value: String,
+        message: String,
+    },
     #[error(
         "invalid {section}.device `{value}`; expected auto, cpu, metal, metal0, cuda, cuda0, cuda:0, ..."
     )]
@@ -218,6 +230,8 @@ impl ServerConfig {
                     max_loaded: 1,
                     device: DevicePreference::Auto,
                     stream_chunk_size: 2.0,
+                    stream_target_segment: DEFAULT_ASR_STREAM_TARGET_SEGMENT,
+                    stream_max_segment: DEFAULT_ASR_STREAM_MAX_SEGMENT,
                 },
                 tts: TtsServiceSection {
                     enabled: false,
@@ -368,6 +382,28 @@ fn parse_asr_service(
             });
         }
         service.stream_chunk_size = stream_chunk_size;
+    }
+    if let Some(stream_target_segment) = raw.stream_target_segment {
+        service.stream_target_segment = parse_stream_segment_duration(
+            "services.asr",
+            "stream_target_segment",
+            &stream_target_segment,
+        )?;
+    }
+    if let Some(stream_max_segment) = raw.stream_max_segment {
+        service.stream_max_segment = parse_stream_segment_duration(
+            "services.asr",
+            "stream_max_segment",
+            &stream_max_segment,
+        )?;
+    }
+    if service.stream_target_segment > service.stream_max_segment {
+        return Err(ConfigError::InvalidStreamSegmentDuration {
+            section: "services.asr",
+            field: "stream_target_segment",
+            value: format_duration_for_error(service.stream_target_segment),
+            message: "value must be no greater than stream_max_segment".to_string(),
+        });
     }
     apply_service_limits(
         "services.asr",
@@ -660,6 +696,37 @@ fn apply_service_limits(
     Ok(())
 }
 
+fn parse_stream_segment_duration(
+    section: &'static str,
+    field: &'static str,
+    value: &str,
+) -> Result<Duration, ConfigError> {
+    let duration = parse_duration(value).map_err(|error| match error {
+        ConfigError::InvalidDuration { value, message } => {
+            ConfigError::InvalidStreamSegmentDuration {
+                section,
+                field,
+                value,
+                message,
+            }
+        }
+        other => other,
+    })?;
+    if duration.as_millis() > u128::from(u32::MAX) {
+        return Err(ConfigError::InvalidStreamSegmentDuration {
+            section,
+            field,
+            value: value.to_string(),
+            message: "value is too large for streaming millisecond conversion".to_string(),
+        });
+    }
+    Ok(duration)
+}
+
+fn format_duration_for_error(duration: Duration) -> String {
+    format!("{}s", duration.as_secs())
+}
+
 fn ensure_default_available(
     category: &'static str,
     section: &'static str,
@@ -884,6 +951,8 @@ struct RawModelService {
     max_loaded: Option<usize>,
     device: Option<String>,
     stream_chunk_size: Option<f32>,
+    stream_target_segment: Option<String>,
+    stream_max_segment: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -944,6 +1013,26 @@ mod tests {
     }
 
     #[test]
+    fn asr_stream_max_segment_defaults_to_two_minutes() {
+        let config = ServerConfig::default_for_exe(Path::new("/tmp/orchion-server"));
+
+        assert_eq!(
+            config.services.asr.stream_max_segment,
+            Duration::from_secs(120)
+        );
+    }
+
+    #[test]
+    fn asr_stream_target_segment_defaults_to_twelve_seconds() {
+        let config = ServerConfig::default_for_exe(Path::new("/tmp/orchion-server"));
+
+        assert_eq!(
+            config.services.asr.stream_target_segment,
+            Duration::from_secs(12)
+        );
+    }
+
+    #[test]
     fn asr_stream_chunk_size_loads_from_config() {
         let config = ServerConfig::from_toml_str(
             r#"
@@ -955,5 +1044,104 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.services.asr.stream_chunk_size, 1.5);
+    }
+
+    #[test]
+    fn asr_stream_max_segment_loads_from_config() {
+        let config = ServerConfig::from_toml_str(
+            r#"
+            [services.asr]
+            stream_max_segment = "90s"
+            "#,
+            Path::new("/tmp/orchion-server"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.services.asr.stream_max_segment,
+            Duration::from_secs(90)
+        );
+    }
+
+    #[test]
+    fn asr_stream_target_segment_loads_from_config() {
+        let config = ServerConfig::from_toml_str(
+            r#"
+            [services.asr]
+            stream_target_segment = "15s"
+            stream_max_segment = "2m"
+            "#,
+            Path::new("/tmp/orchion-server"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.services.asr.stream_target_segment,
+            Duration::from_secs(15)
+        );
+    }
+
+    #[test]
+    fn asr_stream_max_segment_rejects_zero() {
+        let error = ServerConfig::from_toml_str(
+            r#"
+            [services.asr]
+            stream_max_segment = "0s"
+            "#,
+            Path::new("/tmp/orchion-server"),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ConfigError::InvalidStreamSegmentDuration {
+                section: "services.asr",
+                field: "stream_max_segment",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn asr_stream_target_segment_rejects_zero() {
+        let error = ServerConfig::from_toml_str(
+            r#"
+            [services.asr]
+            stream_target_segment = "0s"
+            "#,
+            Path::new("/tmp/orchion-server"),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ConfigError::InvalidStreamSegmentDuration {
+                section: "services.asr",
+                field: "stream_target_segment",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn asr_stream_target_segment_rejects_values_above_max_segment() {
+        let error = ServerConfig::from_toml_str(
+            r#"
+            [services.asr]
+            stream_target_segment = "130s"
+            stream_max_segment = "120s"
+            "#,
+            Path::new("/tmp/orchion-server"),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ConfigError::InvalidStreamSegmentDuration {
+                section: "services.asr",
+                field: "stream_target_segment",
+                ..
+            }
+        ));
     }
 }

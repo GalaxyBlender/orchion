@@ -14,11 +14,11 @@ schema = ["dep:utoipa"]
 
 [dependencies]
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
-pdfium-render = "0.8"
+pdfium-render = "0.9"
 serde = { version = "1", features = ["derive"], optional = true }
 thiserror = "2"
 utoipa = { version = "5", optional = true }
-zip = { version = "4", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 
 [lints.rust]
 unsafe_code = "warn"

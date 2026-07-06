@@ -63,18 +63,17 @@ export const Sidebar: React.FC<SidebarProps> = ({
   };
 
   return (
-    <div className="flex flex-col h-full justify-between p-4" style={{ height: "100%", display: "flex", flexDirection: "column", justifyContent: "space-between" }}>
-      <div className="stack gap-lg">
-        {/* Brand Header */}
-        <div className="hstack gap-sm justify-between">
-          <div className="hstack gap-sm">
-            <div className="brand-icon flex items-center justify-center bg-accent text-base rounded p-2" style={{ background: "var(--color-accent)", color: "var(--color-bg-sunken)", borderRadius: "var(--radius-sm)", padding: "var(--space-2)" }}>
+    <div className={`sidebar-inner ${collapsed ? "sidebar-inner-collapsed" : ""}`}>
+      <div className="sidebar-main stack gap-lg">
+        <div className={`sidebar-brand ${collapsed ? "sidebar-brand-collapsed" : ""}`}>
+          <div className="sidebar-brand-mark">
+            <div className={`brand-icon ${collapsed ? "brand-icon-collapsed" : ""}`}>
               <TerminalIcon size={18} />
             </div>
             {!collapsed && (
-              <div className="stack gap-0">
-                <span className="font-bold text-md text-primary tracking-tight">Orchion</span>
-                <span className="text-xs text-muted">v0.2.0</span>
+              <div className="sidebar-brand-copy stack gap-0">
+                <span className="sidebar-brand-title">Orchion</span>
+                <span className="sidebar-brand-version">v0.2.0</span>
               </div>
             )}
           </div>
@@ -91,33 +90,22 @@ export const Sidebar: React.FC<SidebarProps> = ({
           )}
         </div>
 
-        {/* Navigation items */}
-        <nav className="stack gap-sm" aria-label={t("shell.primaryNav", "Primary navigation")}>
+        <nav className="sidebar-nav stack gap-sm" aria-label={t("shell.primaryNav", "Primary navigation")}>
           {navItems.map((item) => (
             <NavLink
               key={item.to}
               to={item.to}
               className={({ isActive }) => 
-                `nav-link hstack gap-md p-3 rounded-md transition-colors ${isActive ? "active" : ""}`
+                `nav-link ${collapsed ? "nav-link-collapsed" : ""} ${isActive ? "active" : ""}`
               }
-              style={({ isActive }) => ({
-                display: "flex",
-                alignItems: "center",
-                gap: "var(--space-3)",
-                padding: "var(--space-2-5) var(--space-3)",
-                borderRadius: "var(--radius-md)",
-                color: isActive ? "var(--color-text-primary)" : "var(--color-text-secondary)",
-                background: isActive ? "var(--color-surface-active)" : "transparent",
-                borderLeft: isActive ? "3px solid var(--color-accent)" : "3px solid transparent",
-                textDecoration: "none",
-                transition: "var(--transition-colors)"
-              })}
+              aria-label={collapsed ? `${item.label}, ${item.meta}` : undefined}
+              title={collapsed ? `${item.label} - ${item.meta}` : undefined}
             >
               <span className="nav-icon">{item.icon}</span>
               {!collapsed && (
-                <div className="stack gap-0" style={{ display: "flex", flexDirection: "column", gap: "0" }}>
-                  <span className="text-sm font-semibold">{item.label}</span>
-                  <span className="text-xs text-tertiary">{item.meta}</span>
+                <div className="nav-link-copy stack gap-0">
+                  <span className="nav-link-label">{item.label}</span>
+                  <span className="nav-link-meta">{item.meta}</span>
                 </div>
               )}
             </NavLink>
@@ -125,22 +113,12 @@ export const Sidebar: React.FC<SidebarProps> = ({
         </nav>
       </div>
 
-      {/* Footer controls */}
-      <div className="stack gap-md mt-auto">
-        {/* Language switch */}
+      <div className={`sidebar-footer stack gap-md ${collapsed ? "sidebar-footer-collapsed" : ""}`}>
         {!collapsed && (
-          <div className="hstack gap-xs text-xs text-muted" style={{ display: "flex", alignItems: "center", gap: "var(--space-1)" }}>
-            <Globe size={14} className="text-tertiary" />
+          <div className="sidebar-language">
+            <Globe size={14} />
             <select
-              style={{
-                background: "transparent",
-                border: "none",
-                color: "var(--color-text-secondary)",
-                fontSize: "var(--text-xs)",
-                cursor: "pointer",
-                padding: "2px 4px",
-                outline: "none",
-              }}
+              className="sidebar-language-select"
               value={currentLanguageSelection()}
               onChange={handleLanguageChange}
             >
@@ -156,8 +134,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
           <Button
             variant="ghost"
             size="sm"
-            className="btn-icon-only text-muted hover:text-white mx-auto"
+            className="btn-icon-only sidebar-expand-button text-muted hover:text-white mx-auto"
             onClick={onToggleCollapse}
+            title={t("shell.toggleSidebar", "Toggle sidebar collapsed state")}
           >
             <ChevronRight size={16} />
           </Button>

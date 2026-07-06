@@ -1,6 +1,9 @@
 #![allow(clippy::missing_errors_doc, clippy::must_use_candidate)]
 
+mod streaming;
+
 use orchion_core::{ASR_SAMPLE_RATE, OrchionError, Result};
+pub use streaming::{StreamingVadConfig, StreamingVadEvent, WebRtcStreamingVadEndpoint};
 use wavekat_vad::backends::webrtc::WebRtcVad;
 pub use wavekat_vad::backends::webrtc::WebRtcVadMode;
 use wavekat_vad::{VadError, VoiceActivityDetector};
@@ -202,7 +205,7 @@ fn f32_to_i16(sample: f32) -> i16 {
     (sample * f32::from(i16::MAX)).round() as i16
 }
 
-fn vad_error_into_orchion(error: &VadError) -> OrchionError {
+pub(crate) fn vad_error_into_orchion(error: &VadError) -> OrchionError {
     OrchionError::InvalidAudio {
         reason: format!("WebRTC VAD failed: {error}"),
     }

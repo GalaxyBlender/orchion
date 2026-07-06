@@ -24,6 +24,10 @@ pub struct AudioVadConfig {
     pub mode: AudioVadMode,
 }
 
+pub type AudioVadStreamingConfig = orchion_audio_vad::StreamingVadConfig;
+pub type AudioVadStreamingEndpoint = orchion_audio_vad::WebRtcStreamingVadEndpoint;
+pub type AudioVadStreamingEvent = orchion_audio_vad::StreamingVadEvent;
+
 impl Default for AudioVadConfig {
     fn default() -> Self {
         let config = orchion_audio_vad::VadConfig::default();
@@ -99,5 +103,21 @@ impl From<orchion_audio_vad::WebRtcVadMode> for AudioVadMode {
             orchion_audio_vad::WebRtcVadMode::Aggressive => Self::Aggressive,
             orchion_audio_vad::WebRtcVadMode::VeryAggressive => Self::VeryAggressive,
         }
+    }
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use crate::{AudioVadStreamingConfig, AudioVadStreamingEndpoint, AudioVadStreamingEvent};
+    use orchion_core::ASR_SAMPLE_RATE;
+
+    #[test]
+    fn streaming_facade_exports_caption_endpointing_types() {
+        let config = AudioVadStreamingConfig::default();
+        let mut endpoint = AudioVadStreamingEndpoint::new(config).unwrap();
+
+        let events: Vec<AudioVadStreamingEvent> =
+            endpoint.push(&[0.0; 160], ASR_SAMPLE_RATE).unwrap();
+        assert!(events.is_empty());
     }
 }

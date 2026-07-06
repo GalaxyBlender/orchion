@@ -112,7 +112,8 @@ pub fn render_pdf_to_zip(request: PdfRenderRequest) -> Result<RenderedZip> {
     let document = pdfium
         .load_pdf_from_file(&request.pdf_path, None)
         .map_err(|_| PdfError::InvalidPdfFile)?;
-    let page_count = usize::from(document.pages().len());
+    let page_count =
+        usize::try_from(document.pages().len()).map_err(|_| PdfError::InvalidPdfFile)?;
     let page_indices = selected_page_indices(&request.pages, page_count)?;
     let mut archive = ZipWriter::new(Cursor::new(Vec::new()));
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
@@ -130,7 +131,8 @@ pub fn render_pdf_to_zip(request: PdfRenderRequest) -> Result<RenderedZip> {
         let image = page
             .render_with_config(&render_config)
             .map_err(|_| PdfError::RenderPage)?
-            .as_image();
+            .as_image()
+            .map_err(|_| PdfError::RenderPage)?;
         let bytes = encode_image(&image, request.format)?;
 
         archive

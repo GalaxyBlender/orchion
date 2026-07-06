@@ -10,10 +10,13 @@ import {
   detectMicrophoneSupportIssue,
   detectAsrStreamInputFormat,
   formatAsrStreamResult,
+  isAsrCaptionPartialEvent,
   parseAsrStreamEvent,
   preferredMicrophoneMimeType,
+  upsertBoundedAsrCaptionSegments,
+  validateAsrCaptionEndpointingOptions,
 } from "@/features/asr/streaming";
-import type { AsrFormState, AsrMode, AsrRequestInput, AsrResponseFormat, AsrStreamEvent, AsrStreamInputFormat, AsrStreamInputMode } from "@/features/asr/types";
+import type { AsrCaptionEndpointingOptions, AsrFormState, AsrMode, AsrRequestInput, AsrResponseFormat, AsrStreamEvent, AsrStreamInputFormat, AsrStreamInputMode, AsrStreamOutputMode } from "@/features/asr/types";
 import { useModels } from "@/features/models/useModels";
 import { apiUrl, authHeaders } from "@/shared/api/client";
 import { parseApiError } from "@/shared/api/errors";
@@ -32,8 +35,26 @@ const endpointPath = "/v1/audio/transcriptions";
 const previewFile = new File([""], "preview-audio-placeholder.wav", { type: "audio/wav" });
 const streamFileChunkSize = 64 * 1024;
 const asrStreamResponseFormats: AsrResponseFormat[] = ["json"];
+const captionEndpointingDefaults: CaptionEndpointingFormState = {
+  minSpeechMs: "300",
+  minSilenceMs: "500",
+  speechPaddingMs: "200",
+};
 
 type AsrStreamStatus = "idle" | "connecting" | "streaming" | "finishing";
+
+interface CaptionSegmentView {
+  id: number;
+  text: string;
+  startMs?: number;
+  endMs?: number;
+}
+
+interface CaptionEndpointingFormState {
+  minSpeechMs: string;
+  minSilenceMs: string;
+  speechPaddingMs: string;
+}
 
 export function AsrPage() {
   const { t } = useTranslation();
@@ -47,10 +68,14 @@ export function AsrPage() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [mode, setMode] = useState<AsrMode>("file");
   const [streamInputMode, setStreamInputMode] = useState<AsrStreamInputMode>("microphone");
+  const [streamOutputMode, setStreamOutputMode] = useState<AsrStreamOutputMode>("caption");
+  const [captionEndpointing, setCaptionEndpointing] = useState<CaptionEndpointingFormState>(captionEndpointingDefaults);
   const [streamFile, setStreamFile] = useState<File | null>(null);
   const [streamStatus, setStreamStatus] = useState<AsrStreamStatus>("idle");
   const [partialTranscript, setPartialTranscript] = useState("");
   const [finalTranscript, setFinalTranscript] = useState("");
+  const [currentCaptionSegment, setCurrentCaptionSegment] = useState<CaptionSegmentView | null>(null);
+  const [captionSegments, setCaptionSegments] = useState<CaptionSegmentView[]>([]);
   const abortControllerRef = useRef<AbortController | null>(null);
   const webSocketRef = useRef<WebSocket | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -84,11 +109,15 @@ export function AsrPage() {
       t("asr.stream.summary.endpoint", { endpoint: asrStreamEndpointPath, defaultValue: "WebSocket: {{endpoint}}" }),
       t("asr.summary.model", { model: form.model.trim() || "-" }),
       t("asr.summary.responseFormat", { format: "json" }),
+      streamOutputMode === "caption"
+        ? t("asr.stream.summary.caption", "Output: stable caption segments")
+        : t("asr.stream.summary.transcript", "Output: live transcript"),
+      ...(streamOutputMode === "caption" ? [captionEndpointingSummary(captionEndpointing, t)] : []),
       streamInputMode === "microphone"
         ? t("asr.stream.summary.microphone", "Input: live microphone audio")
         : t("asr.stream.summary.file", { file: streamFile?.name ?? "-", defaultValue: "Streaming file: {{file}}" }),
     ],
-    [form.model, form.responseFormat, streamFile?.name, streamInputMode, t],
+    [captionEndpointing, form.model, form.responseFormat, streamFile?.name, streamInputMode, streamOutputMode, t],
   );
 
   const responseFormatOptions = mode === "stream" ? asrStreamResponseFormats : asrResponseFormats;
@@ -108,6 +137,14 @@ export function AsrPage() {
       { id: "file", label: t("asr.stream.input.file", "Streaming file") },
     ],
     [t],
+  );
+
+  const streamOutputTabs = useMemo(
+    () => [
+      { id: "caption", label: t("asr.stream.output.caption", "Captions"), disabled: isStreaming },
+      { id: "transcript", label: t("asr.stream.output.transcript", "Live transcript"), disabled: isStreaming },
+    ],
+    [isStreaming, t],
   );
 
   useEffect(() => {
@@ -134,6 +171,25 @@ export function AsrPage() {
     setSubmitError(null);
     setResult("");
     clearStreamResult();
+  };
+
+  const updateStreamOutputMode = (nextMode: AsrStreamOutputMode) => {
+    if (isStreaming) {
+      showValidationError(t("asr.stream.outputChangeDisabled", "Stop the current stream before changing the output mode."));
+      return;
+    }
+    setStreamOutputMode(nextMode);
+    setValidationError("");
+    setSubmitError(null);
+    setResult("");
+    clearStreamResult();
+  };
+
+  const updateCaptionEndpointing = (field: keyof CaptionEndpointingFormState, value: string) => {
+    setValidationError("");
+    setSubmitError(null);
+    setResult("");
+    setCaptionEndpointing((current) => ({ ...current, [field]: value }));
   };
 
   const updateForm = <K extends keyof AsrFormState>(field: K, value: AsrFormState[K]) => {
@@ -236,6 +292,12 @@ export function AsrPage() {
       showValidationError(t("asr.missingModel"));
       return;
     }
+    const parsedEndpointing =
+      streamOutputMode === "caption" ? parseCaptionEndpointing(captionEndpointing, t) : undefined;
+    if (typeof parsedEndpointing === "string") {
+      showValidationError(parsedEndpointing);
+      return;
+    }
     closeStreamResources();
 
     if (streamInputMode === "file") {
@@ -249,7 +311,7 @@ export function AsrPage() {
         return;
       }
       const selectedStreamFile = streamFile;
-      openTranscriptionStream(inputAudioFormat, (socket) => {
+      openTranscriptionStream(inputAudioFormat, parsedEndpointing, (socket) => {
         void sendStreamFile(socket, selectedStreamFile);
       });
       return;
@@ -288,7 +350,7 @@ export function AsrPage() {
           setStreamStatus("finishing");
         }
       };
-      openTranscriptionStream("auto", () => {
+      openTranscriptionStream("auto", parsedEndpointing, () => {
         if (recorder.state === "inactive") {
           recorder.start(500);
         }
@@ -322,6 +384,7 @@ export function AsrPage() {
 
   const openTranscriptionStream = (
     inputAudioFormat: AsrStreamInputFormat,
+    endpointing: AsrCaptionEndpointingOptions | undefined,
     onReady: (socket: WebSocket) => void,
   ) => {
     streamEndedRef.current = false;
@@ -336,6 +399,8 @@ export function AsrPage() {
         buildAsrStreamStartMessage({
           form,
           inputAudioFormat,
+          outputMode: streamOutputMode,
+          endpointing,
           apiKey: settings.apiKey,
         }),
       );
@@ -379,6 +444,11 @@ export function AsrPage() {
         onReady(socket);
         return;
       case "partial":
+        if (isAsrCaptionPartialEvent(event)) {
+          setCurrentCaptionSegment({ id: event.segment_id, text: event.text });
+          setResult(formatAsrStreamResult(event));
+          return;
+        }
         setPartialTranscript(event.text);
         setResult(formatAsrStreamResult(event));
         return;
@@ -386,6 +456,27 @@ export function AsrPage() {
         streamEndedRef.current = true;
         setPartialTranscript("");
         setFinalTranscript(event.text);
+        setResult(formatAsrStreamResult(event));
+        setStreamStatus("idle");
+        closeStreamResources();
+        toast.success(t("common.success", "Transcription completed successfully!"));
+        return;
+      case "segment_final": {
+        const segment: CaptionSegmentView = {
+          id: event.segment_id,
+          text: event.text,
+          startMs: event.start_ms,
+          endMs: event.end_ms,
+        };
+        setCurrentCaptionSegment((current) => (current?.id === event.segment_id ? null : current));
+        setCaptionSegments((currentSegments) => upsertCaptionSegment(currentSegments, segment));
+        setResult(formatAsrStreamResult(event));
+        return;
+      }
+      case "completed":
+        streamEndedRef.current = true;
+        setPartialTranscript("");
+        setCurrentCaptionSegment(null);
         setResult(formatAsrStreamResult(event));
         setStreamStatus("idle");
         closeStreamResources();
@@ -430,6 +521,8 @@ export function AsrPage() {
   function clearStreamResult(): void {
     setPartialTranscript("");
     setFinalTranscript("");
+    setCurrentCaptionSegment(null);
+    setCaptionSegments([]);
   }
 
   function closeStreamResources(): void {
@@ -585,17 +678,80 @@ export function AsrPage() {
 
               {mode === "stream" && (
                 <div className="stack gap-md">
+                  <FormField
+                    label={t("asr.stream.outputLabel", "Streaming output")}
+                    description={
+                      streamOutputMode === "caption"
+                        ? t("asr.stream.outputCaptionDescription", "Server endpointing emits stable subtitle segments on one WebSocket session.")
+                        : t("asr.stream.outputTranscriptDescription", "Continuous partial transcript events are followed by one final transcript after end.")
+                    }
+                  >
+                    <Tabs tabs={streamOutputTabs} activeTab={streamOutputMode} onChange={(id) => updateStreamOutputMode(id as AsrStreamOutputMode)} />
+                  </FormField>
+                  {streamOutputMode === "caption" && (
+                    <div className="result-block stack gap-sm">
+                      <span className="card-eyebrow">{t("asr.stream.endpointingTitle", "Caption endpointing")}</span>
+                      <p className="text-xs text-muted">
+                        {t("asr.stream.endpointingDescription", "Tune how the server cuts stable subtitle segments. Values are sent only in Captions mode.")}
+                      </p>
+                      <div className="grid grid-cols-2 gap-md">
+                        <FormField label={t("asr.stream.endpointingMinSpeech", "Min speech ms")} description={t("asr.stream.endpointingMinSpeechDescription", "Speech duration before a new segment can start.")}>
+                          <Input
+                            type="number"
+                            min={1}
+                            step={10}
+                            inputMode="numeric"
+                            disabled={isStreaming}
+                            value={captionEndpointing.minSpeechMs}
+                            onChange={(event) => updateCaptionEndpointing("minSpeechMs", event.target.value)}
+                          />
+                        </FormField>
+                        <FormField label={t("asr.stream.endpointingMinSilence", "Min silence ms")} description={t("asr.stream.endpointingMinSilenceDescription", "Silence duration used to finalize a segment.")}>
+                          <Input
+                            type="number"
+                            min={1}
+                            step={10}
+                            inputMode="numeric"
+                            disabled={isStreaming}
+                            value={captionEndpointing.minSilenceMs}
+                            onChange={(event) => updateCaptionEndpointing("minSilenceMs", event.target.value)}
+                          />
+                        </FormField>
+                        <FormField label={t("asr.stream.endpointingPadding", "Speech padding ms")} description={t("asr.stream.endpointingPaddingDescription", "Audio kept before speech starts.")}>
+                          <Input
+                            type="number"
+                            min={0}
+                            step={10}
+                            inputMode="numeric"
+                            disabled={isStreaming}
+                            value={captionEndpointing.speechPaddingMs}
+                            onChange={(event) => updateCaptionEndpointing("speechPaddingMs", event.target.value)}
+                          />
+                        </FormField>
+                      </div>
+                    </div>
+                  )}
                   <Alert variant="info" title={t("asr.stream.noticeTitle", "Streaming API")}> 
-                    {t("asr.stream.notice", "Live ASR uses WebSocket streaming and returns JSON events with text payloads.")}
+                    {streamOutputMode === "caption"
+                      ? t("asr.stream.noticeCaption", "Caption streaming returns partial current segments, stable segment_final events, and completed after end.")
+                      : t("asr.stream.noticeTranscript", "Live transcript streaming returns partial text events and one final text event after end.")}
                   </Alert>
                   <div className="result-block stack gap-sm">
                     <span className="card-eyebrow">{t("asr.stream.protocolTitle", "WebSocket protocol")}</span>
                     <ul className="stack gap-xs text-sm list-disc pl-4 text-muted">
                       <li>{t("asr.stream.protocolEndpoint", "Endpoint: GET /v1/audio/transcriptions/stream with WebSocket upgrade.")}</li>
-                      <li>{t("asr.stream.protocolStart", "First message: JSON { type: \"start\", model, input_audio_format, api_key?, language?, prompt?, chunk_size_sec? }.")}</li>
+                      <li>
+                        {streamOutputMode === "caption"
+                          ? t("asr.stream.protocolStartCaption", "First message includes mode: \"caption\" plus model and input_audio_format.")
+                          : t("asr.stream.protocolStartTranscript", "First message omits mode and includes model and input_audio_format.")}
+                      </li>
                       <li>{t("asr.stream.protocolAudio", "Audio messages: binary chunks in the selected input_audio_format.")}</li>
                       <li>{t("asr.stream.protocolEnd", "End message: JSON { type: \"end\" } after the final audio chunk.")}</li>
-                      <li>{t("asr.stream.protocolEvents", "Server events: ready, partial, final, or error JSON messages; transcript events contain text only.")}</li>
+                      <li>
+                        {streamOutputMode === "caption"
+                          ? t("asr.stream.protocolEventsCaption", "Server events: ready, partial with segment_id, segment_final, completed, or error.")
+                          : t("asr.stream.protocolEventsTranscript", "Server events: ready, partial, final, or error; transcript events contain text only.")}
+                      </li>
                     </ul>
                   </div>
                   <Tabs tabs={streamInputTabs} activeTab={streamInputMode} onChange={(id) => updateStreamInputMode(id as AsrStreamInputMode)} />
@@ -720,24 +876,57 @@ export function AsrPage() {
               <span className="card-eyebrow">{t("asr.stream.status", "Status")}</span>
               <p className="text-sm text-muted">{streamStatusLabel(streamStatus, t)}</p>
             </div>
-            {partialTranscript && (
-              <div className="result-block stack gap-sm">
-                <span className="card-eyebrow">{t("asr.stream.partial", "Partial")}</span>
-                <p className="text-sm">{partialTranscript}</p>
-              </div>
-            )}
-            {finalTranscript && (
-              <div className="result-block stack gap-sm">
-                <span className="card-eyebrow">{t("asr.stream.final", "Final")}</span>
-                <p className="text-sm">{finalTranscript}</p>
-              </div>
-            )}
-            {!partialTranscript && !finalTranscript && (
-              <StateView
-                type="empty"
-                title={t("asr.stream.emptyTitle", "No streaming transcript yet")}
-                description={t("asr.stream.empty", "Start recording or stream a file to see partial results.")}
-              />
+            {streamOutputMode === "caption" ? (
+              <>
+                {currentCaptionSegment && (
+                  <div className="result-block stack gap-sm">
+                    <span className="card-eyebrow">{t("asr.stream.captionCurrent", "Current caption")}</span>
+                    <p className="text-sm">{currentCaptionSegment.text}</p>
+                  </div>
+                )}
+                {captionSegments.length > 0 && (
+                  <div className="result-block stack gap-sm">
+                    <span className="card-eyebrow">{t("asr.stream.captionSegments", "Stable captions")}</span>
+                    <ol className="stack gap-sm text-sm pl-4">
+                      {captionSegments.map((segment) => (
+                        <li key={segment.id}>
+                          <span className="text-tertiary">{captionSegmentTimeLabel(segment, t)}</span>
+                          <p>{segment.text}</p>
+                        </li>
+                      ))}
+                    </ol>
+                  </div>
+                )}
+                {!currentCaptionSegment && captionSegments.length === 0 && (
+                  <StateView
+                    type="empty"
+                    title={t("asr.stream.captionEmptyTitle", "No captions yet")}
+                    description={t("asr.stream.captionEmpty", "Start recording or stream a file to see caption segments.")}
+                  />
+                )}
+              </>
+            ) : (
+              <>
+                {partialTranscript && (
+                  <div className="result-block stack gap-sm">
+                    <span className="card-eyebrow">{t("asr.stream.partial", "Partial")}</span>
+                    <p className="text-sm">{partialTranscript}</p>
+                  </div>
+                )}
+                {finalTranscript && (
+                  <div className="result-block stack gap-sm">
+                    <span className="card-eyebrow">{t("asr.stream.final", "Final")}</span>
+                    <p className="text-sm">{finalTranscript}</p>
+                  </div>
+                )}
+                {!partialTranscript && !finalTranscript && (
+                  <StateView
+                    type="empty"
+                    title={t("asr.stream.emptyTitle", "No streaming transcript yet")}
+                    description={t("asr.stream.empty", "Start recording or stream a file to see partial results.")}
+                  />
+                )}
+              </>
             )}
           </Card.Body>
         </Card>
@@ -841,6 +1030,85 @@ function streamStatusLabel(status: AsrStreamStatus, t: TFunction): string {
     case "idle":
       return t("asr.stream.statusIdle", "Idle");
   }
+}
+
+function upsertCaptionSegment(segments: CaptionSegmentView[], segment: CaptionSegmentView): CaptionSegmentView[] {
+  return upsertBoundedAsrCaptionSegments(segments, segment);
+}
+
+function captionSegmentTimeLabel(segment: CaptionSegmentView, t: TFunction): string {
+  if (segment.startMs === undefined || segment.endMs === undefined) {
+    return t("asr.stream.captionNoTime", "Segment {{id}}", { id: segment.id });
+  }
+  return t("asr.stream.captionTime", "Segment {{id}} · {{start}}-{{end}} ms", {
+    id: segment.id,
+    start: segment.startMs,
+    end: segment.endMs,
+  });
+}
+
+function captionEndpointingSummary(endpointing: CaptionEndpointingFormState, t: TFunction): string {
+  return t(
+    "asr.stream.summary.endpointing",
+    "Endpointing: speech {{minSpeech}} ms, silence {{minSilence}} ms, padding {{padding}} ms",
+    {
+      minSpeech: endpointing.minSpeechMs || "-",
+      minSilence: endpointing.minSilenceMs || "-",
+      padding: endpointing.speechPaddingMs || "-",
+    },
+  );
+}
+
+function parseCaptionEndpointing(
+  endpointing: CaptionEndpointingFormState,
+  t: TFunction,
+): AsrCaptionEndpointingOptions | string {
+  const minSpeechMs = parseIntegerMilliseconds(endpointing.minSpeechMs);
+  const minSilenceMs = parseIntegerMilliseconds(endpointing.minSilenceMs);
+  const speechPaddingMs = parseIntegerMilliseconds(endpointing.speechPaddingMs);
+
+  if (
+    minSpeechMs === null ||
+    minSilenceMs === null ||
+    speechPaddingMs === null ||
+    minSpeechMs <= 0 ||
+    minSilenceMs <= 0 ||
+    speechPaddingMs < 0
+  ) {
+    return t(
+      "asr.stream.endpointingInvalid",
+      "Endpointing values must be whole milliseconds. Min speech and min silence must be greater than 0; speech padding can be 0 or greater.",
+    );
+  }
+  const parsedEndpointing = {
+    min_speech_ms: minSpeechMs,
+    min_silence_ms: minSilenceMs,
+    speech_padding_ms: speechPaddingMs,
+  };
+  const endpointingError = validateAsrCaptionEndpointingOptions(parsedEndpointing);
+  if (endpointingError === "invalid_candidate_window") {
+    return t("asr.stream.endpointingInvalidWindow", "Min speech ms plus speech padding ms must be 60000 ms or less.");
+  }
+  if (endpointingError === "invalid_rounded_window") {
+    return t("asr.stream.endpointingInvalidRoundedWindow", "Min speech ms plus speech padding ms must cover the rounded 30 ms VAD frame window.");
+  }
+  if (endpointingError === "invalid") {
+    return t(
+      "asr.stream.endpointingInvalid",
+      "Endpointing values must be whole milliseconds. Min speech and min silence must be greater than 0; speech padding can be 0 or greater.",
+    );
+  }
+
+  return parsedEndpointing;
+}
+
+function parseIntegerMilliseconds(value: string): number | null {
+  const trimmedValue = value.trim();
+  if (!/^\d+$/.test(trimmedValue)) {
+    return null;
+  }
+  const parsedValue = Number(trimmedValue);
+  return Number.isSafeInteger(parsedValue) ? parsedValue : null;
 }
 
 function timestampGranularityLabel(granularity: string, t: TFunction): string {

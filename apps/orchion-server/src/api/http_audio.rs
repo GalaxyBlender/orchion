@@ -1,3 +1,4 @@
+use crate::api::caption_boundary::{CaptionTextSplitter, CaptionTextUpdate};
 use crate::api::http_shared::{
     authorize, is_multipart, parse_multipart_value, read_text_field, required_multipart_field,
     write_multipart_file_to_temp_file,
@@ -8,7 +9,7 @@ use crate::api::openai::{
 };
 use crate::api::srt::format_srt;
 use crate::infrastructure::orchion::AppState;
-use crate::settings::{parse_asr_model, parse_tts_model};
+use crate::settings::{DEFAULT_ASR_STREAM_MAX_SEGMENT, parse_asr_model, parse_tts_model};
 use axum::Json;
 use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -17,8 +18,10 @@ use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use orchion::{
-    AsrOptions, AsrStreamingOptions, AsrTimestampGranularity, AudioInputFormat, AudioOutputFormat,
-    OrchionError, StreamingAudioDecoder, TtsAudio, decode_audio_file, encode_tts_audio,
+    ASR_SAMPLE_RATE, AsrOptions, AsrStreamingOptions, AsrTimestampGranularity, AudioInputFormat,
+    AudioOutputFormat, AudioVadMode, AudioVadStreamingConfig, AudioVadStreamingEndpoint,
+    AudioVadStreamingEvent, OrchionError, StreamingAudioDecoder, TtsAudio, decode_audio_file,
+    encode_tts_audio,
 };
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -28,6 +31,11 @@ use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 use tokio::time::timeout;
 
 const TRANSCRIPTION_STREAM_START_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn duration_to_millis_u32(duration: Duration, field: &'static str) -> u32 {
+    u32::try_from(duration.as_millis())
+        .unwrap_or_else(|_| panic!("validated ASR {field} must fit in u32 milliseconds"))
+}
 
 pub(super) async fn create_speech(
     State(state): State<Arc<AppState>>,
@@ -388,13 +396,22 @@ pub(super) async fn create_transcription_ws(
 }
 
 async fn handle_transcription_ws(mut socket: WebSocket, state: Arc<AppState>) {
-    let start = match receive_transcription_stream_start(&mut socket).await {
-        Ok(start) => start,
-        Err(error) => {
-            let _ = send_stream_error(&mut socket, error).await;
-            return;
-        }
-    };
+    let stream_target_segment_millis = duration_to_millis_u32(
+        state.config().services.asr.stream_target_segment,
+        "stream_target_segment",
+    );
+    let stream_max_segment_millis = duration_to_millis_u32(
+        state.config().services.asr.stream_max_segment,
+        "stream_max_segment",
+    );
+    let start =
+        match receive_transcription_stream_start(&mut socket, stream_max_segment_millis).await {
+            Ok(start) => start,
+            Err(error) => {
+                let _ = send_stream_error(&mut socket, error).await;
+                return;
+            }
+        };
     let model = start.model.clone();
     let requested = match parse_asr_model(&model) {
         Ok(model) => model,
@@ -414,8 +431,31 @@ async fn handle_transcription_ws(mut socket: WebSocket, state: Arc<AppState>) {
             return;
         }
     };
-    let streaming_options =
-        start.to_streaming_options(state.config().services.asr.stream_chunk_size);
+    let default_chunk_size_sec = state.config().services.asr.stream_chunk_size;
+    match start.mode {
+        TranscriptionStreamMode::Legacy => {
+            run_legacy_transcription_stream(socket, start, asr, default_chunk_size_sec).await;
+        }
+        TranscriptionStreamMode::Caption => {
+            run_caption_transcription_stream(
+                socket,
+                start,
+                asr,
+                default_chunk_size_sec,
+                stream_target_segment_millis,
+            )
+            .await;
+        }
+    }
+}
+
+async fn run_legacy_transcription_stream(
+    mut socket: WebSocket,
+    start: TranscriptionStreamStart,
+    asr: orchion::Asr,
+    default_chunk_size_sec: f32,
+) {
+    let streaming_options = start.to_streaming_options(default_chunk_size_sec);
     let chunk_size_sec = streaming_options.chunk_size_sec;
     let mut stream = match asr.start_streaming_with(streaming_options).await {
         Ok(stream) => stream,
@@ -496,6 +536,120 @@ async fn handle_transcription_ws(mut socket: WebSocket, state: Arc<AppState>) {
     }
 }
 
+async fn run_caption_transcription_stream(
+    mut socket: WebSocket,
+    start: TranscriptionStreamStart,
+    asr: orchion::Asr,
+    default_chunk_size_sec: f32,
+    stream_target_segment_millis: u32,
+) {
+    let streaming_options = start.to_streaming_options(default_chunk_size_sec);
+    if let Err(error) = validate_caption_streaming_options(&streaming_options) {
+        let _ = send_stream_error(&mut socket, error).await;
+        return;
+    }
+    let mut decoder = match start.audio_decoder().await {
+        Ok(decoder) => decoder,
+        Err(error) => {
+            let _ = send_stream_error(&mut socket, ApiError::from(error)).await;
+            return;
+        }
+    };
+    let mut endpoint = match AudioVadStreamingEndpoint::new(start.endpointing.to_vad_config()) {
+        Ok(endpoint) => endpoint,
+        Err(error) => {
+            let _ = send_stream_error(&mut socket, ApiError::from(error)).await;
+            return;
+        }
+    };
+    let mut current_segment = None;
+    let mut next_segment_id = 0;
+
+    if send_stream_ready(&mut socket).await.is_err() {
+        return;
+    }
+
+    while let Some(message) = socket.recv().await {
+        let message = match message {
+            Ok(message) => message,
+            Err(error) => {
+                tracing::debug!(error = %error, "transcription websocket receive failed");
+                return;
+            }
+        };
+        match message {
+            Message::Binary(bytes) => {
+                let decoded = match decoder.push(&bytes).await {
+                    Ok(decoded) => decoded,
+                    Err(error) => {
+                        let _ = send_stream_error(&mut socket, ApiError::from(error)).await;
+                        return;
+                    }
+                };
+                let events = match endpoint.push(&decoded.samples, decoded.sample_rate) {
+                    Ok(events) => events,
+                    Err(error) => {
+                        let _ = send_stream_error(&mut socket, ApiError::from(error)).await;
+                        return;
+                    }
+                };
+                if let Err(error) = handle_caption_vad_events(
+                    &mut socket,
+                    &asr,
+                    &streaming_options,
+                    &mut current_segment,
+                    &mut next_segment_id,
+                    events,
+                    decoded.sample_rate,
+                    stream_target_segment_millis,
+                )
+                .await
+                {
+                    let _ = send_stream_error(&mut socket, error).await;
+                    return;
+                }
+            }
+            Message::Text(text) => match parse_transcription_stream_control(text.as_str()) {
+                Ok(TranscriptionStreamControl::End) => {
+                    if let Err(error) = finish_caption_transcription_stream(
+                        &mut socket,
+                        decoder,
+                        endpoint,
+                        &asr,
+                        &streaming_options,
+                        &mut current_segment,
+                        &mut next_segment_id,
+                        stream_target_segment_millis,
+                    )
+                    .await
+                    {
+                        let _ = send_stream_error(&mut socket, error).await;
+                    }
+                    return;
+                }
+                Ok(TranscriptionStreamControl::Start) => {
+                    let _ = send_stream_error(
+                        &mut socket,
+                        ApiError::invalid_request(
+                            "transcription stream has already started",
+                            Some("type"),
+                            Some("invalid_stream_state"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+                Err(error) => {
+                    let _ = send_stream_error(&mut socket, error).await;
+                    return;
+                }
+            },
+            Message::Close(_) => return,
+            Message::Ping(_) | Message::Pong(_) => {}
+        }
+    }
+}
+
 #[cfg(test)]
 fn validate_transcription_stream_api_key(
     required_api_key: Option<&str>,
@@ -514,12 +668,16 @@ fn validate_transcription_stream_api_key(
 
 async fn receive_transcription_stream_start(
     socket: &mut WebSocket,
+    stream_max_segment_millis: u32,
 ) -> Result<TranscriptionStreamStart, ApiError> {
     let message = timeout(TRANSCRIPTION_STREAM_START_TIMEOUT, socket.recv())
         .await
         .map_err(|_| transcription_stream_start_timeout_error())?;
     match message {
-        Some(Ok(Message::Text(text))) => parse_transcription_stream_start(text.as_str()),
+        Some(Ok(Message::Text(text))) => parse_transcription_stream_start_with_stream_max_segment(
+            text.as_str(),
+            stream_max_segment_millis,
+        ),
         Some(Ok(_)) => Err(ApiError::invalid_request(
             "first websocket message must be a JSON start message",
             Some("type"),
@@ -612,6 +770,304 @@ async fn feed_transcription_stream_chunks(
         }
     }
     Ok(())
+}
+
+async fn handle_caption_vad_events(
+    socket: &mut WebSocket,
+    asr: &orchion::Asr,
+    streaming_options: &AsrStreamingOptions,
+    current_segment: &mut Option<CaptionSegmentStream>,
+    next_segment_id: &mut u64,
+    events: Vec<AudioVadStreamingEvent>,
+    sample_rate: u32,
+    stream_target_segment_millis: u32,
+) -> Result<(), ApiError> {
+    for event in events {
+        match event {
+            AudioVadStreamingEvent::SegmentStarted {
+                start_sample,
+                samples,
+            } => {
+                if let Some(segment) = current_segment.take() {
+                    finalize_caption_segment(socket, segment, start_sample).await?;
+                }
+
+                let segment = start_caption_segment(
+                    asr,
+                    streaming_options,
+                    next_segment_id,
+                    start_sample,
+                    sample_rate,
+                    stream_target_segment_millis,
+                )
+                .await?;
+                let mut segment = segment;
+                feed_caption_segment_audio(
+                    socket,
+                    &mut segment,
+                    &samples,
+                    sample_rate,
+                    next_segment_id,
+                )
+                .await?;
+                *current_segment = Some(segment);
+            }
+            AudioVadStreamingEvent::Audio { samples } => {
+                if let Some(segment) = current_segment.as_mut() {
+                    feed_caption_segment_audio(
+                        socket,
+                        segment,
+                        &samples,
+                        sample_rate,
+                        next_segment_id,
+                    )
+                    .await?;
+                }
+            }
+            AudioVadStreamingEvent::SegmentFinal { end_sample, .. } => {
+                if let Some(segment) = current_segment.take() {
+                    finalize_caption_segment(socket, segment, end_sample).await?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn start_caption_segment(
+    asr: &orchion::Asr,
+    streaming_options: &AsrStreamingOptions,
+    next_segment_id: &mut u64,
+    start_sample: usize,
+    sample_rate: u32,
+    stream_target_segment_millis: u32,
+) -> Result<CaptionSegmentStream, ApiError> {
+    let segment_id = allocate_caption_segment_id(next_segment_id)?;
+    let stream = asr
+        .start_streaming_with(streaming_options.clone())
+        .await
+        .map_err(ApiError::from)?;
+    Ok(CaptionSegmentStream {
+        segment_id,
+        start_sample,
+        subtitle_start_sample: start_sample,
+        last_sample: start_sample,
+        sample_rate,
+        stream,
+        pcm_buffer: AsrPcmBuffer::new(streaming_options.chunk_size_sec),
+        text_splitter: CaptionTextSplitter::new(stream_target_segment_millis),
+    })
+}
+
+fn allocate_caption_segment_id(next_segment_id: &mut u64) -> Result<u64, ApiError> {
+    let segment_id = *next_segment_id;
+    *next_segment_id = next_segment_id
+        .checked_add(1)
+        .ok_or_else(|| ApiError::internal("caption segment id overflowed"))?;
+    Ok(segment_id)
+}
+
+async fn feed_caption_segment_audio(
+    socket: &mut WebSocket,
+    segment: &mut CaptionSegmentStream,
+    samples: &[f32],
+    sample_rate: u32,
+    next_segment_id: &mut u64,
+) -> Result<(), ApiError> {
+    if sample_rate != segment.sample_rate {
+        return Err(ApiError::invalid_request(
+            "caption segment audio sample rate changed",
+            Some("sample_rate"),
+            Some("invalid_sample_rate"),
+        ));
+    }
+    let last_sample = segment
+        .last_sample
+        .checked_add(samples.len())
+        .ok_or_else(|| ApiError::internal("caption segment sample index overflowed"))?;
+    let chunks = segment.pcm_buffer.push(samples, sample_rate)?;
+    segment.last_sample = last_sample;
+    for (chunk_samples, chunk_sample_rate) in chunks {
+        match segment.stream.feed(&chunk_samples, chunk_sample_rate).await {
+            Ok(Some(transcript)) => {
+                send_caption_text_update(socket, segment, &transcript.text, next_segment_id)
+                    .await?;
+            }
+            Ok(None) => {}
+            Err(error) => return Err(ApiError::from(error)),
+        }
+    }
+    Ok(())
+}
+
+async fn send_caption_text_update(
+    socket: &mut WebSocket,
+    segment: &mut CaptionSegmentStream,
+    transcript_text: &str,
+    next_segment_id: &mut u64,
+) -> Result<(), ApiError> {
+    let CaptionTextUpdate {
+        segment_final,
+        partial,
+    } = segment
+        .text_splitter
+        .observe_partial(transcript_text, segment.duration_ms());
+    if let Some(final_text) = segment_final {
+        send_caption_text_final(
+            socket,
+            segment.segment_id,
+            segment.subtitle_start_sample,
+            segment.sample_rate,
+            final_text,
+            segment.last_sample,
+        )
+        .await?;
+        segment.segment_id = allocate_caption_segment_id(next_segment_id)?;
+        segment.subtitle_start_sample = segment.last_sample;
+    }
+    if !partial.trim().is_empty() {
+        send_stream_event(socket, &caption_partial_event(segment.segment_id, partial))
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+    }
+    Ok(())
+}
+
+async fn send_caption_text_final(
+    socket: &mut WebSocket,
+    segment_id: u64,
+    start_sample: usize,
+    sample_rate: u32,
+    text: &str,
+    end_sample: usize,
+) -> Result<(), ApiError> {
+    send_stream_event(
+        socket,
+        &caption_segment_final_event(
+            segment_id,
+            text,
+            Some(sample_index_to_ms(start_sample, sample_rate)),
+            Some(sample_index_to_ms(end_sample, sample_rate)),
+        ),
+    )
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))
+}
+
+async fn finalize_caption_segment(
+    socket: &mut WebSocket,
+    segment: CaptionSegmentStream,
+    end_sample: usize,
+) -> Result<(), ApiError> {
+    let CaptionSegmentStream {
+        segment_id,
+        start_sample: _,
+        subtitle_start_sample,
+        last_sample: _,
+        sample_rate,
+        mut stream,
+        mut pcm_buffer,
+        mut text_splitter,
+    } = segment;
+
+    if let Some((samples, sample_rate)) = pcm_buffer.drain_remaining() {
+        stream
+            .feed(&samples, sample_rate)
+            .await
+            .map_err(ApiError::from)?;
+    }
+
+    let transcript = stream.finish().await.map_err(ApiError::from)?;
+    if let Some(text) = text_splitter.flush(&transcript.text) {
+        send_caption_text_final(
+            socket,
+            segment_id,
+            subtitle_start_sample,
+            sample_rate,
+            text,
+            end_sample,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn finish_caption_transcription_stream(
+    socket: &mut WebSocket,
+    decoder: StreamingAudioDecoder,
+    mut endpoint: AudioVadStreamingEndpoint,
+    asr: &orchion::Asr,
+    streaming_options: &AsrStreamingOptions,
+    current_segment: &mut Option<CaptionSegmentStream>,
+    next_segment_id: &mut u64,
+    stream_target_segment_millis: u32,
+) -> Result<(), ApiError> {
+    let decoded = decoder.finish().await.map_err(ApiError::from)?;
+    let events = endpoint
+        .push(&decoded.samples, decoded.sample_rate)
+        .map_err(ApiError::from)?;
+    handle_caption_vad_events(
+        socket,
+        asr,
+        streaming_options,
+        current_segment,
+        next_segment_id,
+        events,
+        decoded.sample_rate,
+        stream_target_segment_millis,
+    )
+    .await?;
+
+    let events = endpoint.finish();
+    handle_caption_vad_events(
+        socket,
+        asr,
+        streaming_options,
+        current_segment,
+        next_segment_id,
+        events,
+        decoded.sample_rate,
+        stream_target_segment_millis,
+    )
+    .await?;
+
+    if let Some(segment) = current_segment.take() {
+        let end_sample = segment.last_sample;
+        finalize_caption_segment(socket, segment, end_sample).await?;
+    }
+
+    send_stream_event(socket, &caption_completed_event())
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))
+}
+
+struct CaptionSegmentStream {
+    segment_id: u64,
+    start_sample: usize,
+    subtitle_start_sample: usize,
+    last_sample: usize,
+    sample_rate: u32,
+    stream: orchion::AsrStream,
+    pcm_buffer: AsrPcmBuffer,
+    text_splitter: CaptionTextSplitter,
+}
+
+impl CaptionSegmentStream {
+    fn subtitle_start_ms(&self) -> u64 {
+        sample_index_to_ms(self.subtitle_start_sample, self.sample_rate)
+    }
+
+    fn duration_ms(&self) -> u64 {
+        sample_index_to_ms(
+            self.last_sample.saturating_sub(self.start_sample),
+            self.sample_rate,
+        )
+    }
+}
+
+fn sample_index_to_ms(sample_index: usize, sample_rate: u32) -> u64 {
+    assert!(sample_rate > 0, "sample_rate must be greater than zero");
+    (sample_index as u64 * 1_000) / u64::from(sample_rate)
 }
 
 struct AsrPcmBuffer {
@@ -711,6 +1167,38 @@ fn stream_transcript_event<'a>(
     }
 }
 
+fn caption_partial_event(
+    segment_id: u64,
+    text: &str,
+) -> TranscriptionStreamCaptionPartialEvent<'_> {
+    TranscriptionStreamCaptionPartialEvent {
+        event_type: "partial",
+        segment_id,
+        text,
+    }
+}
+
+fn caption_segment_final_event(
+    segment_id: u64,
+    text: &str,
+    start_ms: Option<u64>,
+    end_ms: Option<u64>,
+) -> TranscriptionStreamCaptionSegmentFinalEvent<'_> {
+    TranscriptionStreamCaptionSegmentFinalEvent {
+        event_type: "segment_final",
+        segment_id,
+        text,
+        start_ms,
+        end_ms,
+    }
+}
+
+fn caption_completed_event() -> TranscriptionStreamCaptionCompletedEvent {
+    TranscriptionStreamCaptionCompletedEvent {
+        event_type: "completed",
+    }
+}
+
 async fn send_stream_error(socket: &mut WebSocket, error: ApiError) -> Result<(), axum::Error> {
     send_stream_event(
         socket,
@@ -753,6 +1241,54 @@ pub(super) fn parse_timestamp_granularities(values: &[String]) -> Result<bool, A
     Ok(wants_segments)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscriptionStreamMode {
+    Legacy,
+    Caption,
+}
+
+const CAPTION_VAD_FRAME_DURATION_MS: u32 = 30;
+const CAPTION_VAD_MAX_CANDIDATE_MS: u32 = 60_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CaptionEndpointingOptions {
+    min_speech_ms: u32,
+    min_silence_ms: u32,
+    max_segment_ms: u32,
+    speech_padding_ms: u32,
+}
+
+impl Default for CaptionEndpointingOptions {
+    fn default() -> Self {
+        Self::default_with_stream_max_segment_millis(duration_to_millis_u32(
+            DEFAULT_ASR_STREAM_MAX_SEGMENT,
+            "stream_max_segment",
+        ))
+    }
+}
+
+impl CaptionEndpointingOptions {
+    fn default_with_stream_max_segment_millis(stream_max_segment_millis: u32) -> Self {
+        Self {
+            min_speech_ms: 300,
+            min_silence_ms: 500,
+            max_segment_ms: stream_max_segment_millis,
+            speech_padding_ms: 200,
+        }
+    }
+
+    fn to_vad_config(self) -> AudioVadStreamingConfig {
+        AudioVadStreamingConfig {
+            frame_duration_ms: 30,
+            min_speech_ms: self.min_speech_ms,
+            min_silence_ms: self.min_silence_ms,
+            max_segment_ms: self.max_segment_ms,
+            speech_padding_ms: self.speech_padding_ms,
+            mode: AudioVadMode::Quality.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct TranscriptionStreamStart {
     model: String,
@@ -760,6 +1296,8 @@ struct TranscriptionStreamStart {
     prompt: Option<String>,
     api_key: Option<String>,
     response_format: TranscriptionFormat,
+    mode: TranscriptionStreamMode,
+    endpointing: CaptionEndpointingOptions,
     input_audio_format: TranscriptionStreamInputFormat,
     sample_rate: Option<u32>,
     chunk_size_sec: Option<f32>,
@@ -851,9 +1389,22 @@ enum TranscriptionStreamControl {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCaptionEndpointingOptions {
+    #[serde(default)]
+    min_speech_ms: Option<u32>,
+    #[serde(default)]
+    min_silence_ms: Option<u32>,
+    #[serde(default)]
+    speech_padding_ms: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
 struct RawTranscriptionStreamStart {
     #[serde(rename = "type")]
     message_type: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
     model: Option<String>,
     #[serde(default)]
     language: Option<String>,
@@ -865,6 +1416,8 @@ struct RawTranscriptionStreamStart {
     response_format: Option<String>,
     #[serde(default)]
     input_audio_format: Option<String>,
+    #[serde(default)]
+    endpointing: Option<RawCaptionEndpointingOptions>,
     #[serde(default)]
     sample_rate: Option<u32>,
     #[serde(default)]
@@ -899,6 +1452,32 @@ struct TranscriptionStreamTranscriptEvent<'a> {
 }
 
 #[derive(Serialize)]
+struct TranscriptionStreamCaptionPartialEvent<'a> {
+    #[serde(rename = "type")]
+    event_type: &'static str,
+    segment_id: u64,
+    text: &'a str,
+}
+
+#[derive(Serialize)]
+struct TranscriptionStreamCaptionSegmentFinalEvent<'a> {
+    #[serde(rename = "type")]
+    event_type: &'static str,
+    segment_id: u64,
+    text: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end_ms: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct TranscriptionStreamCaptionCompletedEvent {
+    #[serde(rename = "type")]
+    event_type: &'static str,
+}
+
+#[derive(Serialize)]
 struct TranscriptionStreamErrorEvent {
     #[serde(rename = "type")]
     event_type: &'static str,
@@ -906,6 +1485,16 @@ struct TranscriptionStreamErrorEvent {
 }
 
 fn parse_transcription_stream_start(text: &str) -> Result<TranscriptionStreamStart, ApiError> {
+    parse_transcription_stream_start_with_stream_max_segment(
+        text,
+        duration_to_millis_u32(DEFAULT_ASR_STREAM_MAX_SEGMENT, "stream_max_segment"),
+    )
+}
+
+fn parse_transcription_stream_start_with_stream_max_segment(
+    text: &str,
+    stream_max_segment_millis: u32,
+) -> Result<TranscriptionStreamStart, ApiError> {
     let raw = serde_json::from_str::<RawTranscriptionStreamStart>(text).map_err(|error| {
         ApiError::invalid_request(error.to_string(), None, Some("invalid_json"))
     })?;
@@ -960,12 +1549,18 @@ fn parse_transcription_stream_start(text: &str) -> Result<TranscriptionStreamSta
             Some("unsupported_response_format"),
         ));
     }
+    let mode = parse_transcription_stream_mode(raw.mode.as_deref())?;
+    validate_caption_pcm_sample_rate(mode, input_audio_format, raw.sample_rate)?;
+    let endpointing =
+        parse_caption_endpointing_options(mode, raw.endpointing, stream_max_segment_millis)?;
     Ok(TranscriptionStreamStart {
         model,
         language: raw.language,
         prompt: raw.prompt,
         api_key: raw.api_key,
         response_format,
+        mode,
+        endpointing,
         input_audio_format,
         sample_rate: raw.sample_rate,
         chunk_size_sec: raw.chunk_size_sec,
@@ -974,6 +1569,172 @@ fn parse_transcription_stream_start(text: &str) -> Result<TranscriptionStreamSta
         max_new_tokens_streaming: raw.max_new_tokens_streaming,
         max_new_tokens_final: raw.max_new_tokens_final,
     })
+}
+
+fn parse_transcription_stream_mode(
+    mode: Option<&str>,
+) -> Result<TranscriptionStreamMode, ApiError> {
+    let Some(mode) = mode.map(str::trim) else {
+        return Ok(TranscriptionStreamMode::Legacy);
+    };
+    if mode.is_empty() {
+        return Ok(TranscriptionStreamMode::Legacy);
+    }
+    if mode.eq_ignore_ascii_case("caption") {
+        return Ok(TranscriptionStreamMode::Caption);
+    }
+    Err(ApiError::invalid_request(
+        "unsupported streaming transcription mode",
+        Some("mode"),
+        Some("unsupported_stream_mode"),
+    ))
+}
+
+fn validate_caption_pcm_sample_rate(
+    mode: TranscriptionStreamMode,
+    input_audio_format: TranscriptionStreamInputFormat,
+    sample_rate: Option<u32>,
+) -> Result<(), ApiError> {
+    if matches!(mode, TranscriptionStreamMode::Caption)
+        && matches!(input_audio_format, TranscriptionStreamInputFormat::PcmS16Le)
+        && sample_rate != Some(ASR_SAMPLE_RATE)
+    {
+        return Err(ApiError::invalid_request(
+            format!("caption pcm_s16le input requires {ASR_SAMPLE_RATE} Hz sample_rate"),
+            Some("sample_rate"),
+            Some("unsupported_sample_rate"),
+        ));
+    }
+
+    Ok(())
+}
+
+fn parse_caption_endpointing_options(
+    mode: TranscriptionStreamMode,
+    raw: Option<RawCaptionEndpointingOptions>,
+    stream_max_segment_millis: u32,
+) -> Result<CaptionEndpointingOptions, ApiError> {
+    if !matches!(mode, TranscriptionStreamMode::Caption) && raw.is_some() {
+        return Err(ApiError::invalid_request(
+            "endpointing is only supported when mode is caption",
+            Some("endpointing"),
+            Some("unsupported_stream_option"),
+        ));
+    }
+
+    let defaults = CaptionEndpointingOptions::default_with_stream_max_segment_millis(
+        stream_max_segment_millis,
+    );
+    let Some(raw) = raw else {
+        return Ok(defaults);
+    };
+    let options = CaptionEndpointingOptions {
+        min_speech_ms: raw.min_speech_ms.unwrap_or(defaults.min_speech_ms),
+        min_silence_ms: raw.min_silence_ms.unwrap_or(defaults.min_silence_ms),
+        max_segment_ms: defaults.max_segment_ms,
+        speech_padding_ms: raw.speech_padding_ms.unwrap_or(defaults.speech_padding_ms),
+    };
+    validate_caption_endpointing_options(options)?;
+    Ok(options)
+}
+
+fn validate_caption_endpointing_options(
+    options: CaptionEndpointingOptions,
+) -> Result<(), ApiError> {
+    if options.min_speech_ms == 0 {
+        return Err(ApiError::invalid_request(
+            "endpointing.min_speech_ms must be greater than zero",
+            Some("endpointing.min_speech_ms"),
+            Some("invalid_endpointing"),
+        ));
+    }
+    if options.min_silence_ms == 0 {
+        return Err(ApiError::invalid_request(
+            "endpointing.min_silence_ms must be greater than zero",
+            Some("endpointing.min_silence_ms"),
+            Some("invalid_endpointing"),
+        ));
+    }
+    if options.max_segment_ms < options.min_speech_ms {
+        return Err(ApiError::invalid_request(
+            "endpointing.min_speech_ms must not exceed configured stream_max_segment",
+            Some("endpointing.min_speech_ms"),
+            Some("invalid_endpointing"),
+        ));
+    }
+    let candidate_ms = options
+        .speech_padding_ms
+        .checked_add(options.min_speech_ms)
+        .ok_or_else(|| {
+            ApiError::invalid_request(
+                "endpointing.speech_padding_ms plus endpointing.min_speech_ms is too large",
+                Some("endpointing.speech_padding_ms"),
+                Some("invalid_endpointing"),
+            )
+        })?;
+    if candidate_ms > CAPTION_VAD_MAX_CANDIDATE_MS {
+        return Err(ApiError::invalid_request(
+            "endpointing.speech_padding_ms plus endpointing.min_speech_ms must not exceed 60000",
+            Some("endpointing.speech_padding_ms"),
+            Some("invalid_endpointing"),
+        ));
+    }
+    let rounded_min_speech_ms = options
+        .min_speech_ms
+        .div_ceil(CAPTION_VAD_FRAME_DURATION_MS)
+        .checked_mul(CAPTION_VAD_FRAME_DURATION_MS)
+        .ok_or_else(|| {
+            ApiError::invalid_request(
+                "endpointing.min_speech_ms is too large",
+                Some("endpointing.min_speech_ms"),
+                Some("invalid_endpointing"),
+            )
+        })?;
+    if candidate_ms < rounded_min_speech_ms {
+        return Err(ApiError::invalid_request(
+            "endpointing.speech_padding_ms plus endpointing.min_speech_ms must hold one rounded VAD speech window",
+            Some("endpointing.speech_padding_ms"),
+            Some("invalid_endpointing"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_caption_streaming_options(options: &AsrStreamingOptions) -> Result<(), ApiError> {
+    if !options.chunk_size_sec.is_finite() || options.chunk_size_sec <= 0.0 {
+        return Err(ApiError::invalid_request(
+            "streaming chunk_size_sec must be finite and greater than zero",
+            Some("chunk_size_sec"),
+            Some("invalid_chunk_size"),
+        ));
+    }
+
+    let chunk_size_samples = (options.chunk_size_sec * ASR_SAMPLE_RATE as f32) as usize;
+    if chunk_size_samples == 0 {
+        return Err(ApiError::invalid_request(
+            "streaming chunk_size_sec must produce at least one sample",
+            Some("chunk_size_sec"),
+            Some("invalid_chunk_size"),
+        ));
+    }
+
+    if options.max_new_tokens_streaming == 0 {
+        return Err(ApiError::invalid_request(
+            "streaming max_new_tokens_streaming must be greater than zero",
+            Some("max_new_tokens_streaming"),
+            Some("invalid_stream_option"),
+        ));
+    }
+
+    if options.max_new_tokens_final == 0 {
+        return Err(ApiError::invalid_request(
+            "streaming max_new_tokens_final must be greater than zero",
+            Some("max_new_tokens_final"),
+            Some("invalid_stream_option"),
+        ));
+    }
+
+    Ok(())
 }
 
 fn parse_transcription_stream_control(text: &str) -> Result<TranscriptionStreamControl, ApiError> {
@@ -1080,6 +1841,329 @@ mod tests {
     }
 
     #[test]
+    fn stream_start_defaults_to_legacy_mode() {
+        let start = parse_transcription_stream_start(
+            r#"{
+                "type":"start",
+                "model":"Qwen/Qwen3-ASR-Flash",
+                "input_audio_format":"mp3"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(start.mode, TranscriptionStreamMode::Legacy);
+        assert_eq!(start.endpointing, CaptionEndpointingOptions::default());
+    }
+
+    #[test]
+    fn stream_start_accepts_caption_mode_with_endpointing_defaults() {
+        let start = parse_transcription_stream_start(
+            r#"{
+                "type":"start",
+                "mode":"caption",
+                "model":"Qwen/Qwen3-ASR-Flash",
+                "input_audio_format":"pcm_s16le",
+                "sample_rate":16000
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(start.mode, TranscriptionStreamMode::Caption);
+        assert_eq!(
+            start.endpointing,
+            CaptionEndpointingOptions {
+                min_speech_ms: 300,
+                min_silence_ms: 500,
+                max_segment_ms: 120_000,
+                speech_padding_ms: 200,
+            }
+        );
+    }
+
+    #[test]
+    fn stream_start_accepts_caption_endpointing_overrides() {
+        let start = parse_transcription_stream_start(
+            r#"{
+                "type":"start",
+                "mode":"caption",
+                "model":"Qwen/Qwen3-ASR-Flash",
+                "input_audio_format":"pcm_s16le",
+                "sample_rate":16000,
+                "endpointing":{
+                    "min_speech_ms":250,
+                    "min_silence_ms":700,
+                    "speech_padding_ms":160
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(start.mode, TranscriptionStreamMode::Caption);
+        assert_eq!(start.endpointing.min_speech_ms, 250);
+        assert_eq!(start.endpointing.min_silence_ms, 700);
+        assert_eq!(start.endpointing.max_segment_ms, 120_000);
+        assert_eq!(start.endpointing.speech_padding_ms, 160);
+    }
+
+    #[test]
+    fn stream_start_rejects_caption_pcm_sample_rate_that_vad_cannot_endpoint() {
+        let error = parse_transcription_stream_start(
+            r#"{
+                "type":"start",
+                "mode":"caption",
+                "model":"Qwen/Qwen3-ASR-Flash",
+                "input_audio_format":"pcm_s16le",
+                "sample_rate":48000
+            }"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.error.param.as_deref(), Some("sample_rate"));
+        assert_eq!(error.error.code.as_deref(), Some("unsupported_sample_rate"));
+    }
+
+    #[test]
+    fn caption_streaming_options_reject_invalid_chunk_size_before_ready() {
+        let start = parse_transcription_stream_start(
+            r#"{
+                "type":"start",
+                "mode":"caption",
+                "model":"Qwen/Qwen3-ASR-Flash",
+                "input_audio_format":"pcm_s16le",
+                "sample_rate":16000,
+                "chunk_size_sec":0.0
+            }"#,
+        )
+        .unwrap();
+        let options = start.to_streaming_options(2.0);
+
+        let error = validate_caption_streaming_options(&options).unwrap_err();
+
+        assert_eq!(error.error.param.as_deref(), Some("chunk_size_sec"));
+        assert_eq!(error.error.code.as_deref(), Some("invalid_chunk_size"));
+    }
+
+    #[test]
+    fn caption_streaming_options_reject_zero_streaming_tokens_before_ready() {
+        let start = parse_transcription_stream_start(
+            r#"{
+                "type":"start",
+                "mode":"caption",
+                "model":"Qwen/Qwen3-ASR-Flash",
+                "input_audio_format":"pcm_s16le",
+                "sample_rate":16000,
+                "max_new_tokens_streaming":0
+            }"#,
+        )
+        .unwrap();
+        let options = start.to_streaming_options(2.0);
+
+        let error = validate_caption_streaming_options(&options).unwrap_err();
+
+        assert_eq!(
+            error.error.param.as_deref(),
+            Some("max_new_tokens_streaming")
+        );
+        assert_eq!(error.error.code.as_deref(), Some("invalid_stream_option"));
+    }
+
+    #[test]
+    fn caption_streaming_options_reject_zero_final_tokens_before_ready() {
+        let start = parse_transcription_stream_start(
+            r#"{
+                "type":"start",
+                "mode":"caption",
+                "model":"Qwen/Qwen3-ASR-Flash",
+                "input_audio_format":"pcm_s16le",
+                "sample_rate":16000,
+                "max_new_tokens_final":0
+            }"#,
+        )
+        .unwrap();
+        let options = start.to_streaming_options(2.0);
+
+        let error = validate_caption_streaming_options(&options).unwrap_err();
+
+        assert_eq!(error.error.param.as_deref(), Some("max_new_tokens_final"));
+        assert_eq!(error.error.code.as_deref(), Some("invalid_stream_option"));
+    }
+
+    #[test]
+    fn stream_start_rejects_unknown_mode() {
+        let error = parse_transcription_stream_start(
+            r#"{
+                "type":"start",
+                "mode":"sentence",
+                "model":"Qwen/Qwen3-ASR-Flash",
+                "input_audio_format":"mp3"
+            }"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.error.param.as_deref(), Some("mode"));
+        assert_eq!(error.error.code.as_deref(), Some("unsupported_stream_mode"));
+    }
+
+    #[test]
+    fn stream_start_rejects_endpointing_without_caption_mode() {
+        let error = parse_transcription_stream_start(
+            r#"{
+                "type":"start",
+                "model":"Qwen/Qwen3-ASR-Flash",
+                "input_audio_format":"mp3",
+                "endpointing":{"min_silence_ms":700}
+            }"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.error.param.as_deref(), Some("endpointing"));
+        assert_eq!(
+            error.error.code.as_deref(),
+            Some("unsupported_stream_option")
+        );
+    }
+
+    #[test]
+    fn stream_start_rejects_zero_endpointing_min_speech() {
+        let error = parse_transcription_stream_start(
+            r#"{
+                "type":"start",
+                "mode":"caption",
+                "model":"Qwen/Qwen3-ASR-Flash",
+                "input_audio_format":"pcm_s16le",
+                "sample_rate":16000,
+                "endpointing":{"min_speech_ms":0}
+            }"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.error.param.as_deref(),
+            Some("endpointing.min_speech_ms")
+        );
+        assert_eq!(error.error.code.as_deref(), Some("invalid_endpointing"));
+    }
+
+    #[test]
+    fn stream_start_rejects_zero_endpointing_min_silence() {
+        let error = parse_transcription_stream_start(
+            r#"{
+                "type":"start",
+                "mode":"caption",
+                "model":"Qwen/Qwen3-ASR-Flash",
+                "input_audio_format":"pcm_s16le",
+                "sample_rate":16000,
+                "endpointing":{"min_silence_ms":0}
+            }"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.error.param.as_deref(),
+            Some("endpointing.min_silence_ms")
+        );
+        assert_eq!(error.error.code.as_deref(), Some("invalid_endpointing"));
+    }
+
+    #[test]
+    fn stream_start_rejects_min_speech_above_configured_max_segment() {
+        let error = parse_transcription_stream_start_with_stream_max_segment(
+            r#"{
+                "type":"start",
+                "mode":"caption",
+                "model":"Qwen/Qwen3-ASR-Flash",
+                "input_audio_format":"pcm_s16le",
+                "sample_rate":16000,
+                "endpointing":{"min_speech_ms":300}
+            }"#,
+            299,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.error.param.as_deref(),
+            Some("endpointing.min_speech_ms")
+        );
+        assert_eq!(error.error.code.as_deref(), Some("invalid_endpointing"));
+    }
+
+    #[test]
+    fn stream_start_rejects_endpointing_max_segment_field() {
+        let error = parse_transcription_stream_start(
+            r#"{
+                "type":"start",
+                "mode":"caption",
+                "model":"Qwen/Qwen3-ASR-Flash",
+                "input_audio_format":"pcm_s16le",
+                "sample_rate":16000,
+                "endpointing":{"max_segment_ms":60001}
+            }"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.error.code.as_deref(), Some("invalid_json"));
+    }
+
+    #[test]
+    fn stream_start_rejects_unknown_endpointing_field() {
+        let error = parse_transcription_stream_start(
+            r#"{
+                "type":"start",
+                "mode":"caption",
+                "model":"Qwen/Qwen3-ASR-Flash",
+                "input_audio_format":"pcm_s16le",
+                "sample_rate":16000,
+                "endpointing":{"min_silence":700}
+            }"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.error.code.as_deref(), Some("invalid_json"));
+    }
+
+    #[test]
+    fn stream_start_rejects_oversized_endpointing_candidate_window() {
+        let error = parse_transcription_stream_start(
+            r#"{
+                "type":"start",
+                "mode":"caption",
+                "model":"Qwen/Qwen3-ASR-Flash",
+                "input_audio_format":"pcm_s16le",
+                "sample_rate":16000,
+                "endpointing":{"speech_padding_ms":60000}
+            }"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.error.param.as_deref(),
+            Some("endpointing.speech_padding_ms")
+        );
+        assert_eq!(error.error.code.as_deref(), Some("invalid_endpointing"));
+    }
+
+    #[test]
+    fn stream_start_rejects_endpointing_candidate_that_cannot_hold_rounded_speech_frame() {
+        let error = parse_transcription_stream_start(
+            r#"{
+                "type":"start",
+                "mode":"caption",
+                "model":"Qwen/Qwen3-ASR-Flash",
+                "input_audio_format":"pcm_s16le",
+                "sample_rate":16000,
+                "endpointing":{"min_speech_ms":21,"speech_padding_ms":0}
+            }"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.error.param.as_deref(),
+            Some("endpointing.speech_padding_ms")
+        );
+        assert_eq!(error.error.code.as_deref(), Some("invalid_endpointing"));
+    }
+
+    #[test]
     fn stream_start_api_key_does_not_authenticate_without_header() {
         let error = validate_transcription_stream_api_key(Some("secret"), Some("secret"), false)
             .unwrap_err();
@@ -1183,6 +2267,51 @@ mod tests {
     }
 
     #[test]
+    fn caption_partial_event_contains_segment_id_and_text_only() {
+        let event = caption_partial_event(7, "hello");
+        let json = serde_json::to_value(event).unwrap();
+
+        assert_eq!(json["type"], "partial");
+        assert_eq!(json["segment_id"], 7);
+        assert_eq!(json["text"], "hello");
+        assert!(json.get("language").is_none());
+        assert!(json.get("raw_output").is_none());
+    }
+
+    #[test]
+    fn caption_segment_final_event_contains_segment_id_text_and_optional_times() {
+        let event = caption_segment_final_event(3, "stable text", Some(120), Some(980));
+        let json = serde_json::to_value(event).unwrap();
+
+        assert_eq!(json["type"], "segment_final");
+        assert_eq!(json["segment_id"], 3);
+        assert_eq!(json["text"], "stable text");
+        assert_eq!(json["start_ms"], 120);
+        assert_eq!(json["end_ms"], 980);
+    }
+
+    #[test]
+    fn caption_segment_final_event_omits_absent_times() {
+        let event = caption_segment_final_event(3, "stable text", None, None);
+        let json = serde_json::to_value(event).unwrap();
+
+        assert_eq!(json["type"], "segment_final");
+        assert_eq!(json["segment_id"], 3);
+        assert_eq!(json["text"], "stable text");
+        assert!(json.get("start_ms").is_none());
+        assert!(json.get("end_ms").is_none());
+    }
+
+    #[test]
+    fn caption_completed_event_has_no_transcript_text() {
+        let json = serde_json::to_value(caption_completed_event()).unwrap();
+
+        assert_eq!(json["type"], "completed");
+        assert!(json.get("text").is_none());
+        assert!(json.get("segment_id").is_none());
+    }
+
+    #[test]
     fn stream_control_accepts_end_message() {
         let control = parse_transcription_stream_control(r#"{"type":"end"}"#).unwrap();
 
@@ -1215,5 +2344,12 @@ mod tests {
         assert_eq!(chunks[1].0.len(), 32_000);
         assert_eq!(tail.0.len(), 16_000);
         assert_eq!(tail.1, 16_000);
+    }
+
+    #[test]
+    fn sample_index_to_ms_uses_integer_sample_time() {
+        assert_eq!(sample_index_to_ms(16_000, 16_000), 1_000);
+        assert_eq!(sample_index_to_ms(16_001, 16_000), 1_000);
+        assert_eq!(sample_index_to_ms(47_999, 16_000), 2_999);
     }
 }

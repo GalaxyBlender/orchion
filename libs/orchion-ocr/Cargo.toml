@@ -17,11 +17,11 @@ cuda = ["oar-ocr?/cuda", "oar-ocr-vl?/cuda"]
 
 [dependencies]
 anyhow = "1"
-candle-core = { version = "0.10.2", default-features = false, optional = true }
+candle-core = { version = "0.11.0", default-features = false, optional = true }
 htmd = { version = "0.5.4", optional = true }
 image = "0.25.10"
-oar-ocr = { version = "0.7.1", default-features = false, optional = true }
-oar-ocr-vl = { version = "0.7.1", default-features = false, optional = true }
+oar-ocr = { version = "0.7.2", default-features = false, optional = true }
+oar-ocr-vl = { version = "0.7.2", default-features = false, optional = true }
 orchion-core = { path = "../orchion-core" }
 thiserror = "2"
 tokio = { version = "1", features = ["rt"] }

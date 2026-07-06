@@ -14,6 +14,8 @@ device = "auto"
 available_models = ["Qwen/Qwen3-ASR-0.6B", "Qwen/Qwen3-ASR-1.7B"]
 idle_timeout = "10m"
 stream_chunk_size = 2.0
+stream_target_segment = "12s"
+stream_max_segment = "120s"
 max_loaded = 1
 
 [services.tts]

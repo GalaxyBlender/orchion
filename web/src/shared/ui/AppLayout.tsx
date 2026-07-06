@@ -38,6 +38,8 @@ export const AppLayout: React.FC = () => {
     setCommandPaletteOpen(false);
   };
 
+  const sidebarCollapsed = mobileOpen ? false : collapsed;
+
   // Keyboard Hotkeys listener
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -90,7 +92,7 @@ export const AppLayout: React.FC = () => {
       {/* Sidebar navigation */}
       <div className={`sidebar-wrapper ${mobileOpen ? "mobile-open" : ""}`} style={{ zIndex: 200 }}>
         <Sidebar
-          collapsed={collapsed}
+          collapsed={sidebarCollapsed}
           onToggleCollapse={handleToggleCollapse}
           mobileOpen={mobileOpen}
         />

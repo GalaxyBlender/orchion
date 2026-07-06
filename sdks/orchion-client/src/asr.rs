@@ -77,6 +77,25 @@ impl<'a> AsrClient<'a> {
             ));
         }
 
+        if request.endpointing.is_some() && request.mode != Some(StreamingMode::Caption) {
+            return Err(ClientError::build_request(
+                "endpointing is only supported when streaming mode is caption",
+            ));
+        }
+
+        if request.mode == Some(StreamingMode::Caption)
+            && request.input_audio_format == StreamingInputAudioFormat::PcmS16Le
+            && request.sample_rate != Some(16_000)
+        {
+            return Err(ClientError::build_request(
+                "caption mode requires pcm_s16le input audio at 16000 Hz",
+            ));
+        }
+
+        if let Some(endpointing) = request.endpointing {
+            validate_caption_endpointing(endpointing)?;
+        }
+
         let url = self
             .client
             .websocket_url("/v1/audio/transcriptions/stream")?;
@@ -101,6 +120,9 @@ impl<'a> AsrClient<'a> {
         Ok(StreamingSession { stream })
     }
 }
+
+const CAPTION_VAD_FRAME_DURATION_MS: u32 = 30;
+const CAPTION_VAD_MAX_CANDIDATE_MS: u32 = 60_000;
 
 /// Multipart transcription request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -266,6 +288,31 @@ pub struct AsrSegment {
     pub text: String,
 }
 
+/// Streaming ASR session mode.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamingMode {
+    Caption,
+}
+
+/// Caption endpointing options sent in a streaming ASR start message.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct CaptionEndpointing {
+    pub min_speech_ms: u32,
+    pub min_silence_ms: u32,
+    pub speech_padding_ms: u32,
+}
+
+impl Default for CaptionEndpointing {
+    fn default() -> Self {
+        Self {
+            min_speech_ms: 300,
+            min_silence_ms: 500,
+            speech_padding_ms: 200,
+        }
+    }
+}
+
 /// Start message sent to the ASR streaming WebSocket endpoint.
 #[derive(Clone, Serialize)]
 pub struct StreamingStartRequest {
@@ -278,6 +325,10 @@ pub struct StreamingStartRequest {
     pub prompt: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<StreamingMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpointing: Option<CaptionEndpointing>,
     pub response_format: &'static str,
     pub input_audio_format: StreamingInputAudioFormat,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -303,6 +354,8 @@ impl fmt::Debug for StreamingStartRequest {
             .field("language", &self.language)
             .field("prompt", &self.prompt)
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("mode", &self.mode)
+            .field("endpointing", &self.endpointing)
             .field("response_format", &self.response_format)
             .field("input_audio_format", &self.input_audio_format)
             .field("sample_rate", &self.sample_rate)
@@ -325,6 +378,8 @@ impl StreamingStartRequest {
             language: None,
             prompt: None,
             api_key: None,
+            mode: None,
+            endpointing: None,
             response_format: "json",
             input_audio_format,
             sample_rate: None,
@@ -370,6 +425,65 @@ impl StreamingStartRequest {
         self.chunk_size_sec = Some(chunk_size_sec);
         self
     }
+
+    /// Enables caption mode with server-side endpointing defaults.
+    #[must_use]
+    pub const fn with_caption_mode(mut self) -> Self {
+        self.mode = Some(StreamingMode::Caption);
+        self.endpointing = None;
+        self
+    }
+
+    /// Enables caption mode and sends explicit endpointing options.
+    #[must_use]
+    pub const fn with_caption_endpointing(mut self, endpointing: CaptionEndpointing) -> Self {
+        self.mode = Some(StreamingMode::Caption);
+        self.endpointing = Some(endpointing);
+        self
+    }
+}
+
+fn validate_caption_endpointing(endpointing: CaptionEndpointing) -> Result<(), ClientError> {
+    if endpointing.min_speech_ms == 0 {
+        return Err(ClientError::build_request(
+            "endpointing.min_speech_ms must be greater than zero",
+        ));
+    }
+
+    if endpointing.min_silence_ms == 0 {
+        return Err(ClientError::build_request(
+            "endpointing.min_silence_ms must be greater than zero",
+        ));
+    }
+
+    let candidate_ms = endpointing
+        .speech_padding_ms
+        .checked_add(endpointing.min_speech_ms)
+        .ok_or_else(|| {
+            ClientError::build_request(
+                "endpointing.speech_padding_ms plus endpointing.min_speech_ms is too large",
+            )
+        })?;
+
+    if candidate_ms > CAPTION_VAD_MAX_CANDIDATE_MS {
+        return Err(ClientError::build_request(
+            "endpointing.speech_padding_ms plus endpointing.min_speech_ms must not exceed 60000",
+        ));
+    }
+
+    let rounded_min_speech_ms = endpointing
+        .min_speech_ms
+        .div_ceil(CAPTION_VAD_FRAME_DURATION_MS)
+        .checked_mul(CAPTION_VAD_FRAME_DURATION_MS)
+        .ok_or_else(|| ClientError::build_request("endpointing.min_speech_ms is too large"))?;
+
+    if candidate_ms < rounded_min_speech_ms {
+        return Err(ClientError::build_request(
+            "endpointing.speech_padding_ms plus endpointing.min_speech_ms must hold one rounded VAD speech window",
+        ));
+    }
+
+    Ok(())
 }
 
 /// Input audio format used by the ASR streaming endpoint.
@@ -392,9 +506,26 @@ pub enum StreamingInputAudioFormat {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamingEvent {
     Ready,
-    Partial { text: String },
-    Final { text: String },
-    Error { error: ServerErrorObject },
+    Partial {
+        text: String,
+    },
+    CaptionPartial {
+        segment_id: u64,
+        text: String,
+    },
+    Final {
+        text: String,
+    },
+    SegmentFinal {
+        segment_id: u64,
+        text: String,
+        start_ms: Option<u64>,
+        end_ms: Option<u64>,
+    },
+    Completed,
+    Error {
+        error: ServerErrorObject,
+    },
 }
 
 impl StreamingEvent {
@@ -409,14 +540,34 @@ impl StreamingEvent {
 
         match event.event_type.as_str() {
             "ready" => Ok(Self::Ready),
-            "partial" => event
-                .text
-                .map(|text| Self::Partial { text })
-                .ok_or_else(|| ClientError::decode("partial streaming event missing text")),
+            "partial" => {
+                let text = event
+                    .text
+                    .ok_or_else(|| ClientError::decode("partial streaming event missing text"))?;
+                match event.segment_id {
+                    Some(segment_id) => Ok(Self::CaptionPartial { segment_id, text }),
+                    None => Ok(Self::Partial { text }),
+                }
+            }
             "final" => event
                 .text
                 .map(|text| Self::Final { text })
                 .ok_or_else(|| ClientError::decode("final streaming event missing text")),
+            "segment_final" => {
+                let segment_id = event.segment_id.ok_or_else(|| {
+                    ClientError::decode("segment_final streaming event missing segment_id")
+                })?;
+                let text = event.text.ok_or_else(|| {
+                    ClientError::decode("segment_final streaming event missing text")
+                })?;
+                Ok(Self::SegmentFinal {
+                    segment_id,
+                    text,
+                    start_ms: event.start_ms,
+                    end_ms: event.end_ms,
+                })
+            }
+            "completed" => Ok(Self::Completed),
             "error" => event
                 .error
                 .map(|error| Self::Error { error })
@@ -433,6 +584,9 @@ struct StreamingEventBody {
     #[serde(rename = "type")]
     event_type: String,
     text: Option<String>,
+    segment_id: Option<u64>,
+    start_ms: Option<u64>,
+    end_ms: Option<u64>,
     error: Option<ServerErrorObject>,
 }
 
@@ -509,8 +663,10 @@ fn websocket_error(error: impl std::fmt::Display) -> ClientError {
 
 #[cfg(test)]
 mod tests {
-    use super::{StreamingEvent, StreamingInputAudioFormat, StreamingStartRequest};
-    use crate::ServerErrorObject;
+    use super::{
+        CaptionEndpointing, StreamingEvent, StreamingInputAudioFormat, StreamingStartRequest,
+    };
+    use crate::{Client, ClientError, ServerErrorObject};
 
     #[test]
     fn stream_start_serializes_server_protocol_fields() {
@@ -530,6 +686,169 @@ mod tests {
         assert_eq!(value["language"], "zh");
         assert_eq!(value["prompt"], "context");
         assert_eq!(value["chunk_size_sec"], 2.0);
+    }
+
+    #[test]
+    fn stream_start_serializes_caption_mode_with_default_endpointing() {
+        let request =
+            StreamingStartRequest::new("Qwen/Qwen3-ASR-Flash", StreamingInputAudioFormat::PcmS16Le)
+                .with_sample_rate(16_000)
+                .with_caption_mode();
+
+        let value = serde_json::to_value(request).unwrap();
+
+        assert_eq!(value["mode"], "caption");
+        assert!(value.get("endpointing").is_none());
+    }
+
+    #[test]
+    fn caption_endpointing_default_matches_server_tuned_defaults() {
+        assert_eq!(
+            CaptionEndpointing::default(),
+            CaptionEndpointing {
+                min_speech_ms: 300,
+                min_silence_ms: 500,
+                speech_padding_ms: 200,
+            }
+        );
+    }
+
+    #[test]
+    fn stream_start_serializes_caption_endpointing_overrides() {
+        let endpointing = CaptionEndpointing {
+            min_speech_ms: 250,
+            min_silence_ms: 650,
+            speech_padding_ms: 120,
+        };
+        let request =
+            StreamingStartRequest::new("Qwen/Qwen3-ASR-Flash", StreamingInputAudioFormat::PcmS16Le)
+                .with_sample_rate(16_000)
+                .with_caption_endpointing(endpointing);
+
+        let value = serde_json::to_value(request).unwrap();
+
+        assert_eq!(value["mode"], "caption");
+        assert_eq!(value["endpointing"]["min_speech_ms"], 250);
+        assert_eq!(value["endpointing"]["min_silence_ms"], 650);
+        assert!(value["endpointing"].get("max_segment_ms").is_none());
+        assert_eq!(value["endpointing"]["speech_padding_ms"], 120);
+    }
+
+    #[test]
+    fn stream_start_caption_mode_after_endpointing_omits_endpointing() {
+        let request =
+            StreamingStartRequest::new("Qwen/Qwen3-ASR-Flash", StreamingInputAudioFormat::PcmS16Le)
+                .with_sample_rate(16_000)
+                .with_caption_endpointing(CaptionEndpointing::default())
+                .with_caption_mode();
+
+        let value = serde_json::to_value(request).unwrap();
+
+        assert_eq!(value["mode"], "caption");
+        assert!(value.get("endpointing").is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_start_rejects_endpointing_without_caption_mode() {
+        let client = Client::new("http://localhost:8080").unwrap();
+        let mut request =
+            StreamingStartRequest::new("Qwen/Qwen3-ASR-Flash", StreamingInputAudioFormat::PcmS16Le)
+                .with_sample_rate(16_000);
+        request.endpointing = Some(CaptionEndpointing::default());
+
+        let Err(error) = client.asr().start_streaming(request).await else {
+            panic!("streaming request unexpectedly succeeded");
+        };
+
+        assert!(matches!(
+            error,
+            ClientError::BuildRequest { message }
+                if message == "endpointing is only supported when streaming mode is caption"
+        ));
+    }
+
+    #[tokio::test]
+    async fn stream_start_rejects_caption_pcm_s16le_without_16000_hz() {
+        let client = Client::new("http://localhost:8080").unwrap();
+        let request =
+            StreamingStartRequest::new("Qwen/Qwen3-ASR-Flash", StreamingInputAudioFormat::PcmS16Le)
+                .with_sample_rate(44_100)
+                .with_caption_mode();
+
+        let Err(error) = client.asr().start_streaming(request).await else {
+            panic!("streaming request unexpectedly succeeded");
+        };
+
+        assert!(matches!(
+            error,
+            ClientError::BuildRequest { message }
+                if message == "caption mode requires pcm_s16le input audio at 16000 Hz"
+        ));
+    }
+
+    #[tokio::test]
+    async fn stream_start_rejects_invalid_caption_endpointing_before_network() {
+        let cases = [
+            (
+                CaptionEndpointing {
+                    min_speech_ms: 0,
+                    min_silence_ms: 500,
+                    speech_padding_ms: 200,
+                },
+                "endpointing.min_speech_ms must be greater than zero",
+            ),
+            (
+                CaptionEndpointing {
+                    min_speech_ms: 300,
+                    min_silence_ms: 0,
+                    speech_padding_ms: 200,
+                },
+                "endpointing.min_silence_ms must be greater than zero",
+            ),
+            (
+                CaptionEndpointing {
+                    min_speech_ms: 1,
+                    min_silence_ms: 500,
+                    speech_padding_ms: u32::MAX,
+                },
+                "endpointing.speech_padding_ms plus endpointing.min_speech_ms is too large",
+            ),
+            (
+                CaptionEndpointing {
+                    min_speech_ms: 300,
+                    min_silence_ms: 500,
+                    speech_padding_ms: 60_000,
+                },
+                "endpointing.speech_padding_ms plus endpointing.min_speech_ms must not exceed 60000",
+            ),
+            (
+                CaptionEndpointing {
+                    min_speech_ms: 21,
+                    min_silence_ms: 500,
+                    speech_padding_ms: 0,
+                },
+                "endpointing.speech_padding_ms plus endpointing.min_speech_ms must hold one rounded VAD speech window",
+            ),
+        ];
+
+        for (endpointing, expected_message) in cases {
+            let client = Client::new("http://localhost:8080").unwrap();
+            let request = StreamingStartRequest::new(
+                "Qwen/Qwen3-ASR-Flash",
+                StreamingInputAudioFormat::PcmS16Le,
+            )
+            .with_sample_rate(16_000)
+            .with_caption_endpointing(endpointing);
+
+            let Err(error) = client.asr().start_streaming(request).await else {
+                panic!("streaming request unexpectedly succeeded");
+            };
+
+            assert!(matches!(
+                error,
+                ClientError::BuildRequest { message } if message == expected_message
+            ));
+        }
     }
 
     #[test]
@@ -572,6 +891,55 @@ mod tests {
                     param: Some("model".to_string()),
                     code: Some("model_not_available".to_string()),
                 }
+            }
+        );
+    }
+
+    #[test]
+    fn stream_event_decodes_caption_events() {
+        let partial = StreamingEvent::from_text(
+            r#"{"type":"partial","segment_id":7,"text":"caption draft"}"#,
+        )
+        .unwrap();
+        let final_event = StreamingEvent::from_text(
+            r#"{
+                "type":"segment_final",
+                "segment_id":7,
+                "text":"caption final",
+                "start_ms":1000,
+                "end_ms":2300
+            }"#,
+        )
+        .unwrap();
+        let completed = StreamingEvent::from_text(r#"{"type":"completed"}"#).unwrap();
+
+        assert_eq!(
+            partial,
+            StreamingEvent::CaptionPartial {
+                segment_id: 7,
+                text: "caption draft".to_string(),
+            }
+        );
+        assert_eq!(
+            final_event,
+            StreamingEvent::SegmentFinal {
+                segment_id: 7,
+                text: "caption final".to_string(),
+                start_ms: Some(1000),
+                end_ms: Some(2300),
+            }
+        );
+        assert_eq!(completed, StreamingEvent::Completed);
+    }
+
+    #[test]
+    fn legacy_partial_event_still_decodes_to_legacy_variant() {
+        let partial = StreamingEvent::from_text(r#"{"type":"partial","text":"hel"}"#).unwrap();
+
+        assert_eq!(
+            partial,
+            StreamingEvent::Partial {
+                text: "hel".to_string(),
             }
         );
     }

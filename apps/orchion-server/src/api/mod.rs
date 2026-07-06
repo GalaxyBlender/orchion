@@ -1,3 +1,4 @@
+mod caption_boundary;
 pub mod docs;
 pub mod http;
 mod http_audio;
