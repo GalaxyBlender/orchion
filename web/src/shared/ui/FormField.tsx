@@ -189,7 +189,7 @@ export const FileDropZone: React.FC<FileDropZoneProps> = ({
   className = ""
 }) => {
   const [dragActive, setDragActive] = useState(false);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const inputId = useId();
 
   const handleDrag = (e: React.DragEvent) => {
     e.preventDefault();
@@ -224,32 +224,30 @@ export const FileDropZone: React.FC<FileDropZoneProps> = ({
     }
   };
 
-  const onButtonClick = () => {
-    inputRef.current?.click();
-  };
-
   return (
     <div className={`file-drop-zone-container ${className}`}>
       {!selectedFile ? (
-        <div
-          className={`file-drop-zone ${dragActive ? "drag-active" : ""}`}
-          onDragEnter={handleDrag}
-          onDragOver={handleDrag}
-          onDragLeave={handleDrag}
-          onDrop={handleDrop}
-          onClick={onButtonClick}
-        >
+        <>
           <input
-            ref={inputRef}
+            id={inputId}
             type="file"
-            className="hidden"
+            className="file-drop-input sr-only"
             accept={accept}
             onChange={handleChange}
           />
-          <Upload className="file-drop-icon" size={28} />
-          <p className="text-sm font-semibold">{dragActive ? dropZoneActiveText : dropZoneText}</p>
-          {fileDescText && <p className="text-xs text-muted">{fileDescText}</p>}
-        </div>
+          <label
+            htmlFor={inputId}
+            className={`file-drop-zone ${dragActive ? "drag-active" : ""}`}
+            onDragEnter={handleDrag}
+            onDragOver={handleDrag}
+            onDragLeave={handleDrag}
+            onDrop={handleDrop}
+          >
+            <Upload className="file-drop-icon" size={28} />
+            <span className="text-sm font-semibold">{dragActive ? dropZoneActiveText : dropZoneText}</span>
+            {fileDescText && <span className="text-xs text-muted">{fileDescText}</span>}
+          </label>
+        </>
       ) : (
         <div className="file-info">
           <div className="hstack gap-sm">
@@ -269,6 +267,7 @@ export const FileDropZone: React.FC<FileDropZoneProps> = ({
             size="sm"
             className="btn-icon-only text-danger"
             onClick={() => onFileSelect(null)}
+            aria-label="Remove selected file"
           >
             <X size={16} />
           </Button>

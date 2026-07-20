@@ -84,6 +84,7 @@ impl<'de> Deserialize<'de> for ModelId {
 
 fn valid_segment(segment: &str) -> bool {
     !segment.is_empty()
+        && !matches!(segment, "." | "..")
         && segment.chars().all(|character| {
             character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
         })
@@ -109,6 +110,10 @@ mod tests {
             "a/b/c",
             "/name",
             "vendor/",
+            "./name",
+            "../name",
+            "vendor/.",
+            "vendor/..",
             "vendor/name with space",
             " PaddlePaddle/PaddleOCR-VL-1.6",
             "PaddlePaddle/PaddleOCR-VL-1.6 ",

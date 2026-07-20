@@ -1,9 +1,9 @@
-import { ApiRequestError } from "./types";
+import { ApiRequestError, type ApiErrorDetail } from "./types";
 
 export interface SubmissionError {
   type: "validation" | "network" | "api";
   message: string;
-  detail?: any;
+  detail?: ApiErrorDetail;
 }
 
 export function buildApiError(error: unknown): SubmissionError {
@@ -35,11 +35,10 @@ export function buildApiError(error: unknown): SubmissionError {
   };
 }
 
-export async function readResponsePayload(response: Response): Promise<string> {
+export async function readResponsePayload(response: Response): Promise<unknown> {
   const text = await response.text();
   try {
-    const parsed = JSON.parse(text);
-    return JSON.stringify(parsed, null, 2);
+    return JSON.parse(text) as unknown;
   } catch {
     return text;
   }

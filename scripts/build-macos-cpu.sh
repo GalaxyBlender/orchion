@@ -3,4 +3,4 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-cargo build --release -p orchion-server --features cpu
+cargo build --release -p orchion-server --no-default-features --features cpu

@@ -11,8 +11,6 @@ export function buildAsrFormData(input: AsrRequestInput): FormData {
   formData.append("model", input.model.trim());
   formData.append("response_format", input.responseFormat);
   appendNonblank(formData, "language", input.language);
-  appendNonblank(formData, "prompt", input.prompt);
-  appendNonblank(formData, "temperature", input.temperature);
   appendSupportedTimestampGranularities(formData, input.timestampGranularities);
 
   return formData;
@@ -23,8 +21,6 @@ interface AsrSummaryText {
   file: (file: string) => string;
   responseFormat: (format: string) => string;
   language: (language: string) => string;
-  prompt: string;
-  temperature: string;
   timestamp: (values: string) => string;
 }
 
@@ -33,8 +29,6 @@ const defaultSummaryText: AsrSummaryText = {
   file: (file) => `File: ${file}`,
   responseFormat: (format) => `Response format: ${format}`,
   language: (language) => `Language: ${language}`,
-  prompt: "Prompt: sent for OpenAI compatibility; Orchion currently accepts and ignores it.",
-  temperature: "Temperature: sent for OpenAI compatibility; Orchion currently accepts and ignores it.",
   timestamp: (values) => `Timestamp granularities: ${values} sent for segment-level verbose output.`,
 };
 
@@ -45,18 +39,10 @@ export function summarizeAsrRequest(input: AsrRequestInput, text: AsrSummaryText
     text.responseFormat(input.responseFormat),
   ];
   const language = input.language.trim();
-  const prompt = input.prompt.trim();
-  const temperature = input.temperature.trim();
   const timestampGranularities = nonblankValues(input.timestampGranularities);
 
   if (language !== "") {
     lines.push(text.language(language));
-  }
-  if (prompt !== "") {
-    lines.push(text.prompt);
-  }
-  if (temperature !== "") {
-    lines.push(text.temperature);
   }
   if (timestampGranularities.length > 0) {
     lines.push(text.timestamp(timestampGranularities.join(", ")));
@@ -79,8 +65,6 @@ export function buildAsrCurl(settings: ApiSettings, input: AsrRequestInput): str
 
   parts.push("-F", quote(`file=@${input.file.name}`));
   pushOptionalField(fields, "language", input.language);
-  pushOptionalField(fields, "prompt", input.prompt);
-  pushOptionalField(fields, "temperature", input.temperature);
   for (const value of supportedTimestampGranularities(input.timestampGranularities)) {
     fields.push(["timestamp_granularities[]", value]);
   }

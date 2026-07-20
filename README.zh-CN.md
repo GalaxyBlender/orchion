@@ -71,7 +71,8 @@ use orchion::{Asr, AsrModel, Result};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let asr = Asr::load_or_download(AsrModel::Qwen3Asr06B, "models").await?;
+    let model = AsrModel::parse("Qwen/Qwen3-ASR-0.6B")?;
+    let asr = Asr::load_or_download(model, "models").await?;
     let transcript = asr.transcribe_file("audio.wav").await?;
     println!("{}", transcript.text);
     Ok(())
@@ -90,9 +91,9 @@ cargo run -p orchion-example-tts-preset --features cpu -- "Hello from Orchion" o
 
 完整本地配置示例在 `apps/orchion-server/config.toml`。主要配置段：
 
-- `[server]`：监听地址和上传大小限制。
+- `[server]`：监听地址、上传大小限制，以及 PDF 页数、像素和输出大小限制。
 - `[models]`：模型目录、下载来源和全局驻留上限。
-- `[services.asr]`、`[services.tts]`、`[services.ocr]`、`[services.ocr-vl]`：服务开关、默认模型、allowlist、运行设备和每类驻留上限。ASR 流式字幕使用 `[services.asr].stream_target_segment = "12s"` 做标点感知软切分，使用 `[services.asr].stream_max_segment = "120s"` 做硬上限。
+- `[services.asr]`、`[services.tts]`、`[services.ocr]`、`[services.ocr-vl]`：服务开关、默认模型、allowlist、运行设备和每类驻留上限。ASR 批量音频使用 `max_audio_duration`；流式字幕使用 `stream_target_segment` 和 `stream_max_segment`；会话使用 `stream_idle_timeout` 和 `stream_max_duration`。TTS 使用 `max_length` 和 `max_reference_audio_duration`；OCR-VL 使用 `max_tokens`。
 - `[auth]`：可选 API key。
 
 `ORCHION_MODEL_SOURCE` 和 `models.source` 支持 `auto`、`huggingface`、`modelscope`。`RUST_LOG` 控制运行日志。

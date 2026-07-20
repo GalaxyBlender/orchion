@@ -37,6 +37,30 @@ async fn list_models_sends_auth_and_decodes_typed_models() {
     assert_eq!(models.data[0].subtype, Some(ModelSubtype::Standard));
 }
 
+#[cfg(feature = "models")]
+#[tokio::test]
+async fn list_models_preserves_the_base_url_path_prefix() {
+    use orchion_client::Client;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/orchion/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "object": "list",
+            "data": []
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = Client::new(format!("{}/orchion/", server.uri())).unwrap();
+
+    let models = client.models().list().await.unwrap();
+
+    assert!(models.data.is_empty());
+}
+
 #[cfg(feature = "asr")]
 #[tokio::test]
 async fn transcribe_file_posts_multipart_and_decodes_json() {
@@ -102,6 +126,49 @@ async fn transcribe_text_format_returns_text_response() {
         response,
         TranscriptionResponse::Text("plain transcript".to_string())
     );
+}
+
+#[cfg(feature = "asr")]
+#[tokio::test]
+async fn streaming_handshake_preserves_the_server_error_body() {
+    use orchion_client::asr::{StreamingInputAudioFormat, StreamingStartRequest};
+    use orchion_client::{Client, ClientError};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/audio/transcriptions/stream"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "error": {
+                "message": "invalid API key",
+                "type": "invalid_request_error",
+                "param": null,
+                "code": "invalid_api_key"
+            }
+        })))
+        .mount(&server)
+        .await;
+    let client = Client::new(server.uri()).unwrap();
+    let request =
+        StreamingStartRequest::new("Qwen/Qwen3-ASR-Flash", StreamingInputAudioFormat::Mp3);
+
+    let Err(error) = client.asr().start_streaming(request).await else {
+        panic!("streaming handshake unexpectedly succeeded");
+    };
+
+    match error {
+        ClientError::Http {
+            status,
+            error: Some(error),
+            ..
+        } => {
+            assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED);
+            assert_eq!(error.message, "invalid API key");
+            assert_eq!(error.code.as_deref(), Some("invalid_api_key"));
+        }
+        unexpected => panic!("unexpected error variant: {unexpected:?}"),
+    }
 }
 
 #[cfg(feature = "tts")]
@@ -199,16 +266,11 @@ async fn create_ocr_posts_multipart_and_decodes_json() {
             .any(|window| window == b"PaddlePaddle/PP-OCRv6_tiny")
     );
     assert!(
-        requests[0]
+        !requests[0]
             .body
             .windows(b"response_format".len())
-            .any(|window| window == b"response_format")
-    );
-    assert!(
-        requests[0]
-            .body
-            .windows(b"json".len())
-            .any(|window| window == b"json")
+            .any(|window| window == b"response_format"),
+        "an omitted response format must use the server default"
     );
 }
 

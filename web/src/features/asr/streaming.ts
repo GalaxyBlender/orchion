@@ -11,6 +11,17 @@ export const asrStreamEndpointPath = "/v1/audio/transcriptions/stream";
 export const asrCaptionVadFrameDurationMs = 30;
 export const asrCaptionMaxCandidateMs = 60_000;
 export const asrCaptionMaxDisplaySegments = 300;
+export const asrStreamBufferedAmountHighWatermark = 1024 * 1024;
+export const asrStreamBufferedAmountLowWatermark = 256 * 1024;
+
+interface StoppableMediaStream {
+  getTracks(): readonly { stop(): void }[];
+}
+
+interface BufferedSocket {
+  readonly readyState: number;
+  readonly bufferedAmount: number;
+}
 
 export type AsrCaptionEndpointingValidationError =
   | "invalid"
@@ -53,10 +64,43 @@ export function buildAsrStreamStartMessage(input: AsrStreamStartInput): string {
   }
   appendNonblank(message, "language", input.form.language);
   appendNonblank(message, "prompt", input.form.prompt);
-  appendNonblank(message, "temperature", input.form.temperature);
   appendNonblank(message, "api_key", input.apiKey);
 
   return JSON.stringify(message);
+}
+
+export async function acquireAsrMicrophoneStream<T extends StoppableMediaStream>(
+  getUserMedia: () => Promise<T>,
+  isSessionActive: () => boolean,
+): Promise<T | null> {
+  const stream = await getUserMedia();
+  if (isSessionActive()) {
+    return stream;
+  }
+
+  stream.getTracks().forEach((track) => track.stop());
+  return null;
+}
+
+export async function waitForAsrStreamWritable(
+  socket: BufferedSocket,
+  isSessionActive: () => boolean,
+  wait: () => Promise<void> = waitForBufferedAmountPoll,
+): Promise<boolean> {
+  if (socket.readyState !== WebSocket.OPEN || !isSessionActive()) {
+    return false;
+  }
+  if (socket.bufferedAmount <= asrStreamBufferedAmountHighWatermark) {
+    return true;
+  }
+
+  while (socket.bufferedAmount > asrStreamBufferedAmountLowWatermark) {
+    await wait();
+    if (socket.readyState !== WebSocket.OPEN || !isSessionActive()) {
+      return false;
+    }
+  }
+  return true;
 }
 
 export function parseAsrStreamEvent(text: string): AsrStreamEvent {
@@ -188,4 +232,8 @@ function isNonnegativeInteger(value: number): boolean {
 
 function streamResponseFormat(_format: AsrFormState["responseFormat"]): "json" {
   return "json";
+}
+
+function waitForBufferedAmountPoll(): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, 25));
 }

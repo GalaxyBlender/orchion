@@ -371,6 +371,9 @@ fn toml_overrides_model_registry_and_services() {
 [server]
 bind = "0.0.0.0:9000"
 max_upload_size = "64M"
+max_pdf_pages = 12
+max_pdf_pixels = 345000
+max_pdf_output_size = "16M"
 
 [models]
 dir = "cache/models"
@@ -384,6 +387,9 @@ available_models = ["Qwen/Qwen3-ASR-0.6B", "Qwen/Qwen3-ASR-1.7B"]
 idle_timeout = "5m"
 max_loaded = 2
 device = "cuda0"
+max_audio_duration = "20m"
+stream_idle_timeout = "45s"
+stream_max_duration = "3h"
 
 [services.tts]
 enabled = true
@@ -393,6 +399,11 @@ idle_timeout = "30s"
 max_loaded = 1
 device = "cuda:1"
 format = "mp3"
+max_length = 1024
+max_reference_audio_duration = "2m"
+
+[services.ocr-vl]
+max_tokens = 2048
 
 [auth]
 api_key = "test-secret"
@@ -402,6 +413,9 @@ api_key = "test-secret"
 
     assert_eq!(config.server.bind.port(), 9000);
     assert_eq!(config.server.max_upload_size, 64 * 1024 * 1024);
+    assert_eq!(config.server.max_pdf_pages, 12);
+    assert_eq!(config.server.max_pdf_pixels, 345_000);
+    assert_eq!(config.server.max_pdf_output_size, 16 * 1024 * 1024);
     assert_eq!(
         config.models.dir,
         exe_path.parent().unwrap().join("cache/models")
@@ -423,6 +437,18 @@ api_key = "test-secret"
     assert_eq!(config.services.asr.idle_timeout, Duration::from_secs(300));
     assert_eq!(config.services.asr.max_loaded, 2);
     assert_eq!(config.services.asr.device, DevicePreference::Cuda(Some(0)));
+    assert_eq!(
+        config.services.asr.max_audio_duration,
+        Duration::from_secs(20 * 60)
+    );
+    assert_eq!(
+        config.services.asr.stream_idle_timeout,
+        Duration::from_secs(45)
+    );
+    assert_eq!(
+        config.services.asr.stream_max_duration,
+        Duration::from_secs(3 * 60 * 60)
+    );
     assert!(config.services.tts.enabled);
     assert_eq!(
         config.services.tts.default_model,
@@ -439,6 +465,12 @@ api_key = "test-secret"
     assert_eq!(config.services.tts.max_loaded, 1);
     assert_eq!(config.services.tts.device, DevicePreference::Cuda(Some(1)));
     assert_eq!(config.services.tts.format, "mp3");
+    assert_eq!(config.services.tts.max_length, 1024);
+    assert_eq!(
+        config.services.tts.max_reference_audio_duration,
+        Duration::from_secs(2 * 60)
+    );
+    assert_eq!(config.services.ocr_vl.max_tokens, 2048);
     assert_eq!(config.auth.api_key.as_deref(), Some("test-secret"));
 }
 

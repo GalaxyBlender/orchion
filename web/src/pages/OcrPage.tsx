@@ -1,6 +1,7 @@
 import { type FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ocrParameterMetadata, ocrResponseFormats, ocrTaskOptions } from "@/features/ocr/metadata";
+import { formToOcrState, normalizeOcrFormForSubtype, ocrStateToForm } from "@/features/ocr/form";
 import { buildOcrCurl, buildOcrFormData, summarizeOcrRequest } from "@/features/ocr/request";
 import type { OcrFormState, OcrRequestInput, OcrResponseFormat, OcrTask } from "@/features/ocr/types";
 import { useModels } from "@/features/models/useModels";
@@ -11,7 +12,6 @@ import { copyTextToClipboard } from "@/shared/clipboard";
 import {
   loadPersistentState,
   savePersistentState,
-  type PersistentOcrState,
   type PersistentState,
 } from "@/shared/storage/persistentState";
 import { Alert, Button, Card, CodePreview, FileDropZone, FormField, Input, MetadataPanel, ModelStatus, Select, StateView, SuggestionInput, useToast } from "@/shared/ui";
@@ -41,8 +41,14 @@ export function OcrPage() {
     () => models.classified.ocrLayout.map((model) => model.id),
     [models.classified.ocrLayout],
   );
+  const selectedModelSubtype = models.classified.ocr.find((model) => model.id === form.model.trim())?.subtype;
+  const supportsOcrVlParameters = selectedModelSubtype !== "standard";
+  const effectiveForm = useMemo(
+    () => normalizeOcrFormForSubtype(form, selectedModelSubtype),
+    [form, selectedModelSubtype],
+  );
 
-  const previewInput = useMemo(() => buildRequestInput(form, file ?? previewFile), [file, form]);
+  const previewInput = useMemo(() => buildRequestInput(effectiveForm, file ?? previewFile), [effectiveForm, file]);
   const requestSummary = useMemo(
     () => summarizeOcrRequest(previewInput, {
       model: (model) => t("ocr.summary.model", { model }),
@@ -67,7 +73,9 @@ export function OcrPage() {
     setSubmitError(null);
     setResult("");
     setForm((currentForm) => {
-      const nextForm = { ...currentForm, [field]: value };
+      const updatedForm = { ...currentForm, [field]: value };
+      const subtype = models.classified.ocr.find((model) => model.id === updatedForm.model.trim())?.subtype;
+      const nextForm = normalizeOcrFormForSubtype(updatedForm, subtype);
       setPersistentState((currentState) => {
         const nextState: PersistentState = {
           ...currentState,
@@ -111,7 +119,7 @@ export function OcrPage() {
       const response = await fetch(apiUrl(settings, endpointPath), {
         method: "POST",
         headers: authHeaders(settings),
-        body: buildOcrFormData(buildRequestInput({ ...form, model }, file)),
+        body: buildOcrFormData(buildRequestInput({ ...effectiveForm, model }, file)),
         signal: abortController.signal,
       });
 
@@ -227,7 +235,7 @@ export function OcrPage() {
                 />
               </FormField>
 
-              <div className="grid grid-cols-2 gap-md">
+              <div className={supportsOcrVlParameters ? "grid grid-cols-2 gap-md" : ""}>
                 <FormField label={t("ocr.metadata.response_format.0")} description={t("ocr.responseFormatDescription")}>
                   <Select
                     id="ocr-response-format"
@@ -243,20 +251,22 @@ export function OcrPage() {
                   </Select>
                 </FormField>
 
-                <FormField label={t("ocr.metadata.task.0")} description={t("ocr.taskDescription")}>
-                  <Select
-                    id="ocr-task"
-                    name="task"
-                    onChange={(event) => updateForm("task", event.target.value as OcrTask)}
-                    value={form.task}
-                  >
-                    {ocrTaskOptions.map((task) => (
-                      <option key={task} value={task}>
-                        {task}
-                      </option>
-                    ))}
-                  </Select>
-                </FormField>
+                {supportsOcrVlParameters && (
+                  <FormField label={t("ocr.metadata.task.0")} description={t("ocr.taskDescription")}>
+                    <Select
+                      id="ocr-task"
+                      name="task"
+                      onChange={(event) => updateForm("task", event.target.value as OcrTask)}
+                      value={form.task}
+                    >
+                      {ocrTaskOptions.map((task) => (
+                        <option key={task} value={task}>
+                          {task}
+                        </option>
+                      ))}
+                    </Select>
+                  </FormField>
+                )}
               </div>
 
               <FormField label={t("ocr.metadata.layout_model.0")} description={t("ocr.layoutModelDescription")}>
@@ -275,16 +285,18 @@ export function OcrPage() {
                 </Select>
               </FormField>
 
-              <FormField label={t("ocr.metadata.max_tokens.0")} description={t("ocr.maxTokensDescription")}>
-                <Input
-                  id="ocr-max-tokens"
-                  inputMode="numeric"
-                  name="max_tokens"
-                  onChange={(event) => updateForm("maxTokens", event.target.value)}
-                  placeholder={t("ocr.maxTokensPlaceholder")}
-                  value={form.maxTokens}
-                />
-              </FormField>
+              {supportsOcrVlParameters && (
+                <FormField label={t("ocr.metadata.max_tokens.0")} description={t("ocr.maxTokensDescription")}>
+                  <Input
+                    id="ocr-max-tokens"
+                    inputMode="numeric"
+                    name="max_tokens"
+                    onChange={(event) => updateForm("maxTokens", event.target.value)}
+                    placeholder={t("ocr.maxTokensPlaceholder")}
+                    value={form.maxTokens}
+                  />
+                </FormField>
+              )}
 
               <div className="pt-2 stack gap-sm">
                 <Button
@@ -363,26 +375,6 @@ export function OcrPage() {
 
 function buildRequestInput(form: OcrFormState, selectedFile: File): OcrRequestInput {
   return { ...form, file: selectedFile };
-}
-
-function ocrStateToForm(state: PersistentOcrState): OcrFormState {
-  return {
-    model: state.model,
-    responseFormat: state.responseFormat,
-    task: state.task,
-    layoutModel: "",
-    maxTokens: state.maxTokens,
-  };
-}
-
-function formToOcrState(form: OcrFormState): PersistentOcrState {
-  return {
-    model: form.model,
-    responseFormat: form.responseFormat,
-    task: form.task,
-    layoutModel: form.layoutModel,
-    maxTokens: form.maxTokens,
-  };
 }
 
 async function formatResponse(response: Response, responseFormat: OcrResponseFormat): Promise<string> {

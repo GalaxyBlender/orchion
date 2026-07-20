@@ -4,6 +4,8 @@
 
 Orchion exposes PDF page rendering through `POST /v1/pdf/images`.
 
+Server operators can bound rendering with `[server].max_pdf_pages`, `max_pdf_pixels`, and `max_pdf_output_size`. Requests exceeding a configured limit return `pdf_limit_exceeded`.
+
 The endpoint accepts a PDF upload and returns a ZIP archive containing rendered page images.
 
 ```sh

@@ -3,7 +3,9 @@ name = "orchion-download"
 version = "0.3.0"
 edition = "2024"
 rust-version = "1.95"
+description = "Model download and cache management for Orchion"
 license = "MIT"
+repository = "https://github.com/xuan/orchion"
 
 [features]
 default = ["all-providers"]
@@ -12,15 +14,16 @@ huggingface = []
 modelscope = []
 
 [dependencies]
+fs2 = "0.4"
 model-hub = "0.1.1"
-orchion-core = { path = "../orchion-core" }
+orchion-core = { version = "0.3.0", path = "../orchion-core" }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 serde_json = "1"
-tokio = { version = "1", features = ["fs", "sync", "time"] }
+tempfile = "3"
+tokio = { version = "1", features = ["fs", "rt", "sync", "time"] }
 tracing = "0.1"
 
 [dev-dependencies]
-tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 
 [lints.rust]

@@ -1,11 +1,12 @@
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
 use flate2::read::GzDecoder;
+use sha2::{Digest, Sha256};
 
 const FRONTEND_INPUTS: &[&str] = &[
     "../../web/package.json",
@@ -24,6 +25,7 @@ const PDFIUM_RELEASE_BASE_URL: &str =
 struct PdfiumAsset {
     archive_name: &'static str,
     library_name: &'static str,
+    sha256: &'static str,
 }
 
 fn main() {
@@ -40,17 +42,21 @@ fn main() {
         print_source_rerun_if_changed(&manifest_dir, &web_src);
     }
 
-    provision_pdfium(&manifest_dir).unwrap_or_else(|error| {
+    if env::var("PROFILE").as_deref() != Ok("release") {
+        return;
+    }
+
+    provision_pdfium().unwrap_or_else(|error| {
         panic!("failed to provision PDFium for build: {error}");
     });
 
     let web_dir = manifest_dir.join("../../web");
-    run_bun_command(&web_dir, &["install"], "bun install");
+    run_bun_command(
+        &web_dir,
+        &["install", "--frozen-lockfile"],
+        "bun install --frozen-lockfile",
+    );
     run_bun_command(&web_dir, &["run", "build"], "bun run build");
-
-    if env::var("PROFILE").as_deref() != Ok("release") {
-        return;
-    }
 
     let dist_dir = web_dir.join("dist");
     if !dist_dir.is_dir() {
@@ -128,18 +134,22 @@ fn pdfium_asset() -> io::Result<PdfiumAsset> {
         ("macos", "aarch64") => Ok(PdfiumAsset {
             archive_name: "pdfium-mac-arm64.tgz",
             library_name: "libpdfium.dylib",
+            sha256: "95d44263629eb8d0f6a619d5443da1ed449d4f916b26f4df1878ad4d5a64b0fc",
         }),
         ("macos", "x86_64") => Ok(PdfiumAsset {
             archive_name: "pdfium-mac-x64.tgz",
             library_name: "libpdfium.dylib",
+            sha256: "785c4fce5ca1d7bbd4c2d07fcb3f5adb1dcd1ceba37e1e1fd0b2fd70875481d6",
         }),
         ("linux", "x86_64") => Ok(PdfiumAsset {
             archive_name: "pdfium-linux-x64.tgz",
             library_name: "libpdfium.so",
+            sha256: "e21257c643592dc8eaf284f5f54cd7eca5e1694ff35a5b2158a351931bea107f",
         }),
         ("windows", "x86_64") => Ok(PdfiumAsset {
             archive_name: "pdfium-win-x64.tgz",
             library_name: "pdfium.dll",
+            sha256: "1a5b95fde0eb446a5709ffc4a2e6691fa2b5ace224cee20dddd16c110c5ce60e",
         }),
         _ => Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -169,12 +179,17 @@ fn target_profile_dir() -> io::Result<PathBuf> {
         })
 }
 
-fn provision_pdfium(_manifest_dir: &Path) -> io::Result<()> {
+fn provision_pdfium() -> io::Result<()> {
     let asset = pdfium_asset()?;
     let target_library_path = target_profile_dir()?.join(asset.library_name);
-    if target_library_path.is_file() {
+    let checksum_path =
+        target_library_path.with_file_name(format!("{}.source.sha256", asset.library_name));
+    let installed_checksum = fs::read_to_string(&checksum_path).ok();
+    if target_library_path.is_file()
+        && installed_checksum.as_deref().map(str::trim) == Some(asset.sha256)
+    {
         println!(
-            "cargo:warning=using existing PDFium library {}",
+            "cargo:warning=using verified PDFium library {}",
             target_library_path.display()
         );
         return Ok(());
@@ -197,6 +212,7 @@ fn provision_pdfium(_manifest_dir: &Path) -> io::Result<()> {
         let url = format!("{PDFIUM_RELEASE_BASE_URL}/{}", asset.archive_name);
         download_pdfium_archive(&url, &archive_path)?;
     }
+    verify_pdfium_archive(&archive_path, asset.sha256)?;
 
     let extract_dir = cache_dir.join(format!("extract-{}", asset.archive_name));
     remove_existing(&extract_dir)?;
@@ -219,11 +235,36 @@ fn provision_pdfium(_manifest_dir: &Path) -> io::Result<()> {
         )
     })?;
     copy_file_overwrite(&library_path, &target_library_path)?;
+    fs::write(&checksum_path, format!("{}\n", asset.sha256))?;
     println!(
         "cargo:warning=copied PDFium library to {}",
         target_library_path.display()
     );
 
+    Ok(())
+}
+
+fn verify_pdfium_archive(archive_path: &Path, expected_sha256: &str) -> io::Result<()> {
+    let mut file = fs::File::open(archive_path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let actual_sha256 = format!("{:x}", hasher.finalize());
+    if actual_sha256 != expected_sha256 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "PDFium archive {} SHA-256 mismatch: expected {expected_sha256}, got {actual_sha256}",
+                archive_path.display()
+            ),
+        ));
+    }
     Ok(())
 }
 

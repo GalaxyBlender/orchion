@@ -4,6 +4,8 @@
 
 Orchion 通过 `POST /v1/pdf/images` 提供 PDF 页面渲染能力。
 
+服务端可通过 `[server].max_pdf_pages`、`max_pdf_pixels` 和 `max_pdf_output_size` 限制渲染资源。请求超过配置上限时返回 `pdf_limit_exceeded`。
+
 该接口接收 PDF 上传，并返回包含渲染后页面图片的 ZIP 文件。
 
 ```sh

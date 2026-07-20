@@ -4,6 +4,7 @@ version = "0.3.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
+publish = false
 
 [features]
 default = []
@@ -27,13 +28,13 @@ cuda = ["orchion-qwen3?/cuda", "orchion-ocr?/cuda"]
 flash-attn = []
 
 [dependencies]
-orchion-audio = { path = "../orchion-audio", optional = true }
-orchion-core = { path = "../orchion-core" }
-orchion-docs = { path = "../orchion-docs", default-features = false, optional = true }
-orchion-download = { path = "../orchion-download", default-features = false, optional = true }
-orchion-ocr = { path = "../orchion-ocr", default-features = false, optional = true }
-orchion-qwen3 = { path = "../orchion-qwen3", default-features = false, optional = true }
-orchion-audio-vad = { path = "../orchion-audio-vad", optional = true }
+orchion-audio = { version = "0.3.0", path = "../orchion-audio", optional = true }
+orchion-core = { version = "0.3.0", path = "../orchion-core" }
+orchion-docs = { version = "0.3.0", path = "../orchion-docs", default-features = false, optional = true }
+orchion-download = { version = "0.3.0", path = "../orchion-download", default-features = false, optional = true }
+orchion-ocr = { version = "0.3.0", path = "../orchion-ocr", default-features = false, optional = true }
+orchion-qwen3 = { version = "0.3.0", path = "../orchion-qwen3", default-features = false, optional = true }
+orchion-audio-vad = { version = "0.3.0", path = "../orchion-audio-vad", optional = true }
 tracing = "0.1"
 
 [dev-dependencies]

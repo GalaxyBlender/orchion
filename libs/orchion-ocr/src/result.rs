@@ -439,10 +439,14 @@ fn run_vl_layout_ocr(
     let markdown = (options.response_format == OcrResponseFormat::Markdown)
         .then(|| html_tables_to_markdown(&structure.to_markdown()));
     let html = (options.response_format == OcrResponseFormat::Html).then(|| {
-        oar_ocr_vl::utils::to_markdown_openocr(
-            &structure.layout_elements,
+        render_layout_html(
+            structure.layout_elements.iter().map(|element| {
+                (
+                    element.label.as_deref().unwrap_or("text"),
+                    element.text.as_deref().unwrap_or_default(),
+                )
+            }),
             &parser.config().markdown_ignore_labels,
-            true,
         )
     });
     let blocks = structure
@@ -481,6 +485,69 @@ fn should_use_vl_layout_pipeline(options: &OcrOptions) -> bool {
 #[cfg(feature = "ocr-vl")]
 fn html_tables_to_markdown(input: &str) -> String {
     htmd::convert(input).unwrap_or_else(|_| input.to_string())
+}
+
+#[cfg(feature = "ocr-vl")]
+fn render_layout_html<'a>(
+    elements: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ignore_labels: &[String],
+) -> String {
+    let mut html = String::new();
+    for (label, text) in elements {
+        let text = text.trim();
+        if text.is_empty() || ignore_labels.iter().any(|ignored| ignored == label) {
+            continue;
+        }
+        let escaped = escape_html(text);
+        let block = match label {
+            "doc_title" => format!("<h1>{}</h1>", html_lines(&escaped)),
+            "paragraph_title" | "abstract_title" | "reference_title" | "content_title" => {
+                format!("<h2>{}</h2>", html_lines(&escaped))
+            }
+            "list" => {
+                let items = text
+                    .lines()
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(|item| format!("<li>{}</li>", escape_html(item)))
+                    .collect::<String>();
+                format!("<ul>{items}</ul>")
+            }
+            "algorithm" => format!("<pre><code>{escaped}</code></pre>"),
+            "formula" | "display_formula" | "inline_formula" => {
+                format!("<pre data-ocr-kind=\"formula\">{escaped}</pre>")
+            }
+            "table" => format!("<pre data-ocr-kind=\"table\">{escaped}</pre>"),
+            "image" | "figure" | "chart" | "seal" => {
+                format!(
+                    "<figure><figcaption>{}</figcaption></figure>",
+                    html_lines(&escaped)
+                )
+            }
+            _ => format!("<p>{}</p>", html_lines(&escaped)),
+        };
+        html.push_str(&block);
+        html.push('\n');
+    }
+    html.trim_end().to_string()
+}
+
+#[cfg(feature = "ocr-vl")]
+fn escape_html(text: &str) -> String {
+    text.chars().fold(String::new(), |mut escaped, character| {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            _ => escaped.push(character),
+        }
+        escaped
+    })
+}
+
+#[cfg(feature = "ocr-vl")]
+fn html_lines(escaped_text: &str) -> String {
+    escaped_text.replace('\n', "<br>\n")
 }
 
 #[cfg(feature = "ocr-vl")]
@@ -729,6 +796,24 @@ mod tests {
         };
 
         assert!(should_use_vl_layout_pipeline(&options));
+    }
+
+    #[test]
+    fn ocr_vl_html_is_semantic_and_escapes_recognized_content() {
+        let html = render_layout_html(
+            [
+                ("doc_title", "Invoice <script>alert(1)</script>"),
+                ("text", "Total & tax"),
+                ("table", "<table><tr><td>unsafe</td></tr></table>"),
+            ],
+            &[],
+        );
+
+        assert!(html.contains("<h1>Invoice &lt;script&gt;alert(1)&lt;/script&gt;</h1>"));
+        assert!(html.contains("<p>Total &amp; tax</p>"));
+        assert!(html.contains("data-ocr-kind=\"table\""));
+        assert!(html.contains("&lt;table&gt;"));
+        assert!(!html.contains("<script>"));
     }
 
     #[test]

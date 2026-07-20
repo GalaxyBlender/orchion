@@ -20,4 +20,4 @@ if errorlevel 1 exit /b %errorlevel%
 set "CFLAGS=/MD"
 set "CXXFLAGS=/MD"
 
-cargo build --release -p orchion-server --features cpu
+cargo build --release -p orchion-server --no-default-features --features cpu

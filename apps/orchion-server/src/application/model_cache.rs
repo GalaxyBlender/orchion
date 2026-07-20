@@ -1,9 +1,11 @@
 use orchion::{Asr, AsrModel, KnownOcrModel, ModelDownloader, ModelSpec, Ocr, Tts, TtsModel};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::ops::Deref;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
@@ -45,6 +47,77 @@ struct ModelCacheState<M, E> {
 struct LoadedModel<E> {
     engine: E,
     last_used: Instant,
+    active_leases: Arc<AtomicUsize>,
+}
+
+#[must_use = "the model lease must be held while the model is in use"]
+pub struct ModelLease<E> {
+    engine: E,
+    active_leases: Arc<AtomicUsize>,
+}
+
+impl<E> ModelLease<E> {
+    fn new(engine: E, active_leases: Arc<AtomicUsize>) -> Self {
+        active_leases.fetch_add(1, Ordering::SeqCst);
+        Self {
+            engine,
+            active_leases,
+        }
+    }
+}
+
+impl<E> ModelLease<E>
+where
+    E: Clone + Send + Sync + 'static,
+{
+    pub async fn run<T, F, Fut>(&self, operation: F) -> Result<T, tokio::task::JoinError>
+    where
+        T: Send + 'static,
+        F: FnOnce(ModelLease<E>) -> Fut + Send + 'static,
+        Fut: Future<Output = T> + Send + 'static,
+    {
+        let lease = self.clone();
+        tokio::spawn(async move { operation(lease).await }).await
+    }
+}
+
+impl<E: Clone> Clone for ModelLease<E> {
+    fn clone(&self) -> Self {
+        Self::new(self.engine.clone(), Arc::clone(&self.active_leases))
+    }
+}
+
+impl<E> Deref for ModelLease<E> {
+    type Target = E;
+
+    fn deref(&self) -> &Self::Target {
+        &self.engine
+    }
+}
+
+impl<E: std::fmt::Debug> std::fmt::Debug for ModelLease<E> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.engine.fmt(formatter)
+    }
+}
+
+impl<E> Drop for ModelLease<E> {
+    fn drop(&mut self) {
+        let previous = self.active_leases.fetch_sub(1, Ordering::SeqCst);
+        debug_assert!(previous > 0, "model lease count underflowed");
+    }
+}
+
+impl<E: Clone> LoadedModel<E> {
+    fn lease(&self) -> ModelLease<E> {
+        ModelLease::new(self.engine.clone(), Arc::clone(&self.active_leases))
+    }
+}
+
+impl<E> LoadedModel<E> {
+    fn is_active(&self) -> bool {
+        self.active_leases.load(Ordering::SeqCst) > 0
+    }
 }
 
 #[derive(Clone)]
@@ -67,19 +140,20 @@ impl GlobalModelCacheLimiter {
         all_caches: C,
         model: M,
         load: F,
-    ) -> anyhow::Result<Option<E>>
+    ) -> anyhow::Result<Option<ModelLease<E>>>
     where
         M: ModelSpec + std::hash::Hash,
         E: Clone + Send,
         C: CacheTrackerSet<'a>,
-        F: FnOnce(M, PathBuf) -> Fut,
-        Fut: Future<Output = anyhow::Result<E>>,
+        F: FnOnce(M, PathBuf) -> Fut + Send + 'static,
+        Fut: Future<Output = anyhow::Result<E>> + Send + 'static,
+        E: 'static,
     {
         if let Some(engine) = target.get_loaded(&model).await {
             return Ok(Some(engine));
         }
 
-        let _guard = self.lock.lock().await;
+        let guard = Arc::clone(&self.lock).lock_owned().await;
         if let Some(engine) = target.get_loaded(&model).await {
             return Ok(Some(engine));
         }
@@ -89,26 +163,29 @@ impl GlobalModelCacheLimiter {
         let all_caches = all_caches.into_trackers(target);
         validate_unique_cache_ids(all_caches.as_slice())?;
         self.evict_global_lru_before_load(all_caches.as_slice())
-            .await;
-        let engine = target.get_or_load(model, load).await?;
-        self.evict_global_lru(all_caches.as_slice()).await;
-        Ok(engine)
+            .await?;
+        let target = target.clone();
+        tokio::spawn(async move {
+            let _guard = guard;
+            target.get_or_load(model, load).await
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("model load task failed: {error}"))?
     }
 
-    async fn evict_global_lru_before_load(&self, all_caches: &[&dyn CacheTracker]) {
+    async fn evict_global_lru_before_load(
+        &self,
+        all_caches: &[&dyn CacheTracker],
+    ) -> anyhow::Result<()> {
         while loaded_len(all_caches).await >= self.max_loaded {
             if !self.evict_global_lru_once(all_caches).await {
-                break;
+                anyhow::bail!(
+                    "global model cache capacity of {} is occupied by active models",
+                    self.max_loaded
+                );
             }
         }
-    }
-
-    async fn evict_global_lru(&self, all_caches: &[&dyn CacheTracker]) {
-        while loaded_len(all_caches).await > self.max_loaded {
-            if !self.evict_global_lru_once(all_caches).await {
-                break;
-            }
-        }
+        Ok(())
     }
 
     async fn evict_global_lru_once(&self, all_caches: &[&dyn CacheTracker]) -> bool {
@@ -206,7 +283,11 @@ where
         }
     }
 
-    pub async fn get_or_load<F, Fut>(&self, model: M, load: F) -> anyhow::Result<Option<E>>
+    pub async fn get_or_load<F, Fut>(
+        &self,
+        model: M,
+        load: F,
+    ) -> anyhow::Result<Option<ModelLease<E>>>
     where
         F: FnOnce(M, PathBuf) -> Fut,
         Fut: Future<Output = anyhow::Result<E>>,
@@ -219,7 +300,7 @@ where
             self.log_unloaded_models(state.evict_idle(self.idle_timeout), "idle timeout");
             if let Some(loaded) = state.loaded.get_mut(&model) {
                 loaded.last_used = Instant::now();
-                return Ok(Some(loaded.engine.clone()));
+                return Ok(Some(loaded.lease()));
             }
             Arc::clone(
                 state
@@ -235,7 +316,15 @@ where
             self.log_unloaded_models(state.evict_idle(self.idle_timeout), "idle timeout");
             if let Some(loaded) = state.loaded.get_mut(&model) {
                 loaded.last_used = Instant::now();
-                return Ok(Some(loaded.engine.clone()));
+                return Ok(Some(loaded.lease()));
+            }
+            self.log_unloaded_models(state.evict_lru_until_below(self.max_loaded), "cache limit");
+            if state.loaded.len() >= self.max_loaded {
+                anyhow::bail!(
+                    "model cache `{}` capacity of {} is occupied by active models",
+                    self.cache_id,
+                    self.max_loaded
+                );
             }
         }
 
@@ -243,16 +332,23 @@ where
         let mut state = self.inner.lock().await;
         self.log_unloaded_models(state.evict_idle(self.idle_timeout), "idle timeout");
         self.log_unloaded_models(state.evict_lru_until_below(self.max_loaded), "cache limit");
-        let engine = state
+        if state.loaded.len() >= self.max_loaded {
+            anyhow::bail!(
+                "model cache `{}` capacity of {} is occupied by active models",
+                self.cache_id,
+                self.max_loaded
+            );
+        }
+        let lease = state
             .loaded
             .entry(model)
             .or_insert_with(|| LoadedModel {
                 engine,
                 last_used: Instant::now(),
+                active_leases: Arc::new(AtomicUsize::new(0)),
             })
-            .engine
-            .clone();
-        Ok(Some(engine))
+            .lease();
+        Ok(Some(lease))
     }
 
     pub async fn cleanup_idle(&self) {
@@ -260,12 +356,12 @@ where
         self.log_unloaded_models(state.evict_idle(self.idle_timeout), "idle timeout");
     }
 
-    async fn get_loaded(&self, model: &M) -> Option<E> {
+    async fn get_loaded(&self, model: &M) -> Option<ModelLease<E>> {
         let mut state = self.inner.lock().await;
         self.log_unloaded_models(state.evict_idle(self.idle_timeout), "idle timeout");
         let loaded = state.loaded.get_mut(model)?;
         loaded.last_used = Instant::now();
-        Some(loaded.engine.clone())
+        Some(loaded.lease())
     }
 
     async fn is_available(&self, model: &M) -> bool {
@@ -308,6 +404,7 @@ where
                 .await
                 .loaded
                 .iter()
+                .filter(|(_, loaded)| !loaded.is_active())
                 .min_by_key(|(_, loaded)| loaded.last_used)
                 .map(|(model, loaded)| TrackedLoadedModel {
                     cache_id: self.cache_id,
@@ -328,6 +425,9 @@ where
             else {
                 return false;
             };
+            if state.loaded.get(&model).is_some_and(LoadedModel::is_active) {
+                return false;
+            }
             let removed = state.loaded.remove(&model).is_some();
             if removed {
                 tracing::info!(
@@ -356,7 +456,8 @@ where
             .loaded
             .iter()
             .filter_map(|(model, loaded)| {
-                (now.duration_since(loaded.last_used) >= idle_timeout).then_some(model.clone())
+                (!loaded.is_active() && now.duration_since(loaded.last_used) >= idle_timeout)
+                    .then_some(model.clone())
             })
             .collect::<Vec<_>>();
         for model in &evicted {
@@ -371,6 +472,7 @@ where
             let Some(model) = self
                 .loaded
                 .iter()
+                .filter(|(_, loaded)| !loaded.is_active())
                 .min_by_key(|(_, loaded)| loaded.last_used)
                 .map(|(model, _)| model.clone())
             else {
@@ -408,6 +510,7 @@ mod tests {
     use super::*;
     use orchion::KnownOcrModel;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
 
     fn asr_model(value: &str) -> AsrModel {
         AsrModel::parse(value).unwrap()
@@ -481,7 +584,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result, None);
+        assert!(result.is_none());
         assert_eq!(loads.load(Ordering::SeqCst), 0);
     }
 
@@ -531,6 +634,7 @@ mod tests {
                 LoadedModel {
                     engine: 1,
                     last_used: Instant::now() - Duration::from_secs(10),
+                    active_leases: Arc::new(AtomicUsize::new(0)),
                 },
             )]),
             loading: HashMap::new(),
@@ -549,42 +653,231 @@ mod tests {
         let asr_loads = Arc::new(AtomicUsize::new(0));
         let tts_loads = Arc::new(AtomicUsize::new(0));
 
+        let current_asr_loads = Arc::clone(&asr_loads);
         let asr = limiter
-            .get_or_load(&asr_cache, &all_caches, qwen_asr_06b(), |_, _| {
-                let asr_loads = Arc::clone(&asr_loads);
-                async move { Ok(asr_loads.fetch_add(1, Ordering::SeqCst) + 1) }
-            })
+            .get_or_load(
+                &asr_cache,
+                &all_caches,
+                qwen_asr_06b(),
+                move |_, _| async move { Ok(current_asr_loads.fetch_add(1, Ordering::SeqCst) + 1) },
+            )
             .await
             .unwrap();
 
-        assert_eq!(asr, Some(1));
+        assert_eq!(asr.as_deref(), Some(&1));
         assert!(asr_cache.is_loaded(qwen_asr_06b()).await);
+        drop(asr);
 
+        let current_tts_loads = Arc::clone(&tts_loads);
         let tts = limiter
-            .get_or_load(&tts_cache, &all_caches, qwen_tts_custom_voice(), |_, _| {
-                let tts_loads = Arc::clone(&tts_loads);
-                async move { Ok(tts_loads.fetch_add(1, Ordering::SeqCst) + 1) }
-            })
+            .get_or_load(
+                &tts_cache,
+                &all_caches,
+                qwen_tts_custom_voice(),
+                move |_, _| async move { Ok(current_tts_loads.fetch_add(1, Ordering::SeqCst) + 1) },
+            )
             .await
             .unwrap();
 
-        assert_eq!(tts, Some(1));
+        assert_eq!(tts.as_deref(), Some(&1));
         assert!(!asr_cache.is_loaded(qwen_asr_06b()).await);
         assert!(tts_cache.is_loaded(qwen_tts_custom_voice()).await);
+        drop(tts);
 
+        let current_asr_loads = Arc::clone(&asr_loads);
         let asr = limiter
-            .get_or_load(&asr_cache, &all_caches, qwen_asr_06b(), |_, _| {
-                let asr_loads = Arc::clone(&asr_loads);
-                async move { Ok(asr_loads.fetch_add(1, Ordering::SeqCst) + 1) }
-            })
+            .get_or_load(
+                &asr_cache,
+                &all_caches,
+                qwen_asr_06b(),
+                move |_, _| async move { Ok(current_asr_loads.fetch_add(1, Ordering::SeqCst) + 1) },
+            )
             .await
             .unwrap();
 
-        assert_eq!(asr, Some(2));
+        assert_eq!(asr.as_deref(), Some(&2));
         assert!(asr_cache.is_loaded(qwen_asr_06b()).await);
         assert!(!tts_cache.is_loaded(qwen_tts_custom_voice()).await);
         assert_eq!(asr_loads.load(Ordering::SeqCst), 2);
         assert_eq!(tts_loads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn global_limiter_does_not_evict_an_active_model() {
+        let asr_cache = asr_cache(2, Duration::from_secs(60));
+        let tts_cache = tts_cache(2, Duration::from_secs(60));
+        let all_caches: [&dyn CacheTracker; 2] = [&asr_cache, &tts_cache];
+        let limiter = GlobalModelCacheLimiter::new(1);
+
+        let active_asr = limiter
+            .get_or_load(&asr_cache, &all_caches, qwen_asr_06b(), |_, _| async {
+                Ok(1)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let error = limiter
+            .get_or_load(
+                &tts_cache,
+                &all_caches,
+                qwen_tts_custom_voice(),
+                |_, _| async { Ok(2) },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("model cache capacity"),
+            "unexpected error: {error:#}"
+        );
+        assert!(asr_cache.is_loaded(qwen_asr_06b()).await);
+        assert!(!tts_cache.is_loaded(qwen_tts_custom_voice()).await);
+
+        drop(active_asr);
+        assert!(
+            limiter
+                .get_or_load(
+                    &tts_cache,
+                    &all_caches,
+                    qwen_tts_custom_voice(),
+                    |_, _| async { Ok(2) },
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(!asr_cache.is_loaded(qwen_asr_06b()).await);
+        assert!(tts_cache.is_loaded(qwen_tts_custom_voice()).await);
+    }
+
+    #[tokio::test]
+    async fn detached_model_operation_keeps_lease_after_waiter_is_cancelled() {
+        let asr_cache = asr_cache(2, Duration::from_secs(60));
+        let tts_cache = tts_cache(2, Duration::from_secs(60));
+        let all_caches: [&dyn CacheTracker; 2] = [&asr_cache, &tts_cache];
+        let limiter = GlobalModelCacheLimiter::new(1);
+        let active_asr = limiter
+            .get_or_load(&asr_cache, &all_caches, qwen_asr_06b(), |_, _| async {
+                Ok(1)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let completed = Arc::new(Notify::new());
+
+        let waiter = tokio::spawn({
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            let completed = Arc::clone(&completed);
+            async move {
+                active_asr
+                    .run(move |lease| async move {
+                        started.notify_one();
+                        release.notified().await;
+                        drop(lease);
+                        completed.notify_one();
+                    })
+                    .await
+            }
+        });
+        started.notified().await;
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+
+        let error = limiter
+            .get_or_load(
+                &tts_cache,
+                &all_caches,
+                qwen_tts_custom_voice(),
+                |_, _| async { Ok(2) },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("model cache capacity"));
+
+        release.notify_one();
+        completed.notified().await;
+        assert!(
+            limiter
+                .get_or_load(
+                    &tts_cache,
+                    &all_caches,
+                    qwen_tts_custom_voice(),
+                    |_, _| async { Ok(2) },
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_cold_load_waiter_does_not_release_global_capacity() {
+        let asr_cache = asr_cache(2, Duration::from_secs(60));
+        let tts_cache = tts_cache(2, Duration::from_secs(60));
+        let limiter = GlobalModelCacheLimiter::new(1);
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let loads = Arc::new(AtomicUsize::new(0));
+
+        let waiter = tokio::spawn({
+            let limiter = limiter.clone();
+            let asr_cache = asr_cache.clone();
+            let tts_cache = tts_cache.clone();
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            let loads = Arc::clone(&loads);
+            async move {
+                let all_caches: [&dyn CacheTracker; 2] = [&asr_cache, &tts_cache];
+                limiter
+                    .get_or_load(
+                        &asr_cache,
+                        &all_caches,
+                        qwen_asr_06b(),
+                        move |_, _| async move {
+                            loads.fetch_add(1, Ordering::SeqCst);
+                            started.notify_one();
+                            release.notified().await;
+                            Ok(1)
+                        },
+                    )
+                    .await
+            }
+        });
+        started.notified().await;
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+
+        let blocked_tts_load = async {
+            let all_caches: [&dyn CacheTracker; 2] = [&asr_cache, &tts_cache];
+            limiter
+                .get_or_load(
+                    &tts_cache,
+                    &all_caches,
+                    qwen_tts_custom_voice(),
+                    |_, _| async { Ok(2) },
+                )
+                .await
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), blocked_tts_load)
+                .await
+                .is_err()
+        );
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !asr_cache.is_loaded(qwen_asr_06b()).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -602,8 +895,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(asr, Some(1));
+        assert_eq!(asr.as_deref(), Some(&1));
         assert!(asr_cache.is_loaded(qwen_asr_06b()).await);
+        drop(asr);
 
         let tts = limiter
             .get_or_load(
@@ -615,9 +909,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(tts, Some(2));
+        assert_eq!(tts.as_deref(), Some(&2));
         assert!(asr_cache.is_loaded(qwen_asr_06b()).await);
         assert!(tts_cache.is_loaded(qwen_tts_custom_voice()).await);
+        drop(tts);
 
         let ocr = limiter
             .get_or_load(
@@ -629,7 +924,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(ocr, Some(3));
+        assert_eq!(ocr.as_deref(), Some(&3));
         assert!(!asr_cache.is_loaded(qwen_asr_06b()).await);
         assert!(tts_cache.is_loaded(qwen_tts_custom_voice()).await);
         assert!(ocr_cache.is_loaded(KnownOcrModel::PpOcrV6Tiny).await);
@@ -676,15 +971,16 @@ mod tests {
         let limiter = GlobalModelCacheLimiter::new(2);
         let loads = Arc::new(AtomicUsize::new(0));
 
+        let current_loads = Arc::clone(&loads);
         assert_eq!(
             limiter
-                .get_or_load(&asr_cache, &all_caches, qwen_asr_06b(), |_, _| {
-                    let loads = Arc::clone(&loads);
-                    async move { Ok(loads.fetch_add(1, Ordering::SeqCst) + 1) }
+                .get_or_load(&asr_cache, &all_caches, qwen_asr_06b(), move |_, _| {
+                    async move { Ok(current_loads.fetch_add(1, Ordering::SeqCst) + 1) }
                 })
                 .await
-                .unwrap(),
-            Some(1)
+                .unwrap()
+                .as_deref(),
+            Some(&1)
         );
 
         let cold_limiter = limiter.clone();
@@ -714,9 +1010,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(cached, Some(1));
+        assert_eq!(cached.as_deref(), Some(&1));
         assert!(start.elapsed() < Duration::from_millis(50));
-        assert_eq!(cold_load.await.unwrap().unwrap(), Some(10));
+        assert_eq!(cold_load.await.unwrap().unwrap().as_deref(), Some(&10));
         assert_eq!(loads.load(Ordering::SeqCst), 1);
     }
 
@@ -732,5 +1028,6 @@ mod tests {
             })
             .await
             .unwrap()
+            .map(|lease| *lease)
     }
 }

@@ -6,6 +6,10 @@
 
 第一条 WebSocket 消息必须是 JSON start 消息。收到 `ready` 后，二进制消息承载 `input_audio_format` 声明格式的音频字节。JSON 控制消息 `{"type":"end"}` 用于通知服务端 flush 当前流。
 
+启用 API key 鉴权时，非浏览器客户端可以在握手中使用 `Authorization: Bearer <api_key>`。浏览器客户端可以改为在 start 消息中加入 `"api_key":"<api_key>"`。服务端会先完成鉴权，再加载模型。
+
+超过 `[services.asr].stream_idle_timeout` 或 `[services.asr].stream_max_duration` 的流会被服务端关闭。二进制输入总量受 `[server].max_upload_size` 限制，解码后音频不能超过 `stream_max_duration`，`chunk_size_sec` 不能超过 30 秒。
+
 ## Live Transcript 模式
 
 不传 `mode` 时使用 Live Transcript 模式。

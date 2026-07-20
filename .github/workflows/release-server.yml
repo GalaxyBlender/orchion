@@ -16,6 +16,68 @@ env:
   SCCACHE_GHA_ENABLED: "true"
 
 jobs:
+  test:
+    name: Test release source
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Configure sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install web dependencies
+        working-directory: web
+        run: bun install --frozen-lockfile
+
+      - name: Test web
+        working-directory: web
+        run: |
+          bun test
+          bun run typecheck
+
+      - name: Provision PDFium for tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/pdfium-linux-x64.tgz"
+          curl -fsSL "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/7891/pdfium-linux-x64.tgz" -o "${archive}"
+          echo "e21257c643592dc8eaf284f5f54cd7eca5e1694ff35a5b2158a351931bea107f  ${archive}" | sha256sum --check --strict
+          mkdir -p "${RUNNER_TEMP}/pdfium" target/debug/deps
+          tar -xzf "${archive}" -C "${RUNNER_TEMP}/pdfium" lib/libpdfium.so
+          cp "${RUNNER_TEMP}/pdfium/lib/libpdfium.so" target/debug/deps/libpdfium.so
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Test Rust workspace
+        run: cargo test --workspace
+
+      - name: Check client feature gates
+        run: |
+          cargo check -p orchion-client --no-default-features --features models
+          cargo check -p orchion-client --no-default-features --features asr
+          cargo check -p orchion-client --no-default-features --features tts,ocr,pdf
+
+      - name: Assemble publishable packages
+        run: |
+          cargo package --workspace --no-verify \
+            --exclude orchion \
+            --exclude orchion-qwen3 \
+            --exclude orchion-server \
+            --exclude orchion-example-asr-file \
+            --exclude orchion-example-asr-streaming \
+            --exclude orchion-example-download-model \
+            --exclude orchion-example-tts-preset
+
   build-macos:
     name: Build macos packages
     runs-on: macos-latest
@@ -44,7 +106,10 @@ jobs:
           package="orchion-server-${GITHUB_REF_NAME}-macos-aarch64-metal"
           mkdir -p "dist/${package}"
           cp "target/release/orchion-server" "dist/${package}/"
+          cp "target/release/libpdfium.dylib" "dist/${package}/"
           cp "apps/orchion-server/config.toml" "dist/${package}/config.toml"
+          "dist/${package}/orchion-server" --help >/dev/null
+          python3 -c 'import ctypes, sys; ctypes.CDLL(sys.argv[1])' "dist/${package}/libpdfium.dylib"
           tar -czf "dist/${package}.tar.gz" -C dist "${package}"
 
       - name: Upload Metal package
@@ -100,7 +165,10 @@ jobs:
           package="orchion-server-${GITHUB_REF_NAME}-linux-x86_64-cpu"
           mkdir -p "dist/${package}"
           cp "target/release/orchion-server" "dist/${package}/"
+          cp "target/release/libpdfium.so" "dist/${package}/"
           cp "apps/orchion-server/config.toml" "dist/${package}/config.toml"
+          "dist/${package}/orchion-server" --help >/dev/null
+          python3 -c 'import ctypes, sys; ctypes.CDLL(sys.argv[1])' "dist/${package}/libpdfium.so"
           tar -czf "dist/${package}.tar.gz" -C dist "${package}"
 
       - name: Upload CPU package
@@ -123,7 +191,10 @@ jobs:
           package="orchion-server-${GITHUB_REF_NAME}-linux-x86_64-cuda"
           mkdir -p "dist/${package}"
           cp "target/release/orchion-server" "dist/${package}/"
+          cp "target/release/libpdfium.so" "dist/${package}/"
           cp "apps/orchion-server/config.toml" "dist/${package}/config.toml"
+          "dist/${package}/orchion-server" --help >/dev/null
+          python3 -c 'import ctypes, sys; ctypes.CDLL(sys.argv[1])' "dist/${package}/libpdfium.so"
           tar -czf "dist/${package}.tar.gz" -C dist "${package}"
 
       - name: Upload CUDA package
@@ -163,7 +234,11 @@ jobs:
           $package = "orchion-server-$env:GITHUB_REF_NAME-windows-x86_64-cpu"
           New-Item -ItemType Directory -Force -Path "dist/$package" | Out-Null
           Copy-Item "target/release/orchion-server.exe" "dist/$package/"
+          Copy-Item "target/release/pdfium.dll" "dist/$package/"
           Copy-Item "apps/orchion-server/config.toml" "dist/$package/config.toml"
+          & "dist/$package/orchion-server.exe" --help | Out-Null
+          $pdfium = [System.Runtime.InteropServices.NativeLibrary]::Load((Resolve-Path "dist/$package/pdfium.dll"))
+          [System.Runtime.InteropServices.NativeLibrary]::Free($pdfium)
           Compress-Archive -Path "dist/$package/*" -DestinationPath "dist/$package.zip"
 
       - name: Upload CPU package
@@ -188,7 +263,11 @@ jobs:
           $package = "orchion-server-$env:GITHUB_REF_NAME-windows-x86_64-cuda"
           New-Item -ItemType Directory -Force -Path "dist/$package" | Out-Null
           Copy-Item "target/release/orchion-server.exe" "dist/$package/"
+          Copy-Item "target/release/pdfium.dll" "dist/$package/"
           Copy-Item "apps/orchion-server/config.toml" "dist/$package/config.toml"
+          & "dist/$package/orchion-server.exe" --help | Out-Null
+          $pdfium = [System.Runtime.InteropServices.NativeLibrary]::Load((Resolve-Path "dist/$package/pdfium.dll"))
+          [System.Runtime.InteropServices.NativeLibrary]::Free($pdfium)
           Compress-Archive -Path "dist/$package/*" -DestinationPath "dist/$package.zip"
 
       - name: Upload CUDA package
@@ -201,7 +280,7 @@ jobs:
   release:
     name: Publish GitHub Release
     runs-on: ubuntu-latest
-    needs: [build-macos, build-linux, build-windows]
+    needs: [test, build-macos, build-linux, build-windows]
     steps:
       - name: Download packages
         uses: actions/download-artifact@v4

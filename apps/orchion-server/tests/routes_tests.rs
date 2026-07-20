@@ -1,5 +1,6 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header, header::AUTHORIZATION};
+use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use orchion::{AsrModel, ModelId, TtsModel};
 use orchion_server::api::ui;
@@ -11,6 +12,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tower::ServiceExt;
 
 #[tokio::test]
@@ -249,6 +251,100 @@ async fn v1_routes_accept_matching_bearer_auth() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn transcription_websocket_accepts_api_key_in_start_message() {
+    let (address, server) = start_websocket_test_server().await;
+    let (mut socket, _) =
+        tokio_tungstenite::connect_async(format!("ws://{address}/v1/audio/transcriptions/stream"))
+            .await
+            .unwrap();
+
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"start","model":"Acme/Missing-ASR","api_key":"secret","input_audio_format":"mp3"}"#
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let event = socket.next().await.unwrap().unwrap().into_text().unwrap();
+    let event = serde_json::from_str::<Value>(&event).unwrap();
+
+    assert_eq!(event["type"], "error");
+    assert_eq!(event["error"]["code"], "model_not_available");
+    server.abort();
+}
+
+#[tokio::test]
+async fn transcription_websocket_rejects_invalid_start_message_api_key() {
+    let (address, server) = start_websocket_test_server().await;
+    let (mut socket, _) =
+        tokio_tungstenite::connect_async(format!("ws://{address}/v1/audio/transcriptions/stream"))
+            .await
+            .unwrap();
+
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"start","model":"Acme/Missing-ASR","api_key":"wrong","input_audio_format":"mp3"}"#
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let event = socket.next().await.unwrap().unwrap().into_text().unwrap();
+    let event = serde_json::from_str::<Value>(&event).unwrap();
+
+    assert_eq!(event["type"], "error");
+    assert_eq!(event["error"]["code"], "invalid_api_key");
+    server.abort();
+}
+
+#[tokio::test]
+async fn transcription_websocket_keeps_supporting_bearer_auth() {
+    let (address, server) = start_websocket_test_server().await;
+    let mut request = format!("ws://{address}/v1/audio/transcriptions/stream")
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert(AUTHORIZATION, "Bearer secret".parse().unwrap());
+    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"start","model":"Acme/Missing-ASR","input_audio_format":"mp3"}"#.into(),
+        ))
+        .await
+        .unwrap();
+    let event = socket.next().await.unwrap().unwrap().into_text().unwrap();
+    let event = serde_json::from_str::<Value>(&event).unwrap();
+
+    assert_eq!(event["type"], "error");
+    assert_eq!(event["error"]["code"], "model_not_available");
+    server.abort();
+}
+
+#[tokio::test]
+async fn transcription_websocket_rejects_invalid_options_before_model_load() {
+    let (address, server) = start_websocket_test_server().await;
+    let (mut socket, _) =
+        tokio_tungstenite::connect_async(format!("ws://{address}/v1/audio/transcriptions/stream"))
+            .await
+            .unwrap();
+
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"start","model":"Acme/Missing-ASR","api_key":"secret","input_audio_format":"mp3","chunk_size_sec":31}"#
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let event = socket.next().await.unwrap().unwrap().into_text().unwrap();
+    let event = serde_json::from_str::<Value>(&event).unwrap();
+
+    assert_eq!(event["type"], "error");
+    assert_eq!(event["error"]["code"], "invalid_chunk_size");
+    server.abort();
 }
 
 #[tokio::test]
@@ -506,6 +602,188 @@ async fn json_speech_rejects_voice_clone() {
 }
 
 #[tokio::test]
+async fn speech_rejects_max_length_above_service_limit_before_model_load() {
+    let state = test_state_with_services_config(None, false, true, |config| {
+        config.services.tts.max_length = 4;
+    });
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/speech")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{
+                        "model":"Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+                        "input":"hello",
+                        "voice":"ryan",
+                        "max_length":5
+                    }"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert_eq!(body["error"]["param"], "max_length");
+    assert_eq!(body["error"]["code"], "max_length_exceeded");
+}
+
+#[tokio::test]
+async fn ocr_vl_rejects_max_tokens_above_service_limit_before_model_load() {
+    let state = test_state_with_ocr_services_config(None, |config| {
+        config.services.ocr_vl.max_tokens = 4;
+    });
+    let boundary = "orchion-ocr-vl-token-limit";
+    let body = multipart_body(
+        boundary,
+        &[
+            ("model", "PaddlePaddle/PaddleOCR-VL-1.6"),
+            ("max_tokens", "5"),
+        ],
+        "file",
+        "input.png",
+        b"image",
+    );
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/ocr")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert_eq!(body["error"]["param"], "max_tokens");
+    assert_eq!(body["error"]["code"], "max_tokens_exceeded");
+}
+
+#[tokio::test]
+async fn transcription_rejects_decoded_audio_above_duration_limit_before_model_load() {
+    let state = test_state_with_services_config(None, true, false, |config| {
+        config.services.asr.max_audio_duration = Duration::from_millis(1);
+    });
+    let boundary = "orchion-asr-duration-limit";
+    let body = multipart_body(
+        boundary,
+        &[("model", "Qwen/Qwen3-ASR-0.6B")],
+        "file",
+        "input.wav",
+        &wav_bytes(),
+    );
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/transcriptions")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert_eq!(body["error"]["code"], "invalid_audio");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("sample limit")
+    );
+}
+
+#[tokio::test]
+async fn transcription_rejects_unsupported_prompt_parameter() {
+    let state = test_state_with_services_config(None, true, false, |_| {});
+    let boundary = "orchion-asr-unsupported-prompt";
+    let body = multipart_body(
+        boundary,
+        &[("prompt", "previous context")],
+        "file",
+        "input.wav",
+        &wav_bytes(),
+    );
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/transcriptions")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert_eq!(body["error"]["param"], "prompt");
+    assert_eq!(body["error"]["code"], "unsupported_parameter");
+}
+
+#[tokio::test]
+async fn voice_clone_rejects_reference_audio_above_duration_limit_before_model_load() {
+    let state = test_state_with_services_config(None, false, true, |config| {
+        config.services.tts.max_reference_audio_duration = Duration::from_millis(1);
+    });
+    let boundary = "orchion-tts-reference-duration-limit";
+    let body = multipart_body(
+        boundary,
+        &[
+            ("model", "Qwen/Qwen3-TTS-12Hz-0.6B-Base"),
+            ("input", "hello"),
+            ("voice", "clone"),
+            ("reference_text", "hello"),
+        ],
+        "reference_audio",
+        "reference.wav",
+        &wav_bytes(),
+    );
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/speech")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert_eq!(body["error"]["code"], "invalid_audio");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("sample limit")
+    );
+}
+
+#[tokio::test]
 async fn multipart_speech_accepts_uploaded_voice_clone_audio() {
     let boundary = "orchion-test-boundary";
     let body = multipart_body(
@@ -714,6 +992,17 @@ fn wav_bytes() -> Vec<u8> {
 
 fn test_state(api_key: Option<&str>) -> Arc<AppState> {
     test_state_with_services(api_key, true, true)
+}
+
+async fn start_websocket_test_server() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router(test_state(Some("secret"))))
+            .await
+            .unwrap();
+    });
+    (address, server)
 }
 
 fn test_state_with_ocr_services(api_key: Option<&str>) -> Arc<AppState> {

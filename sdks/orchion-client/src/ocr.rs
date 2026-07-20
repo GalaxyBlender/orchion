@@ -1,6 +1,7 @@
 use crate::client::{decode_json, decode_text};
 use crate::{Client, ClientError};
 use orchion_core::{OcrLayoutBlock, OcrRegion, OcrUsage};
+use reqwest::header::CONTENT_TYPE;
 use reqwest::multipart::{Form, Part};
 use serde::Deserialize;
 use std::path::Path;
@@ -23,7 +24,7 @@ impl<'a> OcrClient<'a> {
     /// Returns [`ClientError`] when the request is invalid, cannot be sent, or the response cannot
     /// be decoded.
     pub async fn recognize(&self, request: OcrRequest) -> Result<OcrResponse, ClientError> {
-        let response_format = request.response_format.unwrap_or(OcrResponseFormat::Json);
+        let response_format = request.response_format;
         let response = self
             .client
             .post("/v1/ocr")?
@@ -32,11 +33,21 @@ impl<'a> OcrClient<'a> {
             .await?;
 
         match response_format {
-            OcrResponseFormat::Json => {
+            Some(OcrResponseFormat::Json) => {
                 let response = decode_json(response).await?;
                 Ok(OcrResponse::Json(response))
             }
-            OcrResponseFormat::Text | OcrResponseFormat::Markdown | OcrResponseFormat::Html => {
+            Some(
+                OcrResponseFormat::Text | OcrResponseFormat::Markdown | OcrResponseFormat::Html,
+            ) => {
+                let response = decode_text(response).await?;
+                Ok(OcrResponse::Text(response))
+            }
+            None if response_is_json(&response) => {
+                let response = decode_json(response).await?;
+                Ok(OcrResponse::Json(response))
+            }
+            None => {
                 let response = decode_text(response).await?;
                 Ok(OcrResponse::Text(response))
             }
@@ -141,8 +152,9 @@ impl OcrRequest {
             form = form.text("model", model);
         }
 
-        let response_format = self.response_format.unwrap_or(OcrResponseFormat::Json);
-        form = form.text("response_format", response_format.as_str());
+        if let Some(response_format) = self.response_format {
+            form = form.text("response_format", response_format.as_str());
+        }
 
         if let Some(task) = self.task {
             form = form.text("task", task.as_str());
@@ -158,6 +170,15 @@ impl OcrRequest {
 
         Ok(form)
     }
+}
+
+fn response_is_json(response: &reqwest::Response) -> bool {
+    response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
 }
 
 /// OCR response format.

@@ -2,10 +2,17 @@ use super::openai::ApiError;
 
 use orchion::docs;
 
-pub use docs::{PageSelection, PdfImageFormat, PdfRenderRequest, RenderedZip};
+pub use docs::{PageSelection, PdfImageFormat, PdfRenderLimits, PdfRenderRequest, RenderedZip};
 
 pub fn render_pdf_to_zip(request: PdfRenderRequest) -> Result<RenderedZip, ApiError> {
     docs::render_pdf_to_zip(request).map_err(map_pdf_error)
+}
+
+pub fn render_pdf_to_zip_with_limits(
+    request: PdfRenderRequest,
+    limits: PdfRenderLimits,
+) -> Result<RenderedZip, ApiError> {
+    docs::render_pdf_to_zip_with_limits(request, limits).map_err(map_pdf_error)
 }
 
 pub fn parse_pdf_image_format(value: Option<&str>) -> Result<PdfImageFormat, ApiError> {
@@ -14,6 +21,13 @@ pub fn parse_pdf_image_format(value: Option<&str>) -> Result<PdfImageFormat, Api
 
 pub fn parse_page_selection(value: Option<&str>) -> Result<PageSelection, ApiError> {
     docs::parse_page_selection(value).map_err(map_pdf_error)
+}
+
+pub fn parse_page_selection_with_max_pages(
+    value: Option<&str>,
+    max_pages: usize,
+) -> Result<PageSelection, ApiError> {
+    docs::parse_page_selection_with_max_pages(value, max_pages).map_err(map_pdf_error)
 }
 
 pub fn parse_scale(value: Option<&str>) -> Result<f32, ApiError> {

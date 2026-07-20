@@ -2,7 +2,7 @@ import { type ChangeEvent, type FormEvent, useEffect, useMemo, useRef, useState 
 import type { TFunction } from "i18next";
 import { useTranslation } from "react-i18next";
 import { ttsLanguageOptions, ttsModes, ttsParameterMetadata, ttsResponseFormats, ttsSpeakerOptions } from "@/features/tts/metadata";
-import { buildTtsCurl, buildTtsPayload, summarizeTtsRequest } from "@/features/tts/request";
+import { buildTtsCurl, buildTtsPayload, summarizeTtsRequest, ttsSupportedSpeed } from "@/features/tts/request";
 import type { TtsFormState, TtsMode, TtsResponseFormat, TtsRequestInput } from "@/features/tts/types";
 import { useModels } from "@/features/models/useModels";
 import { apiUrl, authHeaders } from "@/shared/api/client";
@@ -15,7 +15,7 @@ import {
   type PersistentState,
   type PersistentTtsState,
 } from "@/shared/storage/persistentState";
-import { Card, FormField, Input, Select, TextArea, Button, Alert, StateView, ModelStatus, CodePreview, FileDropZone, useToast, MetadataPanel, Tabs, Slider, SuggestionInput } from "@/shared/ui";
+import { Card, FormField, Input, Select, TextArea, Button, Alert, StateView, ModelStatus, CodePreview, FileDropZone, useToast, MetadataPanel, Tabs, SuggestionInput } from "@/shared/ui";
 import { Play, Download, Clipboard, Square } from "lucide-react";
 
 const endpointPath = "/v1/audio/speech";
@@ -417,12 +417,11 @@ export function TtsPage() {
               {/* Parameters Slider & Inputs */}
               <div className="grid grid-cols-2 gap-md border-t border-subtle pt-4" style={{ borderTop: "1px solid var(--color-border-subtle)", paddingTop: "var(--space-4)" }}>
                 <FormField label={t("tts.metadata.speed.0")} description={t("tts.speedDescription")}>
-                  <Slider
-                    min={0.5}
-                    max={2.0}
-                    step={0.1}
-                    value={parseFloat(form.speed) || 1.0}
-                    onChange={(val) => updateForm("speed", String(val))}
+                  <Input
+                    id="tts-speed"
+                    name="speed"
+                    value={ttsSupportedSpeed.toFixed(1)}
+                    disabled
                   />
                 </FormField>
 
@@ -603,7 +602,7 @@ function ttsStateToForm(tts: PersistentTtsState): TtsFormState {
     referenceAudioName: "",
     referenceText: tts.referenceText,
     voicePrompt: tts.voicePrompt,
-    speed: tts.speed,
+    speed: ttsSupportedSpeed.toFixed(1),
     seed: tts.seed,
     temperature: tts.temperature,
     topK: tts.topK,
@@ -629,7 +628,7 @@ function formToTtsState(form: TtsFormState, previous: PersistentTtsState): Persi
     speaker: form.speaker,
     referenceText: form.referenceText,
     voicePrompt: form.voicePrompt,
-    speed: form.speed,
+    speed: ttsSupportedSpeed.toFixed(1),
     seed: form.seed,
     temperature: form.temperature,
     topK: form.topK,

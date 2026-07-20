@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 import { asrLanguageOptions, asrParameterMetadata, asrResponseFormats, asrTimestampGranularityOptions } from "@/features/asr/metadata";
 import { buildAsrCurl, buildAsrFormData, summarizeAsrRequest } from "@/features/asr/request";
 import {
+  acquireAsrMicrophoneStream,
   asrStreamEndpointPath,
   buildAsrStreamStartMessage,
   buildAsrStreamUrl,
@@ -15,6 +16,7 @@ import {
   preferredMicrophoneMimeType,
   upsertBoundedAsrCaptionSegments,
   validateAsrCaptionEndpointingOptions,
+  waitForAsrStreamWritable,
 } from "@/features/asr/streaming";
 import type { AsrCaptionEndpointingOptions, AsrFormState, AsrMode, AsrRequestInput, AsrResponseFormat, AsrStreamEvent, AsrStreamInputFormat, AsrStreamInputMode, AsrStreamOutputMode } from "@/features/asr/types";
 import { useModels } from "@/features/models/useModels";
@@ -82,6 +84,7 @@ export function AsrPage() {
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const streamEndedRef = useRef(false);
   const streamStopRequestedRef = useRef(false);
+  const streamSessionRef = useRef(0);
   const settings = persistentState.settings;
   const models = useModels(settings);
   const asrModelIds = models.classified.asr.map((model) => model.id);
@@ -95,8 +98,6 @@ export function AsrPage() {
         file: (selectedFile) => t("asr.summary.file", { file: selectedFile }),
         responseFormat: (format) => t("asr.summary.responseFormat", { format }),
         language: (language) => t("asr.summary.language", { language }),
-        prompt: t("asr.summary.prompt"),
-        temperature: t("asr.summary.temperature"),
         timestamp: (values) => t("asr.summary.timestamp", { values }),
       }),
     [previewInput, t],
@@ -299,6 +300,7 @@ export function AsrPage() {
       return;
     }
     closeStreamResources();
+    const streamSession = streamSessionRef.current;
 
     if (streamInputMode === "file") {
       if (!streamFile) {
@@ -311,8 +313,8 @@ export function AsrPage() {
         return;
       }
       const selectedStreamFile = streamFile;
-      openTranscriptionStream(inputAudioFormat, parsedEndpointing, (socket) => {
-        void sendStreamFile(socket, selectedStreamFile);
+      openTranscriptionStream(inputAudioFormat, parsedEndpointing, streamSession, (socket) => {
+        void sendStreamFile(socket, selectedStreamFile, streamSession);
       });
       return;
     }
@@ -324,7 +326,14 @@ export function AsrPage() {
     }
 
     try {
-      const mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      setStreamStatus("connecting");
+      const mediaStream = await acquireAsrMicrophoneStream(
+        () => navigator.mediaDevices.getUserMedia({ audio: true }),
+        () => streamSessionRef.current === streamSession,
+      );
+      if (!mediaStream) {
+        return;
+      }
       const mimeType = preferredMicrophoneMimeType();
       const recorder = new MediaRecorder(mediaStream, mimeType ? { mimeType } : undefined);
       mediaStreamRef.current = mediaStream;
@@ -334,6 +343,9 @@ export function AsrPage() {
           return;
         }
         void event.data.arrayBuffer().then((buffer) => {
+          if (streamSessionRef.current !== streamSession || mediaRecorderRef.current !== recorder) {
+            return;
+          }
           const socket = webSocketRef.current;
           if (socket?.readyState === WebSocket.OPEN) {
             socket.send(buffer);
@@ -341,16 +353,23 @@ export function AsrPage() {
         });
       };
       recorder.onstop = () => {
-        mediaRecorderRef.current = null;
-        mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
-        mediaStreamRef.current = null;
+        if (mediaRecorderRef.current === recorder) {
+          mediaRecorderRef.current = null;
+        }
+        mediaStream.getTracks().forEach((track) => track.stop());
+        if (mediaStreamRef.current === mediaStream) {
+          mediaStreamRef.current = null;
+        }
+        if (streamSessionRef.current !== streamSession) {
+          return;
+        }
         const socket = webSocketRef.current;
         if (streamStopRequestedRef.current && socket?.readyState === WebSocket.OPEN) {
           socket.send(JSON.stringify({ type: "end" }));
           setStreamStatus("finishing");
         }
       };
-      openTranscriptionStream("auto", parsedEndpointing, () => {
+      openTranscriptionStream("auto", parsedEndpointing, streamSession, () => {
         if (recorder.state === "inactive") {
           recorder.start(500);
         }
@@ -385,8 +404,12 @@ export function AsrPage() {
   const openTranscriptionStream = (
     inputAudioFormat: AsrStreamInputFormat,
     endpointing: AsrCaptionEndpointingOptions | undefined,
+    streamSession: number,
     onReady: (socket: WebSocket) => void,
   ) => {
+    if (streamSessionRef.current !== streamSession) {
+      return;
+    }
     streamEndedRef.current = false;
     streamStopRequestedRef.current = false;
     setValidationError("");
@@ -395,6 +418,9 @@ export function AsrPage() {
     const socket = new WebSocket(buildAsrStreamUrl());
     webSocketRef.current = socket;
     socket.onopen = () => {
+      if (webSocketRef.current !== socket || streamSessionRef.current !== streamSession) {
+        return;
+      }
       socket.send(
         buildAsrStreamStartMessage({
           form,
@@ -406,7 +432,7 @@ export function AsrPage() {
       );
     };
     socket.onmessage = (event) => {
-      if (webSocketRef.current !== socket) {
+      if (webSocketRef.current !== socket || streamSessionRef.current !== streamSession) {
         return;
       }
       if (typeof event.data === "string") {
@@ -418,13 +444,13 @@ export function AsrPage() {
       }
     };
     socket.onerror = () => {
-      if (webSocketRef.current !== socket) {
+      if (webSocketRef.current !== socket || streamSessionRef.current !== streamSession) {
         return;
       }
       handleStreamFailure(t("asr.stream.connectionError", "Streaming connection failed."));
     };
     socket.onclose = () => {
-      if (webSocketRef.current !== socket) {
+      if (webSocketRef.current !== socket || streamSessionRef.current !== streamSession) {
         return;
       }
       if (!streamEndedRef.current) {
@@ -492,14 +518,26 @@ export function AsrPage() {
     }
   };
 
-  const sendStreamFile = async (socket: WebSocket, selectedFile: File) => {
+  const sendStreamFile = async (socket: WebSocket, selectedFile: File, streamSession: number) => {
     try {
       for (let offset = 0; offset < selectedFile.size; offset += streamFileChunkSize) {
-        if (streamStopRequestedRef.current || socket.readyState !== WebSocket.OPEN) {
+        const writable = await waitForAsrStreamWritable(
+          socket,
+          () => streamSessionRef.current === streamSession && !streamStopRequestedRef.current,
+        );
+        if (!writable) {
           return;
         }
         const chunk = selectedFile.slice(offset, offset + streamFileChunkSize);
-        socket.send(await chunk.arrayBuffer());
+        const buffer = await chunk.arrayBuffer();
+        if (
+          streamSessionRef.current !== streamSession ||
+          streamStopRequestedRef.current ||
+          socket.readyState !== WebSocket.OPEN
+        ) {
+          return;
+        }
+        socket.send(buffer);
       }
       if (!streamStopRequestedRef.current && socket.readyState === WebSocket.OPEN) {
         socket.send(JSON.stringify({ type: "end" }));
@@ -526,6 +564,7 @@ export function AsrPage() {
   }
 
   function closeStreamResources(): void {
+    streamSessionRef.current += 1;
     stopRecordingResources();
     const socket = webSocketRef.current;
     if (socket && socket.readyState !== WebSocket.CLOSED) {
@@ -773,26 +812,18 @@ export function AsrPage() {
                 </div>
               )}
 
-              <FormField label={t("asr.metadata.prompt.0")} description={t("asr.promptDescription")}>
-                <TextArea
-                  id="asr-prompt"
-                  name="prompt"
-                  onChange={(event) => updateForm("prompt", event.target.value)}
-                  value={form.prompt}
-                />
-              </FormField>
-
-              <div className="grid grid-cols-2 gap-md">
-                <FormField label={t("asr.metadata.temperature.0")} description={t("asr.temperatureDescription")}>
-                  <Input
-                    id="asr-temperature"
-                    inputMode="decimal"
-                    name="temperature"
-                    onChange={(event) => updateForm("temperature", event.target.value)}
-                    value={form.temperature}
+              {mode === "stream" && (
+                <FormField label={t("asr.metadata.prompt.0")} description={t("asr.promptDescription")}>
+                  <TextArea
+                    id="asr-prompt"
+                    name="prompt"
+                    onChange={(event) => updateForm("prompt", event.target.value)}
+                    value={form.prompt}
                   />
                 </FormField>
+              )}
 
+              {mode === "file" && (
                 <FormField label={t("asr.metadata.timestamp_granularities.0")} description={t("asr.timestampDescription")}>
                   <Select
                     id="asr-timestamp-granularities"
@@ -807,7 +838,7 @@ export function AsrPage() {
                     ))}
                   </Select>
                 </FormField>
-              </div>
+              )}
 
               <div className="pt-2 stack gap-sm">
                 {mode === "file" ? (

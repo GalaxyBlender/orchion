@@ -34,9 +34,12 @@ utoipa-swagger-ui = { version = "9", features = ["axum"] }
 flate2 = "1"
 tar = "0.4"
 ureq = "3"
+sha2 = "0.10"
 
 [dev-dependencies]
+futures-util = "0.3"
 http-body-util = "0.1"
+tokio-tungstenite = "0.29"
 tower = "0.5"
 
 [lints.rust]

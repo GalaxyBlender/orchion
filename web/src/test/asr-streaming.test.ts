@@ -1,10 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import {
+  acquireAsrMicrophoneStream,
   buildAsrStreamStartMessage,
   formatAsrStreamResult,
   parseAsrStreamEvent,
   upsertBoundedAsrCaptionSegments,
   validateAsrCaptionEndpointingOptions,
+  waitForAsrStreamWritable,
 } from "../features/asr/streaming";
 import type { AsrFormState } from "../features/asr/types";
 
@@ -91,5 +93,34 @@ describe("ASR streaming protocol helpers", () => {
     const updatedSegments = upsertBoundedAsrCaptionSegments(nextSegments, { id: 300, text: "updated" });
     expect(updatedSegments).toHaveLength(300);
     expect(updatedSegments.at(-1)).toEqual({ id: 300, text: "updated" });
+  });
+
+  test("stops a microphone stream when permission resolves for an expired session", async () => {
+    let active = true;
+    let stopCalls = 0;
+    let resolvePermission!: (stream: { getTracks(): { stop(): void }[] }) => void;
+    const pendingPermission = new Promise<{ getTracks(): { stop(): void }[] }>((resolve) => {
+      resolvePermission = resolve;
+    });
+    const acquired = acquireAsrMicrophoneStream(() => pendingPermission, () => active);
+
+    active = false;
+    resolvePermission({ getTracks: () => [{ stop: () => { stopCalls += 1; } }] });
+
+    expect(await acquired).toBeNull();
+    expect(stopCalls).toBe(1);
+  });
+
+  test("waits for the WebSocket send queue to drain below the low watermark", async () => {
+    const socket = { readyState: 1, bufferedAmount: 2 * 1024 * 1024 };
+    let waits = 0;
+
+    const writable = await waitForAsrStreamWritable(socket, () => true, async () => {
+      waits += 1;
+      socket.bufferedAmount = waits === 1 ? 900 * 1024 : 128 * 1024;
+    });
+
+    expect(writable).toBeTrue();
+    expect(waits).toBe(2);
   });
 });

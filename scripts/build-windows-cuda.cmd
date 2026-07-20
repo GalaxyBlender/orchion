@@ -22,4 +22,4 @@ set "CFLAGS=/MD"
 set "CXXFLAGS=/MD"
 set "NVCC_PREPEND_FLAGS=--compiler-options /Zc:preprocessor,/MD"
 
-cargo build --release -p orchion-server --features cuda
+cargo build --release -p orchion-server --no-default-features --features cuda

@@ -16,10 +16,15 @@ pub(super) async fn create_pdf_images(
     multipart: Multipart,
 ) -> Result<Response, ApiError> {
     authorize(&state, &headers)?;
-    let upload = read_pdf_images_request(multipart).await?;
+    let upload = read_pdf_images_request(multipart, state.config().server.max_pdf_pages).await?;
     let PdfImagesRequest { pdf_file, request } = upload;
+    let limits = pdf::PdfRenderLimits {
+        max_pages: state.config().server.max_pdf_pages,
+        max_pixels: state.config().server.max_pdf_pixels,
+        max_output_bytes: state.config().server.max_pdf_output_size,
+    };
     let rendered = tokio::task::spawn_blocking(move || {
-        let rendered = pdf::render_pdf_to_zip(request);
+        let rendered = pdf::render_pdf_to_zip_with_limits(request, limits);
         drop(pdf_file);
         rendered
     })
@@ -44,7 +49,10 @@ struct PdfImagesRequest {
     request: PdfRenderRequest,
 }
 
-async fn read_pdf_images_request(mut multipart: Multipart) -> Result<PdfImagesRequest, ApiError> {
+async fn read_pdf_images_request(
+    mut multipart: Multipart,
+    max_pages: usize,
+) -> Result<PdfImagesRequest, ApiError> {
     let mut pdf_file = None;
     let mut response_format = None;
     let mut pages = None;
@@ -96,7 +104,7 @@ async fn read_pdf_images_request(mut multipart: Multipart) -> Result<PdfImagesRe
     let request = PdfRenderRequest {
         pdf_path: pdf_file.path().to_path_buf(),
         format: pdf::parse_pdf_image_format(response_format.as_deref())?,
-        pages: pdf::parse_page_selection(pages.as_deref())?,
+        pages: pdf::parse_page_selection_with_max_pages(pages.as_deref(), max_pages)?,
         scale: pdf::parse_scale(scale.as_deref())?,
     };
 

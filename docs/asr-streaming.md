@@ -6,6 +6,10 @@ Endpoint: `/v1/audio/transcriptions/stream`
 
 The first WebSocket message must be a JSON start message. Binary messages after `ready` carry audio bytes in the declared `input_audio_format`. A JSON control message `{"type":"end"}` tells the server to flush the current stream.
 
+When API key authentication is enabled, non-browser clients may use the `Authorization: Bearer <api_key>` handshake header. Browser clients may instead include `"api_key":"<api_key>"` in the start message. Authentication completes before the server loads a model.
+
+The server closes streams that exceed `[services.asr].stream_idle_timeout` or `[services.asr].stream_max_duration`. Total binary input is limited by `[server].max_upload_size`, decoded audio cannot exceed `stream_max_duration`, and `chunk_size_sec` cannot exceed 30 seconds.
+
 ## Live Transcript Mode
 
 Live transcript mode is selected when `mode` is absent.

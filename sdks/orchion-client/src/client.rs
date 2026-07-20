@@ -92,7 +92,8 @@ impl Client {
 
     #[allow(dead_code)]
     pub(crate) fn url(&self, path: &str) -> Result<Url, ClientError> {
-        self.config.base_url.join(path).map_err(|error| {
+        let relative_path = path.strip_prefix('/').unwrap_or(path);
+        self.config.base_url.join(relative_path).map_err(|error| {
             ClientError::build_request(format!("invalid request path `{path}`: {error}"))
         })
     }

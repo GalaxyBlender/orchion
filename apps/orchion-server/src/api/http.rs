@@ -70,8 +70,8 @@ mod tests {
     use super::*;
     use crate::api::http_audio::parse_timestamp_granularities;
     use crate::api::http_ocr::{
-        OcrServiceChoice, resolve_ocr_layout_model, resolve_ocr_response_format,
-        resolve_ocr_service_choice, validate_ocr_parameters,
+        OcrServiceChoice, resolve_ocr_layout_model, resolve_ocr_max_tokens,
+        resolve_ocr_response_format, resolve_ocr_service_choice, validate_ocr_parameters,
     };
     use crate::api::http_shared::multipart_file_suffix;
     use crate::api::openai::OcrApiFormat;
@@ -483,6 +483,21 @@ mod tests {
 
         assert_eq!(error.error.code.as_deref(), Some("model_not_available"));
         assert_eq!(error.error.param.as_deref(), Some("layout_model"));
+    }
+
+    #[test]
+    fn omitted_ocr_vl_max_tokens_uses_configured_limit() {
+        let state = test_state_with_config(false, true, |config| {
+            config.services.ocr_vl.max_tokens = 64;
+        });
+        let choice = OcrServiceChoice::OcrVl {
+            model: KnownOcrModel::PaddleOcrVl16,
+        };
+
+        assert_eq!(
+            resolve_ocr_max_tokens(choice, None, &state.config().services.ocr_vl),
+            Some(64)
+        );
     }
 
     #[test]

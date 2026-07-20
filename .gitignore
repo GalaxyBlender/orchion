@@ -1,5 +1,6 @@
 /target/
 /data/
+/dist/
 /docs/superpowers/
 /web/node_modules/
 /web/dist/

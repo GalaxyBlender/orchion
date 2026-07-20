@@ -1,9 +1,11 @@
 use image::{DynamicImage, ImageFormat};
 use pdfium_render::prelude::{PdfRenderConfig, Pdfium};
 use std::collections::BTreeSet;
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use thiserror::Error;
+use zip::result::ZipError;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
@@ -33,6 +35,72 @@ pub struct PdfRenderRequest {
     pub scale: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PdfRenderLimits {
+    pub max_pages: usize,
+    pub max_pixels: u64,
+    pub max_output_bytes: usize,
+}
+
+impl PdfRenderLimits {
+    #[must_use]
+    pub const fn unlimited() -> Self {
+        Self {
+            max_pages: usize::MAX,
+            max_pixels: u64::MAX,
+            max_output_bytes: usize::MAX,
+        }
+    }
+}
+
+struct LimitedCursor {
+    inner: Cursor<Vec<u8>>,
+    max_len: usize,
+}
+
+impl LimitedCursor {
+    fn new(max_len: usize) -> Self {
+        Self {
+            inner: Cursor::new(Vec::new()),
+            max_len,
+        }
+    }
+
+    fn into_inner(self) -> Vec<u8> {
+        self.inner.into_inner()
+    }
+}
+
+impl Write for LimitedCursor {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let position = usize::try_from(self.inner.position()).map_err(|_| output_limit_error())?;
+        let end = position
+            .checked_add(buffer.len())
+            .ok_or_else(output_limit_error)?;
+        if end > self.max_len {
+            return Err(output_limit_error());
+        }
+        self.inner.write(buffer)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl Seek for LimitedCursor {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(position)
+    }
+}
+
+fn output_limit_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::FileTooLarge,
+        "PDF ZIP output exceeds configured limit",
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedZip {
     pub bytes: Vec<u8>,
@@ -52,6 +120,12 @@ pub enum PdfError {
     InvalidScale,
     #[error("uploaded file must be a valid PDF")]
     InvalidPdfFile,
+    #[error("Requested PDF pages exceed the configured page limit.")]
+    TooManyPages,
+    #[error("Rendered PDF pages exceed the configured pixel limit.")]
+    TooManyPixels,
+    #[error("Rendered PDF ZIP exceeds the configured output size limit.")]
+    OutputTooLarge,
     #[error("Failed to initialize PDF renderer.")]
     InitializeRenderer,
     #[error("Failed to load PDF page.")]
@@ -76,6 +150,9 @@ impl PdfError {
             Self::InvalidPages | Self::PageOutsideDocument => Some("pages"),
             Self::InvalidScale => Some("scale"),
             Self::InvalidPdfFile => Some("file"),
+            Self::TooManyPages => Some("pages"),
+            Self::TooManyPixels => Some("scale"),
+            Self::OutputTooLarge => None,
             Self::InitializeRenderer
             | Self::LoadPage
             | Self::RenderPage
@@ -90,6 +167,9 @@ impl PdfError {
     pub const fn code(self) -> Option<&'static str> {
         match self {
             Self::InvalidPdfFile => Some("invalid_file"),
+            Self::TooManyPages | Self::TooManyPixels | Self::OutputTooLarge => {
+                Some("pdf_limit_exceeded")
+            }
             _ => None,
         }
     }
@@ -103,11 +183,33 @@ impl PdfError {
                 | Self::PageOutsideDocument
                 | Self::InvalidScale
                 | Self::InvalidPdfFile
+                | Self::TooManyPages
+                | Self::TooManyPixels
+                | Self::OutputTooLarge
         )
     }
 }
 
+/// Renders the selected PDF pages into a ZIP archive without resource limits.
+///
+/// # Errors
+///
+/// Returns [`PdfError`] when PDFium cannot be initialized, the request is invalid, or rendering
+/// and ZIP encoding fail.
 pub fn render_pdf_to_zip(request: PdfRenderRequest) -> Result<RenderedZip> {
+    render_pdf_to_zip_with_limits(request, PdfRenderLimits::unlimited())
+}
+
+/// Renders the selected PDF pages into a ZIP archive within the supplied resource limits.
+///
+/// # Errors
+///
+/// Returns [`PdfError`] when PDFium cannot be initialized, the request is invalid, a resource
+/// limit is exceeded, or rendering and ZIP encoding fail.
+pub fn render_pdf_to_zip_with_limits(
+    request: PdfRenderRequest,
+    limits: PdfRenderLimits,
+) -> Result<RenderedZip> {
     let pdfium = bind_pdfium()?;
     let document = pdfium
         .load_pdf_from_file(&request.pdf_path, None)
@@ -115,7 +217,39 @@ pub fn render_pdf_to_zip(request: PdfRenderRequest) -> Result<RenderedZip> {
     let page_count =
         usize::try_from(document.pages().len()).map_err(|_| PdfError::InvalidPdfFile)?;
     let page_indices = selected_page_indices(&request.pages, page_count)?;
-    let mut archive = ZipWriter::new(Cursor::new(Vec::new()));
+    if page_indices.len() > limits.max_pages {
+        return Err(PdfError::TooManyPages);
+    }
+    let mut total_pixels = 0_u64;
+    for page_index in &page_indices {
+        let page = document
+            .pages()
+            .get(
+                (*page_index)
+                    .try_into()
+                    .map_err(|_| PdfError::PageOutsideDocument)?,
+            )
+            .map_err(|_| PdfError::LoadPage)?;
+        let width = (f64::from(page.width().value) * f64::from(request.scale)).ceil();
+        let height = (f64::from(page.height().value) * f64::from(request.scale)).ceil();
+        if !width.is_finite()
+            || !height.is_finite()
+            || width > u64::MAX as f64
+            || height > u64::MAX as f64
+        {
+            return Err(PdfError::TooManyPixels);
+        }
+        let page_pixels = (width as u64)
+            .checked_mul(height as u64)
+            .ok_or(PdfError::TooManyPixels)?;
+        total_pixels = total_pixels
+            .checked_add(page_pixels)
+            .ok_or(PdfError::TooManyPixels)?;
+        if total_pixels > limits.max_pixels {
+            return Err(PdfError::TooManyPixels);
+        }
+    }
+    let mut archive = ZipWriter::new(LimitedCursor::new(limits.max_output_bytes));
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     let render_config = PdfRenderConfig::new().scale_page_by_factor(request.scale);
 
@@ -137,13 +271,15 @@ pub fn render_pdf_to_zip(request: PdfRenderRequest) -> Result<RenderedZip> {
 
         archive
             .start_file(page_file_name(*page_index + 1, request.format), options)
-            .map_err(|_| PdfError::CreateZip)?;
-        archive.write_all(&bytes).map_err(|_| PdfError::WriteZip)?;
+            .map_err(|error| map_zip_error(error, PdfError::CreateZip))?;
+        archive
+            .write_all(&bytes)
+            .map_err(|error| map_write_error(error, PdfError::WriteZip))?;
     }
 
     let bytes = archive
         .finish()
-        .map_err(|_| PdfError::FinishZip)?
+        .map_err(|error| map_zip_error(error, PdfError::FinishZip))?
         .into_inner();
 
     Ok(RenderedZip {
@@ -151,6 +287,21 @@ pub fn render_pdf_to_zip(request: PdfRenderRequest) -> Result<RenderedZip> {
         page_count,
         file_count: page_indices.len(),
     })
+}
+
+fn map_zip_error(error: ZipError, fallback: PdfError) -> PdfError {
+    match error {
+        ZipError::Io(error) => map_write_error(error, fallback),
+        _ => fallback,
+    }
+}
+
+fn map_write_error(error: std::io::Error, fallback: PdfError) -> PdfError {
+    if error.kind() == std::io::ErrorKind::FileTooLarge {
+        PdfError::OutputTooLarge
+    } else {
+        fallback
+    }
 }
 
 pub fn parse_pdf_image_format(value: Option<&str>) -> Result<PdfImageFormat> {
@@ -168,8 +319,22 @@ pub fn parse_pdf_image_format(value: Option<&str>) -> Result<PdfImageFormat> {
 }
 
 pub fn parse_page_selection(value: Option<&str>) -> Result<PageSelection> {
+    parse_page_selection_with_max_pages(value, usize::MAX)
+}
+
+/// Parses an explicit page selection while limiting how many unique pages may be requested.
+///
+/// # Errors
+///
+/// Returns [`PdfError::InvalidPages`] for malformed selectors and [`PdfError::TooManyPages`] as
+/// soon as an explicit selection exceeds `max_pages`.
+pub fn parse_page_selection_with_max_pages(
+    value: Option<&str>,
+    max_pages: usize,
+) -> Result<PageSelection> {
     match value.map(str::trim) {
         None | Some("") => Ok(PageSelection::All),
+        Some(value) if value.eq_ignore_ascii_case("all") => Ok(PageSelection::All),
         Some(value) => {
             let mut pages = BTreeSet::new();
 
@@ -185,9 +350,17 @@ pub fn parse_page_selection(value: Option<&str>) -> Result<PageSelection> {
                     if start > end {
                         return Err(PdfError::InvalidPages);
                     }
-                    pages.extend(start..=end);
+                    for page in start..=end {
+                        pages.insert(page);
+                        if pages.len() > max_pages {
+                            return Err(PdfError::TooManyPages);
+                        }
+                    }
                 } else {
                     pages.insert(parse_page_number(segment)?);
+                    if pages.len() > max_pages {
+                        return Err(PdfError::TooManyPages);
+                    }
                 }
             }
 
@@ -227,7 +400,15 @@ pub fn is_pdf_upload(content_type: Option<&str>, file_name: Option<&str>) -> boo
     }
 }
 
-fn bind_pdfium() -> Result<Pdfium> {
+fn bind_pdfium() -> Result<&'static Pdfium> {
+    static PDFIUM: OnceLock<std::result::Result<Pdfium, PdfError>> = OnceLock::new();
+    PDFIUM
+        .get_or_init(initialize_pdfium)
+        .as_ref()
+        .map_err(|error| *error)
+}
+
+fn initialize_pdfium() -> Result<Pdfium> {
     let executable_bindings = std::env::current_exe()
         .ok()
         .and_then(|path| path.parent().map(library_path_in))
@@ -311,6 +492,7 @@ fn parse_page_number(value: &str) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as FmtWrite;
 
     fn assert_pdf_error(error: PdfError, expected: PdfError, message: &str, param: &str) {
         assert_eq!(error, expected);
@@ -367,6 +549,14 @@ mod tests {
             parse_page_selection(Some("   ")).unwrap(),
             PageSelection::All
         );
+        assert_eq!(
+            parse_page_selection(Some("all")).unwrap(),
+            PageSelection::All
+        );
+        assert_eq!(
+            parse_page_selection(Some("ALL")).unwrap(),
+            PageSelection::All
+        );
     }
 
     #[test]
@@ -374,6 +564,14 @@ mod tests {
         assert_eq!(
             parse_page_selection(Some("1,3-5,4")).unwrap(),
             PageSelection::Pages(vec![1, 3, 4, 5])
+        );
+    }
+
+    #[test]
+    fn parse_page_selection_rejects_ranges_above_limit_without_expanding_them() {
+        assert_eq!(
+            parse_page_selection_with_max_pages(Some("1-18446744073709551615"), 100).unwrap_err(),
+            PdfError::TooManyPages
         );
     }
 
@@ -473,5 +671,105 @@ mod tests {
             "file",
         );
         assert_eq!(error.code(), Some("invalid_file"));
+    }
+
+    #[test]
+    fn render_rejects_selected_pages_above_limit() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), two_page_pdf_bytes()).unwrap();
+        let request = PdfRenderRequest {
+            pdf_path: file.path().to_path_buf(),
+            format: PdfImageFormat::Png,
+            pages: PageSelection::All,
+            scale: 1.0,
+        };
+
+        let error = render_pdf_to_zip_with_limits(
+            request,
+            PdfRenderLimits {
+                max_pages: 1,
+                max_pixels: u64::MAX,
+                max_output_bytes: usize::MAX,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error, PdfError::TooManyPages);
+    }
+
+    #[test]
+    fn render_rejects_pages_above_pixel_limit() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), two_page_pdf_bytes()).unwrap();
+        let request = PdfRenderRequest {
+            pdf_path: file.path().to_path_buf(),
+            format: PdfImageFormat::Png,
+            pages: PageSelection::All,
+            scale: 1.0,
+        };
+
+        let error = render_pdf_to_zip_with_limits(
+            request,
+            PdfRenderLimits {
+                max_pages: 2,
+                max_pixels: 1,
+                max_output_bytes: usize::MAX,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error, PdfError::TooManyPixels);
+    }
+
+    #[test]
+    fn render_stops_when_zip_exceeds_output_limit() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), two_page_pdf_bytes()).unwrap();
+        let request = PdfRenderRequest {
+            pdf_path: file.path().to_path_buf(),
+            format: PdfImageFormat::Png,
+            pages: PageSelection::Pages(vec![1]),
+            scale: 1.0,
+        };
+
+        let error = render_pdf_to_zip_with_limits(
+            request,
+            PdfRenderLimits {
+                max_pages: 1,
+                max_pixels: u64::MAX,
+                max_output_bytes: 16,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error, PdfError::OutputTooLarge);
+    }
+
+    fn two_page_pdf_bytes() -> Vec<u8> {
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << >> >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << >> >>",
+        ];
+        let mut pdf = String::from("%PDF-1.4\n");
+        let mut offsets = Vec::new();
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            writeln!(&mut pdf, "{} 0 obj\n{object}\nendobj", index + 1).unwrap();
+        }
+        let xref_offset = pdf.len();
+        writeln!(&mut pdf, "xref\n0 {}", objects.len() + 1).unwrap();
+        writeln!(&mut pdf, "0000000000 65535 f ").unwrap();
+        for offset in offsets {
+            writeln!(&mut pdf, "{offset:010} 00000 n ").unwrap();
+        }
+        writeln!(
+            &mut pdf,
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF",
+            objects.len() + 1
+        )
+        .unwrap();
+        pdf.into_bytes()
     }
 }

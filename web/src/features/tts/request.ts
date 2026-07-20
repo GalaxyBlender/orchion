@@ -3,9 +3,9 @@ import type { ApiSettings } from "@/shared/api/types";
 import type { TtsJsonBody, TtsPayload, TtsRequestInput } from "./types";
 
 const endpointPath = "/v1/audio/speech";
+export const ttsSupportedSpeed = 1;
 
 const numericFields = [
-  ["speed", "speed"],
   ["seed", "seed"],
   ["temperature", "temperature"],
   ["top_k", "topK"],
@@ -97,7 +97,7 @@ export function summarizeTtsRequest(input: TtsRequestInput, text: TtsSummaryText
     lines.push(text.voicePrompt(input.voicePrompt.trim() === "" ? text.omitted : text.sent));
   }
 
-  lines.push(text.speed(input.speed.trim()));
+  lines.push(text.speed(ttsSupportedSpeed.toFixed(1)));
   lines.push(text.sampling(input.seed.trim(), input.temperature.trim(), input.topK.trim(), input.topP.trim(), input.repetitionPenalty.trim(), input.maxLength.trim()));
   lines.push(text.constraints);
 
@@ -174,6 +174,11 @@ function buildJsonBody(input: TtsRequestInput): TtsJsonBody {
 }
 
 function appendNumericFields(target: TtsJsonBody | FormData, input: TtsRequestInput): void {
+  if (target instanceof FormData) {
+    target.append("speed", String(ttsSupportedSpeed));
+  } else {
+    target.speed = ttsSupportedSpeed;
+  }
   for (const [apiName, inputName] of numericFields) {
     appendNumericField(target, apiName, input[inputName]);
   }
@@ -207,6 +212,7 @@ function cloneCurlFields(input: TtsRequestInput): Array<[string, string]> {
   if (referenceText !== "") {
     fields.push(["reference_text", referenceText]);
   }
+  fields.push(["speed", String(ttsSupportedSpeed)]);
   for (const [apiName, inputName] of numericFields) {
     pushNumericCurlField(fields, apiName, input[inputName]);
   }

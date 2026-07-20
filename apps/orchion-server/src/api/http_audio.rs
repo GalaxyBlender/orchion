@@ -8,6 +8,7 @@ use crate::api::openai::{
     TranscriptionVerboseJson, content_type_for,
 };
 use crate::api::srt::format_srt;
+use crate::application::model_cache::ModelLease;
 use crate::infrastructure::orchion::AppState;
 use crate::settings::{DEFAULT_ASR_STREAM_MAX_SEGMENT, parse_asr_model, parse_tts_model};
 use axum::Json;
@@ -20,8 +21,8 @@ use axum::response::{IntoResponse, Response};
 use orchion::{
     ASR_SAMPLE_RATE, AsrOptions, AsrStreamingOptions, AsrTimestampGranularity, AudioInputFormat,
     AudioOutputFormat, AudioVadMode, AudioVadStreamingConfig, AudioVadStreamingEndpoint,
-    AudioVadStreamingEvent, OrchionError, StreamingAudioDecoder, TtsAudio, decode_audio_file,
-    encode_tts_audio,
+    AudioVadStreamingEvent, OrchionError, StreamingAudioDecoder, TtsAudio,
+    decode_audio_file_with_max_samples, encode_tts_audio,
 };
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -31,6 +32,182 @@ use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 use tokio::time::timeout;
 
 const TRANSCRIPTION_STREAM_START_TIMEOUT: Duration = Duration::from_secs(10);
+const TRANSCRIPTION_STREAM_MAX_CHUNK_SIZE_SEC: f32 = 30.0;
+
+#[derive(Debug, Clone, Copy)]
+struct TranscriptionStreamLimits {
+    idle_timeout: Duration,
+    max_duration: Duration,
+    max_input_bytes: usize,
+}
+
+struct TranscriptionStreamBudget {
+    started_at: Instant,
+    input_bytes: usize,
+    decoded_duration: Duration,
+}
+
+struct LeasedAsrStream {
+    model: ModelLease<orchion::Asr>,
+    stream: Option<orchion::AsrStream>,
+}
+
+impl LeasedAsrStream {
+    async fn start(
+        model: &ModelLease<orchion::Asr>,
+        options: AsrStreamingOptions,
+    ) -> orchion::Result<Self> {
+        let stream = model
+            .run(move |model| async move { model.start_streaming_with(options).await })
+            .await
+            .map_err(model_task_error)??;
+        Ok(Self {
+            model: model.clone(),
+            stream: Some(stream),
+        })
+    }
+
+    async fn feed(
+        &mut self,
+        samples: &[f32],
+        sample_rate: u32,
+    ) -> orchion::Result<Option<orchion::AsrTranscript>> {
+        let mut stream = self.take_stream()?;
+        let samples = samples.to_vec();
+        let (stream, result) = self
+            .model
+            .run(move |model| async move {
+                let result = stream.feed(&samples, sample_rate).await;
+                drop(model);
+                (stream, result)
+            })
+            .await
+            .map_err(model_task_error)?;
+        self.stream = Some(stream);
+        result
+    }
+
+    async fn finish(mut self) -> orchion::Result<orchion::AsrTranscript> {
+        let stream = self.take_stream()?;
+        self.model
+            .run(move |model| async move {
+                let result = stream.finish().await;
+                drop(model);
+                result
+            })
+            .await
+            .map_err(model_task_error)?
+    }
+
+    fn take_stream(&mut self) -> orchion::Result<orchion::AsrStream> {
+        self.stream
+            .take()
+            .ok_or_else(|| OrchionError::InvalidAudio {
+                reason: "streaming session has already finished".to_string(),
+            })
+    }
+}
+
+fn model_task_error(error: tokio::task::JoinError) -> OrchionError {
+    OrchionError::BlockingTask {
+        message: error.to_string(),
+    }
+}
+
+impl TranscriptionStreamBudget {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            input_bytes: 0,
+            decoded_duration: Duration::ZERO,
+        }
+    }
+
+    fn next_wait(&self, limits: TranscriptionStreamLimits) -> Result<Duration, ApiError> {
+        Ok(limits.idle_timeout.min(self.remaining(limits)?))
+    }
+
+    fn remaining(&self, limits: TranscriptionStreamLimits) -> Result<Duration, ApiError> {
+        limits
+            .max_duration
+            .checked_sub(self.started_at.elapsed())
+            .ok_or_else(transcription_stream_duration_error)
+    }
+
+    fn record_binary_input(
+        &mut self,
+        bytes: usize,
+        limits: TranscriptionStreamLimits,
+    ) -> Result<(), ApiError> {
+        self.input_bytes = self
+            .input_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| transcription_stream_input_too_large_error(limits.max_input_bytes))?;
+        if self.input_bytes > limits.max_input_bytes {
+            return Err(transcription_stream_input_too_large_error(
+                limits.max_input_bytes,
+            ));
+        }
+        Ok(())
+    }
+
+    fn record_decoded_samples(
+        &mut self,
+        samples: usize,
+        sample_rate: u32,
+        limits: TranscriptionStreamLimits,
+    ) -> Result<(), ApiError> {
+        let duration = decoded_audio_duration(samples, sample_rate)?;
+        self.decoded_duration = self
+            .decoded_duration
+            .checked_add(duration)
+            .ok_or_else(|| transcription_stream_audio_too_long_error(limits.max_duration))?;
+        if self.decoded_duration > limits.max_duration {
+            return Err(transcription_stream_audio_too_long_error(
+                limits.max_duration,
+            ));
+        }
+        Ok(())
+    }
+
+    fn timeout_error(&self, limits: TranscriptionStreamLimits) -> ApiError {
+        if self.started_at.elapsed() >= limits.max_duration {
+            transcription_stream_duration_error()
+        } else {
+            ApiError::invalid_request(
+                "transcription stream was idle for too long",
+                None,
+                Some("stream_idle_timeout"),
+            )
+        }
+    }
+}
+
+async fn await_stream_operation<T>(
+    budget: &TranscriptionStreamBudget,
+    limits: TranscriptionStreamLimits,
+    operation: impl std::future::Future<Output = T>,
+) -> Result<T, ApiError> {
+    timeout(budget.remaining(limits)?, operation)
+        .await
+        .map_err(|_| transcription_stream_duration_error())
+}
+
+fn decoded_audio_duration(samples: usize, sample_rate: u32) -> Result<Duration, ApiError> {
+    let sample_rate = usize::try_from(sample_rate)
+        .map_err(|_| ApiError::internal("decoded audio sample rate is too large"))?;
+    if sample_rate == 0 {
+        return Err(ApiError::internal("decoded audio sample rate is zero"));
+    }
+    let seconds = u64::try_from(samples / sample_rate)
+        .map_err(|_| ApiError::internal("decoded audio duration is too large"))?;
+    let nanos = (samples % sample_rate)
+        .checked_mul(1_000_000_000)
+        .and_then(|remainder| remainder.checked_div(sample_rate))
+        .and_then(|nanos| u32::try_from(nanos).ok())
+        .ok_or_else(|| ApiError::internal("decoded audio duration is too large"))?;
+    Ok(Duration::new(seconds, nanos))
+}
 
 fn duration_to_millis_u32(duration: Duration, field: &'static str) -> u32 {
     u32::try_from(duration.as_millis())
@@ -165,8 +342,13 @@ async fn create_speech_multipart(
         max_length,
     };
     request.validate()?;
+    validate_speech_request_limit(&request, state.config().services.tts.max_length)?;
     parse_tts_model(&request.model).map_err(|_| ApiError::model_not_available(&request.model))?;
-    let reference_file = transcode_reference_audio_to_wav_file(reference_audio_file.path()).await?;
+    let reference_file = transcode_reference_audio_to_wav_file(
+        reference_audio_file.path(),
+        state.config().services.tts.max_reference_audio_duration,
+    )
+    .await?;
     let reference_path = reference_file
         .path()
         .to_str()
@@ -183,10 +365,14 @@ async fn create_speech_multipart(
 
 async fn transcode_reference_audio_to_wav_file(
     reference_audio: &Path,
+    max_duration: Duration,
 ) -> Result<NamedTempFile, ApiError> {
-    let decoded = decode_audio_file(reference_audio.to_path_buf())
-        .await
-        .map_err(reference_audio_error)?;
+    let decoded = decode_audio_file_with_max_samples(
+        reference_audio.to_path_buf(),
+        max_audio_samples(max_duration)?,
+    )
+    .await
+    .map_err(reference_audio_error)?;
     let audio = TtsAudio::new(decoded.samples, decoded.sample_rate);
     let encoded = encode_tts_audio(&audio, AudioOutputFormat::Wav)
         .await
@@ -222,6 +408,7 @@ async fn create_speech_from_request(
         "speech request received"
     );
     request.validate()?;
+    validate_speech_request_limit(&request, state.config().services.tts.max_length)?;
     let requested = parse_tts_model(&request.model)
         .map_err(|_| ApiError::model_not_available(&request.model))?;
     let tts = state
@@ -236,8 +423,15 @@ async fn create_speech_from_request(
     let voice = request.to_tts_voice()?;
     let synthesis_started = Instant::now();
     tracing::debug!("speech synthesis started");
-    let options = request.to_tts_options();
-    let audio = tts.synthesize_with(request.input, voice, options).await?;
+    let mut options = request.to_tts_options();
+    options.max_length = options
+        .max_length
+        .min(state.config().services.tts.max_length);
+    let input = request.input;
+    let audio = tts
+        .run(move |tts| async move { tts.synthesize_with(input, voice, options).await })
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))??;
     let synthesis_elapsed = synthesis_started.elapsed();
     tracing::debug!(
         samples = audio.samples.len(),
@@ -264,6 +458,20 @@ async fn create_speech_from_request(
         )
         .body(Body::from(encoded.bytes))
         .map_err(|error| ApiError::internal(error.to_string()))
+}
+
+fn validate_speech_request_limit(
+    request: &SpeechRequest,
+    max_length: usize,
+) -> Result<(), ApiError> {
+    if request.max_length.is_some_and(|value| value > max_length) {
+        return Err(ApiError::invalid_request(
+            format!("`max_length` must not exceed the configured limit of {max_length}"),
+            Some("max_length"),
+            Some("max_length_exceeded"),
+        ));
+    }
+    Ok(())
 }
 
 pub(super) async fn create_transcription(
@@ -297,7 +505,11 @@ pub(super) async fn create_transcription(
                     .push(read_text_field(field, "timestamp_granularities").await?);
             }
             "prompt" | "temperature" => {
-                let _ = field.text().await;
+                return Err(ApiError::invalid_request(
+                    format!("`{name}` is not supported for batch transcription"),
+                    Some(name.as_str()),
+                    Some("unsupported_parameter"),
+                ));
             }
             _ => {
                 let _ = field.text().await;
@@ -316,11 +528,15 @@ pub(super) async fn create_transcription(
         )
     })?;
     let requested = parse_asr_model(&model).map_err(|_| ApiError::model_not_available(&model))?;
-    let asr = state
-        .asr(requested)
-        .await
-        .map_err(|error| ApiError::internal(error.to_string()))?
-        .ok_or_else(|| ApiError::model_not_available(&model))?;
+    if !state
+        .config()
+        .services
+        .asr
+        .available_models
+        .contains(&requested)
+    {
+        return Err(ApiError::model_not_available(&model));
+    }
     let (audio_file, audio_bytes) = audio_file.ok_or_else(|| {
         ApiError::invalid_request(
             "`file` is required",
@@ -347,12 +563,26 @@ pub(super) async fn create_transcription(
         language,
         ..Default::default()
     };
-    let transcript = if use_segments {
-        asr.transcribe_audio_file_with_segments(audio_path, options)
-            .await?
-    } else {
-        asr.transcribe_audio_file_with(audio_path, options).await?
-    };
+    let max_samples = max_audio_samples(state.config().services.asr.max_audio_duration)?;
+    let decoded = decode_audio_file_with_max_samples(audio_path, max_samples).await?;
+    let duration = transcription_duration(decoded.samples.len(), decoded.sample_rate)?;
+    let asr = state
+        .asr(requested)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?
+        .ok_or_else(|| ApiError::model_not_available(&model))?;
+    let transcript = asr
+        .run(move |asr| async move {
+            if use_segments {
+                asr.transcribe_samples_with_segments(&decoded.samples, decoded.sample_rate, options)
+                    .await
+            } else {
+                asr.transcribe_samples_with(&decoded.samples, decoded.sample_rate, options)
+                    .await
+            }
+        })
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))??;
     tracing::info!(format = ?response_format, "transcription request completed");
 
     Ok(match response_format {
@@ -363,6 +593,7 @@ pub(super) async fn create_transcription(
         TranscriptionFormat::VerboseJson => Json(TranscriptionVerboseJson {
             text: transcript.text,
             language: transcript.language,
+            duration,
             raw_output: transcript.raw_output,
             segments: segment_timestamps.then_some(transcript.segments),
         })
@@ -386,16 +617,51 @@ pub(super) async fn create_transcription(
     })
 }
 
+fn transcription_duration(sample_count: usize, sample_rate: u32) -> Result<f64, ApiError> {
+    let sample_rate = usize::try_from(sample_rate)
+        .map_err(|_| ApiError::internal("decoded audio sample rate is too large"))?;
+    if sample_rate == 0 {
+        return Err(ApiError::internal("decoded audio sample rate is zero"));
+    }
+    let whole_seconds = u64::try_from(sample_count / sample_rate)
+        .map_err(|_| ApiError::internal("decoded audio duration is too large"))?;
+    let fractional_nanos = (sample_count % sample_rate)
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_div(sample_rate))
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| ApiError::internal("decoded audio duration is too large"))?;
+    Ok(Duration::new(whole_seconds, fractional_nanos).as_secs_f64())
+}
+
+fn max_audio_samples(duration: Duration) -> Result<usize, ApiError> {
+    max_audio_samples_at_rate(duration, ASR_SAMPLE_RATE)
+}
+
+fn max_audio_samples_at_rate(duration: Duration, sample_rate: u32) -> Result<usize, ApiError> {
+    let samples = duration
+        .as_millis()
+        .checked_mul(u128::from(sample_rate))
+        .and_then(|samples| samples.checked_add(999))
+        .map(|samples| samples / 1000)
+        .ok_or_else(|| ApiError::internal("configured audio duration is too large"))?;
+    usize::try_from(samples)
+        .map_err(|_| ApiError::internal("configured audio duration is too large"))
+}
+
 pub(super) async fn create_transcription_ws(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
-    authorize(&state, &headers)?;
-    Ok(ws.on_upgrade(move |socket| handle_transcription_ws(socket, state)))
+    let header_authorized = authorize(&state, &headers).is_ok();
+    Ok(ws.on_upgrade(move |socket| handle_transcription_ws(socket, state, header_authorized)))
 }
 
-async fn handle_transcription_ws(mut socket: WebSocket, state: Arc<AppState>) {
+async fn handle_transcription_ws(
+    mut socket: WebSocket,
+    state: Arc<AppState>,
+    header_authorized: bool,
+) {
     let stream_target_segment_millis = duration_to_millis_u32(
         state.config().services.asr.stream_target_segment,
         "stream_target_segment",
@@ -412,6 +678,27 @@ async fn handle_transcription_ws(mut socket: WebSocket, state: Arc<AppState>) {
                 return;
             }
         };
+    if let Err(error) = validate_transcription_stream_api_key(
+        state.config().auth.api_key.as_deref(),
+        start.api_key.as_deref(),
+        header_authorized,
+    ) {
+        let _ = send_stream_error(&mut socket, error).await;
+        return;
+    }
+    let limits = TranscriptionStreamLimits {
+        idle_timeout: state.config().services.asr.stream_idle_timeout,
+        max_duration: state.config().services.asr.stream_max_duration,
+        max_input_bytes: state.config().server.max_upload_size,
+    };
+    let budget = TranscriptionStreamBudget::new();
+    let default_chunk_size_sec = state.config().services.asr.stream_chunk_size;
+    if let Err(error) = validate_transcription_streaming_options(
+        &start.to_streaming_options(default_chunk_size_sec),
+    ) {
+        let _ = send_stream_error(&mut socket, error).await;
+        return;
+    }
     let model = start.model.clone();
     let requested = match parse_asr_model(&model) {
         Ok(model) => model,
@@ -420,21 +707,32 @@ async fn handle_transcription_ws(mut socket: WebSocket, state: Arc<AppState>) {
             return;
         }
     };
-    let asr = match state.asr(requested).await {
-        Ok(Some(asr)) => asr,
-        Ok(None) => {
+    let asr = match await_stream_operation(&budget, limits, state.asr(requested)).await {
+        Ok(Ok(Some(asr))) => asr,
+        Ok(Ok(None)) => {
             let _ = send_stream_error(&mut socket, ApiError::model_not_available(&model)).await;
             return;
         }
-        Err(error) => {
+        Ok(Err(error)) => {
             let _ = send_stream_error(&mut socket, ApiError::internal(error.to_string())).await;
             return;
         }
+        Err(error) => {
+            let _ = send_stream_error(&mut socket, error).await;
+            return;
+        }
     };
-    let default_chunk_size_sec = state.config().services.asr.stream_chunk_size;
     match start.mode {
         TranscriptionStreamMode::Legacy => {
-            run_legacy_transcription_stream(socket, start, asr, default_chunk_size_sec).await;
+            run_legacy_transcription_stream(
+                socket,
+                start,
+                asr,
+                default_chunk_size_sec,
+                limits,
+                budget,
+            )
+            .await;
         }
         TranscriptionStreamMode::Caption => {
             run_caption_transcription_stream(
@@ -443,6 +741,8 @@ async fn handle_transcription_ws(mut socket: WebSocket, state: Arc<AppState>) {
                 asr,
                 default_chunk_size_sec,
                 stream_target_segment_millis,
+                limits,
+                budget,
             )
             .await;
         }
@@ -452,48 +752,95 @@ async fn handle_transcription_ws(mut socket: WebSocket, state: Arc<AppState>) {
 async fn run_legacy_transcription_stream(
     mut socket: WebSocket,
     start: TranscriptionStreamStart,
-    asr: orchion::Asr,
+    asr: ModelLease<orchion::Asr>,
     default_chunk_size_sec: f32,
+    limits: TranscriptionStreamLimits,
+    mut budget: TranscriptionStreamBudget,
 ) {
     let streaming_options = start.to_streaming_options(default_chunk_size_sec);
-    let chunk_size_sec = streaming_options.chunk_size_sec;
-    let mut stream = match asr.start_streaming_with(streaming_options).await {
-        Ok(stream) => stream,
-        Err(error) => {
-            let _ = send_stream_error(&mut socket, ApiError::from(error)).await;
-            return;
-        }
-    };
-    let mut decoder = match start.audio_decoder().await {
-        Ok(decoder) => decoder,
-        Err(error) => {
-            let _ = send_stream_error(&mut socket, ApiError::from(error)).await;
-            return;
-        }
-    };
-    let mut pcm_buffer = AsrPcmBuffer::new(chunk_size_sec);
-
-    if send_stream_ready(&mut socket).await.is_err() {
+    if let Err(error) = validate_transcription_streaming_options(&streaming_options) {
+        let _ = send_stream_error(&mut socket, error).await;
         return;
     }
-
-    while let Some(message) = socket.recv().await {
-        let message = match message {
-            Ok(message) => message,
+    let chunk_size_sec = streaming_options.chunk_size_sec;
+    let mut stream = match await_stream_operation(
+        &budget,
+        limits,
+        LeasedAsrStream::start(&asr, streaming_options),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(error)) => {
+            let _ = send_stream_error(&mut socket, ApiError::from(error)).await;
+            return;
+        }
+        Err(error) => {
+            let _ = send_stream_error(&mut socket, error).await;
+            return;
+        }
+    };
+    let mut decoder =
+        match await_stream_operation(&budget, limits, start.audio_decoder(limits.max_duration))
+            .await
+        {
+            Ok(Ok(decoder)) => decoder,
+            Ok(Err(error)) => {
+                let _ = send_stream_error(&mut socket, ApiError::from(error)).await;
+                return;
+            }
             Err(error) => {
-                tracing::debug!(error = %error, "transcription websocket receive failed");
+                let _ = send_stream_error(&mut socket, error).await;
                 return;
             }
         };
+    let mut pcm_buffer = AsrPcmBuffer::new(chunk_size_sec);
+
+    match await_stream_operation(&budget, limits, send_stream_ready(&mut socket)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => return,
+        Err(error) => {
+            let _ = send_stream_error(&mut socket, error).await;
+            return;
+        }
+    }
+
+    loop {
+        let message =
+            match receive_transcription_stream_message(&mut socket, &mut budget, limits).await {
+                Ok(Some(message)) => message,
+                Ok(None) => return,
+                Err(error) => {
+                    let _ = send_stream_error(&mut socket, error).await;
+                    return;
+                }
+            };
         match message {
             Message::Binary(bytes) => {
-                let decoded = match decoder.push(&bytes).await {
-                    Ok(decoded) => decoded,
-                    Err(error) => {
-                        let _ = send_stream_error(&mut socket, ApiError::from(error)).await;
-                        return;
-                    }
-                };
+                let decoded =
+                    match await_stream_operation(&budget, limits, decoder.push(&bytes)).await {
+                        Ok(Ok(decoded)) => decoded,
+                        Ok(Err(error)) => {
+                            let _ = send_stream_error(
+                                &mut socket,
+                                transcription_stream_decoder_error(error, limits),
+                            )
+                            .await;
+                            return;
+                        }
+                        Err(error) => {
+                            let _ = send_stream_error(&mut socket, error).await;
+                            return;
+                        }
+                    };
+                if let Err(error) = budget.record_decoded_samples(
+                    decoded.samples.len(),
+                    decoded.sample_rate,
+                    limits,
+                ) {
+                    let _ = send_stream_error(&mut socket, error).await;
+                    return;
+                }
                 let chunks = match pcm_buffer.push(&decoded.samples, decoded.sample_rate) {
                     Ok(chunks) => chunks,
                     Err(error) => {
@@ -501,16 +848,35 @@ async fn run_legacy_transcription_stream(
                         return;
                     }
                 };
-                if let Err(error) =
-                    feed_transcription_stream_chunks(&mut socket, &mut stream, chunks).await
+                match await_stream_operation(
+                    &budget,
+                    limits,
+                    feed_transcription_stream_chunks(&mut socket, &mut stream, chunks),
+                )
+                .await
                 {
-                    let _ = send_stream_error(&mut socket, error).await;
-                    return;
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) | Err(error) => {
+                        let _ = send_stream_error(&mut socket, error).await;
+                        return;
+                    }
                 }
             }
             Message::Text(text) => match parse_transcription_stream_control(text.as_str()) {
                 Ok(TranscriptionStreamControl::End) => {
-                    finish_transcription_stream(&mut socket, decoder, stream, pcm_buffer).await;
+                    let remaining = match budget.remaining(limits) {
+                        Ok(remaining) => remaining,
+                        Err(_) => return,
+                    };
+                    let operation = finish_transcription_stream(
+                        &mut socket,
+                        decoder,
+                        stream,
+                        pcm_buffer,
+                        &mut budget,
+                        limits,
+                    );
+                    let _ = timeout(remaining, operation).await;
                     return;
                 }
                 Ok(TranscriptionStreamControl::Start) => {
@@ -539,22 +905,31 @@ async fn run_legacy_transcription_stream(
 async fn run_caption_transcription_stream(
     mut socket: WebSocket,
     start: TranscriptionStreamStart,
-    asr: orchion::Asr,
+    asr: ModelLease<orchion::Asr>,
     default_chunk_size_sec: f32,
     stream_target_segment_millis: u32,
+    limits: TranscriptionStreamLimits,
+    mut budget: TranscriptionStreamBudget,
 ) {
     let streaming_options = start.to_streaming_options(default_chunk_size_sec);
-    if let Err(error) = validate_caption_streaming_options(&streaming_options) {
+    if let Err(error) = validate_transcription_streaming_options(&streaming_options) {
         let _ = send_stream_error(&mut socket, error).await;
         return;
     }
-    let mut decoder = match start.audio_decoder().await {
-        Ok(decoder) => decoder,
-        Err(error) => {
-            let _ = send_stream_error(&mut socket, ApiError::from(error)).await;
-            return;
-        }
-    };
+    let mut decoder =
+        match await_stream_operation(&budget, limits, start.audio_decoder(limits.max_duration))
+            .await
+        {
+            Ok(Ok(decoder)) => decoder,
+            Ok(Err(error)) => {
+                let _ = send_stream_error(&mut socket, ApiError::from(error)).await;
+                return;
+            }
+            Err(error) => {
+                let _ = send_stream_error(&mut socket, error).await;
+                return;
+            }
+        };
     let mut endpoint = match AudioVadStreamingEndpoint::new(start.endpointing.to_vad_config()) {
         Ok(endpoint) => endpoint,
         Err(error) => {
@@ -564,28 +939,51 @@ async fn run_caption_transcription_stream(
     };
     let mut current_segment = None;
     let mut next_segment_id = 0;
-
-    if send_stream_ready(&mut socket).await.is_err() {
-        return;
+    match await_stream_operation(&budget, limits, send_stream_ready(&mut socket)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => return,
+        Err(error) => {
+            let _ = send_stream_error(&mut socket, error).await;
+            return;
+        }
     }
 
-    while let Some(message) = socket.recv().await {
-        let message = match message {
-            Ok(message) => message,
-            Err(error) => {
-                tracing::debug!(error = %error, "transcription websocket receive failed");
-                return;
-            }
-        };
+    loop {
+        let message =
+            match receive_transcription_stream_message(&mut socket, &mut budget, limits).await {
+                Ok(Some(message)) => message,
+                Ok(None) => return,
+                Err(error) => {
+                    let _ = send_stream_error(&mut socket, error).await;
+                    return;
+                }
+            };
         match message {
             Message::Binary(bytes) => {
-                let decoded = match decoder.push(&bytes).await {
-                    Ok(decoded) => decoded,
-                    Err(error) => {
-                        let _ = send_stream_error(&mut socket, ApiError::from(error)).await;
-                        return;
-                    }
-                };
+                let decoded =
+                    match await_stream_operation(&budget, limits, decoder.push(&bytes)).await {
+                        Ok(Ok(decoded)) => decoded,
+                        Ok(Err(error)) => {
+                            let _ = send_stream_error(
+                                &mut socket,
+                                transcription_stream_decoder_error(error, limits),
+                            )
+                            .await;
+                            return;
+                        }
+                        Err(error) => {
+                            let _ = send_stream_error(&mut socket, error).await;
+                            return;
+                        }
+                    };
+                if let Err(error) = budget.record_decoded_samples(
+                    decoded.samples.len(),
+                    decoded.sample_rate,
+                    limits,
+                ) {
+                    let _ = send_stream_error(&mut socket, error).await;
+                    return;
+                }
                 let events = match endpoint.push(&decoded.samples, decoded.sample_rate) {
                     Ok(events) => events,
                     Err(error) => {
@@ -593,25 +991,36 @@ async fn run_caption_transcription_stream(
                         return;
                     }
                 };
-                if let Err(error) = handle_caption_vad_events(
-                    &mut socket,
-                    &asr,
-                    &streaming_options,
-                    &mut current_segment,
-                    &mut next_segment_id,
-                    events,
-                    decoded.sample_rate,
-                    stream_target_segment_millis,
+                match await_stream_operation(
+                    &budget,
+                    limits,
+                    handle_caption_vad_events(
+                        &mut socket,
+                        &asr,
+                        &streaming_options,
+                        &mut current_segment,
+                        &mut next_segment_id,
+                        events,
+                        decoded.sample_rate,
+                        stream_target_segment_millis,
+                    ),
                 )
                 .await
                 {
-                    let _ = send_stream_error(&mut socket, error).await;
-                    return;
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) | Err(error) => {
+                        let _ = send_stream_error(&mut socket, error).await;
+                        return;
+                    }
                 }
             }
             Message::Text(text) => match parse_transcription_stream_control(text.as_str()) {
                 Ok(TranscriptionStreamControl::End) => {
-                    if let Err(error) = finish_caption_transcription_stream(
+                    let remaining = match budget.remaining(limits) {
+                        Ok(remaining) => remaining,
+                        Err(_) => return,
+                    };
+                    let operation = finish_caption_transcription_stream(
                         &mut socket,
                         decoder,
                         endpoint,
@@ -620,10 +1029,18 @@ async fn run_caption_transcription_stream(
                         &mut current_segment,
                         &mut next_segment_id,
                         stream_target_segment_millis,
-                    )
-                    .await
-                    {
-                        let _ = send_stream_error(&mut socket, error).await;
+                        &mut budget,
+                        limits,
+                    );
+                    match timeout(remaining, operation).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            if let Ok(remaining) = budget.remaining(limits) {
+                                let _ =
+                                    timeout(remaining, send_stream_error(&mut socket, error)).await;
+                            }
+                        }
+                        Err(_) => {}
                     }
                     return;
                 }
@@ -650,16 +1067,78 @@ async fn run_caption_transcription_stream(
     }
 }
 
-#[cfg(test)]
+async fn receive_transcription_stream_message(
+    socket: &mut WebSocket,
+    budget: &mut TranscriptionStreamBudget,
+    limits: TranscriptionStreamLimits,
+) -> Result<Option<Message>, ApiError> {
+    let wait = budget.next_wait(limits)?;
+    let message = timeout(wait, socket.recv())
+        .await
+        .map_err(|_| budget.timeout_error(limits))?;
+    let Some(message) = message else {
+        return Ok(None);
+    };
+    let message = message.map_err(|error| {
+        ApiError::invalid_request(error.to_string(), None, Some("invalid_websocket_message"))
+    })?;
+    if let Message::Binary(bytes) = &message {
+        budget.record_binary_input(bytes.len(), limits)?;
+    }
+    Ok(Some(message))
+}
+
+fn transcription_stream_duration_error() -> ApiError {
+    ApiError::invalid_request(
+        "transcription stream exceeded the maximum session duration",
+        None,
+        Some("stream_duration_exceeded"),
+    )
+}
+
+fn transcription_stream_input_too_large_error(max_input_bytes: usize) -> ApiError {
+    ApiError::invalid_request(
+        format!("transcription stream exceeded the {max_input_bytes} byte input limit"),
+        None,
+        Some("stream_input_too_large"),
+    )
+}
+
+fn transcription_stream_audio_too_long_error(max_duration: Duration) -> ApiError {
+    ApiError::invalid_request(
+        format!(
+            "transcription stream exceeded the {} second audio limit",
+            max_duration.as_secs()
+        ),
+        None,
+        Some("stream_audio_too_long"),
+    )
+}
+
+fn transcription_stream_decoder_error(
+    error: OrchionError,
+    limits: TranscriptionStreamLimits,
+) -> ApiError {
+    if matches!(
+        &error,
+        OrchionError::InvalidAudio { reason }
+            if reason == "streaming decoded audio exceeded the sample limit"
+    ) {
+        transcription_stream_audio_too_long_error(limits.max_duration)
+    } else {
+        ApiError::from(error)
+    }
+}
+
 fn validate_transcription_stream_api_key(
     required_api_key: Option<&str>,
-    _message_api_key: Option<&str>,
+    message_api_key: Option<&str>,
     header_authorized: bool,
 ) -> Result<(), ApiError> {
     if required_api_key.is_none() {
         return Ok(());
     };
-    if header_authorized {
+    if header_authorized || message_api_key == required_api_key {
         Ok(())
     } else {
         Err(ApiError::invalid_api_key())
@@ -707,16 +1186,25 @@ fn transcription_stream_start_timeout_error() -> ApiError {
 async fn finish_transcription_stream(
     socket: &mut WebSocket,
     decoder: StreamingAudioDecoder,
-    mut stream: orchion::AsrStream,
+    mut stream: LeasedAsrStream,
     mut pcm_buffer: AsrPcmBuffer,
+    budget: &mut TranscriptionStreamBudget,
+    limits: TranscriptionStreamLimits,
 ) {
     let decoded = match decoder.finish().await {
         Ok(decoded) => decoded,
         Err(error) => {
-            let _ = send_stream_error(socket, ApiError::from(error)).await;
+            let _ =
+                send_stream_error(socket, transcription_stream_decoder_error(error, limits)).await;
             return;
         }
     };
+    if let Err(error) =
+        budget.record_decoded_samples(decoded.samples.len(), decoded.sample_rate, limits)
+    {
+        let _ = send_stream_error(socket, error).await;
+        return;
+    }
     let chunks = match pcm_buffer.push(&decoded.samples, decoded.sample_rate) {
         Ok(chunks) => chunks,
         Err(error) => {
@@ -757,7 +1245,7 @@ async fn finish_transcription_stream(
 
 async fn feed_transcription_stream_chunks(
     socket: &mut WebSocket,
-    stream: &mut orchion::AsrStream,
+    stream: &mut LeasedAsrStream,
     chunks: Vec<(Vec<f32>, u32)>,
 ) -> Result<(), ApiError> {
     for (samples, sample_rate) in chunks {
@@ -774,7 +1262,7 @@ async fn feed_transcription_stream_chunks(
 
 async fn handle_caption_vad_events(
     socket: &mut WebSocket,
-    asr: &orchion::Asr,
+    asr: &ModelLease<orchion::Asr>,
     streaming_options: &AsrStreamingOptions,
     current_segment: &mut Option<CaptionSegmentStream>,
     next_segment_id: &mut u64,
@@ -835,7 +1323,7 @@ async fn handle_caption_vad_events(
 }
 
 async fn start_caption_segment(
-    asr: &orchion::Asr,
+    asr: &ModelLease<orchion::Asr>,
     streaming_options: &AsrStreamingOptions,
     next_segment_id: &mut u64,
     start_sample: usize,
@@ -843,8 +1331,7 @@ async fn start_caption_segment(
     stream_target_segment_millis: u32,
 ) -> Result<CaptionSegmentStream, ApiError> {
     let segment_id = allocate_caption_segment_id(next_segment_id)?;
-    let stream = asr
-        .start_streaming_with(streaming_options.clone())
+    let stream = LeasedAsrStream::start(asr, streaming_options.clone())
         .await
         .map_err(ApiError::from)?;
     Ok(CaptionSegmentStream {
@@ -996,13 +1483,19 @@ async fn finish_caption_transcription_stream(
     socket: &mut WebSocket,
     decoder: StreamingAudioDecoder,
     mut endpoint: AudioVadStreamingEndpoint,
-    asr: &orchion::Asr,
+    asr: &ModelLease<orchion::Asr>,
     streaming_options: &AsrStreamingOptions,
     current_segment: &mut Option<CaptionSegmentStream>,
     next_segment_id: &mut u64,
     stream_target_segment_millis: u32,
+    budget: &mut TranscriptionStreamBudget,
+    limits: TranscriptionStreamLimits,
 ) -> Result<(), ApiError> {
-    let decoded = decoder.finish().await.map_err(ApiError::from)?;
+    let decoded = decoder
+        .finish()
+        .await
+        .map_err(|error| transcription_stream_decoder_error(error, limits))?;
+    budget.record_decoded_samples(decoded.samples.len(), decoded.sample_rate, limits)?;
     let events = endpoint
         .push(&decoded.samples, decoded.sample_rate)
         .map_err(ApiError::from)?;
@@ -1047,7 +1540,7 @@ struct CaptionSegmentStream {
     subtitle_start_sample: usize,
     last_sample: usize,
     sample_rate: u32,
-    stream: orchion::AsrStream,
+    stream: LeasedAsrStream,
     pcm_buffer: AsrPcmBuffer,
     text_splitter: CaptionTextSplitter,
 }
@@ -1325,8 +1818,24 @@ impl TranscriptionStreamStart {
         }
     }
 
-    async fn audio_decoder(&self) -> orchion::Result<StreamingAudioDecoder> {
-        StreamingAudioDecoder::new_for_asr(self.input_audio_format.into(), self.sample_rate).await
+    async fn audio_decoder(
+        &self,
+        max_duration: Duration,
+    ) -> Result<StreamingAudioDecoder, ApiError> {
+        let output_sample_rate =
+            if self.input_audio_format == TranscriptionStreamInputFormat::PcmS16Le {
+                self.sample_rate.unwrap_or(ASR_SAMPLE_RATE)
+            } else {
+                ASR_SAMPLE_RATE
+            };
+        let max_output_samples = max_audio_samples_at_rate(max_duration, output_sample_rate)?;
+        StreamingAudioDecoder::new_for_asr_with_max_samples(
+            self.input_audio_format.into(),
+            self.sample_rate,
+            max_output_samples,
+        )
+        .await
+        .map_err(ApiError::from)
     }
 }
 
@@ -1700,10 +2209,19 @@ fn validate_caption_endpointing_options(
     Ok(())
 }
 
-fn validate_caption_streaming_options(options: &AsrStreamingOptions) -> Result<(), ApiError> {
+fn validate_transcription_streaming_options(options: &AsrStreamingOptions) -> Result<(), ApiError> {
     if !options.chunk_size_sec.is_finite() || options.chunk_size_sec <= 0.0 {
         return Err(ApiError::invalid_request(
             "streaming chunk_size_sec must be finite and greater than zero",
+            Some("chunk_size_sec"),
+            Some("invalid_chunk_size"),
+        ));
+    }
+    if options.chunk_size_sec > TRANSCRIPTION_STREAM_MAX_CHUNK_SIZE_SEC {
+        return Err(ApiError::invalid_request(
+            format!(
+                "streaming chunk_size_sec must not exceed {TRANSCRIPTION_STREAM_MAX_CHUNK_SIZE_SEC}"
+            ),
             Some("chunk_size_sec"),
             Some("invalid_chunk_size"),
         ));
@@ -1937,7 +2455,7 @@ mod tests {
         .unwrap();
         let options = start.to_streaming_options(2.0);
 
-        let error = validate_caption_streaming_options(&options).unwrap_err();
+        let error = validate_transcription_streaming_options(&options).unwrap_err();
 
         assert_eq!(error.error.param.as_deref(), Some("chunk_size_sec"));
         assert_eq!(error.error.code.as_deref(), Some("invalid_chunk_size"));
@@ -1958,7 +2476,7 @@ mod tests {
         .unwrap();
         let options = start.to_streaming_options(2.0);
 
-        let error = validate_caption_streaming_options(&options).unwrap_err();
+        let error = validate_transcription_streaming_options(&options).unwrap_err();
 
         assert_eq!(
             error.error.param.as_deref(),
@@ -1982,7 +2500,7 @@ mod tests {
         .unwrap();
         let options = start.to_streaming_options(2.0);
 
-        let error = validate_caption_streaming_options(&options).unwrap_err();
+        let error = validate_transcription_streaming_options(&options).unwrap_err();
 
         assert_eq!(error.error.param.as_deref(), Some("max_new_tokens_final"));
         assert_eq!(error.error.code.as_deref(), Some("invalid_stream_option"));
@@ -2164,11 +2682,8 @@ mod tests {
     }
 
     #[test]
-    fn stream_start_api_key_does_not_authenticate_without_header() {
-        let error = validate_transcription_stream_api_key(Some("secret"), Some("secret"), false)
-            .unwrap_err();
-
-        assert_eq!(error.error.code.as_deref(), Some("invalid_api_key"));
+    fn stream_start_api_key_authenticates_without_header() {
+        validate_transcription_stream_api_key(Some("secret"), Some("secret"), false).unwrap();
     }
 
     #[test]
@@ -2189,6 +2704,118 @@ mod tests {
 
         assert_eq!(error.error.param.as_deref(), Some("type"));
         assert_eq!(error.error.code.as_deref(), Some("start_message_timeout"));
+    }
+
+    #[test]
+    fn stream_budget_rejects_cumulative_input_above_limit() {
+        let limits = TranscriptionStreamLimits {
+            idle_timeout: Duration::from_secs(30),
+            max_duration: Duration::from_secs(60),
+            max_input_bytes: 4,
+        };
+        let mut budget = TranscriptionStreamBudget::new();
+
+        budget.record_binary_input(3, limits).unwrap();
+        let error = budget.record_binary_input(2, limits).unwrap_err();
+
+        assert_eq!(error.error.code.as_deref(), Some("stream_input_too_large"));
+    }
+
+    #[test]
+    fn stream_budget_rejects_expired_session() {
+        let limits = TranscriptionStreamLimits {
+            idle_timeout: Duration::from_secs(30),
+            max_duration: Duration::from_secs(60),
+            max_input_bytes: 1024,
+        };
+        let budget = TranscriptionStreamBudget {
+            started_at: Instant::now() - Duration::from_secs(61),
+            input_bytes: 0,
+            decoded_duration: Duration::ZERO,
+        };
+
+        let error = budget.next_wait(limits).unwrap_err();
+
+        assert_eq!(
+            error.error.code.as_deref(),
+            Some("stream_duration_exceeded")
+        );
+    }
+
+    #[test]
+    fn stream_budget_rejects_audio_longer_than_session_limit() {
+        let limits = TranscriptionStreamLimits {
+            idle_timeout: Duration::from_secs(30),
+            max_duration: Duration::from_secs(1),
+            max_input_bytes: 1024,
+        };
+        let mut budget = TranscriptionStreamBudget::new();
+
+        let error = budget
+            .record_decoded_samples(
+                usize::try_from(ASR_SAMPLE_RATE).unwrap() + 1,
+                ASR_SAMPLE_RATE,
+                limits,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.error.code.as_deref(), Some("stream_audio_too_long"));
+    }
+
+    #[test]
+    fn stream_budget_accounts_for_each_decoded_sample_rate() {
+        let limits = TranscriptionStreamLimits {
+            idle_timeout: Duration::from_secs(30),
+            max_duration: Duration::from_secs(1),
+            max_input_bytes: 1024,
+        };
+        let mut budget = TranscriptionStreamBudget::new();
+
+        budget.record_decoded_samples(4_000, 8_000, limits).unwrap();
+        let error = budget
+            .record_decoded_samples(8_001, 16_000, limits)
+            .unwrap_err();
+
+        assert_eq!(error.error.code.as_deref(), Some("stream_audio_too_long"));
+    }
+
+    #[test]
+    fn stream_decoder_sample_limit_uses_audio_duration_error_code() {
+        let limits = TranscriptionStreamLimits {
+            idle_timeout: Duration::from_secs(30),
+            max_duration: Duration::from_secs(60),
+            max_input_bytes: 1024,
+        };
+
+        let error = transcription_stream_decoder_error(
+            OrchionError::InvalidAudio {
+                reason: "streaming decoded audio exceeded the sample limit".to_string(),
+            },
+            limits,
+        );
+
+        assert_eq!(error.error.code.as_deref(), Some("stream_audio_too_long"));
+    }
+
+    #[tokio::test]
+    async fn stream_operation_is_bounded_by_remaining_session_duration() {
+        let limits = TranscriptionStreamLimits {
+            idle_timeout: Duration::from_secs(1),
+            max_duration: Duration::from_millis(10),
+            max_input_bytes: 1024,
+        };
+        let budget = TranscriptionStreamBudget::new();
+
+        let error = await_stream_operation(&budget, limits, async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        })
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.error.code.as_deref(),
+            Some("stream_duration_exceeded")
+        );
     }
 
     #[test]

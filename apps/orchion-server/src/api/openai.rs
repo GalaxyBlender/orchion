@@ -479,6 +479,7 @@ pub struct TranscriptionJson {
 pub struct TranscriptionVerboseJson {
     pub text: String,
     pub language: String,
+    pub duration: f64,
     pub raw_output: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub segments: Option<Vec<AsrSegment>>,
@@ -640,6 +641,7 @@ mod tests {
         let response = TranscriptionVerboseJson {
             text: "hello".to_string(),
             language: "en".to_string(),
+            duration: 3.5,
             raw_output: "raw".to_string(),
             segments: Some(vec![AsrSegment {
                 id: 0,
@@ -654,6 +656,7 @@ mod tests {
         assert_eq!(value["segments"][0]["start"], 1.0);
         assert_eq!(value["segments"][0]["end"], 2.0);
         assert_eq!(value["segments"][0]["text"], "hello");
+        assert_eq!(value["duration"], 3.5);
     }
 
     #[test]

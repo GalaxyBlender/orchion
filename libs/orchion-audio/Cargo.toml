@@ -9,11 +9,11 @@ repository = "https://github.com/xuan/orchion"
 
 [dependencies]
 hound = "3"
-orchion-core = { path = "../orchion-core" }
-tokio = { version = "1", features = ["rt"] }
+orchion-core = { version = "0.3.0", path = "../orchion-core" }
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "sync"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 
 [lints.rust]
 unsafe_code = "warn"

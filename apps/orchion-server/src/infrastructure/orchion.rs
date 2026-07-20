@@ -1,6 +1,6 @@
 use crate::application::model_cache::{
-    AsrModelCache, CacheTracker, GlobalModelCacheLimiter, OcrModelCache, OcrVlModelCache,
-    TtsModelCache, ensure_available_models,
+    AsrModelCache, CacheTracker, GlobalModelCacheLimiter, ModelLease, OcrModelCache,
+    OcrVlModelCache, TtsModelCache, ensure_available_models,
 };
 use crate::settings::ServerConfig;
 use anyhow::Context;
@@ -280,7 +280,7 @@ impl AppState {
         }
     }
 
-    pub async fn asr(&self, model: orchion::AsrModel) -> anyhow::Result<Option<Asr>> {
+    pub async fn asr(&self, model: orchion::AsrModel) -> anyhow::Result<Option<ModelLease<Asr>>> {
         if !self.config.services.asr.enabled {
             return Ok(None);
         }
@@ -291,7 +291,7 @@ impl AppState {
                 &self.asr_models,
                 all_caches.as_slice(),
                 model,
-                |model, path| async move {
+                move |model, path| async move {
                     tracing::info!(model = ?model, device = %device, "loading ASR model");
                     Asr::load_with_device(model, path, device)
                         .await
@@ -301,7 +301,7 @@ impl AppState {
             .await
     }
 
-    pub async fn tts(&self, model: orchion::TtsModel) -> anyhow::Result<Option<Tts>> {
+    pub async fn tts(&self, model: orchion::TtsModel) -> anyhow::Result<Option<ModelLease<Tts>>> {
         if !self.config.services.tts.enabled {
             return Ok(None);
         }
@@ -312,7 +312,7 @@ impl AppState {
                 &self.tts_models,
                 all_caches.as_slice(),
                 model,
-                |model, path| async move {
+                move |model, path| async move {
                     tracing::info!(model = ?model, device = %device, "loading TTS model");
                     Tts::load_with_device(model, path, device)
                         .await
@@ -322,7 +322,7 @@ impl AppState {
             .await
     }
 
-    pub async fn ocr(&self, model: KnownOcrModel) -> anyhow::Result<Option<Ocr>> {
+    pub async fn ocr(&self, model: KnownOcrModel) -> anyhow::Result<Option<ModelLease<Ocr>>> {
         if !self.config.services.ocr.active() {
             return Ok(None);
         }
@@ -333,7 +333,7 @@ impl AppState {
                 &self.ocr_models,
                 all_caches.as_slice(),
                 model,
-                |model, path| async move {
+                move |model, path| async move {
                     tracing::info!(model = ?model, device = %device, "loading OCR model");
                     Ocr::load_with_device(model.id(), path, device)
                         .await
@@ -343,7 +343,7 @@ impl AppState {
             .await
     }
 
-    pub async fn ocr_vl(&self, model: KnownOcrModel) -> anyhow::Result<Option<Ocr>> {
+    pub async fn ocr_vl(&self, model: KnownOcrModel) -> anyhow::Result<Option<ModelLease<Ocr>>> {
         if !self.config.services.ocr_vl.active() {
             return Ok(None);
         }
@@ -354,7 +354,7 @@ impl AppState {
                 &self.ocr_vl_models,
                 all_caches.as_slice(),
                 model,
-                |model, path| async move {
+                move |model, path| async move {
                     tracing::info!(model = ?model, device = %device, "loading OCR-VL model");
                     Ocr::load_with_device(model.id(), path, device)
                         .await

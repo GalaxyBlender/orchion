@@ -88,6 +88,7 @@ pub(super) async fn create_ocr(
         &state.config().services.ocr,
         &state.config().services.ocr_vl,
     )?;
+    let max_tokens = resolve_ocr_max_tokens(choice, max_tokens, &state.config().services.ocr_vl);
     let ocr = match choice {
         OcrServiceChoice::Ocr { model } => state.ocr(model).await,
         OcrServiceChoice::OcrVl { model } => state.ocr_vl(model).await,
@@ -104,7 +105,14 @@ pub(super) async fn create_ocr(
         layout_model: resolve_ocr_layout_model(&state, choice, layout_model),
         max_tokens,
     };
-    let result = ocr.recognize_file_with(image_file.path(), options).await?;
+    let result = ocr
+        .run(move |ocr| async move {
+            let result = ocr.recognize_file_with(image_file.path(), options).await;
+            drop(image_file);
+            result
+        })
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))??;
 
     Ok(match response_format {
         OcrApiFormat::Json => Json(OcrJsonResponse {
@@ -358,6 +366,16 @@ pub(super) fn validate_ocr_parameters(
         ));
     }
     if choice.is_ocr_vl() {
+        if max_tokens.is_some_and(|value| value > ocr_vl_service.max_tokens) {
+            return Err(ApiError::invalid_request(
+                format!(
+                    "`max_tokens` must not exceed the configured limit of {}",
+                    ocr_vl_service.max_tokens
+                ),
+                Some("max_tokens"),
+                Some("max_tokens_exceeded"),
+            ));
+        }
         if let Some(layout_model) = layout_model {
             validate_ocr_layout_model(layout_model)?;
             validate_configured_layout_model(
@@ -384,6 +402,21 @@ pub(super) fn validate_ocr_parameters(
         ));
     }
     Ok(())
+}
+
+pub(super) fn resolve_ocr_max_tokens(
+    choice: OcrServiceChoice,
+    requested: Option<usize>,
+    ocr_vl_service: &crate::settings::OcrVlServiceSection,
+) -> Option<usize> {
+    if choice.is_ocr_vl() {
+        Some(match requested {
+            Some(value) => value.min(ocr_vl_service.max_tokens),
+            None => ocr_vl_service.max_tokens,
+        })
+    } else {
+        requested
+    }
 }
 
 fn validate_ocr_layout_model(layout_model: &ModelId) -> Result<(), ApiError> {

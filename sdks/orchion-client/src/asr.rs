@@ -5,6 +5,7 @@ use reqwest::multipart::{Form, Part};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::Path;
+use tokio_tungstenite::tungstenite::Error as TungsteniteError;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
@@ -108,7 +109,7 @@ impl<'a> AsrClient<'a> {
 
         let (mut stream, _) = tokio_tungstenite::connect_async(websocket_request)
             .await
-            .map_err(websocket_error)?;
+            .map_err(websocket_connect_error)?;
         let start_message = serde_json::to_string(&request).map_err(|error| {
             ClientError::decode(format!("invalid streaming start request: {error}"))
         })?;
@@ -275,6 +276,7 @@ struct TranscriptionJson {
 pub struct VerboseTranscriptionResponse {
     pub text: String,
     pub language: String,
+    pub duration: f64,
     pub raw_output: String,
     pub segments: Option<Vec<AsrSegment>>,
 }
@@ -658,6 +660,41 @@ impl StreamingSession {
 fn websocket_error(error: impl std::fmt::Display) -> ClientError {
     ClientError::WebSocket {
         message: error.to_string(),
+    }
+}
+
+fn websocket_connect_error(error: TungsteniteError) -> ClientError {
+    let TungsteniteError::Http(response) = error else {
+        return websocket_error(error);
+    };
+    let status = response.status();
+    let body = response
+        .body()
+        .as_deref()
+        .map(String::from_utf8_lossy)
+        .unwrap_or_default();
+
+    if let Ok(server_error) = serde_json::from_str::<crate::ServerErrorBody>(&body) {
+        let message = server_error.error.message.clone();
+        return ClientError::Http {
+            status,
+            message,
+            error: Some(server_error.error),
+        };
+    }
+
+    let message = if body.trim().is_empty() {
+        status
+            .canonical_reason()
+            .unwrap_or("WebSocket handshake failed")
+            .to_string()
+    } else {
+        body.trim().to_string()
+    };
+    ClientError::Http {
+        status,
+        message,
+        error: None,
     }
 }
 

@@ -56,10 +56,10 @@ export const asrParameterMetadata: ParameterMetadata[] = [
     name: "prompt",
     label: "Prompt",
     defaultValue: "",
-    description: "Optional OpenAI-compatible prompt field.",
+    description: "Optional initial context for streaming transcription.",
     required: false,
     supported: true,
-    notice: "Orchion currently accepts and ignores prompt for OpenAI compatibility.",
+    notice: "Prompt is supported by streaming transcription only.",
   },
   {
     name: "temperature",
@@ -67,8 +67,8 @@ export const asrParameterMetadata: ParameterMetadata[] = [
     defaultValue: "",
     description: "Optional OpenAI-compatible sampling temperature field.",
     required: false,
-    supported: true,
-    notice: "Orchion currently accepts and ignores temperature for OpenAI compatibility.",
+    supported: false,
+    notice: "Temperature is not accepted because the ASR runtime does not expose sampling temperature.",
   },
   {
     name: "timestamp_granularities",

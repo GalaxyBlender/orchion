@@ -9,6 +9,12 @@ use std::time::Duration;
 
 pub const DEFAULT_ASR_STREAM_TARGET_SEGMENT: Duration = Duration::from_secs(12);
 pub const DEFAULT_ASR_STREAM_MAX_SEGMENT: Duration = Duration::from_secs(120);
+pub const DEFAULT_ASR_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_ASR_STREAM_MAX_DURATION: Duration = Duration::from_secs(2 * 60 * 60);
+pub const DEFAULT_ASR_MAX_AUDIO_DURATION: Duration = Duration::from_secs(30 * 60);
+pub const DEFAULT_TTS_MAX_LENGTH: usize = 2048;
+pub const DEFAULT_TTS_MAX_REFERENCE_AUDIO_DURATION: Duration = Duration::from_secs(5 * 60);
+pub const DEFAULT_OCR_VL_MAX_TOKENS: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelSource {
@@ -40,6 +46,9 @@ pub struct ServerConfig {
 pub struct ServerSection {
     pub bind: SocketAddr,
     pub max_upload_size: usize,
+    pub max_pdf_pages: usize,
+    pub max_pdf_pixels: u64,
+    pub max_pdf_output_size: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +77,9 @@ pub struct AsrServiceSection {
     pub stream_chunk_size: f32,
     pub stream_target_segment: Duration,
     pub stream_max_segment: Duration,
+    pub stream_idle_timeout: Duration,
+    pub stream_max_duration: Duration,
+    pub max_audio_duration: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +101,8 @@ pub struct TtsServiceSection {
     pub max_loaded: usize,
     pub device: DevicePreference,
     pub format: String,
+    pub max_length: usize,
+    pub max_reference_audio_duration: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +136,7 @@ pub struct OcrVlServiceSection {
     pub max_loaded: usize,
     pub device: DevicePreference,
     pub format: OcrResponseFormat,
+    pub max_tokens: usize,
 }
 
 impl OcrVlServiceSection {
@@ -162,6 +177,18 @@ pub enum ConfigError {
     InvalidDuration { value: String, message: String },
     #[error("invalid {section}.max_loaded `{value}`: value must be greater than zero")]
     InvalidMaxLoaded { section: &'static str, value: usize },
+    #[error("invalid {section}.{field} `{value}`: value must be greater than zero")]
+    InvalidGenerationLimit {
+        section: &'static str,
+        field: &'static str,
+        value: usize,
+    },
+    #[error("invalid {section}.{field} `{value}`: value must be greater than zero")]
+    InvalidResourceLimit {
+        section: &'static str,
+        field: &'static str,
+        value: String,
+    },
     #[error(
         "invalid {section}.stream_chunk_size `{value}`: value must be finite and greater than zero"
     )]
@@ -190,6 +217,8 @@ pub enum ConfigError {
         section: &'static str,
         value: String,
     },
+    #[error("invalid services.tts.format `{value}`; expected wav, mp3, aac, opus, flac, or pcm")]
+    InvalidTtsFormat { value: String },
     #[error("{section} is enabled but available_models is empty")]
     ServiceEnabledWithoutModels { section: &'static str },
     #[error("invalid {section} model `{model}`: expected {expected}")]
@@ -215,6 +244,9 @@ impl ServerConfig {
             server: ServerSection {
                 bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9090),
                 max_upload_size: 30 * 1024 * 1024,
+                max_pdf_pages: 100,
+                max_pdf_pixels: 200_000_000,
+                max_pdf_output_size: 100 * 1024 * 1024,
             },
             models: ModelsSection {
                 dir: exe_dir.join("models"),
@@ -232,6 +264,9 @@ impl ServerConfig {
                     stream_chunk_size: 2.0,
                     stream_target_segment: DEFAULT_ASR_STREAM_TARGET_SEGMENT,
                     stream_max_segment: DEFAULT_ASR_STREAM_MAX_SEGMENT,
+                    stream_idle_timeout: DEFAULT_ASR_STREAM_IDLE_TIMEOUT,
+                    stream_max_duration: DEFAULT_ASR_STREAM_MAX_DURATION,
+                    max_audio_duration: DEFAULT_ASR_MAX_AUDIO_DURATION,
                 },
                 tts: TtsServiceSection {
                     enabled: false,
@@ -241,6 +276,8 @@ impl ServerConfig {
                     max_loaded: 1,
                     device: DevicePreference::Auto,
                     format: "wav".to_string(),
+                    max_length: DEFAULT_TTS_MAX_LENGTH,
+                    max_reference_audio_duration: DEFAULT_TTS_MAX_REFERENCE_AUDIO_DURATION,
                 },
                 ocr: OcrServiceSection {
                     enabled: false,
@@ -263,6 +300,7 @@ impl ServerConfig {
                     max_loaded: 1,
                     device: DevicePreference::Auto,
                     format: OcrResponseFormat::Markdown,
+                    max_tokens: DEFAULT_OCR_VL_MAX_TOKENS,
                 },
             },
             auth: AuthSection { api_key: None },
@@ -272,8 +310,9 @@ impl ServerConfig {
     pub fn load(config_path: Option<PathBuf>) -> Result<Self, ConfigError> {
         let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("orchion-server"));
         let default = Self::default_for_exe(&exe_path);
+        let explicit_path = config_path.is_some();
         let path = config_path.unwrap_or_else(|| default.config_path.clone());
-        if !path.exists() {
+        if !explicit_path && !path.exists() {
             return Ok(Self {
                 config_path: path,
                 ..default
@@ -302,6 +341,29 @@ impl ServerConfig {
             }
             if let Some(max_upload_size) = server.max_upload_size {
                 config.server.max_upload_size = parse_upload_size(&max_upload_size)?;
+            }
+            if let Some(max_pdf_pages) = server.max_pdf_pages {
+                if max_pdf_pages == 0 {
+                    return Err(ConfigError::InvalidResourceLimit {
+                        section: "server",
+                        field: "max_pdf_pages",
+                        value: max_pdf_pages.to_string(),
+                    });
+                }
+                config.server.max_pdf_pages = max_pdf_pages;
+            }
+            if let Some(max_pdf_pixels) = server.max_pdf_pixels {
+                if max_pdf_pixels == 0 {
+                    return Err(ConfigError::InvalidResourceLimit {
+                        section: "server",
+                        field: "max_pdf_pixels",
+                        value: max_pdf_pixels.to_string(),
+                    });
+                }
+                config.server.max_pdf_pixels = max_pdf_pixels;
+            }
+            if let Some(max_pdf_output_size) = server.max_pdf_output_size {
+                config.server.max_pdf_output_size = parse_upload_size(&max_pdf_output_size)?;
             }
         }
 
@@ -397,12 +459,41 @@ fn parse_asr_service(
             &stream_max_segment,
         )?;
     }
+    if let Some(stream_idle_timeout) = raw.stream_idle_timeout {
+        service.stream_idle_timeout = parse_stream_segment_duration(
+            "services.asr",
+            "stream_idle_timeout",
+            &stream_idle_timeout,
+        )?;
+    }
+    if let Some(stream_max_duration) = raw.stream_max_duration {
+        service.stream_max_duration = parse_stream_segment_duration(
+            "services.asr",
+            "stream_max_duration",
+            &stream_max_duration,
+        )?;
+    }
+    if let Some(max_audio_duration) = raw.max_audio_duration {
+        service.max_audio_duration = parse_stream_segment_duration(
+            "services.asr",
+            "max_audio_duration",
+            &max_audio_duration,
+        )?;
+    }
     if service.stream_target_segment > service.stream_max_segment {
         return Err(ConfigError::InvalidStreamSegmentDuration {
             section: "services.asr",
             field: "stream_target_segment",
             value: format_duration_for_error(service.stream_target_segment),
             message: "value must be no greater than stream_max_segment".to_string(),
+        });
+    }
+    if service.stream_idle_timeout > service.stream_max_duration {
+        return Err(ConfigError::InvalidStreamSegmentDuration {
+            section: "services.asr",
+            field: "stream_idle_timeout",
+            value: format_duration_for_error(service.stream_idle_timeout),
+            message: "value must be no greater than stream_max_duration".to_string(),
         });
     }
     apply_service_limits(
@@ -445,7 +536,24 @@ fn parse_tts_service(
         service.device = parse_device_preference("services.tts", &device)?;
     }
     if let Some(format) = raw.format {
-        service.format = format;
+        service.format = parse_tts_format(&format)?;
+    }
+    if let Some(max_length) = raw.max_length {
+        if max_length == 0 {
+            return Err(ConfigError::InvalidGenerationLimit {
+                section: "services.tts",
+                field: "max_length",
+                value: max_length,
+            });
+        }
+        service.max_length = max_length;
+    }
+    if let Some(max_reference_audio_duration) = raw.max_reference_audio_duration {
+        service.max_reference_audio_duration = parse_stream_segment_duration(
+            "services.tts",
+            "max_reference_audio_duration",
+            &max_reference_audio_duration,
+        )?;
     }
     apply_service_limits(
         "services.tts",
@@ -463,6 +571,16 @@ fn parse_tts_service(
         )?;
     }
     Ok(service)
+}
+
+fn parse_tts_format(value: &str) -> Result<String, ConfigError> {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "wav" | "mp3" | "aac" | "opus" | "flac" | "pcm" => Ok(normalized),
+        _ => Err(ConfigError::InvalidTtsFormat {
+            value: value.to_string(),
+        }),
+    }
 }
 
 fn parse_ocr_service(
@@ -563,6 +681,16 @@ fn parse_ocr_vl_service(
     }
     if let Some(format) = raw.format {
         service.format = parse_ocr_format("services.ocr-vl.format", &format)?;
+    }
+    if let Some(max_tokens) = raw.max_tokens {
+        if max_tokens == 0 {
+            return Err(ConfigError::InvalidGenerationLimit {
+                section: "services.ocr-vl",
+                field: "max_tokens",
+                value: max_tokens,
+            });
+        }
+        service.max_tokens = max_tokens;
     }
     apply_service_limits(
         "services.ocr-vl",
@@ -921,6 +1049,9 @@ struct RawConfig {
 struct RawServer {
     bind: Option<String>,
     max_upload_size: Option<String>,
+    max_pdf_pages: Option<usize>,
+    max_pdf_pixels: Option<u64>,
+    max_pdf_output_size: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -953,6 +1084,9 @@ struct RawModelService {
     stream_chunk_size: Option<f32>,
     stream_target_segment: Option<String>,
     stream_max_segment: Option<String>,
+    stream_idle_timeout: Option<String>,
+    stream_max_duration: Option<String>,
+    max_audio_duration: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -965,6 +1099,8 @@ struct RawTtsService {
     max_loaded: Option<usize>,
     device: Option<String>,
     format: Option<String>,
+    max_length: Option<usize>,
+    max_reference_audio_duration: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -993,6 +1129,7 @@ struct RawOcrVlService {
     max_loaded: Option<usize>,
     device: Option<String>,
     format: Option<String>,
+    max_tokens: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1004,6 +1141,33 @@ struct RawAuth {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_config_path_must_exist() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("missing.toml");
+
+        let error = ServerConfig::load(Some(path.clone())).unwrap_err();
+
+        assert!(
+            matches!(error, ConfigError::Read { path: error_path, source }
+            if error_path == path && source.kind() == std::io::ErrorKind::NotFound)
+        );
+    }
+
+    #[test]
+    fn tts_default_format_is_validated_at_startup() {
+        let error = ServerConfig::from_toml_str(
+            r#"
+            [services.tts]
+            format = "wave"
+            "#,
+            Path::new("/tmp/orchion-server"),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ConfigError::InvalidTtsFormat { value } if value == "wave"));
+    }
 
     #[test]
     fn asr_stream_chunk_size_defaults_to_two_seconds() {
@@ -1019,6 +1183,20 @@ mod tests {
         assert_eq!(
             config.services.asr.stream_max_segment,
             Duration::from_secs(120)
+        );
+    }
+
+    #[test]
+    fn asr_stream_session_limits_have_safe_defaults() {
+        let config = ServerConfig::default_for_exe(Path::new("/tmp/orchion-server"));
+
+        assert_eq!(
+            config.services.asr.stream_idle_timeout,
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            config.services.asr.stream_max_duration,
+            Duration::from_secs(2 * 60 * 60)
         );
     }
 

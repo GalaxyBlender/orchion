@@ -1,6 +1,9 @@
 [server]
 bind = "127.0.0.1:9090"
 max_upload_size = "100M"
+max_pdf_pages = 100
+max_pdf_pixels = 200000000
+max_pdf_output_size = "100M"
 
 [models]
 dir = "../../data/models"
@@ -16,6 +19,9 @@ idle_timeout = "10m"
 stream_chunk_size = 2.0
 stream_target_segment = "12s"
 stream_max_segment = "120s"
+stream_idle_timeout = "30s"
+stream_max_duration = "2h"
+max_audio_duration = "30m"
 max_loaded = 1
 
 [services.tts]
@@ -32,6 +38,8 @@ available_models = [
 idle_timeout = "10m"
 max_loaded = 1
 format = "wav"
+max_length = 2048
+max_reference_audio_duration = "5m"
 
 [services.ocr]
 enabled = true
@@ -63,6 +71,7 @@ device = "auto"
 idle_timeout = "10m"
 max_loaded = 1
 format = "markdown"
+max_tokens = 4096
 
 [auth]
 # api_key = "change-me"

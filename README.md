@@ -71,7 +71,8 @@ use orchion::{Asr, AsrModel, Result};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let asr = Asr::load_or_download(AsrModel::Qwen3Asr06B, "models").await?;
+    let model = AsrModel::parse("Qwen/Qwen3-ASR-0.6B")?;
+    let asr = Asr::load_or_download(model, "models").await?;
     let transcript = asr.transcribe_file("audio.wav").await?;
     println!("{}", transcript.text);
     Ok(())
@@ -90,9 +91,9 @@ cargo run -p orchion-example-tts-preset --features cpu -- "Hello from Orchion" o
 
 `apps/orchion-server/config.toml` is the full local example. Key sections:
 
-- `[server]`: bind address and upload limit.
+- `[server]`: bind address, upload limit, and PDF page/pixel/output limits.
 - `[models]`: model directory, source, and global residency limit.
-- `[services.asr]`, `[services.tts]`, `[services.ocr]`, `[services.ocr-vl]`: service enablement, defaults, allowlists, device, and per-service residency. ASR streaming captions use `[services.asr].stream_target_segment = "12s"` for punctuation-aware soft cuts and `[services.asr].stream_max_segment = "120s"` for the hard limit.
+- `[services.asr]`, `[services.tts]`, `[services.ocr]`, `[services.ocr-vl]`: service enablement, defaults, allowlists, device, and per-service residency. ASR batch audio uses `max_audio_duration`; streaming captions use `stream_target_segment` and `stream_max_segment`; sessions use `stream_idle_timeout` and `stream_max_duration`. TTS uses `max_length` and `max_reference_audio_duration`; OCR-VL uses `max_tokens`.
 - `[auth]`: optional API key.
 
 `ORCHION_MODEL_SOURCE` and `models.source` accept `auto`, `huggingface`, or `modelscope`. `RUST_LOG` controls runtime logging.

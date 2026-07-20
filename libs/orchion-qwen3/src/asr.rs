@@ -13,7 +13,7 @@ pub struct Asr {
 
 pub struct AsrStream {
     engine: Arc<Mutex<qwen3_asr::AsrInference>>,
-    state: Option<qwen3_asr::StreamingState>,
+    state: Arc<Mutex<qwen3_asr::StreamingState>>,
 }
 
 impl Asr {
@@ -135,7 +135,7 @@ impl Asr {
         .await?;
         Ok(AsrStream {
             engine,
-            state: Some(state),
+            state: Arc::new(Mutex::new(state)),
         })
     }
 }
@@ -148,9 +148,12 @@ impl AsrStream {
     ) -> Result<Option<AsrTranscript>> {
         let prepared = prepare_asr_samples(samples, sample_rate)?.into_owned();
         let engine = Arc::clone(&self.engine);
-        let mut state = self.take_state()?;
-        let (state, transcript) = crate::blocking::run(move || {
+        let state = Arc::clone(&self.state);
+        crate::blocking::run(move || {
             let engine = engine.lock().map_err(|error| OrchionError::Inference {
+                message: error.to_string(),
+            })?;
+            let mut state = state.lock().map_err(|error| OrchionError::Inference {
                 message: error.to_string(),
             })?;
             let transcript = engine
@@ -159,18 +162,19 @@ impl AsrStream {
                     message: source.to_string(),
                 })?
                 .map(transcript_from_upstream);
-            Ok((state, transcript))
+            Ok(transcript)
         })
-        .await?;
-        self.state = Some(state);
-        Ok(transcript)
+        .await
     }
 
-    pub async fn finish(mut self) -> Result<AsrTranscript> {
+    pub async fn finish(self) -> Result<AsrTranscript> {
         let engine = Arc::clone(&self.engine);
-        let mut state = self.take_state()?;
+        let state = Arc::clone(&self.state);
         crate::blocking::run(move || {
             let engine = engine.lock().map_err(|error| OrchionError::Inference {
+                message: error.to_string(),
+            })?;
+            let mut state = state.lock().map_err(|error| OrchionError::Inference {
                 message: error.to_string(),
             })?;
             engine
@@ -181,12 +185,6 @@ impl AsrStream {
                 })
         })
         .await
-    }
-
-    fn take_state(&mut self) -> Result<qwen3_asr::StreamingState> {
-        self.state.take().ok_or_else(|| OrchionError::InvalidAudio {
-            reason: "streaming session has already finished".to_string(),
-        })
     }
 }
 

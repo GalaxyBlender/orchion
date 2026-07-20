@@ -1,11 +1,14 @@
 use orchion_core::{ASR_SAMPLE_RATE, OrchionError, Result, TtsAudio};
 use std::fs;
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::str::FromStr;
-use std::sync::mpsc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::process::{Child, ChildStdin, Command as TokioCommand};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioOutputFormat {
@@ -148,7 +151,12 @@ pub struct StreamingAudioDecoder {
 }
 
 enum StreamingAudioDecoderInner {
-    PcmS16Le { sample_rate: u32, pending: Vec<u8> },
+    PcmS16Le {
+        sample_rate: u32,
+        pending: Vec<u8>,
+        output_samples: usize,
+        max_output_samples: Option<usize>,
+    },
     Ffmpeg(FfmpegStreamingDecoder),
 }
 
@@ -156,9 +164,9 @@ struct FfmpegStreamingDecoder {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     stdout_rx: mpsc::Receiver<std::io::Result<Vec<u8>>>,
-    stderr_rx: mpsc::Receiver<std::io::Result<Vec<u8>>>,
-    stdout_thread: Option<std::thread::JoinHandle<()>>,
-    stderr_thread: Option<std::thread::JoinHandle<()>>,
+    stderr_rx: mpsc::UnboundedReceiver<std::io::Result<Vec<u8>>>,
+    stdout_task: Option<JoinHandle<()>>,
+    stderr_task: Option<JoinHandle<()>>,
     pending: Vec<u8>,
     input_bytes: usize,
     output_samples: usize,
@@ -184,13 +192,32 @@ impl FfmpegAudioCodec {
 
     pub async fn decode_for_asr(&self, input: Vec<u8>) -> Result<DecodedAudio> {
         let binary = self.binary.clone();
-        run_blocking(move || decode_for_asr_blocking(&binary, input)).await
+        run_blocking(move || decode_for_asr_blocking(&binary, input, None)).await
+    }
+
+    pub async fn decode_for_asr_with_max_samples(
+        &self,
+        input: Vec<u8>,
+        max_samples: usize,
+    ) -> Result<DecodedAudio> {
+        let binary = self.binary.clone();
+        run_blocking(move || decode_for_asr_blocking(&binary, input, Some(max_samples))).await
     }
 
     pub async fn decode_file_for_asr(&self, input: impl Into<PathBuf>) -> Result<DecodedAudio> {
         let binary = self.binary.clone();
         let input = input.into();
-        run_blocking(move || decode_file_for_asr_blocking(&binary, &input)).await
+        run_blocking(move || decode_file_for_asr_blocking(&binary, &input, None)).await
+    }
+
+    pub async fn decode_file_for_asr_with_max_samples(
+        &self,
+        input: impl Into<PathBuf>,
+        max_samples: usize,
+    ) -> Result<DecodedAudio> {
+        let binary = self.binary.clone();
+        let input = input.into();
+        run_blocking(move || decode_file_for_asr_blocking(&binary, &input, Some(max_samples))).await
     }
 
     pub async fn encode_tts_samples(
@@ -206,7 +233,20 @@ impl FfmpegAudioCodec {
 
 impl StreamingAudioDecoder {
     pub async fn new_for_asr(format: AudioInputFormat, sample_rate: Option<u32>) -> Result<Self> {
-        Self::new_for_asr_with_binary(format, sample_rate, PathBuf::from("ffmpeg")).await
+        Self::new_for_asr_inner(format, sample_rate, PathBuf::from("ffmpeg"), None)
+    }
+
+    pub async fn new_for_asr_with_max_samples(
+        format: AudioInputFormat,
+        sample_rate: Option<u32>,
+        max_output_samples: usize,
+    ) -> Result<Self> {
+        Self::new_for_asr_inner(
+            format,
+            sample_rate,
+            PathBuf::from("ffmpeg"),
+            Some(max_output_samples),
+        )
     }
 
     pub async fn new_for_asr_with_binary(
@@ -214,6 +254,30 @@ impl StreamingAudioDecoder {
         sample_rate: Option<u32>,
         binary: PathBuf,
     ) -> Result<Self> {
+        Self::new_for_asr_inner(format, sample_rate, binary, None)
+    }
+
+    pub async fn new_for_asr_with_binary_and_max_samples(
+        format: AudioInputFormat,
+        sample_rate: Option<u32>,
+        binary: PathBuf,
+        max_output_samples: usize,
+    ) -> Result<Self> {
+        Self::new_for_asr_inner(format, sample_rate, binary, Some(max_output_samples))
+    }
+
+    fn new_for_asr_inner(
+        format: AudioInputFormat,
+        sample_rate: Option<u32>,
+        binary: PathBuf,
+        max_output_samples: Option<usize>,
+    ) -> Result<Self> {
+        if max_output_samples == Some(0) {
+            return Err(OrchionError::InvalidAudio {
+                reason: "streaming decoded audio sample limit must be greater than zero"
+                    .to_string(),
+            });
+        }
         match format {
             AudioInputFormat::PcmS16Le => {
                 let sample_rate = sample_rate.ok_or_else(|| OrchionError::InvalidAudio {
@@ -228,6 +292,8 @@ impl StreamingAudioDecoder {
                     inner: StreamingAudioDecoderInner::PcmS16Le {
                         sample_rate,
                         pending: Vec::new(),
+                        output_samples: 0,
+                        max_output_samples,
                     },
                 })
             }
@@ -239,9 +305,11 @@ impl StreamingAudioDecoder {
             | AudioInputFormat::Aac
             | AudioInputFormat::Flac
             | AudioInputFormat::Ogg => Ok(Self {
-                inner: StreamingAudioDecoderInner::Ffmpeg(
-                    FfmpegStreamingDecoder::start(binary, format).await?,
-                ),
+                inner: StreamingAudioDecoderInner::Ffmpeg(FfmpegStreamingDecoder::start(
+                    binary,
+                    format,
+                    max_output_samples,
+                )?),
             }),
         }
     }
@@ -251,10 +319,24 @@ impl StreamingAudioDecoder {
             StreamingAudioDecoderInner::PcmS16Le {
                 sample_rate,
                 pending,
+                output_samples,
+                max_output_samples,
             } => {
+                let complete_samples = pending
+                    .len()
+                    .checked_add(bytes.len())
+                    .and_then(|bytes| bytes.checked_div(2))
+                    .ok_or_else(streaming_sample_limit_error)?;
+                let total_samples = output_samples
+                    .checked_add(complete_samples)
+                    .ok_or_else(streaming_sample_limit_error)?;
+                if max_output_samples.is_some_and(|limit| total_samples > limit) {
+                    return Err(streaming_sample_limit_error());
+                }
                 pending.extend_from_slice(bytes);
                 let complete_len = pending.len() - (pending.len() % 2);
                 let complete = pending.drain(..complete_len).collect::<Vec<_>>();
+                *output_samples = total_samples;
                 Ok(DecodedAudio {
                     samples: decode_pcm_s16le_complete_bytes(&complete),
                     sample_rate: *sample_rate,
@@ -269,6 +351,8 @@ impl StreamingAudioDecoder {
             StreamingAudioDecoderInner::PcmS16Le {
                 sample_rate,
                 pending,
+                output_samples: _,
+                max_output_samples: _,
             } => {
                 if !pending.is_empty() {
                     return Err(OrchionError::InvalidAudio {
@@ -286,7 +370,11 @@ impl StreamingAudioDecoder {
 }
 
 impl FfmpegStreamingDecoder {
-    async fn start(binary: PathBuf, format: AudioInputFormat) -> Result<Self> {
+    fn start(
+        binary: PathBuf,
+        format: AudioInputFormat,
+        max_output_samples: Option<usize>,
+    ) -> Result<Self> {
         let mut args = vec![
             "-hide_banner".to_string(),
             "-loglevel".to_string(),
@@ -310,11 +398,14 @@ impl FfmpegStreamingDecoder {
             "f32le".to_string(),
             "pipe:1".to_string(),
         ]);
-        let mut child = Command::new(&binary)
+        let mut command = TokioCommand::new(&binary);
+        command
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command
             .spawn()
             .map_err(|error| ffmpeg_start_error(&binary, error))?;
         let stdin = child
@@ -335,15 +426,22 @@ impl FfmpegStreamingDecoder {
             .ok_or_else(|| OrchionError::InvalidAudio {
                 reason: "failed to open ffmpeg stderr".to_string(),
             })?;
-        let (stdout_rx, stdout_thread) = spawn_pipe_reader(stdout);
-        let (stderr_rx, stderr_thread) = spawn_pipe_reader(stderr);
+        let max_output_bytes = max_output_samples
+            .map(|samples| {
+                samples
+                    .checked_mul(4)
+                    .ok_or_else(streaming_sample_limit_error)
+            })
+            .transpose()?;
+        let (stdout_rx, stdout_task) = spawn_bounded_pipe_reader(stdout, max_output_bytes);
+        let (stderr_rx, stderr_task) = spawn_limited_pipe_reader(stderr, 64 * 1024);
         Ok(Self {
             child: Some(child),
             stdin: Some(stdin),
             stdout_rx,
             stderr_rx,
-            stdout_thread: Some(stdout_thread),
-            stderr_thread: Some(stderr_thread),
+            stdout_task: Some(stdout_task),
+            stderr_task: Some(stderr_task),
             pending: Vec::new(),
             input_bytes: 0,
             output_samples: 0,
@@ -363,16 +461,39 @@ impl FfmpegStreamingDecoder {
             .ok_or_else(|| OrchionError::InvalidAudio {
                 reason: "cannot push audio after decoder input is closed".to_string(),
             })?;
-        stdin
-            .write_all(bytes)
-            .map_err(|error| OrchionError::InvalidAudio {
-                reason: format!("failed to write audio bytes to ffmpeg: {error}"),
-            })?;
-        self.input_bytes += bytes.len();
-        stdin.flush().map_err(|error| OrchionError::InvalidAudio {
-            reason: format!("failed to flush audio bytes to ffmpeg: {error}"),
-        })?;
-        self.drain_available_output()
+        let write_input = async {
+            stdin.write_all(bytes).await?;
+            stdin.flush().await
+        };
+        tokio::pin!(write_input);
+        let mut output = Vec::new();
+        let mut output_open = true;
+        loop {
+            if !output_open {
+                write_input.await.map_err(ffmpeg_stream_input_error)?;
+                break;
+            }
+            tokio::select! {
+                result = &mut write_input => {
+                    result.map_err(ffmpeg_stream_input_error)?;
+                    break;
+                }
+                chunk = self.stdout_rx.recv() => {
+                    match chunk {
+                        Some(chunk) => append_ffmpeg_output(&mut output, chunk)?,
+                        None => output_open = false,
+                    }
+                }
+            }
+        }
+        while let Ok(chunk) = self.stdout_rx.try_recv() {
+            append_ffmpeg_output(&mut output, chunk)?;
+        }
+        self.input_bytes = self
+            .input_bytes
+            .checked_add(bytes.len())
+            .ok_or_else(streaming_sample_limit_error)?;
+        self.samples_from_output(output)
     }
 
     async fn finish(&mut self) -> Result<DecodedAudio> {
@@ -383,16 +504,24 @@ impl FfmpegStreamingDecoder {
             .ok_or_else(|| OrchionError::InvalidAudio {
                 reason: "ffmpeg decoder has already finished".to_string(),
             })?;
-        let status = tokio::task::spawn_blocking(move || child.wait())
-            .await
-            .map_err(|error| OrchionError::BlockingTask {
-                message: error.to_string(),
-            })?
-            .map_err(|error| OrchionError::InvalidAudio {
-                reason: format!("ffmpeg decode audio stream failed to finish: {error}"),
-            })?;
-        let output = self.drain_all_output().await?;
-        self.join_reader_threads()?;
+        let wait_for_child = async {
+            child
+                .wait()
+                .await
+                .map_err(|error| OrchionError::InvalidAudio {
+                    reason: format!("ffmpeg decode audio stream failed to finish: {error}"),
+                })
+        };
+        let drain_output = async {
+            let mut bytes = Vec::new();
+            while let Some(chunk) = self.stdout_rx.recv().await {
+                append_ffmpeg_output(&mut bytes, chunk)?;
+            }
+            Ok::<_, OrchionError>(bytes)
+        };
+        let (status, output) = tokio::try_join!(wait_for_child, drain_output)?;
+        let output = self.samples_from_output(output)?;
+        self.join_reader_tasks().await?;
         let stderr = self.drain_stderr()?;
         if !status.success() {
             return Err(OrchionError::InvalidAudio {
@@ -405,26 +534,6 @@ impl FfmpegStreamingDecoder {
             });
         }
         Ok(output)
-    }
-
-    fn drain_available_output(&mut self) -> Result<DecodedAudio> {
-        let mut bytes = Vec::new();
-        while let Ok(chunk) = self.stdout_rx.try_recv() {
-            bytes.extend(chunk.map_err(|error| OrchionError::InvalidAudio {
-                reason: format!("failed to read ffmpeg decoded audio stream: {error}"),
-            })?);
-        }
-        self.samples_from_output(bytes)
-    }
-
-    async fn drain_all_output(&mut self) -> Result<DecodedAudio> {
-        let mut bytes = Vec::new();
-        while let Ok(chunk) = self.stdout_rx.recv() {
-            bytes.extend(chunk.map_err(|error| OrchionError::InvalidAudio {
-                reason: format!("failed to read ffmpeg decoded audio stream: {error}"),
-            })?);
-        }
-        self.samples_from_output(bytes)
     }
 
     fn samples_from_output(&mut self, bytes: Vec<u8>) -> Result<DecodedAudio> {
@@ -449,15 +558,15 @@ impl FfmpegStreamingDecoder {
         Ok(stderr)
     }
 
-    fn join_reader_threads(&mut self) -> Result<()> {
-        if let Some(thread) = self.stdout_thread.take() {
-            thread.join().map_err(|_| OrchionError::InvalidAudio {
-                reason: "ffmpeg stdout reader panicked".to_string(),
+    async fn join_reader_tasks(&mut self) -> Result<()> {
+        if let Some(task) = self.stdout_task.take() {
+            task.await.map_err(|_| OrchionError::InvalidAudio {
+                reason: "ffmpeg stdout reader task failed".to_string(),
             })?;
         }
-        if let Some(thread) = self.stderr_thread.take() {
-            thread.join().map_err(|_| OrchionError::InvalidAudio {
-                reason: "ffmpeg stderr reader panicked".to_string(),
+        if let Some(task) = self.stderr_task.take() {
+            task.await.map_err(|_| OrchionError::InvalidAudio {
+                reason: "ffmpeg stderr reader task failed".to_string(),
             })?;
         }
         Ok(())
@@ -468,8 +577,13 @@ impl Drop for FfmpegStreamingDecoder {
     fn drop(&mut self) {
         drop(self.stdin.take());
         if let Some(child) = &mut self.child {
-            let _ = child.kill();
-            let _ = child.wait();
+            let _ = child.start_kill();
+        }
+        if let Some(task) = self.stdout_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.stderr_task.take() {
+            task.abort();
         }
     }
 }
@@ -480,8 +594,26 @@ pub async fn decode_audio_bytes(input: impl Into<Vec<u8>>) -> Result<DecodedAudi
         .await
 }
 
+pub async fn decode_audio_bytes_with_max_samples(
+    input: impl Into<Vec<u8>>,
+    max_samples: usize,
+) -> Result<DecodedAudio> {
+    FfmpegAudioCodec::default()
+        .decode_for_asr_with_max_samples(input.into(), max_samples)
+        .await
+}
+
 pub async fn decode_audio_file(input: impl Into<PathBuf>) -> Result<DecodedAudio> {
     FfmpegAudioCodec::default().decode_file_for_asr(input).await
+}
+
+pub async fn decode_audio_file_with_max_samples(
+    input: impl Into<PathBuf>,
+    max_samples: usize,
+) -> Result<DecodedAudio> {
+    FfmpegAudioCodec::default()
+        .decode_file_for_asr_with_max_samples(input, max_samples)
+        .await
 }
 
 pub fn decode_pcm_s16le_bytes(bytes: &[u8]) -> Result<Vec<f32>> {
@@ -511,7 +643,11 @@ where
         })?
 }
 
-fn decode_for_asr_blocking(binary: &Path, input: Vec<u8>) -> Result<DecodedAudio> {
+fn decode_for_asr_blocking(
+    binary: &Path,
+    input: Vec<u8>,
+    max_samples: Option<usize>,
+) -> Result<DecodedAudio> {
     if input.is_empty() {
         return Err(OrchionError::InvalidAudio {
             reason: "audio input bytes are empty".to_string(),
@@ -519,7 +655,7 @@ fn decode_for_asr_blocking(binary: &Path, input: Vec<u8>) -> Result<DecodedAudio
     }
 
     let input_path = write_temp_audio_input(&input)?;
-    let decoded = decode_file_for_asr_blocking(binary, &input_path);
+    let decoded = decode_file_for_asr_blocking(binary, &input_path, max_samples);
     let remove_result = fs::remove_file(&input_path);
     match decoded {
         Ok(decoded) => {
@@ -538,19 +674,35 @@ fn decode_for_asr_blocking(binary: &Path, input: Vec<u8>) -> Result<DecodedAudio
     }
 }
 
-fn decode_file_for_asr_blocking(binary: &Path, input: &Path) -> Result<DecodedAudio> {
+fn decode_file_for_asr_blocking(
+    binary: &Path,
+    input: &Path,
+    max_samples: Option<usize>,
+) -> Result<DecodedAudio> {
     if input.as_os_str().is_empty() {
         return Err(OrchionError::InvalidAudio {
             reason: "audio input path is empty".to_string(),
         });
     }
 
-    let args = vec![
+    if max_samples == Some(0) {
+        return Err(OrchionError::InvalidAudio {
+            reason: "audio sample limit must be greater than zero".to_string(),
+        });
+    }
+    let mut args = vec![
         "-hide_banner".to_string(),
         "-loglevel".to_string(),
         "error".to_string(),
         "-i".to_string(),
         input.to_string_lossy().into_owned(),
+    ];
+    if let Some(max_samples) = max_samples {
+        let probe_samples = max_samples.saturating_add(1);
+        let duration_seconds = probe_samples as f64 / f64::from(ASR_SAMPLE_RATE);
+        args.extend(["-t".to_string(), format!("{duration_seconds:.9}")]);
+    }
+    args.extend([
         "-vn".to_string(),
         "-ac".to_string(),
         "1".to_string(),
@@ -559,13 +711,22 @@ fn decode_file_for_asr_blocking(binary: &Path, input: &Path) -> Result<DecodedAu
         "-f".to_string(),
         "f32le".to_string(),
         "pipe:1".to_string(),
-    ];
+    ]);
     let output = run_ffmpeg_dynamic(binary, &args, Vec::new(), "decode audio input")?;
     let samples = f32_samples_from_le_bytes(&output)?;
     if samples.is_empty() {
         return Err(OrchionError::InvalidAudio {
             reason: "ffmpeg decoded audio to an empty sample buffer".to_string(),
         });
+    }
+    if let Some(max_samples) = max_samples {
+        if samples.len() > max_samples {
+            return Err(OrchionError::InvalidAudio {
+                reason: format!(
+                    "decoded audio exceeds the configured sample limit of {max_samples}"
+                ),
+            });
+        }
     }
     Ok(DecodedAudio {
         samples,
@@ -785,24 +946,80 @@ fn decode_pcm_s16le_complete_bytes(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-fn spawn_pipe_reader<R>(
+fn spawn_bounded_pipe_reader<R>(
     mut reader: R,
-) -> (
-    mpsc::Receiver<std::io::Result<Vec<u8>>>,
-    std::thread::JoinHandle<()>,
-)
+    max_bytes: Option<usize>,
+) -> (mpsc::Receiver<std::io::Result<Vec<u8>>>, JoinHandle<()>)
 where
-    R: Read + Send + 'static,
+    R: AsyncRead + Unpin + Send + 'static,
 {
-    let (sender, receiver) = mpsc::channel();
-    let handle = std::thread::spawn(move || {
+    let (sender, receiver) = mpsc::channel(8);
+    let handle = tokio::spawn(async move {
         let mut buffer = [0_u8; 8192];
+        let mut total_bytes = 0_usize;
         loop {
-            match reader.read(&mut buffer) {
+            match reader.read(&mut buffer).await {
                 Ok(0) => break,
                 Ok(size) => {
-                    if sender.send(Ok(buffer[..size].to_vec())).is_err() {
+                    total_bytes = match total_bytes.checked_add(size) {
+                        Some(total_bytes) => total_bytes,
+                        None => {
+                            let _ = sender
+                                .send(Err(std::io::Error::new(
+                                    std::io::ErrorKind::FileTooLarge,
+                                    "streaming decoded audio exceeded the sample limit",
+                                )))
+                                .await;
+                            break;
+                        }
+                    };
+                    if max_bytes.is_some_and(|limit| total_bytes > limit) {
+                        let _ = sender
+                            .send(Err(std::io::Error::new(
+                                std::io::ErrorKind::FileTooLarge,
+                                "streaming decoded audio exceeded the sample limit",
+                            )))
+                            .await;
                         break;
+                    }
+                    if sender.send(Ok(buffer[..size].to_vec())).await.is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = sender.send(Err(error)).await;
+                    break;
+                }
+            }
+        }
+    });
+    (receiver, handle)
+}
+
+fn spawn_limited_pipe_reader<R>(
+    mut reader: R,
+    max_retained_bytes: usize,
+) -> (
+    mpsc::UnboundedReceiver<std::io::Result<Vec<u8>>>,
+    JoinHandle<()>,
+)
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let (sender, receiver) = mpsc::unbounded_channel();
+    let handle = tokio::spawn(async move {
+        let mut buffer = [0_u8; 8192];
+        let mut retained = 0_usize;
+        loop {
+            match reader.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(size) => {
+                    let keep = size.min(max_retained_bytes.saturating_sub(retained));
+                    if keep > 0 {
+                        retained += keep;
+                        if sender.send(Ok(buffer[..keep].to_vec())).is_err() {
+                            break;
+                        }
                     }
                 }
                 Err(error) => {
@@ -813,6 +1030,32 @@ where
         }
     });
     (receiver, handle)
+}
+
+fn append_ffmpeg_output(output: &mut Vec<u8>, chunk: std::io::Result<Vec<u8>>) -> Result<()> {
+    let chunk = chunk.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::FileTooLarge {
+            streaming_sample_limit_error()
+        } else {
+            OrchionError::InvalidAudio {
+                reason: format!("failed to read ffmpeg decoded audio stream: {error}"),
+            }
+        }
+    })?;
+    output.extend(chunk);
+    Ok(())
+}
+
+fn ffmpeg_stream_input_error(error: std::io::Error) -> OrchionError {
+    OrchionError::InvalidAudio {
+        reason: format!("failed to write audio bytes to ffmpeg: {error}"),
+    }
+}
+
+fn streaming_sample_limit_error() -> OrchionError {
+    OrchionError::InvalidAudio {
+        reason: "streaming decoded audio exceeded the sample limit".to_string(),
+    }
 }
 
 fn s16_samples_to_le_bytes(samples: &[f32]) -> Vec<u8> {
