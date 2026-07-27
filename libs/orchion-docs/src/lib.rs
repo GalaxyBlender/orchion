@@ -147,13 +147,11 @@ impl PdfError {
     pub const fn param(self) -> Option<&'static str> {
         match self {
             Self::UnsupportedImageFormat => Some("response_format"),
-            Self::InvalidPages | Self::PageOutsideDocument => Some("pages"),
-            Self::InvalidScale => Some("scale"),
+            Self::InvalidPages | Self::PageOutsideDocument | Self::TooManyPages => Some("pages"),
+            Self::InvalidScale | Self::TooManyPixels => Some("scale"),
             Self::InvalidPdfFile => Some("file"),
-            Self::TooManyPages => Some("pages"),
-            Self::TooManyPixels => Some("scale"),
-            Self::OutputTooLarge => None,
-            Self::InitializeRenderer
+            Self::OutputTooLarge
+            | Self::InitializeRenderer
             | Self::LoadPage
             | Self::RenderPage
             | Self::EncodeImage
@@ -194,7 +192,7 @@ impl PdfError {
 ///
 /// # Errors
 ///
-/// Returns [`PdfError`] when PDFium cannot be initialized, the request is invalid, or rendering
+/// Returns [`PdfError`] when `PDFium` cannot be initialized, the request is invalid, or rendering
 /// and ZIP encoding fail.
 pub fn render_pdf_to_zip(request: PdfRenderRequest) -> Result<RenderedZip> {
     render_pdf_to_zip_with_limits(request, PdfRenderLimits::unlimited())
@@ -204,19 +202,25 @@ pub fn render_pdf_to_zip(request: PdfRenderRequest) -> Result<RenderedZip> {
 ///
 /// # Errors
 ///
-/// Returns [`PdfError`] when PDFium cannot be initialized, the request is invalid, a resource
+/// Returns [`PdfError`] when `PDFium` cannot be initialized, the request is invalid, a resource
 /// limit is exceeded, or rendering and ZIP encoding fail.
 pub fn render_pdf_to_zip_with_limits(
     request: PdfRenderRequest,
     limits: PdfRenderLimits,
 ) -> Result<RenderedZip> {
+    let PdfRenderRequest {
+        pdf_path,
+        format,
+        pages,
+        scale,
+    } = request;
     let pdfium = bind_pdfium()?;
     let document = pdfium
-        .load_pdf_from_file(&request.pdf_path, None)
+        .load_pdf_from_file(&pdf_path, None)
         .map_err(|_| PdfError::InvalidPdfFile)?;
     let page_count =
         usize::try_from(document.pages().len()).map_err(|_| PdfError::InvalidPdfFile)?;
-    let page_indices = selected_page_indices(&request.pages, page_count)?;
+    let page_indices = selected_page_indices(&pages, page_count)?;
     if page_indices.len() > limits.max_pages {
         return Err(PdfError::TooManyPages);
     }
@@ -230,18 +234,11 @@ pub fn render_pdf_to_zip_with_limits(
                     .map_err(|_| PdfError::PageOutsideDocument)?,
             )
             .map_err(|_| PdfError::LoadPage)?;
-        let width = (f64::from(page.width().value) * f64::from(request.scale)).ceil();
-        let height = (f64::from(page.height().value) * f64::from(request.scale)).ceil();
-        if !width.is_finite()
-            || !height.is_finite()
-            || width > u64::MAX as f64
-            || height > u64::MAX as f64
-        {
-            return Err(PdfError::TooManyPixels);
-        }
-        let page_pixels = (width as u64)
-            .checked_mul(height as u64)
+        let width = checked_ceil_to_u64(f64::from(page.width().value) * f64::from(scale))
             .ok_or(PdfError::TooManyPixels)?;
+        let height = checked_ceil_to_u64(f64::from(page.height().value) * f64::from(scale))
+            .ok_or(PdfError::TooManyPixels)?;
+        let page_pixels = width.checked_mul(height).ok_or(PdfError::TooManyPixels)?;
         total_pixels = total_pixels
             .checked_add(page_pixels)
             .ok_or(PdfError::TooManyPixels)?;
@@ -251,7 +248,7 @@ pub fn render_pdf_to_zip_with_limits(
     }
     let mut archive = ZipWriter::new(LimitedCursor::new(limits.max_output_bytes));
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
-    let render_config = PdfRenderConfig::new().scale_page_by_factor(request.scale);
+    let render_config = PdfRenderConfig::new().scale_page_by_factor(scale);
 
     for page_index in &page_indices {
         let page = document
@@ -267,14 +264,14 @@ pub fn render_pdf_to_zip_with_limits(
             .map_err(|_| PdfError::RenderPage)?
             .as_image()
             .map_err(|_| PdfError::RenderPage)?;
-        let bytes = encode_image(&image, request.format)?;
+        let bytes = encode_image(&image, format)?;
 
         archive
-            .start_file(page_file_name(*page_index + 1, request.format), options)
+            .start_file(page_file_name(*page_index + 1, format), options)
             .map_err(|error| map_zip_error(error, PdfError::CreateZip))?;
         archive
             .write_all(&bytes)
-            .map_err(|error| map_write_error(error, PdfError::WriteZip))?;
+            .map_err(|error| map_write_error(&error, PdfError::WriteZip))?;
     }
 
     let bytes = archive
@@ -289,14 +286,30 @@ pub fn render_pdf_to_zip_with_limits(
     })
 }
 
+fn checked_ceil_to_u64(value: f64) -> Option<u64> {
+    const U64_EXCLUSIVE_UPPER_BOUND: f64 = 18_446_744_073_709_551_616.0;
+
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    let value = value.ceil();
+    if value >= U64_EXCLUSIVE_UPPER_BOUND {
+        return None;
+    }
+
+    // The checks above prove that the rounded value is finite and within the u64 range.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Some(value as u64)
+}
+
 fn map_zip_error(error: ZipError, fallback: PdfError) -> PdfError {
     match error {
-        ZipError::Io(error) => map_write_error(error, fallback),
+        ZipError::Io(error) => map_write_error(&error, fallback),
         _ => fallback,
     }
 }
 
-fn map_write_error(error: std::io::Error, fallback: PdfError) -> PdfError {
+fn map_write_error(error: &std::io::Error, fallback: PdfError) -> PdfError {
     if error.kind() == std::io::ErrorKind::FileTooLarge {
         PdfError::OutputTooLarge
     } else {
@@ -304,6 +317,11 @@ fn map_write_error(error: std::io::Error, fallback: PdfError) -> PdfError {
     }
 }
 
+/// Parses a PDF image format, defaulting to PNG when no value is supplied.
+///
+/// # Errors
+///
+/// Returns [`PdfError::UnsupportedImageFormat`] when the value is not PNG, JPEG, or WebP.
 pub fn parse_pdf_image_format(value: Option<&str>) -> Result<PdfImageFormat> {
     match value
         .map(str::trim)
@@ -318,6 +336,11 @@ pub fn parse_pdf_image_format(value: Option<&str>) -> Result<PdfImageFormat> {
     }
 }
 
+/// Parses a PDF page selection without imposing a page-count limit.
+///
+/// # Errors
+///
+/// Returns [`PdfError::InvalidPages`] when the page selection is malformed.
 pub fn parse_page_selection(value: Option<&str>) -> Result<PageSelection> {
     parse_page_selection_with_max_pages(value, usize::MAX)
 }
@@ -369,6 +392,11 @@ pub fn parse_page_selection_with_max_pages(
     }
 }
 
+/// Parses a PDF rendering scale, defaulting to `1.0` when no value is supplied.
+///
+/// # Errors
+///
+/// Returns [`PdfError::InvalidScale`] unless the value is a finite number from `0.1` to `4.0`.
 pub fn parse_scale(value: Option<&str>) -> Result<f32> {
     match value.map(str::trim) {
         None | Some("") => Ok(1.0),
@@ -494,6 +522,13 @@ mod tests {
     use super::*;
     use std::fmt::Write as FmtWrite;
 
+    fn assert_f32_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() <= f32::EPSILON,
+            "expected {actual} to be within f32::EPSILON of {expected}"
+        );
+    }
+
     fn assert_pdf_error(error: PdfError, expected: PdfError, message: &str, param: &str) {
         assert_eq!(error, expected);
         assert_eq!(error.to_string(), message);
@@ -590,11 +625,20 @@ mod tests {
 
     #[test]
     fn parse_scale_defaults_and_accepts_inclusive_bounds() {
-        assert_eq!(parse_scale(None).unwrap(), 1.0);
-        assert_eq!(parse_scale(Some("")).unwrap(), 1.0);
-        assert_eq!(parse_scale(Some("   ")).unwrap(), 1.0);
-        assert_eq!(parse_scale(Some("0.1")).unwrap(), 0.1);
-        assert_eq!(parse_scale(Some("4.0")).unwrap(), 4.0);
+        assert_f32_close(parse_scale(None).unwrap(), 1.0);
+        assert_f32_close(parse_scale(Some("")).unwrap(), 1.0);
+        assert_f32_close(parse_scale(Some("   ")).unwrap(), 1.0);
+        assert_f32_close(parse_scale(Some("0.1")).unwrap(), 0.1);
+        assert_f32_close(parse_scale(Some("4.0")).unwrap(), 4.0);
+    }
+
+    #[test]
+    fn checked_ceil_to_u64_rejects_invalid_values_and_rounds_valid_values_up() {
+        assert_eq!(checked_ceil_to_u64(1.1), Some(2));
+        assert_eq!(checked_ceil_to_u64(-0.1), None);
+        assert_eq!(checked_ceil_to_u64(f64::INFINITY), None);
+        assert_eq!(checked_ceil_to_u64(f64::NAN), None);
+        assert_eq!(checked_ceil_to_u64(18_446_744_073_709_551_616.0), None);
     }
 
     #[test]

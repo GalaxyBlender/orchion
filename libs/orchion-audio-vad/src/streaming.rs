@@ -231,7 +231,7 @@ impl StreamingVadState {
         };
         self.next_sample += frame.samples.len();
 
-        match self.phase.clone() {
+        match self.phase {
             StreamingVadPhase::Idle => self.push_idle(is_speech, frame),
             StreamingVadPhase::CandidateSpeech { speech_frames } => {
                 self.push_candidate(is_speech, frame, speech_frames)
@@ -260,6 +260,7 @@ impl StreamingVadState {
         events
     }
 
+    #[cfg(test)]
     pub(crate) fn retained_sample_count(&self) -> usize {
         self.pre_speech_sample_count() + self.candidate_sample_count()
     }
@@ -384,6 +385,7 @@ impl StreamingVadState {
         )
     }
 
+    #[cfg(test)]
     fn pre_speech_sample_count(&self) -> usize {
         self.pre_speech
             .iter()
@@ -475,9 +477,11 @@ mod tests {
     }
 
     fn voiced_samples(sample_count: usize) -> Vec<f32> {
+        let sample_rate = u16::try_from(ASR_SAMPLE_RATE).expect("test sample rate fits u16");
         (0..sample_count)
             .map(|index| {
-                let time = index as f32 / ASR_SAMPLE_RATE as f32;
+                let index = u16::try_from(index).expect("test sample index fits u16");
+                let time = f32::from(index) / f32::from(sample_rate);
                 (time * 2.0 * std::f32::consts::PI * 180.0).sin() * 0.4
                     + (time * 2.0 * std::f32::consts::PI * 720.0).sin() * 0.15
             })

@@ -32,6 +32,7 @@ struct PdfImagesMultipartRequest {
     scale: Option<f32>,
 }
 
+#[must_use]
 pub fn swagger_ui() -> SwaggerUi {
     SwaggerUi::new("/docs").url("/openapi/v1.json", ApiDoc::openapi())
 }
@@ -173,7 +174,7 @@ mod tests {
     responses((status = 200, description = "Server health", body = String))
 )]
 #[allow(dead_code)]
-async fn healthz_doc() {}
+fn healthz_doc() {}
 
 #[utoipa::path(
     get,
@@ -185,7 +186,7 @@ async fn healthz_doc() {}
     tag = "models"
 )]
 #[allow(dead_code)]
-async fn list_models_doc() {}
+fn list_models_doc() {}
 
 #[utoipa::path(
     post,
@@ -203,7 +204,7 @@ async fn list_models_doc() {}
     tag = "audio"
 )]
 #[allow(dead_code)]
-async fn create_speech_doc() {}
+fn create_speech_doc() {}
 
 #[utoipa::path(
     post,
@@ -217,7 +218,7 @@ async fn create_speech_doc() {}
     tag = "audio"
 )]
 #[allow(dead_code)]
-async fn create_transcription_doc() {}
+fn create_transcription_doc() {}
 
 #[utoipa::path(
     post,
@@ -236,7 +237,7 @@ async fn create_transcription_doc() {}
     tag = "ocr"
 )]
 #[allow(dead_code)]
-async fn create_ocr_doc() {}
+fn create_ocr_doc() {}
 
 #[utoipa::path(
     post,
@@ -255,4 +256,4 @@ async fn create_ocr_doc() {}
     tag = "pdf"
 )]
 #[allow(dead_code)]
-async fn create_pdf_images_doc() {}
+fn create_pdf_images_doc() {}

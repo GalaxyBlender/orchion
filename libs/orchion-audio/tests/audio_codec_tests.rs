@@ -190,13 +190,13 @@ async fn streaming_decoder_decodes_mp3_chunks_to_asr_pcm() {
     let mut samples = Vec::new();
 
     for chunk in encoded.bytes.chunks(257) {
-        let decoded = decoder.push(chunk).await.unwrap();
-        assert_eq!(decoded.sample_rate, ASR_SAMPLE_RATE);
-        samples.extend(decoded.samples);
+        let chunk_audio = decoder.push(chunk).await.unwrap();
+        assert_eq!(chunk_audio.sample_rate, ASR_SAMPLE_RATE);
+        samples.extend(chunk_audio.samples);
     }
-    let decoded = decoder.finish().await.unwrap();
-    assert_eq!(decoded.sample_rate, ASR_SAMPLE_RATE);
-    samples.extend(decoded.samples);
+    let final_audio = decoder.finish().await.unwrap();
+    assert_eq!(final_audio.sample_rate, ASR_SAMPLE_RATE);
+    samples.extend(final_audio.samples);
 
     assert!(!samples.is_empty());
 }
@@ -216,13 +216,13 @@ async fn streaming_decoder_decodes_webm_opus_chunks_to_asr_pcm() {
     let mut samples = Vec::new();
 
     for chunk in encoded.bytes.chunks(257) {
-        let decoded = decoder.push(chunk).await.unwrap();
-        assert_eq!(decoded.sample_rate, ASR_SAMPLE_RATE);
-        samples.extend(decoded.samples);
+        let chunk_audio = decoder.push(chunk).await.unwrap();
+        assert_eq!(chunk_audio.sample_rate, ASR_SAMPLE_RATE);
+        samples.extend(chunk_audio.samples);
     }
-    let decoded = decoder.finish().await.unwrap();
-    assert_eq!(decoded.sample_rate, ASR_SAMPLE_RATE);
-    samples.extend(decoded.samples);
+    let final_audio = decoder.finish().await.unwrap();
+    assert_eq!(final_audio.sample_rate, ASR_SAMPLE_RATE);
+    samples.extend(final_audio.samples);
 
     assert!(!samples.is_empty());
 }
@@ -242,13 +242,13 @@ async fn streaming_decoder_decodes_wav_chunks_to_asr_pcm() {
     let mut samples = Vec::new();
 
     for chunk in encoded.bytes.chunks(257) {
-        let decoded = decoder.push(chunk).await.unwrap();
-        assert_eq!(decoded.sample_rate, ASR_SAMPLE_RATE);
-        samples.extend(decoded.samples);
+        let chunk_audio = decoder.push(chunk).await.unwrap();
+        assert_eq!(chunk_audio.sample_rate, ASR_SAMPLE_RATE);
+        samples.extend(chunk_audio.samples);
     }
-    let decoded = decoder.finish().await.unwrap();
-    assert_eq!(decoded.sample_rate, ASR_SAMPLE_RATE);
-    samples.extend(decoded.samples);
+    let final_audio = decoder.finish().await.unwrap();
+    assert_eq!(final_audio.sample_rate, ASR_SAMPLE_RATE);
+    samples.extend(final_audio.samples);
 
     assert!(!samples.is_empty());
 }
@@ -266,13 +266,13 @@ async fn streaming_decoder_decodes_m4a_chunks_to_asr_pcm() {
     let mut samples = Vec::new();
 
     for chunk in encoded.chunks(257) {
-        let decoded = decoder.push(chunk).await.unwrap();
-        assert_eq!(decoded.sample_rate, ASR_SAMPLE_RATE);
-        samples.extend(decoded.samples);
+        let chunk_audio = decoder.push(chunk).await.unwrap();
+        assert_eq!(chunk_audio.sample_rate, ASR_SAMPLE_RATE);
+        samples.extend(chunk_audio.samples);
     }
-    let decoded = decoder.finish().await.unwrap();
-    assert_eq!(decoded.sample_rate, ASR_SAMPLE_RATE);
-    samples.extend(decoded.samples);
+    let final_audio = decoder.finish().await.unwrap();
+    assert_eq!(final_audio.sample_rate, ASR_SAMPLE_RATE);
+    samples.extend(final_audio.samples);
 
     assert!(!samples.is_empty());
 }
@@ -290,13 +290,13 @@ async fn streaming_decoder_decodes_regular_m4a_file_chunks_to_asr_pcm() {
     let mut samples = Vec::new();
 
     for chunk in encoded.chunks(257) {
-        let decoded = decoder.push(chunk).await.unwrap();
-        assert_eq!(decoded.sample_rate, ASR_SAMPLE_RATE);
-        samples.extend(decoded.samples);
+        let chunk_audio = decoder.push(chunk).await.unwrap();
+        assert_eq!(chunk_audio.sample_rate, ASR_SAMPLE_RATE);
+        samples.extend(chunk_audio.samples);
     }
-    let decoded = decoder.finish().await.unwrap();
-    assert_eq!(decoded.sample_rate, ASR_SAMPLE_RATE);
-    samples.extend(decoded.samples);
+    let final_audio = decoder.finish().await.unwrap();
+    assert_eq!(final_audio.sample_rate, ASR_SAMPLE_RATE);
+    samples.extend(final_audio.samples);
 
     assert!(!samples.is_empty());
 }
@@ -378,8 +378,7 @@ fn ffmpeg_available() -> bool {
     Command::new("ffmpeg")
         .arg("-version")
         .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|output| output.status.success())
 }
 
 fn wav_bytes() -> Vec<u8> {
@@ -392,9 +391,9 @@ fn wav_bytes() -> Vec<u8> {
     let mut cursor = Cursor::new(Vec::new());
     {
         let mut writer = hound::WavWriter::new(&mut cursor, spec).unwrap();
-        for index in 0..2_400 {
-            let phase = index as f32 / 24_000.0 * 440.0 * std::f32::consts::TAU;
-            let sample = (phase.sin() * f32::from(i16::MAX) * 0.25) as i16;
+        for index in 0_u16..2_400 {
+            let phase = f32::from(index) / 24_000.0 * 440.0 * std::f32::consts::TAU;
+            let sample = test_sample_to_i16(phase.sin() * 0.25);
             writer.write_sample(sample).unwrap();
         }
         writer.finalize().unwrap();
@@ -403,12 +402,24 @@ fn wav_bytes() -> Vec<u8> {
 }
 
 fn sine_samples(sample_rate: u32) -> Vec<f32> {
+    let sample_rate = u16::try_from(sample_rate).expect("test sample rate fits u16");
     (0..sample_rate)
         .map(|index| {
-            let phase = index as f32 / sample_rate as f32 * 440.0 * std::f32::consts::TAU;
+            let phase = f32::from(index) / f32::from(sample_rate) * 440.0 * std::f32::consts::TAU;
             phase.sin() * 0.25
         })
         .collect()
+}
+
+fn test_sample_to_i16(sample: f32) -> i16 {
+    let scaled = sample.clamp(-1.0, 1.0) * f32::from(i16::MAX);
+    assert!(scaled.is_finite(), "test sample must be finite");
+
+    // The finite clamped value is in the i16 range; test encoding intentionally truncates it.
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        scaled as i16
+    }
 }
 
 fn encode_m4a_for_test(audio: &TtsAudio) -> Vec<u8> {
@@ -416,7 +427,7 @@ fn encode_m4a_for_test(audio: &TtsAudio) -> Vec<u8> {
         .samples
         .iter()
         .flat_map(|sample| {
-            let sample = (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16;
+            let sample = test_sample_to_i16(*sample);
             sample.to_le_bytes()
         })
         .collect::<Vec<_>>();
@@ -462,7 +473,7 @@ fn encode_regular_m4a_file_for_test(audio: &TtsAudio) -> Vec<u8> {
         .samples
         .iter()
         .flat_map(|sample| {
-            let sample = (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16;
+            let sample = test_sample_to_i16(*sample);
             sample.to_le_bytes()
         })
         .collect::<Vec<_>>();

@@ -1,10 +1,7 @@
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use orchion::{
-    AsrSegment, AudioOutputFormat, ModelSpec, OcrResponseFormat, TtsLanguage, TtsOptions,
-    TtsSpeaker, TtsVoice,
-};
+use orchion::{AsrSegment, AudioOutputFormat, ModelSpec, OcrResponseFormat, TtsOptions, TtsVoice};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::path::PathBuf;
 use utoipa::ToSchema;
@@ -80,6 +77,20 @@ impl ApiError {
     }
 
     #[must_use]
+    pub fn resource_exhausted(resource: &'static str) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            error: ErrorObject {
+                message: format!("{resource} capacity is currently exhausted"),
+                error_type: "rate_limit_error",
+                param: None,
+                code: Some("resource_exhausted".to_string()),
+            },
+            log_message: None,
+        }
+    }
+
+    #[must_use]
     pub fn model_not_loaded(model: &str) -> Self {
         Self::invalid_request(
             format!("model `{model}` is not loaded by this server"),
@@ -146,8 +157,10 @@ impl ModelObject {
         model_type: ModelType,
         subtype: Option<ModelSubtype>,
     ) -> Self {
+        let id = model.huggingface_repo().to_string();
+        drop(model);
         Self {
-            id: model.huggingface_repo().to_string(),
+            id,
             object: "model",
             created: 0,
             owned_by: "orchion",
@@ -213,26 +226,47 @@ impl From<orchion::OrchionError> for ApiError {
             orchion::OrchionError::InvalidAudio { reason } => {
                 Self::invalid_request(reason, None, Some("invalid_audio"))
             }
+            orchion::OrchionError::InvalidImage { reason }
+            | orchion::OrchionError::InvalidDocument { reason } => {
+                Self::invalid_request(reason, Some("file"), Some("invalid_file"))
+            }
             other => Self::internal(other.to_string()),
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+impl From<crate::application::UseCaseError> for ApiError {
+    fn from(error: crate::application::UseCaseError) -> Self {
+        use crate::application::UseCaseError;
+
+        match error {
+            UseCaseError::InvalidRequest {
+                message,
+                param,
+                code,
+            } => Self::invalid_request(message, param, Some(code)),
+            UseCaseError::ModelNotAvailable(model) => Self::model_not_available(&model),
+            UseCaseError::ResourceExhausted(resource) => Self::resource_exhausted(resource),
+            UseCaseError::Core(error) => Self::from(error),
+            UseCaseError::ReferenceAudio(orchion::OrchionError::InvalidAudio { reason }) => {
+                Self::invalid_request(reason, Some("reference_audio"), Some("invalid_audio"))
+            }
+            UseCaseError::ReferenceAudio(error) => Self::internal(error.to_string()),
+            UseCaseError::Internal(message) => Self::internal(message),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SpeechFormat {
+    #[default]
     Wav,
     Mp3,
     Aac,
     Opus,
     Flac,
     Pcm,
-}
-
-impl Default for SpeechFormat {
-    fn default() -> Self {
-        Self::Wav
-    }
 }
 
 impl std::fmt::Display for SpeechFormat {
@@ -318,128 +352,50 @@ pub struct SpeechRequest {
 }
 
 impl SpeechRequest {
+    #[must_use]
     pub fn to_tts_options(&self) -> TtsOptions {
-        let defaults = TtsOptions::default();
-        TtsOptions {
-            seed: Some(self.seed.unwrap_or(42)),
-            temperature: self.temperature.unwrap_or(defaults.temperature),
-            top_k: self.top_k.unwrap_or(defaults.top_k),
-            top_p: self.top_p.unwrap_or(defaults.top_p),
-            repetition_penalty: self
-                .repetition_penalty
-                .unwrap_or(defaults.repetition_penalty),
-            max_length: self.max_length.unwrap_or(defaults.max_length),
-            ..defaults
-        }
+        crate::application::speech::to_tts_options(&self.application_command())
     }
 
+    /// # Errors
+    ///
+    /// Returns [`ApiError`] when the requested voice configuration is invalid.
     pub fn to_tts_voice(&self) -> Result<TtsVoice, ApiError> {
-        let language = self
-            .language
-            .as_deref()
-            .map(parse_language)
-            .transpose()?
-            .unwrap_or(TtsLanguage::Auto);
-        match normalize_identifier(&self.voice).as_str() {
-            "clone" => {
-                let reference_audio = self.reference_audio.as_ref().ok_or_else(|| {
-                    ApiError::invalid_request(
-                        "voice clone requires `reference_audio`",
-                        Some("reference_audio"),
-                        Some("missing_required_parameter"),
-                    )
-                })?;
-                let reference_text = self.reference_text.as_ref().ok_or_else(|| {
-                    ApiError::invalid_request(
-                        "voice clone requires `reference_text`",
-                        Some("reference_text"),
-                        Some("missing_required_parameter"),
-                    )
-                })?;
-                Ok(TtsVoice::Clone {
-                    reference_audio: PathBuf::from(reference_audio),
-                    reference_text: reference_text.clone(),
-                    language,
-                })
-            }
-            "design" => {
-                let prompt = self.voice_prompt.as_ref().ok_or_else(|| {
-                    ApiError::invalid_request(
-                        "voice design requires `voice_prompt`",
-                        Some("voice_prompt"),
-                        Some("missing_required_parameter"),
-                    )
-                })?;
-                Ok(TtsVoice::Design {
-                    prompt: prompt.clone(),
-                    language,
-                })
-            }
-            voice => Ok(TtsVoice::Preset {
-                speaker: parse_speaker(voice)?,
-                language,
-            }),
-        }
+        crate::application::speech::to_tts_voice(&self.application_command())
+            .map_err(ApiError::from)
     }
 
+    #[must_use]
     pub fn is_voice_clone(&self) -> bool {
         normalize_identifier(&self.voice) == "clone"
     }
 
+    /// # Errors
+    ///
+    /// Returns [`ApiError`] when any speech request parameter is invalid.
     pub fn validate(&self) -> Result<(), ApiError> {
-        if self.input.trim().is_empty() {
-            return Err(ApiError::invalid_request(
-                "`input` must not be empty",
-                Some("input"),
-                Some("empty_input"),
-            ));
+        crate::application::speech::validate(&self.application_command()).map_err(ApiError::from)
+    }
+
+    fn application_command(&self) -> crate::application::speech::SpeechCommand {
+        crate::application::speech::SpeechCommand {
+            model: self.model.clone(),
+            input: self.input.clone(),
+            voice: self.voice.clone(),
+            output_format: self.response_format.map(AudioOutputFormat::from),
+            speed: self.speed,
+            language: self.language.clone(),
+            reference_audio: self.reference_audio.as_deref().map(PathBuf::from),
+            reference_audio_output: None,
+            reference_text: self.reference_text.clone(),
+            voice_prompt: self.voice_prompt.clone(),
+            seed: self.seed,
+            temperature: self.temperature,
+            top_k: self.top_k,
+            top_p: self.top_p,
+            repetition_penalty: self.repetition_penalty,
+            max_length: self.max_length,
         }
-        if (self.speed - 1.0).abs() > f32::EPSILON {
-            return Err(ApiError::invalid_request(
-                "`speed` values other than 1.0 are not currently supported",
-                Some("speed"),
-                Some("unsupported_speed"),
-            ));
-        }
-        if self.temperature.is_some_and(|value| value <= 0.0) {
-            return Err(ApiError::invalid_request(
-                "`temperature` must be greater than 0",
-                Some("temperature"),
-                Some("invalid_temperature"),
-            ));
-        }
-        if self.top_k.is_some_and(|value| value == 0) {
-            return Err(ApiError::invalid_request(
-                "`top_k` must be greater than 0",
-                Some("top_k"),
-                Some("invalid_top_k"),
-            ));
-        }
-        if self
-            .top_p
-            .is_some_and(|value| !(0.0..=1.0).contains(&value))
-        {
-            return Err(ApiError::invalid_request(
-                "`top_p` must be between 0 and 1",
-                Some("top_p"),
-                Some("invalid_top_p"),
-            ));
-        }
-        if self.repetition_penalty.is_some_and(|value| value <= 0.0) {
-            return Err(ApiError::invalid_request(
-                "`repetition_penalty` must be greater than 0",
-                Some("repetition_penalty"),
-                Some("invalid_repetition_penalty"),
-            ));
-        }
-        if self.max_length.is_some_and(|value| value == 0) {
-            return Err(ApiError::invalid_request(
-                "`max_length` must be greater than 0",
-                Some("max_length"),
-                Some("invalid_max_length"),
-            ));
-        }
-        Ok(())
     }
 }
 
@@ -524,6 +480,17 @@ impl From<OcrApiFormat> for OcrResponseFormat {
     }
 }
 
+impl From<OcrResponseFormat> for OcrApiFormat {
+    fn from(format: OcrResponseFormat) -> Self {
+        match format {
+            OcrResponseFormat::Json => Self::Json,
+            OcrResponseFormat::Text => Self::Text,
+            OcrResponseFormat::Markdown => Self::Markdown,
+            OcrResponseFormat::Html => Self::Html,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct OcrJsonResponse {
     pub model: String,
@@ -558,46 +525,6 @@ impl From<SpeechFormat> for AudioOutputFormat {
 
 fn default_speed() -> f32 {
     1.0
-}
-
-fn parse_speaker(value: &str) -> Result<TtsSpeaker, ApiError> {
-    match normalize_identifier(value).as_str() {
-        "serena" => Ok(TtsSpeaker::Serena),
-        "vivian" => Ok(TtsSpeaker::Vivian),
-        "uncle-fu" | "unclefu" => Ok(TtsSpeaker::UncleFu),
-        "ryan" => Ok(TtsSpeaker::Ryan),
-        "aiden" => Ok(TtsSpeaker::Aiden),
-        "ono-anna" | "onoanna" => Ok(TtsSpeaker::OnoAnna),
-        "sohee" => Ok(TtsSpeaker::Sohee),
-        "eric" => Ok(TtsSpeaker::Eric),
-        "dylan" => Ok(TtsSpeaker::Dylan),
-        _ => Err(ApiError::invalid_request(
-            format!("unsupported voice `{value}`"),
-            Some("voice"),
-            Some("unsupported_voice"),
-        )),
-    }
-}
-
-fn parse_language(value: &str) -> Result<TtsLanguage, ApiError> {
-    match normalize_identifier(value).as_str() {
-        "" | "auto" => Ok(TtsLanguage::Auto),
-        "english" | "en" => Ok(TtsLanguage::English),
-        "chinese" | "zh" => Ok(TtsLanguage::Chinese),
-        "japanese" | "ja" => Ok(TtsLanguage::Japanese),
-        "korean" | "ko" => Ok(TtsLanguage::Korean),
-        "german" | "de" => Ok(TtsLanguage::German),
-        "french" | "fr" => Ok(TtsLanguage::French),
-        "russian" | "ru" => Ok(TtsLanguage::Russian),
-        "portuguese" | "pt" => Ok(TtsLanguage::Portuguese),
-        "spanish" | "es" => Ok(TtsLanguage::Spanish),
-        "italian" | "it" => Ok(TtsLanguage::Italian),
-        _ => Err(ApiError::invalid_request(
-            format!("unsupported language `{value}`"),
-            Some("language"),
-            Some("unsupported_language"),
-        )),
-    }
 }
 
 fn normalize_identifier(value: &str) -> String {
@@ -667,5 +594,23 @@ mod tests {
         assert_eq!(body.error.message, "internal server error");
         assert!(!body.error.message.contains("/tmp/orchion"));
         assert_eq!(body.error.code.as_deref(), Some("internal_error"));
+    }
+
+    #[test]
+    fn invalid_image_and_document_errors_use_invalid_file_shape() {
+        for error in [
+            orchion::OrchionError::InvalidImage {
+                reason: "bad image".to_string(),
+            },
+            orchion::OrchionError::InvalidDocument {
+                reason: "bad document".to_string(),
+            },
+        ] {
+            let (status, body) = ApiError::from(error).into_status_body();
+
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body.error.param.as_deref(), Some("file"));
+            assert_eq!(body.error.code.as_deref(), Some("invalid_file"));
+        }
     }
 }

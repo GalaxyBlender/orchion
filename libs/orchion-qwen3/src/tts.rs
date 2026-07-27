@@ -10,7 +10,13 @@ const VOICE_CLONE_ICL_PREFILL_TOKENS: usize = 9;
 const VOICE_CLONE_ICL_CODEC_BOS_TOKENS: usize = 1;
 const VOICE_CLONE_ICL_MIN_GENERATED_FRAMES: usize = 75;
 const VOICE_CLONE_ICL_EXTRA_CACHE_TOKENS: usize = 256;
+const LATIN_LANGUAGE_CONFIDENCE_THRESHOLD: f64 = 0.90;
 
+/// Qwen TTS inference engine.
+///
+/// [`TtsLanguage::Auto`] uses fast script detection for Japanese, Korean, Chinese, and
+/// Cyrillic text. Latin text must be detected as a Qwen-supported language with confidence
+/// greater than 0.90; otherwise synthesis returns an error and the caller must select a language.
 #[derive(Clone)]
 pub struct Tts {
     model: TtsModel,
@@ -114,8 +120,8 @@ impl Tts {
                     .synthesize_with_voice(
                         text.as_str(),
                         speaker_to_upstream(speaker),
-                        language_to_upstream(language),
-                        Some(options_to_upstream(options)),
+                        language_to_upstream(language, &text)?,
+                        Some(options_to_upstream(&options)),
                     )
                     .map_err(|source| OrchionError::Inference {
                         message: source.to_string(),
@@ -141,8 +147,8 @@ impl Tts {
                         .synthesize_voice_clone(
                             text.as_str(),
                             &prompt,
-                            language_to_upstream(language),
-                            Some(options_to_upstream(options)),
+                            language_to_upstream(language, &text)?,
+                            Some(options_to_upstream(&options)),
                         )
                         .map_err(|source| OrchionError::Inference {
                             message: source.to_string(),
@@ -152,8 +158,8 @@ impl Tts {
                     .synthesize_voice_design(
                         text.as_str(),
                         prompt.as_str(),
-                        language_to_upstream(language),
-                        Some(options_to_upstream(options)),
+                        language_to_upstream(language, &text)?,
+                        Some(options_to_upstream(&options)),
                     )
                     .map_err(|source| OrchionError::Inference {
                         message: source.to_string(),
@@ -186,31 +192,95 @@ fn speaker_to_upstream(speaker: TtsSpeaker) -> qwen3_tts::Speaker {
     }
 }
 
-fn language_to_upstream(language: TtsLanguage) -> qwen3_tts::Language {
-    match language {
-        TtsLanguage::Auto => qwen3_tts::Language::English,
-        TtsLanguage::English => qwen3_tts::Language::English,
-        TtsLanguage::Chinese => qwen3_tts::Language::Chinese,
-        TtsLanguage::Japanese => qwen3_tts::Language::Japanese,
-        TtsLanguage::Korean => qwen3_tts::Language::Korean,
-        TtsLanguage::German => qwen3_tts::Language::German,
-        TtsLanguage::French => qwen3_tts::Language::French,
-        TtsLanguage::Russian => qwen3_tts::Language::Russian,
-        TtsLanguage::Portuguese => qwen3_tts::Language::Portuguese,
-        TtsLanguage::Spanish => qwen3_tts::Language::Spanish,
-        TtsLanguage::Italian => qwen3_tts::Language::Italian,
+fn language_to_upstream(language: TtsLanguage, text: &str) -> Result<qwen3_tts::Language> {
+    let language = match language {
+        TtsLanguage::Auto => detect_language(text),
+        TtsLanguage::English => Ok(qwen3_tts::Language::English),
+        TtsLanguage::Chinese => Ok(qwen3_tts::Language::Chinese),
+        TtsLanguage::Japanese => Ok(qwen3_tts::Language::Japanese),
+        TtsLanguage::Korean => Ok(qwen3_tts::Language::Korean),
+        TtsLanguage::German => Ok(qwen3_tts::Language::German),
+        TtsLanguage::French => Ok(qwen3_tts::Language::French),
+        TtsLanguage::Russian => Ok(qwen3_tts::Language::Russian),
+        TtsLanguage::Portuguese => Ok(qwen3_tts::Language::Portuguese),
+        TtsLanguage::Spanish => Ok(qwen3_tts::Language::Spanish),
+        TtsLanguage::Italian => Ok(qwen3_tts::Language::Italian),
+    }?;
+    Ok(language)
+}
+
+fn detect_language(text: &str) -> Result<qwen3_tts::Language> {
+    if text
+        .chars()
+        .any(|character| matches!(character as u32, 0x3040..=0x30ff))
+    {
+        Ok(qwen3_tts::Language::Japanese)
+    } else if text
+        .chars()
+        .any(|character| matches!(character as u32, 0xac00..=0xd7af))
+    {
+        Ok(qwen3_tts::Language::Korean)
+    } else if text.chars().any(
+        |character| matches!(character as u32, 0x3400..=0x4dbf | 0x4e00..=0x9fff | 0xf900..=0xfaff),
+    ) {
+        Ok(qwen3_tts::Language::Chinese)
+    } else if text
+        .chars()
+        .any(|character| matches!(character as u32, 0x0400..=0x052f))
+    {
+        Ok(qwen3_tts::Language::Russian)
+    } else {
+        detect_latin_language(text)
     }
 }
 
-fn options_to_upstream(options: TtsOptions) -> qwen3_tts::SynthesisOptions {
-    let mut upstream = qwen3_tts::SynthesisOptions::default();
-    upstream.seed = options.seed;
-    upstream.temperature = options.temperature;
-    upstream.top_k = options.top_k;
-    upstream.top_p = options.top_p;
-    upstream.repetition_penalty = options.repetition_penalty;
-    upstream.max_length = options.max_length;
-    upstream
+fn detect_latin_language(text: &str) -> Result<qwen3_tts::Language> {
+    let info = whatlang::detect(text).ok_or_else(|| {
+        auto_language_error("could not determine a language from the provided text")
+    })?;
+
+    if info.script() != whatlang::Script::Latin {
+        return Err(auto_language_error(
+            "detected a script that Qwen does not support",
+        ));
+    }
+    if info.confidence() <= LATIN_LANGUAGE_CONFIDENCE_THRESHOLD {
+        return Err(auto_language_error(
+            "did not meet the required confidence threshold",
+        ));
+    }
+
+    match info.lang() {
+        whatlang::Lang::Eng => Ok(qwen3_tts::Language::English),
+        whatlang::Lang::Deu => Ok(qwen3_tts::Language::German),
+        whatlang::Lang::Fra => Ok(qwen3_tts::Language::French),
+        whatlang::Lang::Por => Ok(qwen3_tts::Language::Portuguese),
+        whatlang::Lang::Spa => Ok(qwen3_tts::Language::Spanish),
+        whatlang::Lang::Ita => Ok(qwen3_tts::Language::Italian),
+        _ => Err(auto_language_error(
+            "detected a language that Qwen does not support",
+        )),
+    }
+}
+
+fn auto_language_error(reason: &'static str) -> OrchionError {
+    OrchionError::Inference {
+        message: format!(
+            "TTS language auto-detection {reason}; specify the language explicitly and retry"
+        ),
+    }
+}
+
+fn options_to_upstream(options: &TtsOptions) -> qwen3_tts::SynthesisOptions {
+    qwen3_tts::SynthesisOptions {
+        seed: options.seed,
+        temperature: options.temperature,
+        top_k: options.top_k,
+        top_p: options.top_p,
+        repetition_penalty: options.repetition_penalty,
+        max_length: options.max_length,
+        ..Default::default()
+    }
 }
 
 fn audio_from_upstream(audio: qwen3_tts::AudioBuffer) -> TtsAudio {
@@ -282,8 +352,104 @@ mod tests {
             TtsLanguage::Italian,
         ];
         for language in languages {
-            let _ = language_to_upstream(language);
+            assert!(
+                language_to_upstream(
+                    language,
+                    "The weather is pleasant today, and we are taking a walk through the park."
+                )
+                .is_ok()
+            );
         }
+    }
+
+    #[test]
+    fn auto_language_detects_non_latin_scripts() {
+        assert!(matches!(
+            language_to_upstream(TtsLanguage::Auto, "你好"),
+            Ok(qwen3_tts::Language::Chinese)
+        ));
+        assert!(matches!(
+            language_to_upstream(TtsLanguage::Auto, "こんにちは"),
+            Ok(qwen3_tts::Language::Japanese)
+        ));
+        assert!(matches!(
+            language_to_upstream(TtsLanguage::Auto, "안녕하세요"),
+            Ok(qwen3_tts::Language::Korean)
+        ));
+        assert!(matches!(
+            language_to_upstream(TtsLanguage::Auto, "Привет"),
+            Ok(qwen3_tts::Language::Russian)
+        ));
+    }
+
+    #[test]
+    fn auto_language_detects_supported_latin_languages() {
+        assert!(matches!(
+            language_to_upstream(
+                TtsLanguage::Auto,
+                "The weather is pleasant today, and we are taking a walk through the park."
+            ),
+            Ok(qwen3_tts::Language::English)
+        ));
+        assert!(matches!(
+            language_to_upstream(
+                TtsLanguage::Auto,
+                "Der schnelle braune Fuchs springt über den faulen Hund, während die Sonne hinter den Hügeln untergeht."
+            ),
+            Ok(qwen3_tts::Language::German)
+        ));
+        assert!(matches!(
+            language_to_upstream(
+                TtsLanguage::Auto,
+                "Le renard brun et rapide saute par-dessus le chien paresseux pendant que le soleil se couche."
+            ),
+            Ok(qwen3_tts::Language::French)
+        ));
+        assert!(matches!(
+            language_to_upstream(
+                TtsLanguage::Auto,
+                "A rápida raposa marrom salta sobre o cão preguiçoso enquanto o sol se põe atrás das colinas."
+            ),
+            Ok(qwen3_tts::Language::Portuguese)
+        ));
+        assert!(matches!(
+            language_to_upstream(
+                TtsLanguage::Auto,
+                "El rápido zorro marrón salta sobre el perro perezoso mientras el sol se pone detrás de las colinas."
+            ),
+            Ok(qwen3_tts::Language::Spanish)
+        ));
+        assert!(matches!(
+            language_to_upstream(
+                TtsLanguage::Auto,
+                "Questa mattina sono andato al mercato per comprare pane fresco, frutta e verdura. Dopo aver fatto la spesa, ho incontrato alcuni amici e abbiamo bevuto un caffè insieme."
+            ),
+            Ok(qwen3_tts::Language::Italian)
+        ));
+    }
+
+    #[test]
+    fn auto_language_rejects_ambiguous_latin_text_without_exposing_it() {
+        let text = "Hello";
+        let error = language_to_upstream(TtsLanguage::Auto, text).unwrap_err();
+        let message = error.to_string();
+
+        assert!(matches!(error, OrchionError::Inference { .. }));
+        assert!(message.contains("confidence threshold"));
+        assert!(message.contains("specify the language explicitly"));
+        assert!(!message.contains(text));
+    }
+
+    #[test]
+    fn auto_language_rejects_unsupported_latin_language_without_exposing_it() {
+        let text = "De snelle bruine vos springt over de luie hond terwijl de zon achter de heuvels ondergaat.";
+        let error = language_to_upstream(TtsLanguage::Auto, text).unwrap_err();
+        let message = error.to_string();
+
+        assert!(matches!(error, OrchionError::Inference { .. }));
+        assert!(message.contains("does not support"));
+        assert!(message.contains("specify the language explicitly"));
+        assert!(!message.contains(text));
     }
 
     #[test]

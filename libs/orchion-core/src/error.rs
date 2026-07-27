@@ -9,6 +9,7 @@ pub struct DownloadFailure {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum OrchionError {
     #[error("invalid model source `{value}`; expected `auto`, `huggingface`, or `modelscope`")]
     InvalidModelSource { value: String },
@@ -40,6 +41,12 @@ pub enum OrchionError {
 
     #[error("invalid audio input: {reason}")]
     InvalidAudio { reason: String },
+
+    #[error("invalid image input: {reason}")]
+    InvalidImage { reason: String },
+
+    #[error("invalid document input: {reason}")]
+    InvalidDocument { reason: String },
 
     #[error("resampling failed: {reason}")]
     Resample { reason: String },

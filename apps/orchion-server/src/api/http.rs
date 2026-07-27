@@ -3,7 +3,7 @@ use crate::api::http_models::list_models;
 use crate::api::http_ocr::create_ocr;
 use crate::api::http_pdf_images::create_pdf_images;
 use crate::api::{docs, ui};
-use crate::infrastructure::orchion::AppState;
+use crate::application::ServerApplication;
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::http::header::LOCATION;
@@ -14,31 +14,41 @@ use std::sync::Arc;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
 use tracing::Level;
 
-pub fn router(state: Arc<AppState>) -> Router {
-    router_with_ui_routes(state, ui::routes())
+pub fn router<S>(state: Arc<S>) -> Router
+where
+    S: ServerApplication,
+{
+    router_with_ui_routes(state, ui::routes::<S>())
 }
 
-pub fn router_with_ui_routes(state: Arc<AppState>, ui_routes: Router<Arc<AppState>>) -> Router {
-    let max_upload_size = state.config().server.max_upload_size;
+pub fn router_with_ui_routes<S>(state: Arc<S>, ui_routes: Router<Arc<S>>) -> Router
+where
+    S: ServerApplication,
+{
+    let policy = state.api_policy();
+    let max_upload_size = policy.max_upload_size;
+    let tts_enabled = policy.tts_models.is_some();
+    let asr_enabled = policy.asr.is_some();
+    let ocr_enabled = policy.ocr.is_some() || policy.ocr_vl.is_some();
     let mut router = Router::new()
         .route("/", get(root_redirect))
         .route("/healthz", get(healthz))
-        .route("/v1/models", get(list_models))
-        .route("/v1/pdf/images", post(create_pdf_images));
+        .route("/v1/models", get(list_models::<S>))
+        .route("/v1/pdf/images", post(create_pdf_images::<S>));
 
-    if state.config().services.tts.enabled {
-        router = router.route("/v1/audio/speech", post(create_speech));
+    if tts_enabled {
+        router = router.route("/v1/audio/speech", post(create_speech::<S>));
     }
-    if state.config().services.asr.enabled {
+    if asr_enabled {
         router = router
-            .route("/v1/audio/transcriptions", post(create_transcription))
+            .route("/v1/audio/transcriptions", post(create_transcription::<S>))
             .route(
                 "/v1/audio/transcriptions/stream",
-                get(create_transcription_ws),
+                get(create_transcription_ws::<S>),
             );
     }
-    if state.config().services.ocr.active() || state.config().services.ocr_vl.active() {
-        router = router.route("/v1/ocr", post(create_ocr));
+    if ocr_enabled {
+        router = router.route("/v1/ocr", post(create_ocr::<S>));
     }
 
     router
@@ -69,19 +79,15 @@ async fn healthz() -> &'static str {
 mod tests {
     use super::*;
     use crate::api::http_audio::parse_timestamp_granularities;
-    use crate::api::http_ocr::{
-        OcrServiceChoice, resolve_ocr_layout_model, resolve_ocr_max_tokens,
-        resolve_ocr_response_format, resolve_ocr_service_choice, validate_ocr_parameters,
-    };
     use crate::api::http_shared::multipart_file_suffix;
-    use crate::api::openai::OcrApiFormat;
+    use crate::infrastructure::orchion::AppState;
     use crate::settings::ServerConfig;
     use axum::body::Body;
     use axum::http::header::CONTENT_TYPE;
     use axum::http::{Request, StatusCode};
     use axum::response::Response;
     use http_body_util::BodyExt;
-    use orchion::{AsrModel, KnownOcrModel, ModelId, OcrResponseFormat, OcrTask, TtsModel};
+    use orchion::{AsrModel, ModelId, TtsModel};
     use serde_json::Value;
     use std::time::Duration;
     use tower::ServiceExt;
@@ -326,209 +332,6 @@ mod tests {
         assert_eq!(body["error"]["param"], "scale");
     }
 
-    #[test]
-    fn resolve_ocr_service_choice_selects_ocr_vl_for_default_markdown() {
-        let state = test_state(true, true);
-
-        let choice =
-            resolve_ocr_service_choice(&state, None, Some(OcrApiFormat::Markdown)).unwrap();
-
-        assert_eq!(choice.model(), KnownOcrModel::PaddleOcrVl16);
-        assert!(choice.is_ocr_vl());
-    }
-
-    #[test]
-    fn resolve_ocr_service_choice_selects_ocr_vl_for_default_html() {
-        let state = test_state(true, true);
-
-        let choice = resolve_ocr_service_choice(&state, None, Some(OcrApiFormat::Html)).unwrap();
-
-        assert_eq!(choice.model(), KnownOcrModel::PaddleOcrVl16);
-        assert!(choice.is_ocr_vl());
-    }
-
-    #[test]
-    fn resolve_ocr_service_choice_defaults_ocr_vl_format_when_only_ocr_vl_is_active() {
-        let state = test_state(false, true);
-
-        let choice = resolve_ocr_service_choice(&state, None, None).unwrap();
-        let response_format = resolve_ocr_response_format(&state, choice, None);
-
-        assert_eq!(choice.model(), KnownOcrModel::PaddleOcrVl16);
-        assert!(choice.is_ocr_vl());
-        assert_eq!(response_format, OcrApiFormat::Markdown);
-    }
-
-    #[test]
-    fn resolve_ocr_service_choice_defaults_to_ocr_config_format_when_ocr_is_active() {
-        let state = test_state_with_config(true, true, |config| {
-            config.services.ocr.format = OcrResponseFormat::Text;
-        });
-
-        let choice = resolve_ocr_service_choice(&state, None, None).unwrap();
-        let response_format = resolve_ocr_response_format(&state, choice, None);
-
-        assert_eq!(choice.model(), KnownOcrModel::PpOcrV6Tiny);
-        assert!(!choice.is_ocr_vl());
-        assert_eq!(response_format, OcrApiFormat::Text);
-    }
-
-    #[test]
-    fn resolve_ocr_service_choice_keeps_explicit_markdown_preference_for_ocr_vl() {
-        let state = test_state(true, true);
-
-        let choice =
-            resolve_ocr_service_choice(&state, None, Some(OcrApiFormat::Markdown)).unwrap();
-        let response_format =
-            resolve_ocr_response_format(&state, choice, Some(OcrApiFormat::Markdown));
-
-        assert_eq!(choice.model(), KnownOcrModel::PaddleOcrVl16);
-        assert!(choice.is_ocr_vl());
-        assert_eq!(response_format, OcrApiFormat::Markdown);
-    }
-
-    #[test]
-    fn resolve_ocr_service_choice_selects_ocr_vl_fallback_for_default_markdown() {
-        let state = test_state_with_config(true, true, |config| {
-            let ocr_vl_model = ModelId::parse("PaddlePaddle/PaddleOCR-VL-1.6").unwrap();
-            config.services.ocr_vl.default_model = None;
-            config.services.ocr_vl.available_models = vec![ocr_vl_model];
-        });
-
-        let choice =
-            resolve_ocr_service_choice(&state, None, Some(OcrApiFormat::Markdown)).unwrap();
-
-        assert_eq!(choice.model(), KnownOcrModel::PaddleOcrVl16);
-        assert!(choice.is_ocr_vl());
-    }
-
-    #[test]
-    fn resolve_ocr_service_choice_selects_ocr_fallback_for_default_format() {
-        let state = test_state_with_config(true, true, |config| {
-            config.services.ocr.default_model = None;
-        });
-
-        let choice = resolve_ocr_service_choice(&state, None, None).unwrap();
-
-        assert_eq!(choice.model(), KnownOcrModel::PpOcrV6Tiny);
-        assert!(!choice.is_ocr_vl());
-    }
-
-    #[test]
-    fn resolve_ocr_layout_model_does_not_use_ocr_vl_layout_default_without_request_value() {
-        let state = test_state_with_config(false, true, |config| {
-            let layout_model = ModelId::parse("PaddlePaddle/PP-DocLayoutV3").unwrap();
-            config.services.ocr_vl.layout_default_model = Some(layout_model);
-        });
-        let choice = resolve_ocr_service_choice(&state, None, None).unwrap();
-
-        let resolved = resolve_ocr_layout_model(&state, choice, None);
-
-        assert_eq!(resolved, None);
-    }
-
-    #[test]
-    fn resolve_ocr_layout_model_does_not_use_ocr_layout_default_without_request_value() {
-        let state = test_state_with_config(true, false, |config| {
-            let layout_model = ModelId::parse("PaddlePaddle/PP-DocLayoutV3").unwrap();
-            config.services.ocr.layout_default_model = Some(layout_model);
-        });
-        let choice = resolve_ocr_service_choice(&state, None, None).unwrap();
-
-        let resolved = resolve_ocr_layout_model(&state, choice, None);
-
-        assert_eq!(resolved, None);
-    }
-
-    #[test]
-    fn validate_ocr_parameters_allows_markdown_for_traditional_layout() {
-        let layout_model = ModelId::parse("PaddlePaddle/PP-DocLayoutV3").unwrap();
-        let state = test_state_with_config(true, false, |config| {
-            config.services.ocr.layout_available_models = vec![layout_model.clone()];
-        });
-        let choice = OcrServiceChoice::Ocr {
-            model: KnownOcrModel::PpOcrV6Tiny,
-        };
-
-        validate_ocr_parameters(
-            choice,
-            OcrApiFormat::Markdown,
-            OcrTask::Ocr,
-            Some(&layout_model),
-            None,
-            &state.config().services.ocr,
-            &state.config().services.ocr_vl,
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn validate_ocr_parameters_rejects_unconfigured_traditional_layout() {
-        let state = test_state(true, false);
-        let layout_model = ModelId::parse("PaddlePaddle/PP-DocLayoutV3").unwrap();
-        let choice = OcrServiceChoice::Ocr {
-            model: KnownOcrModel::PpOcrV6Tiny,
-        };
-
-        let error = validate_ocr_parameters(
-            choice,
-            OcrApiFormat::Json,
-            OcrTask::Ocr,
-            Some(&layout_model),
-            None,
-            &state.config().services.ocr,
-            &state.config().services.ocr_vl,
-        )
-        .unwrap_err();
-
-        assert_eq!(error.error.code.as_deref(), Some("model_not_available"));
-        assert_eq!(error.error.param.as_deref(), Some("layout_model"));
-    }
-
-    #[test]
-    fn omitted_ocr_vl_max_tokens_uses_configured_limit() {
-        let state = test_state_with_config(false, true, |config| {
-            config.services.ocr_vl.max_tokens = 64;
-        });
-        let choice = OcrServiceChoice::OcrVl {
-            model: KnownOcrModel::PaddleOcrVl16,
-        };
-
-        assert_eq!(
-            resolve_ocr_max_tokens(choice, None, &state.config().services.ocr_vl),
-            Some(64)
-        );
-    }
-
-    #[test]
-    fn resolve_ocr_service_choice_rejects_unknown_explicit_model() {
-        let state = test_state(true, false);
-
-        let error = resolve_ocr_service_choice(
-            &state,
-            Some("Acme/Experimental-OCR"),
-            Some(OcrApiFormat::Json),
-        )
-        .unwrap_err();
-
-        assert_eq!(error.error.code.as_deref(), Some("model_not_available"));
-    }
-
-    #[test]
-    fn resolve_ocr_service_choice_rejects_traditional_model_not_configured_for_ocr_vl_service() {
-        let state = test_state(false, true);
-
-        let error = resolve_ocr_service_choice(
-            &state,
-            Some("PaddlePaddle/PP-OCRv6_tiny"),
-            Some(OcrApiFormat::Json),
-        )
-        .unwrap_err();
-
-        assert_eq!(error.error.code.as_deref(), Some("model_not_available"));
-        assert_eq!(error.error.param.as_deref(), Some("model"));
-    }
-
     async fn post_ocr(state: Arc<AppState>, boundary: &str, body: Vec<u8>) -> Response {
         router_with_ui_routes(state, Router::new())
             .oneshot(
@@ -630,8 +433,8 @@ mod tests {
             vec![AsrModel::parse("Qwen/Qwen3-ASR-0.6B").unwrap()];
         config.services.tts.available_models =
             vec![TtsModel::parse("Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice").unwrap()];
-        config.services.asr.idle_timeout = Duration::from_secs(600);
-        config.services.tts.idle_timeout = Duration::from_secs(600);
+        config.services.asr.idle_timeout = Duration::from_mins(10);
+        config.services.tts.idle_timeout = Duration::from_mins(10);
         configure(&mut config);
 
         Arc::new(AppState::from_prepared_config(config).unwrap())

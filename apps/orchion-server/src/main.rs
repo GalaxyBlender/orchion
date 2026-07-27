@@ -18,6 +18,7 @@ async fn main() -> ExitCode {
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
+            eprintln!("orchion server failed: {error:#}");
             tracing::error!(error = %format!("{error:#}"), "orchion server failed");
             ExitCode::FAILURE
         }

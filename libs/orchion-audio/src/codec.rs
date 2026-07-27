@@ -1,10 +1,8 @@
 use orchion_core::{ASR_SAMPLE_RATE, OrchionError, Result, TtsAudio};
-use std::fs;
 use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::str::FromStr;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, Command as TokioCommand};
 use tokio::sync::mpsc;
@@ -31,22 +29,6 @@ pub enum AudioInputFormat {
     Aac,
     Flac,
     Ogg,
-}
-
-impl AudioInputFormat {
-    const fn ffmpeg_input_args(self) -> &'static [&'static str] {
-        match self {
-            Self::Auto => &[],
-            Self::PcmS16Le => &[],
-            Self::WebmOpus => &[],
-            Self::Mp3 => &[],
-            Self::Wav => &[],
-            Self::M4a => &[],
-            Self::Aac => &[],
-            Self::Flac => &[],
-            Self::Ogg => &[],
-        }
-    }
 }
 
 impl FromStr for AudioInputFormat {
@@ -232,10 +214,18 @@ impl FfmpegAudioCodec {
 }
 
 impl StreamingAudioDecoder {
+    #[allow(
+        clippy::unused_async,
+        reason = "preserves the public async constructor API"
+    )]
     pub async fn new_for_asr(format: AudioInputFormat, sample_rate: Option<u32>) -> Result<Self> {
         Self::new_for_asr_inner(format, sample_rate, PathBuf::from("ffmpeg"), None)
     }
 
+    #[allow(
+        clippy::unused_async,
+        reason = "preserves the public async constructor API"
+    )]
     pub async fn new_for_asr_with_max_samples(
         format: AudioInputFormat,
         sample_rate: Option<u32>,
@@ -249,6 +239,10 @@ impl StreamingAudioDecoder {
         )
     }
 
+    #[allow(
+        clippy::unused_async,
+        reason = "preserves the public async constructor API"
+    )]
     pub async fn new_for_asr_with_binary(
         format: AudioInputFormat,
         sample_rate: Option<u32>,
@@ -257,6 +251,10 @@ impl StreamingAudioDecoder {
         Self::new_for_asr_inner(format, sample_rate, binary, None)
     }
 
+    #[allow(
+        clippy::unused_async,
+        reason = "preserves the public async constructor API"
+    )]
     pub async fn new_for_asr_with_binary_and_max_samples(
         format: AudioInputFormat,
         sample_rate: Option<u32>,
@@ -375,17 +373,13 @@ impl FfmpegStreamingDecoder {
         format: AudioInputFormat,
         max_output_samples: Option<usize>,
     ) -> Result<Self> {
+        let binary = binary.into_boxed_path();
         let mut args = vec![
             "-hide_banner".to_string(),
             "-loglevel".to_string(),
             "error".to_string(),
         ];
-        args.extend(
-            format
-                .ffmpeg_input_args()
-                .iter()
-                .map(|arg| (*arg).to_string()),
-        );
+        let _ = format;
         args.extend([
             "-i".to_string(),
             "pipe:0".to_string(),
@@ -398,7 +392,7 @@ impl FfmpegStreamingDecoder {
             "f32le".to_string(),
             "pipe:1".to_string(),
         ]);
-        let mut command = TokioCommand::new(&binary);
+        let mut command = TokioCommand::new(binary.as_ref());
         command
             .args(args)
             .stdin(Stdio::piped())
@@ -407,7 +401,7 @@ impl FfmpegStreamingDecoder {
             .kill_on_drop(true);
         let mut child = command
             .spawn()
-            .map_err(|error| ffmpeg_start_error(&binary, error))?;
+            .map_err(|error| ffmpeg_start_error(&binary, &error))?;
         let stdin = child
             .stdin
             .take()
@@ -470,12 +464,14 @@ impl FfmpegStreamingDecoder {
         let mut output_open = true;
         loop {
             if !output_open {
-                write_input.await.map_err(ffmpeg_stream_input_error)?;
+                write_input
+                    .await
+                    .map_err(|error| ffmpeg_stream_input_error(&error))?;
                 break;
             }
             tokio::select! {
                 result = &mut write_input => {
-                    result.map_err(ffmpeg_stream_input_error)?;
+                    result.map_err(|error| ffmpeg_stream_input_error(&error))?;
                     break;
                 }
                 chunk = self.stdout_rx.recv() => {
@@ -617,7 +613,7 @@ pub async fn decode_audio_file_with_max_samples(
 }
 
 pub fn decode_pcm_s16le_bytes(bytes: &[u8]) -> Result<Vec<f32>> {
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return Err(OrchionError::InvalidAudio {
             reason: "pcm_s16le byte length must be divisible by 2".to_string(),
         });
@@ -648,30 +644,15 @@ fn decode_for_asr_blocking(
     input: Vec<u8>,
     max_samples: Option<usize>,
 ) -> Result<DecodedAudio> {
+    let input = input.into_boxed_slice();
     if input.is_empty() {
         return Err(OrchionError::InvalidAudio {
             reason: "audio input bytes are empty".to_string(),
         });
     }
 
-    let input_path = write_temp_audio_input(&input)?;
-    let decoded = decode_file_for_asr_blocking(binary, &input_path, max_samples);
-    let remove_result = fs::remove_file(&input_path);
-    match decoded {
-        Ok(decoded) => {
-            remove_result.map_err(|error| OrchionError::InvalidAudio {
-                reason: format!(
-                    "failed to remove temporary audio input `{}`: {error}",
-                    input_path.display()
-                ),
-            })?;
-            Ok(decoded)
-        }
-        Err(error) => {
-            let _ = remove_result;
-            Err(error)
-        }
-    }
+    let input_file = write_temp_audio_input(&input)?;
+    decode_file_for_asr_blocking(binary, input_file.path(), max_samples)
 }
 
 fn decode_file_for_asr_blocking(
@@ -699,8 +680,7 @@ fn decode_file_for_asr_blocking(
     ];
     if let Some(max_samples) = max_samples {
         let probe_samples = max_samples.saturating_add(1);
-        let duration_seconds = probe_samples as f64 / f64::from(ASR_SAMPLE_RATE);
-        args.extend(["-t".to_string(), format!("{duration_seconds:.9}")]);
+        args.extend(["-t".to_string(), format_sample_duration(probe_samples)?]);
     }
     args.extend([
         "-vn".to_string(),
@@ -719,14 +699,12 @@ fn decode_file_for_asr_blocking(
             reason: "ffmpeg decoded audio to an empty sample buffer".to_string(),
         });
     }
-    if let Some(max_samples) = max_samples {
-        if samples.len() > max_samples {
-            return Err(OrchionError::InvalidAudio {
-                reason: format!(
-                    "decoded audio exceeds the configured sample limit of {max_samples}"
-                ),
-            });
-        }
+    if let Some(max_samples) = max_samples
+        && samples.len() > max_samples
+    {
+        return Err(OrchionError::InvalidAudio {
+            reason: format!("decoded audio exceeds the configured sample limit of {max_samples}"),
+        });
     }
     Ok(DecodedAudio {
         samples,
@@ -734,36 +712,33 @@ fn decode_file_for_asr_blocking(
     })
 }
 
-fn write_temp_audio_input(input: &[u8]) -> Result<PathBuf> {
-    let mut path = std::env::temp_dir();
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+fn write_temp_audio_input(input: &[u8]) -> Result<tempfile::NamedTempFile> {
+    let mut file = tempfile::Builder::new()
+        .prefix("orchion-audio-")
+        .suffix(".input")
+        .tempfile()
         .map_err(|error| OrchionError::InvalidAudio {
-            reason: format!("failed to create temporary audio filename: {error}"),
-        })?
-        .as_nanos();
-    path.push(format!(
-        "orchion-audio-{}-{unique}.input",
-        std::process::id()
-    ));
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .map_err(|error| OrchionError::InvalidAudio {
-            reason: format!(
-                "failed to create temporary audio input `{}`: {error}",
-                path.display()
-            ),
+            reason: format!("failed to create temporary audio input: {error}"),
         })?;
     file.write_all(input)
         .map_err(|error| OrchionError::InvalidAudio {
-            reason: format!(
-                "failed to write temporary audio input `{}`: {error}",
-                path.display()
-            ),
+            reason: format!("failed to write temporary audio input: {error}"),
         })?;
-    Ok(path)
+    Ok(file)
+}
+
+fn format_sample_duration(sample_count: usize) -> Result<String> {
+    let sample_rate = usize::try_from(ASR_SAMPLE_RATE).map_err(|_| OrchionError::InvalidAudio {
+        reason: "ASR sample rate does not fit usize".to_string(),
+    })?;
+    let whole_seconds = sample_count / sample_rate;
+    let fractional_nanos = (sample_count % sample_rate)
+        .checked_mul(1_000_000_000)
+        .ok_or_else(|| OrchionError::InvalidAudio {
+            reason: "audio duration exceeds supported range".to_string(),
+        })?
+        / sample_rate;
+    Ok(format!("{whole_seconds}.{fractional_nanos:09}"))
 }
 
 fn encode_tts_blocking(
@@ -868,7 +843,7 @@ fn run_ffmpeg_dynamic(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| ffmpeg_start_error(binary, error))?;
+        .map_err(|error| ffmpeg_start_error(binary, &error))?;
 
     let mut stdin = child
         .stdin
@@ -903,7 +878,7 @@ fn run_ffmpeg_dynamic(
     Ok(output.stdout)
 }
 
-fn ffmpeg_start_error(binary: &Path, error: std::io::Error) -> OrchionError {
+fn ffmpeg_start_error(binary: &Path, error: &std::io::Error) -> OrchionError {
     if error.kind() == std::io::ErrorKind::NotFound {
         OrchionError::InvalidAudio {
             reason: format!(
@@ -928,7 +903,7 @@ fn ffmpeg_status_error(operation: &str, status: std::process::ExitStatus, stderr
 }
 
 fn f32_samples_from_le_bytes(bytes: &[u8]) -> Result<Vec<f32>> {
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return Err(OrchionError::InvalidAudio {
             reason: "ffmpeg returned an invalid f32le byte stream".to_string(),
         });
@@ -961,18 +936,16 @@ where
             match reader.read(&mut buffer).await {
                 Ok(0) => break,
                 Ok(size) => {
-                    total_bytes = match total_bytes.checked_add(size) {
-                        Some(total_bytes) => total_bytes,
-                        None => {
-                            let _ = sender
-                                .send(Err(std::io::Error::new(
-                                    std::io::ErrorKind::FileTooLarge,
-                                    "streaming decoded audio exceeded the sample limit",
-                                )))
-                                .await;
-                            break;
-                        }
+                    let Some(next_total_bytes) = total_bytes.checked_add(size) else {
+                        let _ = sender
+                            .send(Err(std::io::Error::new(
+                                std::io::ErrorKind::FileTooLarge,
+                                "streaming decoded audio exceeded the sample limit",
+                            )))
+                            .await;
+                        break;
                     };
+                    total_bytes = next_total_bytes;
                     if max_bytes.is_some_and(|limit| total_bytes > limit) {
                         let _ = sender
                             .send(Err(std::io::Error::new(
@@ -1046,7 +1019,7 @@ fn append_ffmpeg_output(output: &mut Vec<u8>, chunk: std::io::Result<Vec<u8>>) -
     Ok(())
 }
 
-fn ffmpeg_stream_input_error(error: std::io::Error) -> OrchionError {
+fn ffmpeg_stream_input_error(error: &std::io::Error) -> OrchionError {
     OrchionError::InvalidAudio {
         reason: format!("failed to write audio bytes to ffmpeg: {error}"),
     }
@@ -1067,5 +1040,38 @@ fn s16_samples_to_le_bytes(samples: &[f32]) -> Vec<u8> {
 }
 
 fn sample_to_i16(sample: f32) -> i16 {
-    (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16
+    let scaled = sample.clamp(-1.0, 1.0) * f32::from(i16::MAX);
+    if !scaled.is_finite() {
+        return 0;
+    }
+
+    // Clamping proves the finite value is within the i16 range; truncation is intentional.
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        scaled as i16
+    }
+}
+
+#[cfg(test)]
+mod temp_file_tests {
+    use super::*;
+
+    #[test]
+    fn temporary_audio_input_is_removed_on_drop() {
+        let file = write_temp_audio_input(b"private audio").unwrap();
+        let path = file.path().to_path_buf();
+        assert!(path.exists());
+        drop(file);
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temporary_audio_input_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let file = write_temp_audio_input(b"private audio").unwrap();
+        let mode = file.as_file().metadata().unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
 }

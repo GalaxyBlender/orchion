@@ -1,4 +1,3 @@
-use crate::infrastructure::orchion::AppState;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::Path;
@@ -27,27 +26,36 @@ enum UiAssetSource {
     Embedded,
 }
 
-pub fn routes() -> Router<Arc<AppState>> {
+pub fn routes<S>() -> Router<Arc<S>>
+where
+    S: Send + Sync + 'static,
+{
     #[cfg(debug_assertions)]
     {
-        routes_from_path(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../web/dist"))
+        routes_from_path::<S>(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../web/dist"))
     }
 
     #[cfg(not(debug_assertions))]
     {
-        routes_for_assets(UiAssets {
+        routes_for_assets::<S>(UiAssets {
             source: UiAssetSource::Embedded,
         })
     }
 }
 
-pub fn routes_from_path(path: impl Into<PathBuf>) -> Router<Arc<AppState>> {
-    routes_for_assets(UiAssets {
+pub fn routes_from_path<S>(path: impl Into<PathBuf>) -> Router<Arc<S>>
+where
+    S: Send + Sync + 'static,
+{
+    routes_for_assets::<S>(UiAssets {
         source: UiAssetSource::Path(path.into()),
     })
 }
 
-pub fn routes_for_assets(assets: UiAssets) -> Router<Arc<AppState>> {
+pub fn routes_for_assets<S>(assets: UiAssets) -> Router<Arc<S>>
+where
+    S: Send + Sync + 'static,
+{
     let assets = Arc::new(assets);
     Router::new()
         .route(
@@ -80,7 +88,7 @@ async fn serve_ui_path(assets: Arc<UiAssets>, requested_path: String) -> Respons
     let index = match assets.read_file("index.html").await {
         Ok(Some(index)) => index,
         Ok(None) => return missing_dist_response(),
-        Err(error) => return read_error_response(error),
+        Err(error) => return read_error_response(&error),
     };
 
     if path.is_empty() {
@@ -91,7 +99,7 @@ async fn serve_ui_path(assets: Arc<UiAssets>, requested_path: String) -> Respons
         Ok(Some(asset)) => asset_response(path, asset),
         Ok(None) if has_file_extension(path) => not_found_response(),
         Ok(None) => asset_response("index.html", index),
-        Err(error) => read_error_response(error),
+        Err(error) => read_error_response(&error),
     }
 }
 
@@ -158,7 +166,7 @@ fn not_found_response() -> Response {
     )
 }
 
-fn read_error_response(error: std::io::Error) -> Response {
+fn read_error_response(error: &std::io::Error) -> Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         format!("failed to read UI asset: {error}"),

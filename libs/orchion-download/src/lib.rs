@@ -1,7 +1,19 @@
+mod assets;
+mod provider;
+mod transaction;
+
+pub use provider::{
+    DownloadFuture, DownloadProvider, DownloadProviderRegistry, DownloadSource, HubProviderOptions,
+    HuggingFaceProvider, ModelScopeProvider, ProviderDownloadRequest, ProviderDownloadResult,
+    ProviderModel, ResolvedDownloadFuture,
+};
+
+use assets::{ModelHubAsset, ModelHubAssetKind, uses_modelscope_file_assets};
 use orchion_core::{DownloadFailure, ModelCategory, ModelId, ModelSpec, OrchionError, Result};
-use std::fs::OpenOptions;
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::future::Future;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -10,27 +22,11 @@ use std::time::Duration;
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 const READY_MANIFEST_FILE: &str = ".orchion-ready.json";
-const READY_MANIFEST_SCHEMA_VERSION: u64 = 1;
+const READY_MANIFEST_SCHEMA_VERSION: u64 = 3;
 const READY_MANIFEST_LAYOUT: &str = "model-hub-native";
-const DOWNLOAD_LOCK_FILE: &str = ".orchion-download.lock";
 const PUBLISH_TRANSACTION_DIR: &str = ".orchion-publish-transaction";
 const PUBLISH_TRANSACTION_MANIFEST: &str = "manifest.json";
 const PUBLISH_TRANSACTION_COMMITTED: &str = "committed";
-
-struct CacheDownloadLock(std::fs::File);
-
-impl Drop for CacheDownloadLock {
-    fn drop(&mut self) {
-        let _ = fs2::FileExt::unlock(&self.0);
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DownloadSource {
-    Auto,
-    HuggingFace,
-    ModelScope,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DownloadEnv {
@@ -44,129 +40,25 @@ enum ResolvedSource {
     ModelScope,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum ModelHubAssetKind {
-    RequiredFile,
-    PaddleOcrDictionary { output_file: &'static str },
-    ModelScopeFile { output_file: &'static str },
+#[derive(Debug)]
+struct RequiredCacheFile {
+    repo: String,
+    path: String,
+    absolute_path: PathBuf,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct ModelHubAsset {
-    repo: &'static str,
-    file: &'static str,
-    kind: ModelHubAssetKind,
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepositoryRequest {
+    identity: String,
+    repository: String,
+    requested_revision: String,
 }
 
-const PP_OCRV5_MOBILE_ASSETS: &[ModelHubAsset] = &[
-    ModelHubAsset {
-        repo: "greatv/oar-ocr",
-        file: "pp-ocrv5_mobile_det.onnx",
-        kind: ModelHubAssetKind::ModelScopeFile {
-            output_file: "pp-ocrv5_mobile_det.onnx",
-        },
-    },
-    ModelHubAsset {
-        repo: "greatv/oar-ocr",
-        file: "pp-ocrv5_mobile_rec.onnx",
-        kind: ModelHubAssetKind::ModelScopeFile {
-            output_file: "pp-ocrv5_mobile_rec.onnx",
-        },
-    },
-    ModelHubAsset {
-        repo: "greatv/oar-ocr",
-        file: "ppocrv5_dict.txt",
-        kind: ModelHubAssetKind::ModelScopeFile {
-            output_file: "ppocrv5_dict.txt",
-        },
-    },
-];
-
-const PP_OCRV5_SERVER_ASSETS: &[ModelHubAsset] = &[
-    ModelHubAsset {
-        repo: "PaddlePaddle/PP-OCRv5_server_det_onnx",
-        file: "inference.onnx",
-        kind: ModelHubAssetKind::RequiredFile,
-    },
-    ModelHubAsset {
-        repo: "PaddlePaddle/PP-OCRv5_server_rec_onnx",
-        file: "inference.onnx",
-        kind: ModelHubAssetKind::RequiredFile,
-    },
-    ModelHubAsset {
-        repo: "PaddlePaddle/PP-OCRv5_server_rec_onnx",
-        file: "inference.yml",
-        kind: ModelHubAssetKind::PaddleOcrDictionary {
-            output_file: "ppocrv5_dict.txt",
-        },
-    },
-];
-
-const PP_OCRV6_TINY_ASSETS: &[ModelHubAsset] = &[
-    ModelHubAsset {
-        repo: "PaddlePaddle/PP-OCRv6_tiny_det_onnx",
-        file: "inference.onnx",
-        kind: ModelHubAssetKind::RequiredFile,
-    },
-    ModelHubAsset {
-        repo: "PaddlePaddle/PP-OCRv6_tiny_rec_onnx",
-        file: "inference.onnx",
-        kind: ModelHubAssetKind::RequiredFile,
-    },
-    ModelHubAsset {
-        repo: "PaddlePaddle/PP-OCRv6_tiny_rec_onnx",
-        file: "inference.yml",
-        kind: ModelHubAssetKind::PaddleOcrDictionary {
-            output_file: "ppocrv6_tiny_dict.txt",
-        },
-    },
-];
-
-const PP_OCRV6_SMALL_ASSETS: &[ModelHubAsset] = &[
-    ModelHubAsset {
-        repo: "PaddlePaddle/PP-OCRv6_small_det_onnx",
-        file: "inference.onnx",
-        kind: ModelHubAssetKind::RequiredFile,
-    },
-    ModelHubAsset {
-        repo: "PaddlePaddle/PP-OCRv6_small_rec_onnx",
-        file: "inference.onnx",
-        kind: ModelHubAssetKind::RequiredFile,
-    },
-    ModelHubAsset {
-        repo: "PaddlePaddle/PP-OCRv6_small_rec_onnx",
-        file: "inference.yml",
-        kind: ModelHubAssetKind::PaddleOcrDictionary {
-            output_file: "ppocrv6_dict.txt",
-        },
-    },
-];
-
-const PP_OCRV6_MEDIUM_ASSETS: &[ModelHubAsset] = &[
-    ModelHubAsset {
-        repo: "PaddlePaddle/PP-OCRv6_medium_det_onnx",
-        file: "inference.onnx",
-        kind: ModelHubAssetKind::RequiredFile,
-    },
-    ModelHubAsset {
-        repo: "PaddlePaddle/PP-OCRv6_medium_rec_onnx",
-        file: "inference.onnx",
-        kind: ModelHubAssetKind::RequiredFile,
-    },
-    ModelHubAsset {
-        repo: "PaddlePaddle/PP-OCRv6_medium_rec_onnx",
-        file: "inference.yml",
-        kind: ModelHubAssetKind::PaddleOcrDictionary {
-            output_file: "ppocrv6_dict.txt",
-        },
-    },
-];
-
-const PP_DOCLAYOUTV3_ASSETS: &[ModelHubAsset] = &[ModelHubAsset {
-    repo: "PaddlePaddle/PP-DocLayoutV3_onnx",
-    file: "inference.onnx",
-    kind: ModelHubAssetKind::RequiredFile,
-}];
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepositoryDownload {
+    request: RepositoryRequest,
+    resolved_revision: Option<String>,
+}
 
 impl ResolvedSource {
     const fn label(self) -> &'static str {
@@ -174,6 +66,46 @@ impl ResolvedSource {
             Self::HuggingFace => "huggingface",
             Self::ModelScope => "modelscope",
         }
+    }
+
+    #[cfg(test)]
+    const fn default_revision(self) -> &'static str {
+        match self {
+            Self::HuggingFace => "main",
+            Self::ModelScope => "master",
+        }
+    }
+
+    #[cfg(test)]
+    fn repo<M: ModelSpec>(self, model: &M) -> &str {
+        match self {
+            Self::HuggingFace => model.huggingface_repo(),
+            Self::ModelScope => model.modelscope_repo(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl DownloadProvider for ResolvedSource {
+    fn label(&self) -> &'static str {
+        (*self).label()
+    }
+
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn default_revision(&self) -> &str {
+        (*self).default_revision()
+    }
+
+    fn repository(&self, model: ProviderModel<'_>) -> String {
+        match self {
+            Self::HuggingFace => model.huggingface_repo(),
+            Self::ModelScope => model.modelscope_repo(),
+        }
+        .to_string()
+    }
+
+    fn download<'a>(&'a self, _request: ProviderDownloadRequest<'a>) -> DownloadFuture<'a> {
+        Box::pin(async { unreachable!("test manifest provider does not download") })
     }
 }
 
@@ -187,7 +119,9 @@ impl DownloadEnv {
 }
 
 fn resolve_source(source: DownloadSource, env: &DownloadEnv) -> Result<Vec<ResolvedSource>> {
-    if let Some(value) = env.orchion_model_source.as_deref() {
+    if matches!(source, DownloadSource::Auto)
+        && let Some(value) = env.orchion_model_source.as_deref()
+    {
         return match value.trim().to_ascii_lowercase().as_str() {
             "auto" => Ok(vec![
                 ResolvedSource::HuggingFace,
@@ -211,10 +145,32 @@ fn resolve_source(source: DownloadSource, env: &DownloadEnv) -> Result<Vec<Resol
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderSelection {
+    BuiltIn(DownloadSource),
+    Registry,
+}
+
+#[derive(Clone)]
 pub struct ModelDownloader {
-    source: DownloadSource,
+    selection: ProviderSelection,
+    providers: DownloadProviderRegistry,
+    revision: Option<String>,
+    repository_revisions: HashMap<String, String>,
     huggingface_available: Arc<tokio::sync::OnceCell<bool>>,
+}
+
+impl std::fmt::Debug for ModelDownloader {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ModelDownloader")
+            .field("selection", &self.selection)
+            .field("providers", &self.providers)
+            .field("revision", &self.revision)
+            .field("repository_revisions", &self.repository_revisions)
+            .field("huggingface_available", &self.huggingface_available)
+            .finish()
+    }
 }
 
 impl Default for ModelDownloader {
@@ -224,13 +180,61 @@ impl Default for ModelDownloader {
 }
 
 impl ModelDownloader {
+    #[must_use]
     pub fn new(source: DownloadSource) -> Self {
         Self {
-            source,
+            selection: ProviderSelection::BuiltIn(source),
+            providers: DownloadProviderRegistry::new()
+                .with_provider(HuggingFaceProvider::new())
+                .with_provider(ModelScopeProvider::new()),
+            revision: None,
+            repository_revisions: HashMap::new(),
             huggingface_available: Arc::new(tokio::sync::OnceCell::const_new()),
         }
     }
 
+    #[must_use]
+    pub fn from_provider<P>(provider: P) -> Self
+    where
+        P: DownloadProvider,
+    {
+        Self::from_registry(DownloadProviderRegistry::new().with_provider(provider))
+    }
+
+    #[must_use]
+    pub fn from_registry(providers: DownloadProviderRegistry) -> Self {
+        Self {
+            selection: ProviderSelection::Registry,
+            providers,
+            revision: None,
+            repository_revisions: HashMap::new(),
+            huggingface_available: Arc::new(tokio::sync::OnceCell::const_new()),
+        }
+    }
+
+    #[must_use]
+    pub fn with_revision(mut self, revision: impl Into<String>) -> Self {
+        self.revision = Some(revision.into());
+        self
+    }
+
+    /// Selects a revision for one provider-neutral repository identity.
+    #[must_use]
+    pub fn with_repository_revision(
+        mut self,
+        repository: impl Into<String>,
+        revision: impl Into<String>,
+    ) -> Self {
+        self.repository_revisions
+            .insert(repository.into(), revision.into());
+        self
+    }
+
+    /// Downloads and transactionally publishes a model into the cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when provider selection, download, validation, or cache publication fails.
     pub async fn download<M: ModelSpec>(
         &self,
         model: M,
@@ -259,6 +263,7 @@ impl ModelDownloader {
             .await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn download_with_client_and_probe<M: ModelSpec, C: DownloadClient, P: SourceProbe>(
         &self,
         model: M,
@@ -268,6 +273,13 @@ impl ModelDownloader {
         env: &DownloadEnv,
     ) -> Result<PathBuf> {
         let cache_dir = cache_dir.as_ref();
+        if let Some(revision) = self.revision.as_deref() {
+            validate_revision(model.huggingface_repo(), revision)?;
+        }
+        for (repo, revision) in &self.repository_revisions {
+            validate_repo_id(repo)?;
+            validate_revision(repo, revision)?;
+        }
         validate_repo_id(model.huggingface_repo())?;
         validate_repo_id(model.modelscope_repo())?;
         for asset in model_hub_assets(&model) {
@@ -282,7 +294,8 @@ impl ModelDownloader {
                 repo: model.huggingface_repo().to_string(),
                 message: error.to_string(),
             })?;
-        let _cache_lock = acquire_cache_download_lock(cache_dir, model.huggingface_repo()).await?;
+        let model_lock =
+            transaction::acquire_model_lock(cache_dir, model.huggingface_repo()).await?;
         for repo in std::iter::once(model.huggingface_repo())
             .chain(model_hub_assets(&model).iter().map(|asset| asset.repo))
         {
@@ -294,16 +307,20 @@ impl ModelDownloader {
                     message: error.to_string(),
                 })?;
         }
-        let publication_clean =
-            recover_interrupted_publication(cache_dir)
-                .await
-                .map_err(|error| OrchionError::Download {
-                    source_name: "cache",
-                    repo: model.huggingface_repo().to_string(),
-                    message: format!("failed to recover interrupted cache publication: {error}"),
-                })?;
+        let (mut model_lock, publication_clean) = recover_with_owned_locks(
+            cache_dir.to_path_buf(),
+            model.huggingface_repo().to_string(),
+            model_lock,
+        )
+        .await?;
 
-        if is_ready_cache(&model, &target).await? {
+        let assets = model_hub_assets(&model);
+        let cache_sources = self.configured_providers(
+            env,
+            uses_modelscope_file_assets(assets),
+            model.huggingface_repo(),
+        )?;
+        if is_ready_cache(&model, &target, &cache_sources, self).await? {
             tracing::debug!(model = ?model, path = %target.display(), "model cache ready");
             return Ok(target);
         }
@@ -320,9 +337,10 @@ impl ModelDownloader {
             unreachable!("direct asset downloads are not implemented yet");
         }
 
-        let assets = model_hub_assets(&model);
-        let candidates = if uses_modelscope_file_assets(assets) {
-            vec![ResolvedSource::ModelScope]
+        let candidates = if uses_modelscope_file_assets(assets)
+            && matches!(self.selection, ProviderSelection::BuiltIn(_))
+        {
+            self.configured_providers(env, true, model.huggingface_repo())?
         } else {
             self.resolve_candidates(env, probe).await?
         };
@@ -334,108 +352,112 @@ impl ModelDownloader {
         );
         let mut failures = Vec::new();
         for candidate in candidates {
+            let source_name = candidate.label();
+            let repo = candidate.repository(provider_model(&model));
+            let repository_requests =
+                self.repository_requests(&model, candidate.as_ref(), assets)?;
             let staging = tempfile::Builder::new()
                 .prefix(".orchion-download-")
                 .tempdir_in(cache_dir)
                 .map_err(|error| OrchionError::Download {
-                    source_name: candidate.label(),
+                    source_name,
                     repo: model.huggingface_repo().to_string(),
                     message: error.to_string(),
                 })?;
             let staging_root = staging.path();
             let staging_target = validated_model_cache_path(&model, staging_root)?;
-            if !assets.is_empty() {
-                match download_hub_assets(
-                    &model,
-                    candidate,
-                    assets,
-                    staging_root,
-                    &staging_target,
-                    client,
-                    env,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        prepare_cached_model(&model, &staging_target, candidate.label()).await?;
-                        ensure_ready_cache_files(&model, &staging_target, candidate.label())
-                            .await?;
-                        write_ready_manifest(&model, &staging_target, candidate.label()).await?;
-                        publish_staged_cache(
-                            &model,
-                            assets,
+            let preparation_result = async {
+                let downloads = if assets.is_empty() {
+                    let request = &repository_requests[0];
+                    tracing::info!(
+                        source = source_name,
+                        repo = request.repository,
+                        path = %target.display(),
+                        "downloading model"
+                    );
+                    let result = client
+                        .download(
+                            candidate.as_ref(),
+                            &request.repository,
                             staging_root,
-                            cache_dir,
-                            candidate.label(),
+                            &staging_target,
+                            None,
+                            &request.requested_revision,
+                            env,
                         )
                         .await?;
-                        tracing::info!(
-                            source = candidate.label(),
-                            path = %target.display(),
-                            "model asset download completed"
-                        );
-                        return Ok(target);
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            source = candidate.label(),
-                            path = %target.display(),
-                            error = %error,
-                            "model asset download failed"
-                        );
-                        failures.push(DownloadFailure {
-                            source_name: candidate.label(),
-                            message: error.to_string(),
-                        });
-                    }
-                }
-                continue;
-            }
-
-            let repo = match candidate {
-                ResolvedSource::HuggingFace => model.huggingface_repo(),
-                ResolvedSource::ModelScope => model.modelscope_repo(),
-            };
-            tracing::info!(
-                source = candidate.label(),
-                repo,
-                path = %target.display(),
-                "downloading model"
-            );
-            match client
-                .download(candidate, repo, staging_root, &staging_target, None, env)
-                .await
-            {
-                Ok(()) => {
-                    prepare_cached_model(&model, &staging_target, candidate.label()).await?;
-                    ensure_ready_cache_files(&model, &staging_target, candidate.label()).await?;
-                    write_ready_manifest(&model, &staging_target, candidate.label()).await?;
-                    publish_staged_cache(
+                    vec![RepositoryDownload {
+                        request: request.clone(),
+                        resolved_revision: result.resolved_revision().map(str::to_string),
+                    }]
+                } else {
+                    download_hub_assets(
                         &model,
+                        candidate.as_ref(),
                         assets,
+                        &repository_requests,
                         staging_root,
-                        cache_dir,
-                        candidate.label(),
+                        &staging_target,
+                        client,
+                        env,
+                    )
+                    .await?
+                };
+                prepare_cached_model(&model, &staging_target, source_name).await?;
+                ensure_ready_cache_files(&model, &staging_target, source_name).await?;
+                write_ready_manifest(
+                    &model,
+                    &staging_target,
+                    candidate.as_ref(),
+                    &repo,
+                    self.repository_revision(
+                        model.huggingface_repo(),
+                        model.huggingface_repo(),
+                        candidate.as_ref(),
+                    ),
+                    &downloads,
+                )
+                .await?;
+                Ok::<_, OrchionError>(())
+            }
+            .await;
+            let transaction_result = match preparation_result {
+                Ok(()) => {
+                    let repos = publication_repositories(&model, assets);
+                    let (returned_lock, result) = publish_staged_cache(
+                        model.huggingface_repo().to_string(),
+                        repos,
+                        staging,
+                        cache_dir.to_path_buf(),
+                        source_name,
+                        model_lock,
                     )
                     .await?;
+                    model_lock = returned_lock;
+                    result
+                }
+                Err(error) => Err(error),
+            };
+            match transaction_result {
+                Ok(()) => {
                     tracing::info!(
-                        source = candidate.label(),
+                        source = source_name,
                         repo,
                         path = %target.display(),
-                        "model download completed"
+                        "model candidate transaction completed"
                     );
                     return Ok(target);
                 }
                 Err(error) => {
                     tracing::warn!(
-                        source = candidate.label(),
+                        source = source_name,
                         repo,
                         path = %target.display(),
                         error = %error,
-                        "model download failed"
+                        "model candidate transaction failed"
                     );
                     failures.push(DownloadFailure {
-                        source_name: candidate.label(),
+                        source_name,
                         message: error.to_string(),
                     });
                 }
@@ -448,13 +470,100 @@ impl ModelDownloader {
         })
     }
 
+    fn repository_requests<M: ModelSpec>(
+        &self,
+        model: &M,
+        provider: &dyn DownloadProvider,
+        assets: &[ModelHubAsset],
+    ) -> Result<Vec<RepositoryRequest>> {
+        let mut identities = Vec::new();
+        if assets.is_empty() {
+            identities.push(model.huggingface_repo());
+        } else {
+            for asset in assets {
+                if !identities.contains(&asset.repo) {
+                    identities.push(asset.repo);
+                }
+            }
+        }
+
+        identities
+            .into_iter()
+            .map(|identity| {
+                let repository = if identity == model.huggingface_repo() {
+                    provider.repository(provider_model(model))
+                } else {
+                    provider.repository(ProviderModel::for_repository(identity))
+                };
+                let requested_revision = self
+                    .repository_revision(identity, model.huggingface_repo(), provider)
+                    .to_string();
+                validate_revision(identity, &requested_revision)?;
+                Ok(RepositoryRequest {
+                    identity: identity.to_string(),
+                    repository,
+                    requested_revision,
+                })
+            })
+            .collect()
+    }
+
+    fn repository_revision<'a>(
+        &'a self,
+        identity: &str,
+        canonical_identity: &str,
+        provider: &'a dyn DownloadProvider,
+    ) -> &'a str {
+        if identity == canonical_identity
+            && let Some(revision) = self.revision.as_deref()
+        {
+            return revision;
+        }
+        self.repository_revisions
+            .get(identity)
+            .map_or_else(|| provider.default_revision(), String::as_str)
+    }
+
+    fn configured_providers(
+        &self,
+        env: &DownloadEnv,
+        require_modelscope: bool,
+        model_repo: &str,
+    ) -> Result<Vec<Arc<dyn DownloadProvider>>> {
+        if matches!(self.selection, ProviderSelection::Registry) {
+            return Ok(self.providers.providers().iter().map(Arc::clone).collect());
+        }
+        let ProviderSelection::BuiltIn(source) = self.selection else {
+            unreachable!("registry selection returned above");
+        };
+        let mut sources = resolve_source(source, env)?;
+        if require_modelscope {
+            if !sources.contains(&ResolvedSource::ModelScope) {
+                return Err(OrchionError::Download {
+                    source_name: "huggingface",
+                    repo: model_repo.to_string(),
+                    message: "model has assets that are only available from ModelScope".to_string(),
+                });
+            }
+            sources.retain(|source| *source == ResolvedSource::ModelScope);
+        }
+        Ok(sources
+            .into_iter()
+            .filter_map(|source| self.providers.provider(source.label()))
+            .collect())
+    }
+
     async fn resolve_candidates<P: SourceProbe>(
         &self,
         env: &DownloadEnv,
         probe: &P,
-    ) -> Result<Vec<ResolvedSource>> {
-        let candidates = resolve_source(self.source, env)?;
-        if self.source != DownloadSource::Auto || env.orchion_model_source.is_some() {
+    ) -> Result<Vec<Arc<dyn DownloadProvider>>> {
+        let candidates = self.configured_providers(env, false, "provider-selection")?;
+        if !matches!(
+            self.selection,
+            ProviderSelection::BuiltIn(DownloadSource::Auto)
+        ) || env.orchion_model_source.is_some()
+        {
             return Ok(candidates);
         }
         if *self
@@ -467,7 +576,7 @@ impl ModelDownloader {
             tracing::warn!("huggingface unavailable; using modelscope download source");
             Ok(candidates
                 .into_iter()
-                .filter(|source| *source != ResolvedSource::HuggingFace)
+                .filter(|provider| provider.label() != "huggingface")
                 .collect())
         }
     }
@@ -493,6 +602,23 @@ fn validate_repo_id(repo: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_revision(repo: &str, revision: &str) -> Result<()> {
+    if revision.trim().is_empty()
+        || revision.chars().any(char::is_control)
+        || revision.contains(['\\', '?', '#'])
+        || revision
+            .split('/')
+            .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
+    {
+        return Err(OrchionError::Download {
+            source_name: "cache",
+            repo: repo.to_string(),
+            message: format!("invalid model revision `{revision}`"),
+        });
+    }
+    Ok(())
+}
+
 fn validated_model_cache_path<M: ModelSpec>(model: &M, cache_dir: &Path) -> Result<PathBuf> {
     let path = model.cache_path(cache_dir);
     let expected = repo_cache_path(cache_dir, model.huggingface_repo());
@@ -510,41 +636,7 @@ fn validated_model_cache_path<M: ModelSpec>(model: &M, cache_dir: &Path) -> Resu
     Ok(path)
 }
 
-async fn acquire_cache_download_lock(cache_dir: &Path, repo: &str) -> Result<CacheDownloadLock> {
-    let lock_path = cache_dir.join(DOWNLOAD_LOCK_FILE);
-    let repo = repo.to_string();
-    tokio::task::spawn_blocking(move || {
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(lock_path)
-            .map_err(|error| OrchionError::Download {
-                source_name: "cache",
-                repo: repo.clone(),
-                message: error.to_string(),
-            })?;
-        fs2::FileExt::lock_exclusive(&file).map_err(|error| OrchionError::Download {
-            source_name: "cache",
-            repo,
-            message: error.to_string(),
-        })?;
-        Ok(CacheDownloadLock(file))
-    })
-    .await
-    .map_err(|error| OrchionError::BlockingTask {
-        message: error.to_string(),
-    })?
-}
-
-async fn publish_staged_cache<M: ModelSpec>(
-    model: &M,
-    assets: &[ModelHubAsset],
-    staging_root: &Path,
-    cache_dir: &Path,
-    source_name: &'static str,
-) -> Result<()> {
+fn publication_repositories<M: ModelSpec>(model: &M, assets: &[ModelHubAsset]) -> Vec<String> {
     let mut repos = Vec::new();
     for asset in assets {
         if asset.repo != model.huggingface_repo() && !repos.iter().any(|repo| repo == asset.repo) {
@@ -552,15 +644,64 @@ async fn publish_staged_cache<M: ModelSpec>(
         }
     }
     repos.push(model.huggingface_repo().to_string());
-    publish_staged_repositories(staging_root, cache_dir, &repos)
-        .await
-        .map_err(|error| OrchionError::Download {
-            source_name,
-            repo: model.huggingface_repo().to_string(),
-            message: error.to_string(),
-        })
+    repos
 }
 
+async fn recover_with_owned_locks(
+    cache_dir: PathBuf,
+    model_key: String,
+    model_lock: transaction::CacheLock,
+) -> Result<(transaction::CacheLock, bool)> {
+    let task = tokio::spawn(async move {
+        let recovery = async {
+            let _publication_lock =
+                transaction::acquire_publication_lock(&cache_dir, &model_key).await?;
+            recover_interrupted_publication(&cache_dir)
+                .await
+                .map_err(|error| OrchionError::Download {
+                    source_name: "cache",
+                    repo: model_key,
+                    message: format!("failed to recover interrupted cache publication: {error}"),
+                })
+        }
+        .await;
+        (model_lock, recovery)
+    });
+    let (model_lock, recovery) = task.await.map_err(|error| OrchionError::BlockingTask {
+        message: format!("cache recovery task failed: {error}"),
+    })?;
+    Ok((model_lock, recovery?))
+}
+
+async fn publish_staged_cache(
+    model_key: String,
+    repos: Vec<String>,
+    staging: tempfile::TempDir,
+    cache_dir: PathBuf,
+    source_name: &'static str,
+    model_lock: transaction::CacheLock,
+) -> Result<(transaction::CacheLock, Result<()>)> {
+    let task = tokio::spawn(async move {
+        let publication = async {
+            let _publication_lock =
+                transaction::acquire_publication_lock(&cache_dir, &model_key).await?;
+            publish_staged_repositories(staging.path(), &cache_dir, &repos)
+                .await
+                .map_err(|error| OrchionError::Download {
+                    source_name,
+                    repo: model_key,
+                    message: error.to_string(),
+                })
+        }
+        .await;
+        (model_lock, publication)
+    });
+    task.await.map_err(|error| OrchionError::BlockingTask {
+        message: format!("cache publication task failed: {error}"),
+    })
+}
+
+#[allow(clippy::too_many_lines)]
 async fn publish_staged_repositories(
     staging_root: &Path,
     cache_dir: &Path,
@@ -837,7 +978,12 @@ async fn sync_directory(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-async fn is_ready_cache<M: ModelSpec>(model: &M, target: &Path) -> Result<bool> {
+async fn is_ready_cache<M: ModelSpec>(
+    model: &M,
+    target: &Path,
+    allowed_providers: &[Arc<dyn DownloadProvider>],
+    downloader: &ModelDownloader,
+) -> Result<bool> {
     let manifest = match tokio::fs::read_to_string(target.join(READY_MANIFEST_FILE)).await {
         Ok(manifest) => manifest,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -853,56 +999,236 @@ async fn is_ready_cache<M: ModelSpec>(model: &M, target: &Path) -> Result<bool> 
         return Ok(false);
     };
     if manifest["schema_version"].as_u64() != Some(READY_MANIFEST_SCHEMA_VERSION)
-        || manifest["repo_id"].as_str() != Some(model.huggingface_repo())
         || manifest["layout"].as_str() != Some(READY_MANIFEST_LAYOUT)
     {
         return Ok(false);
     }
-
-    required_cache_files_exist(model, target).await
-}
-
-async fn required_cache_files_exist<M: ModelSpec>(model: &M, target: &Path) -> Result<bool> {
-    for file_name in model.required_files() {
-        if !cache_file_exists(model, target, file_name).await? {
-            return Ok(false);
-        }
-    }
-    if model.category() == ModelCategory::OcrVl && !ocr_vl_weight_files_exist(model, target).await?
+    let Some(source_name) = manifest["source"].as_str() else {
+        return Ok(false);
+    };
+    let Some(provider) = allowed_providers
+        .iter()
+        .find(|provider| provider.label() == source_name)
+    else {
+        return Ok(false);
+    };
+    let expected_revision = downloader.repository_revision(
+        model.huggingface_repo(),
+        model.huggingface_repo(),
+        provider.as_ref(),
+    );
+    let expected_repo = provider.repository(provider_model(model));
+    if manifest["repo_id"].as_str() != Some(expected_repo.as_str())
+        || manifest["revision"].as_str() != Some(expected_revision)
     {
         return Ok(false);
     }
-    if !hub_asset_files_exist(model, target).await? {
-        return Ok(false);
-    }
-    Ok(true)
-}
-
-async fn hub_asset_files_exist<M: ModelSpec>(model: &M, target: &Path) -> Result<bool> {
-    let Some(cache_dir) = cache_root_from_target(target) else {
+    let expected_requests =
+        downloader.repository_requests(model, provider.as_ref(), model_hub_assets(model))?;
+    let Some(manifest_repos) = manifest["downloaded_repos"].as_array() else {
         return Ok(false);
     };
-    for asset in model_hub_assets(model) {
-        let asset_path = match asset.kind {
-            ModelHubAssetKind::RequiredFile | ModelHubAssetKind::PaddleOcrDictionary { .. } => {
-                repo_cache_path(cache_dir, asset.repo).join(asset.file)
-            }
-            ModelHubAssetKind::ModelScopeFile { .. } => {
-                repo_cache_path(cache_dir, asset.repo).join(asset.file)
-            }
+    if manifest_repos.len() != expected_requests.len()
+        || manifest_repos
+            .iter()
+            .zip(&expected_requests)
+            .any(|(actual, expected)| actual.as_str() != Some(expected.repository.as_str()))
+    {
+        return Ok(false);
+    }
+    let Some(repositories) = manifest["repositories"].as_array() else {
+        return Ok(false);
+    };
+    if repositories.len() != expected_requests.len() {
+        return Ok(false);
+    }
+    for expected in expected_requests {
+        let Some(actual) = repositories
+            .iter()
+            .find(|actual| actual["identity"].as_str() == Some(expected.identity.as_str()))
+        else {
+            return Ok(false);
         };
-        if !tokio::fs::try_exists(&asset_path)
-            .await
-            .map_err(|error| OrchionError::Download {
-                source_name: "cache",
-                repo: asset.repo.to_string(),
-                message: error.to_string(),
-            })?
+        if actual["repo_id"].as_str() != Some(expected.repository.as_str())
+            || actual["requested_revision"].as_str() != Some(expected.requested_revision.as_str())
+        {
+            return Ok(false);
+        }
+        if provider::is_immutable_revision(&expected.requested_revision)
+            && actual["resolved_revision"].as_str() != Some(expected.requested_revision.as_str())
+        {
+            return Ok(false);
+        }
+        if actual["resolved_revision"]
+            .as_str()
+            .is_some_and(str::is_empty)
         {
             return Ok(false);
         }
     }
+
+    manifest_files_match(model, target, &manifest).await
+}
+
+async fn manifest_files_match<M: ModelSpec>(
+    model: &M,
+    target: &Path,
+    manifest: &serde_json::Value,
+) -> Result<bool> {
+    let Some(required_files) = required_cache_files(model, target).await? else {
+        return Ok(false);
+    };
+    let Some(manifest_files) = manifest["files"].as_array() else {
+        return Ok(false);
+    };
+    if manifest_files.len() != required_files.len() {
+        return Ok(false);
+    }
+    for required in required_files {
+        let Some(entry) = manifest_files.iter().find(|entry| {
+            entry["repo"].as_str() == Some(required.repo.as_str())
+                && entry["path"].as_str() == Some(required.path.as_str())
+        }) else {
+            return Ok(false);
+        };
+        if entry["file_type"].as_str() != Some("file") {
+            return Ok(false);
+        }
+        let Some(expected_size) = entry["size"].as_u64().filter(|size| *size > 0) else {
+            return Ok(false);
+        };
+        let Some(expected_sha256) = entry["sha256"].as_str().filter(|hash| hash.len() == 64) else {
+            return Ok(false);
+        };
+        let (actual_size, actual_sha256) = match cache_file_integrity(required.absolute_path).await
+        {
+            Ok(integrity) => integrity,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidData
+                ) =>
+            {
+                return Ok(false);
+            }
+            Err(error) => {
+                return Err(OrchionError::Download {
+                    source_name: "cache",
+                    repo: required.repo,
+                    message: error.to_string(),
+                });
+            }
+        };
+        if actual_size != expected_size || actual_sha256 != expected_sha256 {
+            return Ok(false);
+        }
+    }
     Ok(true)
+}
+
+async fn required_cache_files<M: ModelSpec>(
+    model: &M,
+    target: &Path,
+) -> Result<Option<Vec<RequiredCacheFile>>> {
+    let mut files = Vec::new();
+    for file_name in model.required_files() {
+        push_required_cache_file(
+            &mut files,
+            model.huggingface_repo(),
+            file_name,
+            target.join(file_name),
+        );
+    }
+    if model.category() == ModelCategory::OcrVl {
+        let Some(weight_files) = ocr_vl_weight_file_names(model, target).await? else {
+            return Ok(None);
+        };
+        for file_name in weight_files {
+            push_required_cache_file(
+                &mut files,
+                model.huggingface_repo(),
+                &file_name,
+                target.join(&file_name),
+            );
+        }
+    }
+    let Some(cache_dir) = cache_root_from_target(target) else {
+        return Ok(None);
+    };
+    for asset in model_hub_assets(model) {
+        push_required_cache_file(
+            &mut files,
+            asset.repo,
+            asset.file,
+            repo_cache_path(cache_dir, asset.repo).join(asset.file),
+        );
+        if let ModelHubAssetKind::PaddleOcrDictionary { output_file } = asset.kind {
+            push_required_cache_file(
+                &mut files,
+                model.huggingface_repo(),
+                output_file,
+                target.join(output_file),
+            );
+        }
+    }
+    Ok(Some(files))
+}
+
+fn push_required_cache_file(
+    files: &mut Vec<RequiredCacheFile>,
+    repo: &str,
+    path: &str,
+    absolute_path: PathBuf,
+) {
+    if files
+        .iter()
+        .any(|file| file.repo == repo && file.path == path)
+    {
+        return;
+    }
+    files.push(RequiredCacheFile {
+        repo: repo.to_string(),
+        path: path.to_string(),
+        absolute_path,
+    });
+}
+
+async fn required_cache_files_exist<M: ModelSpec>(model: &M, target: &Path) -> Result<bool> {
+    let Some(files) = required_cache_files(model, target).await? else {
+        return Ok(false);
+    };
+    for file in files {
+        match cache_file_size(&file.absolute_path).await {
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidData
+                ) =>
+            {
+                return Ok(false);
+            }
+            Err(error) => {
+                return Err(OrchionError::Download {
+                    source_name: "cache",
+                    repo: file.repo,
+                    message: error.to_string(),
+                });
+            }
+        }
+    }
+    Ok(true)
+}
+
+async fn cache_file_size(path: &Path) -> std::io::Result<u64> {
+    let metadata = tokio::fs::symlink_metadata(path).await?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "expected a non-empty regular file",
+        ));
+    }
+    Ok(metadata.len())
 }
 
 fn cache_root_from_target(target: &Path) -> Option<&Path> {
@@ -910,15 +1236,7 @@ fn cache_root_from_target(target: &Path) -> Option<&Path> {
 }
 
 fn model_hub_assets<M: ModelSpec>(model: &M) -> &'static [ModelHubAsset] {
-    match model.huggingface_repo() {
-        "PaddlePaddle/PP-OCRv5_mobile" => PP_OCRV5_MOBILE_ASSETS,
-        "PaddlePaddle/PP-OCRv5_server" => PP_OCRV5_SERVER_ASSETS,
-        "PaddlePaddle/PP-OCRv6_tiny" => PP_OCRV6_TINY_ASSETS,
-        "PaddlePaddle/PP-OCRv6_small" => PP_OCRV6_SMALL_ASSETS,
-        "PaddlePaddle/PP-OCRv6_medium" => PP_OCRV6_MEDIUM_ASSETS,
-        "PaddlePaddle/PP-DocLayoutV3" => PP_DOCLAYOUTV3_ASSETS,
-        _ => &[],
-    }
+    assets::for_model(model.huggingface_repo())
 }
 
 fn repo_cache_path(cache_dir: &Path, repo: &str) -> PathBuf {
@@ -926,96 +1244,76 @@ fn repo_cache_path(cache_dir: &Path, repo: &str) -> PathBuf {
         .fold(cache_dir.to_path_buf(), |path, segment| path.join(segment))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn download_hub_assets<M: ModelSpec, C: DownloadClient>(
     model: &M,
-    source: ResolvedSource,
+    provider: &dyn DownloadProvider,
     assets: &[ModelHubAsset],
+    repository_requests: &[RepositoryRequest],
     cache_dir: &Path,
     target: &Path,
     client: &C,
     env: &DownloadEnv,
-) -> Result<()> {
+) -> Result<Vec<RepositoryDownload>> {
     tokio::fs::create_dir_all(target)
         .await
         .map_err(|error| OrchionError::Download {
-            source_name: source.label(),
+            source_name: provider.label(),
             repo: model.huggingface_repo().to_string(),
             message: error.to_string(),
         })?;
 
-    let mut downloaded_repos = Vec::new();
-    for asset in assets {
-        if downloaded_repos.contains(&asset.repo) {
-            continue;
-        }
-        let repo_target = repo_cache_path(cache_dir, asset.repo);
-        let repo_files = asset_files_for_repo(assets, asset.repo);
+    let mut downloads = Vec::with_capacity(repository_requests.len());
+    for request in repository_requests {
+        let repo_target = repo_cache_path(cache_dir, &request.identity);
+        let repo_files = assets::files_for_repo(assets, &request.identity);
         tracing::info!(
-            source = source.label(),
-            repo = asset.repo,
+            source = provider.label(),
+            repo = request.repository,
             path = %repo_target.display(),
             "downloading model asset repo"
         );
-        client
+        let result = client
             .download(
-                source,
-                asset.repo,
+                provider,
+                &request.repository,
                 cache_dir,
                 &repo_target,
                 Some(&repo_files),
+                &request.requested_revision,
                 env,
             )
             .await?;
-        downloaded_repos.push(asset.repo);
+        downloads.push(RepositoryDownload {
+            request: request.clone(),
+            resolved_revision: result.resolved_revision().map(str::to_string),
+        });
     }
 
     for asset in assets {
         let source_path = repo_cache_path(cache_dir, asset.repo).join(asset.file);
         match asset.kind {
             ModelHubAssetKind::RequiredFile => {
-                ensure_asset_file_exists(source, asset.repo, &source_path).await?;
+                ensure_asset_file_exists(provider.label(), asset.repo, &source_path).await?;
             }
             ModelHubAssetKind::PaddleOcrDictionary { output_file } => {
                 let dictionary =
-                    build_paddle_ocr_dictionary(source, asset.repo, &source_path).await?;
+                    build_paddle_ocr_dictionary(provider.label(), asset.repo, &source_path).await?;
                 tokio::fs::write(target.join(output_file), dictionary)
                     .await
                     .map_err(|error| OrchionError::Download {
-                        source_name: source.label(),
+                        source_name: provider.label(),
                         repo: asset.repo.to_string(),
                         message: error.to_string(),
                     })?;
             }
             ModelHubAssetKind::ModelScopeFile { output_file } => {
-                if source != ResolvedSource::ModelScope {
-                    return Err(OrchionError::Download {
-                        source_name: source.label(),
-                        repo: asset.repo.to_string(),
-                        message: "asset is only available from ModelScope".to_string(),
-                    });
-                }
-                ensure_asset_file_exists(source, asset.repo, &source_path).await?;
+                ensure_asset_file_exists(provider.label(), asset.repo, &source_path).await?;
                 let _ = output_file;
             }
         }
     }
-    Ok(())
-}
-
-fn uses_modelscope_file_assets(assets: &[ModelHubAsset]) -> bool {
-    assets
-        .iter()
-        .any(|asset| matches!(asset.kind, ModelHubAssetKind::ModelScopeFile { .. }))
-}
-
-fn asset_files_for_repo(assets: &[ModelHubAsset], repo: &'static str) -> Vec<&'static str> {
-    let mut files = Vec::new();
-    for asset in assets.iter().filter(|asset| asset.repo == repo) {
-        if !files.contains(&asset.file) {
-            files.push(asset.file);
-        }
-    }
-    files
+    Ok(downloads)
 }
 
 async fn ensure_ready_cache_files<M: ModelSpec>(
@@ -1034,14 +1332,14 @@ async fn ensure_ready_cache_files<M: ModelSpec>(
 }
 
 async fn ensure_asset_file_exists(
-    source: ResolvedSource,
+    source_name: &'static str,
     repo: &'static str,
     path: &Path,
 ) -> Result<()> {
     if tokio::fs::try_exists(path)
         .await
         .map_err(|error| OrchionError::Download {
-            source_name: source.label(),
+            source_name,
             repo: repo.to_string(),
             message: error.to_string(),
         })?
@@ -1049,27 +1347,27 @@ async fn ensure_asset_file_exists(
         return Ok(());
     }
     Err(OrchionError::Download {
-        source_name: source.label(),
+        source_name,
         repo: repo.to_string(),
         message: format!("missing required model asset `{}`", path.display()),
     })
 }
 
 async fn build_paddle_ocr_dictionary(
-    source: ResolvedSource,
+    source_name: &'static str,
     repo: &'static str,
     path: &Path,
 ) -> Result<String> {
     let yaml = tokio::fs::read_to_string(path)
         .await
         .map_err(|error| OrchionError::Download {
-            source_name: source.label(),
+            source_name,
             repo: repo.to_string(),
             message: error.to_string(),
         })?;
     let characters =
         parse_paddle_ocr_character_dict(&yaml).ok_or_else(|| OrchionError::Download {
-            source_name: source.label(),
+            source_name,
             repo: repo.to_string(),
             message: format!("missing character_dict in `{}`", path.display()),
         })?;
@@ -1134,25 +1432,29 @@ fn parse_yaml_scalar(value: &str) -> String {
     value.to_string()
 }
 
-async fn cache_file_exists<M: ModelSpec>(
+async fn ocr_vl_weight_file_names<M: ModelSpec>(
     model: &M,
     target: &Path,
-    file_name: &str,
-) -> Result<bool> {
-    tokio::fs::try_exists(target.join(file_name))
-        .await
-        .map_err(|error| OrchionError::Download {
-            source_name: "cache",
-            repo: model.huggingface_repo().to_string(),
-            message: error.to_string(),
-        })
-}
-
-async fn ocr_vl_weight_files_exist<M: ModelSpec>(model: &M, target: &Path) -> Result<bool> {
+) -> Result<Option<Vec<String>>> {
     let index = match tokio::fs::read_to_string(target.join("model.safetensors.index.json")).await {
         Ok(index) => index,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return cache_file_is_nonempty(model, target, "model.safetensors").await;
+            return match cache_file_size(&target.join("model.safetensors")).await {
+                Ok(_) => Ok(Some(vec!["model.safetensors".to_string()])),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidData
+                    ) =>
+                {
+                    Ok(None)
+                }
+                Err(error) => Err(OrchionError::Download {
+                    source_name: "cache",
+                    repo: model.huggingface_repo().to_string(),
+                    message: error.to_string(),
+                }),
+            };
         }
         Err(error) => {
             return Err(OrchionError::Download {
@@ -1163,15 +1465,15 @@ async fn ocr_vl_weight_files_exist<M: ModelSpec>(model: &M, target: &Path) -> Re
         }
     };
     let Ok(index) = serde_json::from_str::<serde_json::Value>(&index) else {
-        return Ok(false);
+        return Ok(None);
     };
     let Some(weight_map) = index["weight_map"].as_object() else {
-        return Ok(false);
+        return Ok(None);
     };
-    let mut weight_files = Vec::new();
+    let mut weight_files = vec!["model.safetensors.index.json".to_string()];
     for file_name in weight_map.values() {
         let Some(file_name) = file_name.as_str() else {
-            return Ok(false);
+            return Ok(None);
         };
         let path = Path::new(file_name);
         if path.is_absolute()
@@ -1179,48 +1481,81 @@ async fn ocr_vl_weight_files_exist<M: ModelSpec>(model: &M, target: &Path) -> Re
                 .components()
                 .all(|component| matches!(component, std::path::Component::Normal(_)))
         {
-            return Ok(false);
+            return Ok(None);
         }
-        if !weight_files.contains(&file_name) {
-            weight_files.push(file_name);
-        }
-    }
-    if weight_files.is_empty() {
-        return Ok(false);
-    }
-    for file_name in weight_files {
-        if !cache_file_is_nonempty(model, target, file_name).await? {
-            return Ok(false);
+        if !weight_files.iter().any(|current| current == file_name) {
+            weight_files.push(file_name.to_string());
         }
     }
-    Ok(true)
-}
-
-async fn cache_file_is_nonempty<M: ModelSpec>(
-    model: &M,
-    target: &Path,
-    file_name: &str,
-) -> Result<bool> {
-    match tokio::fs::metadata(target.join(file_name)).await {
-        Ok(metadata) => Ok(metadata.is_file() && metadata.len() > 0),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(OrchionError::Download {
-            source_name: "cache",
-            repo: model.huggingface_repo().to_string(),
-            message: error.to_string(),
-        }),
+    if weight_files.len() == 1 {
+        return Ok(None);
     }
+    Ok(Some(weight_files))
 }
 
 async fn write_ready_manifest<M: ModelSpec>(
     model: &M,
     target: &Path,
-    source_name: &'static str,
+    provider: &dyn DownloadProvider,
+    repo: &str,
+    requested_revision: &str,
+    downloads: &[RepositoryDownload],
 ) -> Result<()> {
+    let source_name = provider.label();
+    let downloaded_repos = downloads
+        .iter()
+        .map(|download| download.request.repository.as_str())
+        .collect::<Vec<_>>();
+    let repositories = downloads
+        .iter()
+        .map(|download| {
+            serde_json::json!({
+                "identity": download.request.identity,
+                "repo_id": download.request.repository,
+                "requested_revision": download.request.requested_revision,
+                "resolved_revision": download.resolved_revision,
+            })
+        })
+        .collect::<Vec<_>>();
+    let resolved_revision = downloads
+        .iter()
+        .find(|download| download.request.identity == model.huggingface_repo())
+        .and_then(|download| download.resolved_revision.as_deref());
+    let required_files =
+        required_cache_files(model, target)
+            .await?
+            .ok_or_else(|| OrchionError::Download {
+                source_name,
+                repo: repo.to_string(),
+                message: "download completed without a complete required file set".to_string(),
+            })?;
+    let mut files = Vec::with_capacity(required_files.len());
+    for file in required_files {
+        let (size, sha256) = cache_file_integrity(file.absolute_path)
+            .await
+            .map_err(|error| OrchionError::Download {
+                source_name,
+                repo: repo.to_string(),
+                message: format!("invalid required cache file `{}`: {error}", file.path),
+            })?;
+        files.push(serde_json::json!({
+            "repo": file.repo,
+            "path": file.path,
+            "file_type": "file",
+            "size": size,
+            "sha256": sha256,
+        }));
+    }
     let manifest = serde_json::json!({
         "schema_version": READY_MANIFEST_SCHEMA_VERSION,
-        "repo_id": model.huggingface_repo(),
+        "source": source_name,
+        "repo_id": repo,
+        "downloaded_repos": downloaded_repos,
+        "revision": requested_revision,
+        "resolved_revision": resolved_revision,
+        "repositories": repositories,
         "layout": READY_MANIFEST_LAYOUT,
+        "files": files,
     });
     let tmp = target.join(format!("{READY_MANIFEST_FILE}.tmp"));
     tokio::fs::write(&tmp, manifest.to_string())
@@ -1239,6 +1574,45 @@ async fn write_ready_manifest<M: ModelSpec>(
         })
 }
 
+fn provider_model<M: ModelSpec>(model: &M) -> ProviderModel<'_> {
+    ProviderModel::new(model.huggingface_repo(), model.modelscope_repo())
+}
+
+async fn cache_file_integrity(path: PathBuf) -> std::io::Result<(u64, String)> {
+    tokio::task::spawn_blocking(move || {
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "expected a non-empty regular file",
+            ));
+        }
+        let mut file = std::fs::File::open(path)?;
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0_u8; 1024 * 1024].into_boxed_slice();
+        let mut bytes_read = 0_u64;
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            bytes_read = bytes_read
+                .checked_add(u64::try_from(read).map_err(std::io::Error::other)?)
+                .ok_or_else(|| std::io::Error::other("required file size overflow"))?;
+            hasher.update(&buffer[..read]);
+        }
+        if bytes_read != metadata.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "required file changed while its integrity was calculated",
+            ));
+        }
+        Ok((metadata.len(), format!("{:x}", hasher.finalize())))
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
+
 fn uses_hub_download<M: ModelSpec>(_model: &M) -> bool {
     true
 }
@@ -1252,7 +1626,7 @@ struct HttpSourceProbe;
 const HUGGINGFACE_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 impl HttpSourceProbe {
-    const fn timeout(&self) -> Duration {
+    const fn timeout() -> Duration {
         HUGGINGFACE_PROBE_TIMEOUT
     }
 }
@@ -1265,7 +1639,7 @@ impl SourceProbe for HttpSourceProbe {
                 .as_deref()
                 .unwrap_or("https://huggingface.co")
                 .trim_end_matches('/');
-            let client = match reqwest::Client::builder().timeout(self.timeout()).build() {
+            let client = match reqwest::Client::builder().timeout(Self::timeout()).build() {
                 Ok(client) => client,
                 Err(error) => {
                     tracing::warn!(error = %error, "failed to create huggingface probe client");
@@ -1295,16 +1669,18 @@ impl SourceProbe for AlwaysAvailableProbe {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 trait DownloadClient {
     fn download<'a>(
         &'a self,
-        source: ResolvedSource,
+        provider: &'a dyn DownloadProvider,
         repo: &'a str,
         cache_dir: &'a Path,
         target: &'a Path,
-        files: Option<&'a [&'static str]>,
+        files: Option<&'a [&'a str]>,
+        revision: &'a str,
         env: &'a DownloadEnv,
-    ) -> BoxFuture<'a, Result<()>>;
+    ) -> BoxFuture<'a, Result<ProviderDownloadResult>>;
 }
 
 struct LibraryDownloadClient;
@@ -1312,46 +1688,18 @@ struct LibraryDownloadClient;
 impl DownloadClient for LibraryDownloadClient {
     fn download<'a>(
         &'a self,
-        source: ResolvedSource,
+        provider: &'a dyn DownloadProvider,
         repo: &'a str,
         cache_dir: &'a Path,
-        _target: &'a Path,
-        files: Option<&'a [&'static str]>,
+        target: &'a Path,
+        files: Option<&'a [&'a str]>,
+        revision: &'a str,
         _env: &'a DownloadEnv,
-    ) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move { download_model_hub(source, repo, cache_dir, files).await })
+    ) -> BoxFuture<'a, Result<ProviderDownloadResult>> {
+        provider.download_with_result(ProviderDownloadRequest::new(
+            repo, revision, cache_dir, target, files,
+        ))
     }
-}
-
-async fn download_model_hub(
-    source: ResolvedSource,
-    repo: &str,
-    cache_dir: &Path,
-    files: Option<&[&'static str]>,
-) -> Result<()> {
-    let provider = match source {
-        ResolvedSource::HuggingFace => model_hub::HubProvider::HuggingFace { token: None },
-        ResolvedSource::ModelScope => model_hub::HubProvider::ModelScope { token: None },
-    };
-    let downloader =
-        model_hub::ModelDownloader::new(provider).map_err(|error| OrchionError::Download {
-            source_name: source.label(),
-            repo: repo.to_string(),
-            message: error.to_string(),
-        })?;
-    downloader
-        .download(model_hub::DownloadOptions {
-            repo_id: repo.to_string(),
-            revision: None,
-            save_dir: cache_dir.to_path_buf(),
-            files: files.map(|files| files.iter().map(|file| (*file).to_string()).collect()),
-        })
-        .await
-        .map_err(|error| OrchionError::Download {
-            source_name: source.label(),
-            repo: repo.to_string(),
-            message: error.to_string(),
-        })
 }
 
 async fn prepare_cached_model<M: ModelSpec>(
@@ -1569,6 +1917,8 @@ mod tests {
 
 #[cfg(test)]
 mod downloader_tests {
+    #![allow(clippy::struct_excessive_bools, clippy::unnecessary_literal_bound)]
+
     use super::*;
     use orchion_core::{AsrModel, KnownOcrModel, TtsModel};
     use std::sync::{Arc, Mutex};
@@ -1628,15 +1978,36 @@ mod downloader_tests {
         }
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct DifferentProviderReposModel;
+
+    impl ModelSpec for DifferentProviderReposModel {
+        fn category(&self) -> ModelCategory {
+            ModelCategory::Tts
+        }
+
+        fn huggingface_repo(&self) -> &str {
+            "Acme/HuggingFaceModel"
+        }
+
+        fn modelscope_repo(&self) -> &str {
+            "Acme/ModelScopeModel"
+        }
+    }
+
     #[derive(Default)]
     struct FakeDownloadClient {
         fail_huggingface: bool,
         omit_asr_tokenizer_sources: bool,
+        omit_huggingface_asr_tokenizer_sources: bool,
+        write_empty_config: bool,
         write_ocr_vl_weights: bool,
         delay: Duration,
         calls: Arc<Mutex<Vec<&'static str>>>,
         repos: Arc<Mutex<Vec<String>>>,
-        file_filters: Arc<Mutex<Vec<Option<Vec<&'static str>>>>>,
+        file_filters: Arc<Mutex<Vec<Option<Vec<String>>>>>,
+        revisions: Arc<Mutex<Vec<String>>>,
+        omit_resolved_revision: bool,
     }
 
     struct FakeProbe {
@@ -1680,25 +2051,27 @@ mod downloader_tests {
     impl DownloadClient for FakeDownloadClient {
         fn download<'a>(
             &'a self,
-            source: ResolvedSource,
+            provider: &'a dyn DownloadProvider,
             repo: &'a str,
             _cache_dir: &'a Path,
             target: &'a Path,
-            files: Option<&'a [&'static str]>,
+            files: Option<&'a [&'a str]>,
+            revision: &'a str,
             _env: &'a DownloadEnv,
-        ) -> BoxFuture<'a, Result<()>> {
+        ) -> BoxFuture<'a, Result<ProviderDownloadResult>> {
             Box::pin(async move {
-                tokio::time::sleep(self.delay).await;
-                self.calls.lock().unwrap().push(source.label());
+                let source_name = provider.label();
+                self.calls.lock().unwrap().push(source_name);
                 self.repos.lock().unwrap().push(repo.to_string());
-                self.file_filters
-                    .lock()
-                    .unwrap()
-                    .push(files.map(|files| files.to_vec()));
-                if self.fail_huggingface && source == ResolvedSource::HuggingFace {
+                self.revisions.lock().unwrap().push(revision.to_string());
+                self.file_filters.lock().unwrap().push(
+                    files.map(|files| files.iter().map(|file| (*file).to_string()).collect()),
+                );
+                tokio::time::sleep(self.delay).await;
+                if self.fail_huggingface && source_name == "huggingface" {
                     tokio::fs::create_dir_all(target).await.map_err(|error| {
                         OrchionError::Download {
-                            source_name: source.label(),
+                            source_name,
                             repo: repo.to_string(),
                             message: error.to_string(),
                         }
@@ -1706,27 +2079,28 @@ mod downloader_tests {
                     tokio::fs::write(target.join("partial.bin"), "partial")
                         .await
                         .map_err(|error| OrchionError::Download {
-                            source_name: source.label(),
+                            source_name,
                             repo: repo.to_string(),
                             message: error.to_string(),
                         })?;
                     return Err(OrchionError::Download {
-                        source_name: source.label(),
+                        source_name,
                         repo: repo.to_string(),
                         message: "simulated failure".to_string(),
                     });
                 }
                 tokio::fs::create_dir_all(target).await.map_err(|error| {
                     OrchionError::Download {
-                        source_name: source.label(),
+                        source_name,
                         repo: repo.to_string(),
                         message: error.to_string(),
                     }
                 })?;
-                tokio::fs::write(target.join("config.json"), "{}")
+                let config = if self.write_empty_config { "" } else { "{}" };
+                tokio::fs::write(target.join("config.json"), config)
                     .await
                     .map_err(|error| OrchionError::Download {
-                        source_name: source.label(),
+                        source_name,
                         repo: repo.to_string(),
                         message: error.to_string(),
                     })?;
@@ -1735,19 +2109,28 @@ mod downloader_tests {
                         tokio::fs::write(target.join(file_name), b"asset")
                             .await
                             .map_err(|error| OrchionError::Download {
-                                source_name: source.label(),
+                                source_name,
                                 repo: repo.to_string(),
                                 message: error.to_string(),
                             })?;
                     }
                 }
-                if !self.omit_asr_tokenizer_sources {
+                let omit_tokenizer_sources = self.omit_asr_tokenizer_sources
+                    || (self.omit_huggingface_asr_tokenizer_sources
+                        && source_name == "huggingface");
+                if !omit_tokenizer_sources {
                     write_asr_tokenizer_sources(target).await;
                 }
                 if self.write_ocr_vl_weights {
                     write_complete_ocr_vl_cache(target).await;
                 }
-                Ok(())
+                Ok(if self.omit_resolved_revision {
+                    ProviderDownloadResult::unresolved()
+                } else {
+                    ProviderDownloadResult::with_resolved_revision(
+                        "1111111111111111111111111111111111111111",
+                    )
+                })
             })
         }
     }
@@ -1778,6 +2161,231 @@ mod downloader_tests {
         assert!(!path.join("partial.bin").exists());
         assert!(!path.join(".orchion-complete").exists());
         assert_eq!(&*calls.lock().unwrap(), &["huggingface", "modelscope"]);
+    }
+
+    #[tokio::test]
+    async fn auto_falls_back_when_huggingface_prepare_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = FakeDownloadClient {
+            omit_huggingface_asr_tokenizer_sources: true,
+            ..Default::default()
+        };
+        let calls = Arc::clone(&client.calls);
+        let env = DownloadEnv {
+            orchion_model_source: None,
+            hf_endpoint: None,
+        };
+
+        let path = ModelDownloader::new(DownloadSource::Auto)
+            .download_with_client(qwen_asr_06b(), dir.path(), &client, &env)
+            .await
+            .unwrap();
+
+        assert_eq!(&*calls.lock().unwrap(), &["huggingface", "modelscope"]);
+        assert!(path.join("tokenizer.json").exists());
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &tokio::fs::read(path.join(READY_MANIFEST_FILE))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["source"], "modelscope");
+    }
+
+    #[tokio::test]
+    async fn ready_manifest_records_download_identity_and_required_file_integrity() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = FakeDownloadClient::default();
+        let env = DownloadEnv {
+            orchion_model_source: None,
+            hf_endpoint: None,
+        };
+
+        let path = ModelDownloader::new(DownloadSource::HuggingFace)
+            .with_revision("0123456789abcdef0123456789abcdef01234567")
+            .download_with_client(qwen_asr_06b(), dir.path(), &client, &env)
+            .await
+            .unwrap();
+
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &tokio::fs::read(path.join(READY_MANIFEST_FILE))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["source"], "huggingface");
+        assert_eq!(manifest["repo_id"], "Qwen/Qwen3-ASR-0.6B");
+        assert_eq!(
+            manifest["revision"],
+            "0123456789abcdef0123456789abcdef01234567"
+        );
+        assert_eq!(
+            manifest["repositories"],
+            serde_json::json!([{
+                "identity": "Qwen/Qwen3-ASR-0.6B",
+                "repo_id": "Qwen/Qwen3-ASR-0.6B",
+                "requested_revision": "0123456789abcdef0123456789abcdef01234567",
+                "resolved_revision": "1111111111111111111111111111111111111111"
+            }])
+        );
+        assert_eq!(
+            manifest["downloaded_repos"],
+            serde_json::json!(["Qwen/Qwen3-ASR-0.6B"])
+        );
+        let config = manifest["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|file| file["path"] == "config.json")
+            .unwrap();
+        assert_eq!(config["file_type"], "file");
+        assert_eq!(config["size"], 2);
+        assert_eq!(
+            config["sha256"],
+            "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+        );
+    }
+
+    #[tokio::test]
+    async fn ready_manifest_records_the_selected_providers_actual_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = FakeDownloadClient::default();
+        let repos = Arc::clone(&client.repos);
+        let env = DownloadEnv {
+            orchion_model_source: None,
+            hf_endpoint: None,
+        };
+
+        let path = ModelDownloader::new(DownloadSource::ModelScope)
+            .download_with_client(DifferentProviderReposModel, dir.path(), &client, &env)
+            .await
+            .unwrap();
+
+        assert_eq!(&*repos.lock().unwrap(), &["Acme/ModelScopeModel"]);
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &tokio::fs::read(path.join(READY_MANIFEST_FILE))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["source"], "modelscope");
+        assert_eq!(manifest["repo_id"], "Acme/ModelScopeModel");
+        assert_eq!(
+            manifest["downloaded_repos"],
+            serde_json::json!(["Acme/ModelScopeModel"])
+        );
+        assert_eq!(manifest["revision"], "master");
+    }
+
+    #[tokio::test]
+    async fn explicit_source_does_not_reuse_cache_from_another_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = FakeDownloadClient::default();
+        let calls = Arc::clone(&client.calls);
+        let env = DownloadEnv {
+            orchion_model_source: None,
+            hf_endpoint: None,
+        };
+
+        ModelDownloader::new(DownloadSource::ModelScope)
+            .download_with_client(qwen_asr_06b(), dir.path(), &client, &env)
+            .await
+            .unwrap();
+        ModelDownloader::new(DownloadSource::HuggingFace)
+            .download_with_client(qwen_asr_06b(), dir.path(), &client, &env)
+            .await
+            .unwrap();
+
+        assert_eq!(&*calls.lock().unwrap(), &["modelscope", "huggingface"]);
+    }
+
+    #[tokio::test]
+    async fn ready_cache_with_same_size_modified_required_file_is_redownloaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = FakeDownloadClient::default();
+        let calls = Arc::clone(&client.calls);
+        let env = DownloadEnv {
+            orchion_model_source: None,
+            hf_endpoint: None,
+        };
+        let downloader = ModelDownloader::new(DownloadSource::HuggingFace);
+
+        let path = downloader
+            .download_with_client(qwen_asr_06b(), dir.path(), &client, &env)
+            .await
+            .unwrap();
+        tokio::fs::write(path.join("config.json"), "[]")
+            .await
+            .unwrap();
+        downloader
+            .download_with_client(qwen_asr_06b(), dir.path(), &client, &env)
+            .await
+            .unwrap();
+
+        assert_eq!(&*calls.lock().unwrap(), &["huggingface", "huggingface"]);
+        assert_eq!(
+            tokio::fs::read_to_string(path.join("config.json"))
+                .await
+                .unwrap(),
+            "{}"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_revision_does_not_reuse_cache_from_another_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = FakeDownloadClient::default();
+        let calls = Arc::clone(&client.calls);
+        let env = DownloadEnv {
+            orchion_model_source: None,
+            hf_endpoint: None,
+        };
+
+        ModelDownloader::new(DownloadSource::HuggingFace)
+            .with_revision("revision-a")
+            .download_with_client(qwen_asr_06b(), dir.path(), &client, &env)
+            .await
+            .unwrap();
+        let path = ModelDownloader::new(DownloadSource::HuggingFace)
+            .with_revision("revision-b")
+            .download_with_client(qwen_asr_06b(), dir.path(), &client, &env)
+            .await
+            .unwrap();
+
+        assert_eq!(&*calls.lock().unwrap(), &["huggingface", "huggingface"]);
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &tokio::fs::read(path.join(READY_MANIFEST_FILE))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["revision"], "revision-b");
+    }
+
+    #[tokio::test]
+    async fn zero_size_required_file_is_not_published_as_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = FakeDownloadClient {
+            write_empty_config: true,
+            ..Default::default()
+        };
+        let env = DownloadEnv {
+            orchion_model_source: None,
+            hf_endpoint: None,
+        };
+
+        let error = ModelDownloader::new(DownloadSource::HuggingFace)
+            .download_with_client(qwen_asr_06b(), dir.path(), &client, &env)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            OrchionError::DownloadFallbackExhausted { failures, .. }
+                if failures.len() == 1
+                    && failures[0].message.contains("required cache files")
+        ));
+        assert!(!qwen_asr_06b().cache_path(dir.path()).exists());
     }
 
     #[tokio::test]
@@ -1950,6 +2558,93 @@ mod downloader_tests {
     }
 
     #[tokio::test]
+    async fn cancelling_download_does_not_release_publication_resources_early() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().to_path_buf();
+        let model = qwen_asr_06b();
+        let model_key = model.huggingface_repo().to_string();
+        let target = model.cache_path(&cache_dir);
+        let client = FakeDownloadClient {
+            delay: Duration::from_millis(200),
+            ..Default::default()
+        };
+        let calls = Arc::clone(&client.calls);
+        let env = DownloadEnv {
+            orchion_model_source: Some("huggingface".to_string()),
+            hf_endpoint: None,
+        };
+        let download_cache = cache_dir.clone();
+        let download = tokio::spawn(async move {
+            ModelDownloader::default()
+                .download_with_client(model, download_cache, &client, &env)
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while calls.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let publication_lock =
+            transaction::acquire_publication_lock(&cache_dir, "test-publication")
+                .await
+                .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let mut entries = tokio::fs::read_dir(&cache_dir).await.unwrap();
+                let mut manifest_is_staged = false;
+                while let Some(entry) = entries.next_entry().await.unwrap() {
+                    let is_staging = entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".orchion-download-");
+                    if is_staging
+                        && tokio::fs::try_exists(
+                            entry.path().join(&model_key).join(READY_MANIFEST_FILE),
+                        )
+                        .await
+                        .unwrap()
+                    {
+                        manifest_is_staged = true;
+                        break;
+                    }
+                }
+                if manifest_is_staged {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        download.abort();
+        assert!(download.await.unwrap_err().is_cancelled());
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                transaction::acquire_model_lock(&cache_dir, &model_key),
+            )
+            .await
+            .is_err()
+        );
+        drop(publication_lock);
+        let completed_lock = tokio::time::timeout(
+            Duration::from_secs(2),
+            transaction::acquire_model_lock(&cache_dir, &model_key),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(completed_lock);
+
+        assert!(target.join(READY_MANIFEST_FILE).exists());
+    }
+
+    #[tokio::test]
     async fn auto_skips_huggingface_when_probe_reports_unavailable() {
         let dir = tempfile::tempdir().unwrap();
         let client = FakeDownloadClient::default();
@@ -2016,7 +2711,7 @@ mod downloader_tests {
             .await
             .unwrap();
         write_asr_tokenizer_json(&target).await;
-        write_ready_manifest(&target, model.huggingface_repo()).await;
+        write_ready_manifest(&model, &target, ResolvedSource::HuggingFace).await;
 
         let client = FakeDownloadClient::default();
         let calls = Arc::clone(&client.calls);
@@ -2047,7 +2742,7 @@ mod downloader_tests {
             .await
             .unwrap();
         write_asr_tokenizer_json(&backup).await;
-        write_ready_manifest(&backup, model.huggingface_repo()).await;
+        write_ready_manifest(&model, &backup, ResolvedSource::HuggingFace).await;
         tokio::fs::write(backup.join("old.bin"), "old")
             .await
             .unwrap();
@@ -2103,7 +2798,11 @@ mod downloader_tests {
         tokio::fs::write(target.join("config.json"), "{}")
             .await
             .unwrap();
-        write_ready_manifest(&target, model.huggingface_repo()).await;
+        write_asr_tokenizer_json(&target).await;
+        write_ready_manifest(&model, &target, ResolvedSource::ModelScope).await;
+        tokio::fs::remove_file(target.join("tokenizer.json"))
+            .await
+            .unwrap();
 
         let client = FakeDownloadClient::default();
         let calls = Arc::clone(&client.calls);
@@ -2134,11 +2833,17 @@ mod downloader_tests {
                 .await
                 .unwrap();
         }
-        super::write_ready_manifest(&model, &target, "test")
-            .await
-            .unwrap();
         write_ocr_vl_weight_index(&target).await;
-        tokio::fs::write(target.join("model-00001-of-00002.safetensors"), b"weights")
+        for file_name in [
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+        ] {
+            tokio::fs::write(target.join(file_name), b"weights")
+                .await
+                .unwrap();
+        }
+        write_ready_manifest(&model, &target, ResolvedSource::HuggingFace).await;
+        tokio::fs::remove_file(target.join("model-00002-of-00002.safetensors"))
             .await
             .unwrap();
         let client = FakeDownloadClient {
@@ -2172,14 +2877,20 @@ mod downloader_tests {
                 .await
                 .unwrap();
         }
-        super::write_ready_manifest(&model, &target, "test")
-            .await
-            .unwrap();
         write_ocr_vl_weight_index(&target).await;
         tokio::fs::write(target.join("model.safetensors"), b"weights")
             .await
             .unwrap();
-        tokio::fs::write(target.join("model-00001-of-00002.safetensors"), b"weights")
+        for file_name in [
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+        ] {
+            tokio::fs::write(target.join(file_name), b"weights")
+                .await
+                .unwrap();
+        }
+        write_ready_manifest(&model, &target, ResolvedSource::HuggingFace).await;
+        tokio::fs::remove_file(target.join("model-00002-of-00002.safetensors"))
             .await
             .unwrap();
         let client = FakeDownloadClient {
@@ -2230,6 +2941,7 @@ mod downloader_tests {
         let calls = Arc::clone(&client.calls);
         let repos = Arc::clone(&client.repos);
         let file_filters = Arc::clone(&client.file_filters);
+        let revisions = Arc::clone(&client.revisions);
         let env = DownloadEnv {
             orchion_model_source: None,
             hf_endpoint: None,
@@ -2244,12 +2956,13 @@ mod downloader_tests {
         assert_eq!(path, KnownOcrModel::PpOcrV5Mobile.cache_path(dir.path()));
         assert_eq!(&*calls.lock().unwrap(), &["modelscope"]);
         assert_eq!(&*repos.lock().unwrap(), &["greatv/oar-ocr".to_string()]);
+        assert_eq!(&*revisions.lock().unwrap(), &["master"]);
         assert_eq!(
             &*file_filters.lock().unwrap(),
             &[Some(vec![
-                "pp-ocrv5_mobile_det.onnx",
-                "pp-ocrv5_mobile_rec.onnx",
-                "ppocrv5_dict.txt"
+                "pp-ocrv5_mobile_det.onnx".to_string(),
+                "pp-ocrv5_mobile_rec.onnx".to_string(),
+                "ppocrv5_dict.txt".to_string()
             ])]
         );
         assert!(path.join(".orchion-ready.json").exists());
@@ -2261,17 +2974,147 @@ mod downloader_tests {
         assert!(registry_dir.join("pp-ocrv5_mobile_det.onnx").exists());
         assert!(registry_dir.join("pp-ocrv5_mobile_rec.onnx").exists());
         assert!(registry_dir.join("ppocrv5_dict.txt").exists());
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &tokio::fs::read(path.join(READY_MANIFEST_FILE))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            manifest["downloaded_repos"],
+            serde_json::json!(["greatv/oar-ocr"])
+        );
+        assert_eq!(manifest["repositories"][0]["requested_revision"], "master");
+        assert_eq!(
+            manifest["repositories"][0]["resolved_revision"],
+            "1111111111111111111111111111111111111111"
+        );
     }
 
-    async fn write_ready_manifest(target: &Path, repo: &str) {
-        let manifest = serde_json::json!({
-            "schema_version": 1,
-            "repo_id": repo,
-            "layout": "model-hub-native",
-        });
-        tokio::fs::write(target.join(".orchion-ready.json"), manifest.to_string())
+    #[tokio::test]
+    async fn canonical_revision_is_not_applied_to_auxiliary_repositories() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = FakeDownloadClient::default();
+        let revisions = Arc::clone(&client.revisions);
+        let env = DownloadEnv {
+            orchion_model_source: None,
+            hf_endpoint: None,
+        };
+
+        ModelDownloader::new(DownloadSource::Auto)
+            .with_revision("canonical-revision")
+            .download_with_client(KnownOcrModel::PpOcrV5Mobile, dir.path(), &client, &env)
             .await
             .unwrap();
+
+        assert_eq!(&*revisions.lock().unwrap(), &["master"]);
+    }
+
+    #[tokio::test]
+    async fn repository_revision_is_applied_only_to_the_selected_auxiliary_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = FakeDownloadClient::default();
+        let revisions = Arc::clone(&client.revisions);
+        let env = DownloadEnv {
+            orchion_model_source: None,
+            hf_endpoint: None,
+        };
+
+        ModelDownloader::new(DownloadSource::Auto)
+            .with_repository_revision("greatv/oar-ocr", "asset-revision")
+            .download_with_client(KnownOcrModel::PpOcrV5Mobile, dir.path(), &client, &env)
+            .await
+            .unwrap();
+
+        assert_eq!(&*revisions.lock().unwrap(), &["asset-revision"]);
+    }
+
+    #[tokio::test]
+    async fn explicit_huggingface_rejects_modelscope_only_assets() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = FakeDownloadClient::default();
+        let env = DownloadEnv {
+            orchion_model_source: None,
+            hf_endpoint: None,
+        };
+
+        let error = ModelDownloader::new(DownloadSource::HuggingFace)
+            .download_with_client(KnownOcrModel::PpOcrV5Mobile, dir.path(), &client, &env)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("only available from ModelScope"));
+        assert!(client.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn auto_with_explicit_huggingface_env_rejects_modelscope_only_assets() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = FakeDownloadClient::default();
+        let env = DownloadEnv {
+            orchion_model_source: Some("huggingface".to_string()),
+            hf_endpoint: None,
+        };
+
+        let error = ModelDownloader::new(DownloadSource::Auto)
+            .download_with_client(KnownOcrModel::PpOcrV5Mobile, dir.path(), &client, &env)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("only available from ModelScope"));
+        assert!(client.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unresolved_mutable_revision_reuses_verified_local_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = FakeDownloadClient {
+            omit_resolved_revision: true,
+            ..Default::default()
+        };
+        let calls = Arc::clone(&client.calls);
+        let env = DownloadEnv {
+            orchion_model_source: None,
+            hf_endpoint: None,
+        };
+        let downloader = ModelDownloader::new(DownloadSource::HuggingFace);
+
+        downloader
+            .download_with_client(qwen_asr_06b(), dir.path(), &client, &env)
+            .await
+            .unwrap();
+        downloader
+            .download_with_client(qwen_asr_06b(), dir.path(), &client, &env)
+            .await
+            .unwrap();
+
+        assert_eq!(&*calls.lock().unwrap(), &["huggingface"]);
+    }
+
+    async fn write_ready_manifest<M: ModelSpec>(model: &M, target: &Path, source: ResolvedSource) {
+        let downloader = ModelDownloader::new(match source {
+            ResolvedSource::HuggingFace => DownloadSource::HuggingFace,
+            ResolvedSource::ModelScope => DownloadSource::ModelScope,
+        });
+        let downloads = downloader
+            .repository_requests(model, &source, model_hub_assets(model))
+            .unwrap()
+            .into_iter()
+            .map(|request| RepositoryDownload {
+                request,
+                resolved_revision: Some("1111111111111111111111111111111111111111".to_string()),
+            })
+            .collect::<Vec<_>>();
+        super::write_ready_manifest(
+            model,
+            target,
+            &source,
+            source.repo(model),
+            source.default_revision(),
+            &downloads,
+        )
+        .await
+        .unwrap();
     }
 
     fn qwen_asr_06b() -> AsrModel {

@@ -1,4 +1,6 @@
-use super::{ModelCategory, ModelId, ModelSpec, ParseModelIdError};
+use super::{
+    ModelCategory, ModelDescriptor, ModelId, ModelSpec, ParseModelIdError, model_descriptor,
+};
 use std::fmt;
 use std::str::FromStr;
 
@@ -16,6 +18,11 @@ impl AsrModel {
 
     pub fn as_str(&self) -> &str {
         self.id.as_str()
+    }
+
+    pub fn descriptor(&self) -> Option<ModelDescriptor> {
+        model_descriptor(self.as_str())
+            .filter(|descriptor| descriptor.category == ModelCategory::Asr)
     }
 }
 
@@ -37,11 +44,15 @@ impl ModelSpec for AsrModel {
     }
 
     fn huggingface_repo(&self) -> &str {
-        self.as_str()
+        self.descriptor().map_or(self.as_str(), |descriptor| {
+            descriptor.source_locators.hugging_face
+        })
     }
 
     fn modelscope_repo(&self) -> &str {
-        self.huggingface_repo()
+        self.descriptor().map_or(self.as_str(), |descriptor| {
+            descriptor.source_locators.model_scope
+        })
     }
 
     fn required_files(&self) -> &'static [&'static str] {

@@ -4,6 +4,10 @@ max_upload_size = "100M"
 max_pdf_pages = 100
 max_pdf_pixels = 200000000
 max_pdf_output_size = "100M"
+max_concurrent_inference = 2
+max_websocket_connections = 64
+max_pending_websocket_connections = 16
+max_websocket_message_size = 2097152
 
 [models]
 dir = "models"
@@ -57,6 +61,7 @@ device = "auto"
 idle_timeout = "10m"
 max_loaded = 1
 format = "json"
+max_pixels = 100000000
 
 [services.ocr-vl]
 enabled = true
@@ -72,6 +77,7 @@ idle_timeout = "10m"
 max_loaded = 1
 format = "markdown"
 max_tokens = 4096
+max_pixels = 100000000
 
 [auth]
 # api_key = "change-me"

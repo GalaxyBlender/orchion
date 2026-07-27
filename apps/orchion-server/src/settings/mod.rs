@@ -8,13 +8,18 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub const DEFAULT_ASR_STREAM_TARGET_SEGMENT: Duration = Duration::from_secs(12);
-pub const DEFAULT_ASR_STREAM_MAX_SEGMENT: Duration = Duration::from_secs(120);
+pub const DEFAULT_ASR_STREAM_MAX_SEGMENT: Duration = Duration::from_mins(2);
 pub const DEFAULT_ASR_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-pub const DEFAULT_ASR_STREAM_MAX_DURATION: Duration = Duration::from_secs(2 * 60 * 60);
-pub const DEFAULT_ASR_MAX_AUDIO_DURATION: Duration = Duration::from_secs(30 * 60);
+pub const DEFAULT_ASR_STREAM_MAX_DURATION: Duration = Duration::from_hours(2);
+pub const DEFAULT_ASR_MAX_AUDIO_DURATION: Duration = Duration::from_mins(30);
 pub const DEFAULT_TTS_MAX_LENGTH: usize = 2048;
-pub const DEFAULT_TTS_MAX_REFERENCE_AUDIO_DURATION: Duration = Duration::from_secs(5 * 60);
+pub const DEFAULT_TTS_MAX_REFERENCE_AUDIO_DURATION: Duration = Duration::from_mins(5);
 pub const DEFAULT_OCR_VL_MAX_TOKENS: usize = 4096;
+pub const DEFAULT_OCR_MAX_PIXELS: u64 = 100_000_000;
+pub const DEFAULT_MAX_CONCURRENT_INFERENCE: usize = 2;
+pub const DEFAULT_MAX_WEBSOCKET_CONNECTIONS: usize = 64;
+pub const DEFAULT_MAX_PENDING_WEBSOCKET_CONNECTIONS: usize = 16;
+pub const DEFAULT_MAX_WEBSOCKET_MESSAGE_SIZE: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelSource {
@@ -49,6 +54,10 @@ pub struct ServerSection {
     pub max_pdf_pages: usize,
     pub max_pdf_pixels: u64,
     pub max_pdf_output_size: usize,
+    pub max_concurrent_inference: usize,
+    pub max_websocket_connections: usize,
+    pub max_pending_websocket_connections: usize,
+    pub max_websocket_message_size: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,12 +125,20 @@ pub struct OcrServiceSection {
     pub max_loaded: usize,
     pub device: DevicePreference,
     pub format: OcrResponseFormat,
+    pub max_pixels: u64,
 }
 
 impl OcrServiceSection {
     #[must_use]
     pub fn active(&self) -> bool {
         self.enabled && !self.available_models.is_empty()
+    }
+
+    #[must_use]
+    pub fn effective_default_model(&self) -> Option<&ModelId> {
+        self.default_model
+            .as_ref()
+            .or_else(|| self.available_models.first())
     }
 }
 
@@ -137,12 +154,20 @@ pub struct OcrVlServiceSection {
     pub device: DevicePreference,
     pub format: OcrResponseFormat,
     pub max_tokens: usize,
+    pub max_pixels: u64,
 }
 
 impl OcrVlServiceSection {
     #[must_use]
     pub fn active(&self) -> bool {
         self.enabled && !self.available_models.is_empty()
+    }
+
+    #[must_use]
+    pub fn effective_default_model(&self) -> Option<&ModelId> {
+        self.default_model
+            .as_ref()
+            .or_else(|| self.available_models.first())
     }
 }
 
@@ -152,6 +177,7 @@ pub struct AuthSection {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ConfigError {
     #[error("failed to read config `{path}`: {source}")]
     Read {
@@ -233,6 +259,16 @@ pub enum ConfigError {
         section: &'static str,
         default: String,
     },
+    #[error("invalid {section}.format `{format}`: layout_default_model is required")]
+    StructuredOcrFormatWithoutLayout {
+        section: &'static str,
+        format: &'static str,
+    },
+    #[error("invalid {section}.format `{format}`: format is not supported by this service")]
+    UnsupportedOcrDefaultFormat {
+        section: &'static str,
+        format: &'static str,
+    },
 }
 
 impl ServerConfig {
@@ -247,6 +283,10 @@ impl ServerConfig {
                 max_pdf_pages: 100,
                 max_pdf_pixels: 200_000_000,
                 max_pdf_output_size: 100 * 1024 * 1024,
+                max_concurrent_inference: DEFAULT_MAX_CONCURRENT_INFERENCE,
+                max_websocket_connections: DEFAULT_MAX_WEBSOCKET_CONNECTIONS,
+                max_pending_websocket_connections: DEFAULT_MAX_PENDING_WEBSOCKET_CONNECTIONS,
+                max_websocket_message_size: DEFAULT_MAX_WEBSOCKET_MESSAGE_SIZE,
             },
             models: ModelsSection {
                 dir: exe_dir.join("models"),
@@ -258,7 +298,7 @@ impl ServerConfig {
                     enabled: false,
                     default_model: default_asr_model(),
                     available_models: vec![default_asr_model()],
-                    idle_timeout: Duration::from_secs(600),
+                    idle_timeout: Duration::from_mins(10),
                     max_loaded: 1,
                     device: DevicePreference::Auto,
                     stream_chunk_size: 2.0,
@@ -272,7 +312,7 @@ impl ServerConfig {
                     enabled: false,
                     default_model: default_tts_model(),
                     available_models: vec![default_tts_model()],
-                    idle_timeout: Duration::from_secs(600),
+                    idle_timeout: Duration::from_mins(10),
                     max_loaded: 1,
                     device: DevicePreference::Auto,
                     format: "wav".to_string(),
@@ -285,10 +325,11 @@ impl ServerConfig {
                     available_models: Vec::new(),
                     layout_default_model: None,
                     layout_available_models: Vec::new(),
-                    idle_timeout: Duration::from_secs(600),
+                    idle_timeout: Duration::from_mins(10),
                     max_loaded: 1,
                     device: DevicePreference::Auto,
                     format: OcrResponseFormat::Json,
+                    max_pixels: DEFAULT_OCR_MAX_PIXELS,
                 },
                 ocr_vl: OcrVlServiceSection {
                     enabled: false,
@@ -296,17 +337,21 @@ impl ServerConfig {
                     available_models: Vec::new(),
                     layout_default_model: None,
                     layout_available_models: Vec::new(),
-                    idle_timeout: Duration::from_secs(600),
+                    idle_timeout: Duration::from_mins(10),
                     max_loaded: 1,
                     device: DevicePreference::Auto,
                     format: OcrResponseFormat::Markdown,
                     max_tokens: DEFAULT_OCR_VL_MAX_TOKENS,
+                    max_pixels: DEFAULT_OCR_MAX_PIXELS,
                 },
             },
             auth: AuthSection { api_key: None },
         }
     }
 
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] when the configuration cannot be read or validated.
     pub fn load(config_path: Option<PathBuf>) -> Result<Self, ConfigError> {
         let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("orchion-server"));
         let default = Self::default_for_exe(&exe_path);
@@ -327,6 +372,13 @@ impl ServerConfig {
         Ok(config)
     }
 
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] when the TOML document is malformed or invalid.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "all config overrides are validated in one parsing transaction"
+    )]
     pub fn from_toml_str(document: &str, exe_path: &Path) -> Result<Self, ConfigError> {
         let raw = toml::from_str::<RawConfig>(document)?;
         let mut config = Self::default_for_exe(exe_path);
@@ -365,6 +417,36 @@ impl ServerConfig {
             if let Some(max_pdf_output_size) = server.max_pdf_output_size {
                 config.server.max_pdf_output_size = parse_upload_size(&max_pdf_output_size)?;
             }
+            if let Some(max_concurrent_inference) = server.max_concurrent_inference {
+                config.server.max_concurrent_inference = validate_nonzero_resource_limit(
+                    "server",
+                    "max_concurrent_inference",
+                    max_concurrent_inference,
+                )?;
+            }
+            if let Some(max_websocket_connections) = server.max_websocket_connections {
+                config.server.max_websocket_connections = validate_nonzero_resource_limit(
+                    "server",
+                    "max_websocket_connections",
+                    max_websocket_connections,
+                )?;
+            }
+            if let Some(max_pending_websocket_connections) =
+                server.max_pending_websocket_connections
+            {
+                config.server.max_pending_websocket_connections = validate_nonzero_resource_limit(
+                    "server",
+                    "max_pending_websocket_connections",
+                    max_pending_websocket_connections,
+                )?;
+            }
+            if let Some(max_websocket_message_size) = server.max_websocket_message_size {
+                config.server.max_websocket_message_size = validate_nonzero_resource_limit(
+                    "server",
+                    "max_websocket_message_size",
+                    max_websocket_message_size,
+                )?;
+            }
         }
 
         if let Some(models) = raw.models {
@@ -400,21 +482,25 @@ impl ServerConfig {
             }
         }
 
-        if let Some(auth) = raw.auth {
-            if let Some(api_key) = auth.api_key {
-                let api_key = api_key.trim();
-                config.auth.api_key = if api_key.is_empty() {
-                    None
-                } else {
-                    Some(api_key.to_string())
-                };
-            }
+        if let Some(auth) = raw.auth
+            && let Some(api_key) = auth.api_key
+        {
+            let api_key = api_key.trim();
+            config.auth.api_key = if api_key.is_empty() {
+                None
+            } else {
+                Some(api_key.to_string())
+            };
         }
 
         Ok(config)
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "keeps validation for one configuration section together"
+)]
 fn parse_asr_service(
     raw: RawModelService,
     mut service: AsrServiceSection,
@@ -620,6 +706,9 @@ fn parse_ocr_service(
     if let Some(format) = raw.format {
         service.format = parse_ocr_format("services.ocr.format", &format)?;
     }
+    if let Some(max_pixels) = raw.max_pixels {
+        service.max_pixels = validate_ocr_max_pixels("services.ocr", max_pixels)?;
+    }
     apply_service_limits(
         "services.ocr",
         raw.idle_timeout,
@@ -642,6 +731,21 @@ fn parse_ocr_service(
         service.layout_default_model.as_ref(),
         &service.layout_available_models,
     )?;
+    if service.enabled && service.format == OcrResponseFormat::Html {
+        return Err(ConfigError::UnsupportedOcrDefaultFormat {
+            section: "services.ocr",
+            format: "html",
+        });
+    }
+    if service.enabled
+        && service.format == OcrResponseFormat::Markdown
+        && service.layout_default_model.is_none()
+    {
+        return Err(ConfigError::StructuredOcrFormatWithoutLayout {
+            section: "services.ocr",
+            format: "markdown",
+        });
+    }
     Ok(service)
 }
 
@@ -692,6 +796,9 @@ fn parse_ocr_vl_service(
         }
         service.max_tokens = max_tokens;
     }
+    if let Some(max_pixels) = raw.max_pixels {
+        service.max_pixels = validate_ocr_max_pixels("services.ocr-vl", max_pixels)?;
+    }
     apply_service_limits(
         "services.ocr-vl",
         raw.idle_timeout,
@@ -714,7 +821,49 @@ fn parse_ocr_vl_service(
         service.layout_default_model.as_ref(),
         &service.layout_available_models,
     )?;
+    if service.enabled
+        && matches!(
+            service.format,
+            OcrResponseFormat::Markdown | OcrResponseFormat::Html
+        )
+        && service.layout_default_model.is_none()
+    {
+        return Err(ConfigError::StructuredOcrFormatWithoutLayout {
+            section: "services.ocr-vl",
+            format: match service.format {
+                OcrResponseFormat::Markdown => "markdown",
+                OcrResponseFormat::Html => "html",
+                OcrResponseFormat::Json | OcrResponseFormat::Text => unreachable!(),
+            },
+        });
+    }
     Ok(service)
+}
+
+fn validate_ocr_max_pixels(section: &'static str, max_pixels: u64) -> Result<u64, ConfigError> {
+    if max_pixels == 0 {
+        return Err(ConfigError::InvalidResourceLimit {
+            section,
+            field: "max_pixels",
+            value: max_pixels.to_string(),
+        });
+    }
+    Ok(max_pixels)
+}
+
+fn validate_nonzero_resource_limit(
+    section: &'static str,
+    field: &'static str,
+    value: usize,
+) -> Result<usize, ConfigError> {
+    if value == 0 {
+        return Err(ConfigError::InvalidResourceLimit {
+            section,
+            field,
+            value: value.to_string(),
+        });
+    }
+    Ok(value)
 }
 
 fn validate_ocr_service(
@@ -749,13 +898,15 @@ fn validate_traditional_ocr_model(
     section: &'static str,
     model: &ModelId,
 ) -> Result<(), ConfigError> {
-    KnownOcrModel::from_traditional_model_id(model)
-        .map(|_| ())
-        .map_err(|_| ConfigError::InvalidOcrModelKind {
+    match KnownOcrModel::from_model_id(model) {
+        Err(_) => Ok(()),
+        Ok(known) if known.is_traditional_ocr() => Ok(()),
+        Ok(_) => Err(ConfigError::InvalidOcrModelKind {
             section,
             model: model.to_string(),
             expected: "traditional OCR model",
-        })
+        }),
+    }
 }
 
 fn validate_ocr_layout_config(
@@ -783,23 +934,27 @@ fn validate_ocr_layout_config(
 }
 
 fn validate_ocr_vl_model(section: &'static str, model: &ModelId) -> Result<(), ConfigError> {
-    KnownOcrModel::from_ocr_vl_model_id(model)
-        .map(|_| ())
-        .map_err(|_| ConfigError::InvalidOcrModelKind {
+    match KnownOcrModel::from_model_id(model) {
+        Err(_) => Ok(()),
+        Ok(known) if known.is_ocr_vl() => Ok(()),
+        Ok(_) => Err(ConfigError::InvalidOcrModelKind {
             section,
             model: model.to_string(),
             expected: "OCR-VL model",
-        })
+        }),
+    }
 }
 
 fn validate_layout_model(section: &'static str, model: &ModelId) -> Result<(), ConfigError> {
-    KnownOcrModel::from_layout_model_id(model)
-        .map(|_| ())
-        .map_err(|_| ConfigError::InvalidOcrModelKind {
+    match KnownOcrModel::from_model_id(model) {
+        Err(_) => Ok(()),
+        Ok(known) if known.is_layout_model() => Ok(()),
+        Ok(_) => Err(ConfigError::InvalidOcrModelKind {
             section,
             model: model.to_string(),
             expected: "PaddlePaddle/PP-DocLayoutV3",
-        })
+        }),
+    }
 }
 
 fn apply_service_limits(
@@ -954,12 +1109,18 @@ fn parse_upload_size(value: &str) -> Result<usize, ConfigError> {
         })
 }
 
+/// # Errors
+///
+/// Returns [`ConfigError`] when `value` is not a supported ASR model identifier.
 pub fn parse_asr_model(value: &str) -> Result<AsrModel, ConfigError> {
     value
         .parse()
         .map_err(|_| ConfigError::InvalidAsrModelId(value.to_string()))
 }
 
+/// # Errors
+///
+/// Returns [`ConfigError`] when `value` is not a supported TTS model identifier.
 pub fn parse_tts_model(value: &str) -> Result<TtsModel, ConfigError> {
     value
         .parse()
@@ -1052,6 +1213,10 @@ struct RawServer {
     max_pdf_pages: Option<usize>,
     max_pdf_pixels: Option<u64>,
     max_pdf_output_size: Option<String>,
+    max_concurrent_inference: Option<usize>,
+    max_websocket_connections: Option<usize>,
+    max_pending_websocket_connections: Option<usize>,
+    max_websocket_message_size: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1115,6 +1280,7 @@ struct RawOcrService {
     max_loaded: Option<usize>,
     device: Option<String>,
     format: Option<String>,
+    max_pixels: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1130,6 +1296,7 @@ struct RawOcrVlService {
     device: Option<String>,
     format: Option<String>,
     max_tokens: Option<usize>,
+    max_pixels: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1141,6 +1308,13 @@ struct RawAuth {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_f32_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() <= f32::EPSILON,
+            "expected {actual} to be within f32::EPSILON of {expected}"
+        );
+    }
 
     #[test]
     fn explicit_config_path_must_exist() {
@@ -1173,7 +1347,7 @@ mod tests {
     fn asr_stream_chunk_size_defaults_to_two_seconds() {
         let config = ServerConfig::default_for_exe(Path::new("/tmp/orchion-server"));
 
-        assert_eq!(config.services.asr.stream_chunk_size, 2.0);
+        assert_f32_close(config.services.asr.stream_chunk_size, 2.0);
     }
 
     #[test]
@@ -1182,7 +1356,7 @@ mod tests {
 
         assert_eq!(
             config.services.asr.stream_max_segment,
-            Duration::from_secs(120)
+            Duration::from_mins(2)
         );
     }
 
@@ -1196,7 +1370,7 @@ mod tests {
         );
         assert_eq!(
             config.services.asr.stream_max_duration,
-            Duration::from_secs(2 * 60 * 60)
+            Duration::from_hours(2)
         );
     }
 
@@ -1213,15 +1387,15 @@ mod tests {
     #[test]
     fn asr_stream_chunk_size_loads_from_config() {
         let config = ServerConfig::from_toml_str(
-            r#"
+            r"
             [services.asr]
             stream_chunk_size = 1.5
-            "#,
+            ",
             Path::new("/tmp/orchion-server"),
         )
         .unwrap();
 
-        assert_eq!(config.services.asr.stream_chunk_size, 1.5);
+        assert_f32_close(config.services.asr.stream_chunk_size, 1.5);
     }
 
     #[test]

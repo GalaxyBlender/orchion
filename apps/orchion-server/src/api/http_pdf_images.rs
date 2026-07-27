@@ -1,7 +1,9 @@
-use crate::api::http_shared::{authorize, read_text_field, write_multipart_file_to_temp_file};
+use crate::api::http_shared::{
+    authorize, read_text_field, run_inference_owned, write_multipart_file_to_temp_file,
+};
 use crate::api::openai::ApiError;
 use crate::api::pdf::{self, PdfRenderRequest};
-use crate::infrastructure::orchion::AppState;
+use crate::application::ServerApplication;
 use axum::body::Body;
 use axum::extract::{Multipart, State};
 use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
@@ -10,26 +12,33 @@ use axum::response::Response;
 use std::sync::Arc;
 use tempfile::NamedTempFile;
 
-pub(super) async fn create_pdf_images(
-    State(state): State<Arc<AppState>>,
+pub(super) async fn create_pdf_images<S>(
+    State(state): State<Arc<S>>,
     headers: HeaderMap,
     multipart: Multipart,
-) -> Result<Response, ApiError> {
-    authorize(&state, &headers)?;
-    let upload = read_pdf_images_request(multipart, state.config().server.max_pdf_pages).await?;
+) -> Result<Response, ApiError>
+where
+    S: ServerApplication,
+{
+    authorize(state.as_ref(), &headers)?;
+    let policy = state.api_policy();
+    let upload = read_pdf_images_request(multipart, policy.max_pdf_pages).await?;
     let PdfImagesRequest { pdf_file, request } = upload;
     let limits = pdf::PdfRenderLimits {
-        max_pages: state.config().server.max_pdf_pages,
-        max_pixels: state.config().server.max_pdf_pixels,
-        max_output_bytes: state.config().server.max_pdf_output_size,
+        max_pages: policy.max_pdf_pages,
+        max_pixels: policy.max_pdf_pixels,
+        max_output_bytes: policy.max_pdf_output_size,
     };
-    let rendered = tokio::task::spawn_blocking(move || {
-        let rendered = pdf::render_pdf_to_zip_with_limits(request, limits);
-        drop(pdf_file);
-        rendered
+    let rendered = run_inference_owned(state.try_acquire_inference(), async move {
+        tokio::task::spawn_blocking(move || {
+            let rendered = pdf::render_pdf_to_zip_with_limits(request, limits);
+            drop(pdf_file);
+            rendered
+        })
+        .await
+        .map_err(|error| ApiError::internal(format!("PDF render task failed: {error:#}")))?
     })
-    .await
-    .map_err(|error| ApiError::internal(error.to_string()))??;
+    .await?;
 
     Response::builder()
         .status(StatusCode::OK)

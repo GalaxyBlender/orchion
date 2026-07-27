@@ -1,23 +1,17 @@
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "asr")]
+use std::time::Duration;
+
+pub use orchion_protocol::ErrorObject as ServerErrorObject;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ServerErrorBody {
     pub error: ServerErrorObject,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ServerErrorObject {
-    pub message: String,
-    #[serde(rename = "type")]
-    pub error_type: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub param: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub code: Option<String>,
-}
-
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ClientError {
     #[error("invalid client configuration: {message}")]
     InvalidConfig { message: String },
@@ -36,6 +30,15 @@ pub enum ClientError {
     #[cfg(feature = "asr")]
     #[error("websocket failed: {message}")]
     WebSocket { message: String },
+    #[cfg(feature = "asr")]
+    #[error("{operation} timed out after {timeout:?}")]
+    Timeout {
+        operation: &'static str,
+        timeout: Duration,
+    },
+    #[cfg(feature = "asr")]
+    #[error("streaming session is terminal after {operation} failed")]
+    StreamingSessionTerminated { operation: &'static str },
 }
 
 impl ClientError {
@@ -51,6 +54,18 @@ impl ClientError {
         Self::Decode {
             message: message.into(),
         }
+    }
+
+    #[cfg(feature = "asr")]
+    #[must_use]
+    pub(crate) const fn timeout(operation: &'static str, timeout: Duration) -> Self {
+        Self::Timeout { operation, timeout }
+    }
+
+    #[cfg(feature = "asr")]
+    #[must_use]
+    pub(crate) const fn streaming_session_terminated(operation: &'static str) -> Self {
+        Self::StreamingSessionTerminated { operation }
     }
 }
 

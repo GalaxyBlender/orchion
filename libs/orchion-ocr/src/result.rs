@@ -1,15 +1,20 @@
+use crate::OcrAssets;
 #[cfg(any(feature = "ocr", feature = "ocr-vl"))]
-use crate::device::ProviderPolicy;
-#[cfg(any(feature = "ocr", feature = "ocr-vl"))]
-use orchion_core::ModelSpec;
+use crate::device::{ProviderPolicy, try_provider_candidates};
+use image::{ImageReader, Limits};
 #[cfg(feature = "ocr")]
 use orchion_core::OcrPoint;
 #[cfg(feature = "ocr-vl")]
 use orchion_core::OcrTask;
-use orchion_core::{DevicePreference, KnownOcrModel, OcrOptions, OcrResult, OrchionError, Result};
+use orchion_core::{
+    DevicePreference, KnownOcrModel, OcrLimits, OcrOptions, OcrResult, OrchionError, Result,
+};
 #[cfg(any(feature = "ocr", feature = "ocr-vl"))]
 use orchion_core::{ModelId, OcrLayoutBlock, OcrResponseFormat, OcrUsage};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(feature = "ocr")]
+use std::path::PathBuf;
+#[cfg(any(feature = "ocr", feature = "ocr-vl"))]
 use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "ocr-vl")]
@@ -44,10 +49,10 @@ pub struct OcrVlRuntime {
 
 pub async fn load_runtime(
     model: KnownOcrModel,
-    model_dir: PathBuf,
+    assets: OcrAssets,
     device: DevicePreference,
 ) -> Result<LoadedOcrRuntime> {
-    tokio::task::spawn_blocking(move || load_runtime_blocking(model, &model_dir, device))
+    tokio::task::spawn_blocking(move || load_runtime_blocking(model, &assets, device))
         .await
         .map_err(|error| OrchionError::BlockingTask {
             message: error.to_string(),
@@ -56,7 +61,7 @@ pub async fn load_runtime(
 
 fn load_runtime_blocking(
     model: KnownOcrModel,
-    model_dir: &Path,
+    assets: &OcrAssets,
     device: DevicePreference,
 ) -> Result<LoadedOcrRuntime> {
     match model {
@@ -64,10 +69,10 @@ fn load_runtime_blocking(
         | KnownOcrModel::PpOcrV5Server
         | KnownOcrModel::PpOcrV6Tiny
         | KnownOcrModel::PpOcrV6Small
-        | KnownOcrModel::PpOcrV6Medium => load_traditional_runtime(model, model_dir, device),
-        KnownOcrModel::PpDocLayoutV3 => load_layout_runtime(model, model_dir, device),
+        | KnownOcrModel::PpOcrV6Medium => load_traditional_runtime(model, assets, device),
+        KnownOcrModel::PpDocLayoutV3 => load_layout_runtime(model, assets, device),
         KnownOcrModel::PaddleOcrVl15 | KnownOcrModel::PaddleOcrVl16 => {
-            load_vl_runtime(model, model_dir, device)
+            load_vl_runtime(model, assets, device)
         }
     }
 }
@@ -77,13 +82,31 @@ pub async fn run_ocr(
     runtime: LoadedOcrRuntime,
     image_path: &Path,
     options: OcrOptions,
+    limits: OcrLimits,
 ) -> Result<OcrResult> {
     let image_path = image_path.to_path_buf();
-    tokio::task::spawn_blocking(move || run_ocr_blocking(model, &runtime, &image_path, &options))
-        .await
-        .map_err(|error| OrchionError::BlockingTask {
-            message: error.to_string(),
-        })?
+    tokio::task::spawn_blocking(move || {
+        run_ocr_blocking(model, &runtime, &image_path, &options, limits)
+    })
+    .await
+    .map_err(|error| OrchionError::BlockingTask {
+        message: error.to_string(),
+    })?
+}
+
+/// Validates an OCR image header and decoder limits without decoding its pixels.
+///
+/// # Errors
+///
+/// Returns [`OrchionError::InvalidImage`] when the file is not a supported image or exceeds the
+/// pixel limit.
+pub fn validate_image_file(image_path: &Path, max_pixels: u64) -> Result<()> {
+    let dimensions = image_dimensions(image_path)?;
+    validate_pixel_count(dimensions, max_pixels)?;
+    let mut reader = image_reader(image_path)?;
+    reader.limits(image_limits(max_pixels));
+    reader.into_dimensions().map_err(invalid_image_error)?;
+    Ok(())
 }
 
 fn run_ocr_blocking(
@@ -91,7 +114,11 @@ fn run_ocr_blocking(
     runtime: &LoadedOcrRuntime,
     image_path: &Path,
     options: &OcrOptions,
+    limits: OcrLimits,
 ) -> Result<OcrResult> {
+    #[cfg(not(any(feature = "ocr", feature = "ocr-vl")))]
+    let _ = (image_path, options, limits);
+
     match (model, runtime) {
         #[cfg(feature = "ocr")]
         (
@@ -101,16 +128,16 @@ fn run_ocr_blocking(
             | KnownOcrModel::PpOcrV6Small
             | KnownOcrModel::PpOcrV6Medium,
             LoadedOcrRuntime::Traditional(runtime),
-        ) => run_traditional_ocr(model, runtime, image_path, options),
+        ) => run_traditional_ocr(model, runtime, image_path, options, limits),
         #[cfg(feature = "ocr")]
         (KnownOcrModel::PpDocLayoutV3, LoadedOcrRuntime::Layout(structure)) => {
-            run_layout_ocr(model, structure, image_path, options)
+            run_layout_ocr(model, structure, image_path, options, limits)
         }
         #[cfg(feature = "ocr-vl")]
         (
             KnownOcrModel::PaddleOcrVl15 | KnownOcrModel::PaddleOcrVl16,
             LoadedOcrRuntime::OcrVl(vl),
-        ) => run_vl_ocr(model, vl, image_path, options),
+        ) => run_vl_ocr(model, vl, image_path, options, limits),
         #[cfg(any(not(feature = "ocr"), not(feature = "ocr-vl")))]
         (_, LoadedOcrRuntime::Unsupported { model, capability }) => {
             Err(OrchionError::UnsupportedCapability {
@@ -118,6 +145,7 @@ fn run_ocr_blocking(
                 capability,
             })
         }
+        #[cfg(any(feature = "ocr", feature = "ocr-vl"))]
         _ => Err(OrchionError::Inference {
             message: format!("loaded OCR runtime does not match model `{}`", model.id()),
         }),
@@ -127,20 +155,23 @@ fn run_ocr_blocking(
 #[cfg(feature = "ocr")]
 fn load_traditional_runtime(
     model: KnownOcrModel,
-    model_dir: &Path,
+    assets: &OcrAssets,
     device: DevicePreference,
 ) -> Result<LoadedOcrRuntime> {
     use oar_ocr::oarocr::OAROCRBuilder;
 
-    let assets = traditional_assets(model, model_dir)?;
-    let builder = OAROCRBuilder::new(
-        assets.detector.clone(),
-        assets.recognizer.clone(),
-        assets.dictionary.clone(),
-    )
-    .ort_session(ort_session_config(ProviderPolicy::for_model(model, device)));
-    let ocr = builder.build().map_err(model_load_error)?;
-    let structure = load_related_structure_runtime(model_dir, assets, device)?;
+    let (assets, layout) = traditional_assets(model, assets)?;
+    let ocr = try_ort_provider_candidates(model, device, |provider| {
+        OAROCRBuilder::new(
+            assets.detector.clone(),
+            assets.recognizer.clone(),
+            assets.dictionary.clone(),
+        )
+        .ort_session(ort_session_config(provider))
+        .build()
+        .map_err(model_load_error)
+    })?;
+    let structure = load_related_structure_runtime(layout, &assets, device)?;
     Ok(LoadedOcrRuntime::Traditional(Arc::new(
         TraditionalRuntime {
             ocr: Mutex::new(ocr),
@@ -150,9 +181,10 @@ fn load_traditional_runtime(
 }
 
 #[cfg(not(feature = "ocr"))]
+#[allow(clippy::unnecessary_wraps)]
 fn load_traditional_runtime(
     model: KnownOcrModel,
-    _model_dir: &Path,
+    _assets: &OcrAssets,
     _device: DevicePreference,
 ) -> Result<LoadedOcrRuntime> {
     Ok(LoadedOcrRuntime::Unsupported {
@@ -164,29 +196,32 @@ fn load_traditional_runtime(
 #[cfg(feature = "ocr")]
 fn load_layout_runtime(
     model: KnownOcrModel,
-    model_dir: &Path,
+    assets: &OcrAssets,
     device: DevicePreference,
 ) -> Result<LoadedOcrRuntime> {
-    let layout_model = layout_model_path(model_dir)?;
+    let OcrAssets::Layout {
+        model: layout_model,
+    } = assets
+    else {
+        return Err(asset_kind_error(model, "layout"));
+    };
     let structure = build_structure_runtime(model, layout_model, None, device)?;
     Ok(LoadedOcrRuntime::Layout(Arc::new(Mutex::new(structure))))
 }
 
 #[cfg(feature = "ocr")]
 fn load_related_structure_runtime(
-    model_dir: &Path,
-    assets: TraditionalAssets,
+    layout_model: Option<&Path>,
+    assets: &TraditionalAssets,
     device: DevicePreference,
 ) -> Result<Option<oar_ocr::oarocr::OARStructure>> {
-    let layout_dir = related_model_dir(model_dir, KnownOcrModel::PpDocLayoutV3)?;
-    let layout_path = layout_model_path(&layout_dir)?;
-    if !layout_path.is_file() {
+    let Some(layout_model) = layout_model else {
         return Ok(None);
-    }
+    };
 
     build_structure_runtime(
         KnownOcrModel::PpDocLayoutV3,
-        layout_path,
+        layout_model,
         Some(assets),
         device,
     )
@@ -196,30 +231,34 @@ fn load_related_structure_runtime(
 #[cfg(feature = "ocr")]
 fn build_structure_runtime(
     provider_model: KnownOcrModel,
-    layout_model: PathBuf,
-    ocr_assets: Option<TraditionalAssets>,
+    layout_model: &Path,
+    ocr_assets: Option<&TraditionalAssets>,
     device: DevicePreference,
 ) -> Result<oar_ocr::oarocr::OARStructure> {
     use oar_ocr::oarocr::OARStructureBuilder;
 
-    let builder = OARStructureBuilder::new(layout_model)
-        .layout_model_name("PP-DocLayout_plus-L")
-        .ort_session(ort_session_config(ProviderPolicy::for_model(
-            provider_model,
-            device,
-        )));
-    let builder = if let Some(assets) = ocr_assets {
-        builder.with_ocr(assets.detector, assets.recognizer, assets.dictionary)
-    } else {
-        builder
-    };
-    builder.build().map_err(model_load_error)
+    try_ort_provider_candidates(provider_model, device, |provider| {
+        let builder = OARStructureBuilder::new(layout_model.to_path_buf())
+            .layout_model_name("PP-DocLayout_plus-L")
+            .ort_session(ort_session_config(provider));
+        let builder = if let Some(assets) = ocr_assets {
+            builder.with_ocr(
+                assets.detector.clone(),
+                assets.recognizer.clone(),
+                assets.dictionary.clone(),
+            )
+        } else {
+            builder
+        };
+        builder.build().map_err(model_load_error)
+    })
 }
 
 #[cfg(not(feature = "ocr"))]
+#[allow(clippy::unnecessary_wraps)]
 fn load_layout_runtime(
     model: KnownOcrModel,
-    _model_dir: &Path,
+    _assets: &OcrAssets,
     _device: DevicePreference,
 ) -> Result<LoadedOcrRuntime> {
     Ok(LoadedOcrRuntime::Unsupported {
@@ -231,19 +270,21 @@ fn load_layout_runtime(
 #[cfg(feature = "ocr-vl")]
 fn load_vl_runtime(
     model: KnownOcrModel,
-    model_dir: &Path,
+    assets: &OcrAssets,
     device_preference: DevicePreference,
 ) -> Result<LoadedOcrRuntime> {
     use oar_ocr_vl::{PaddleOcrVl, utils::parse_device};
 
-    let provider_policy = ProviderPolicy::for_model(model, device_preference);
-    let device = candle_device(provider_policy);
-    let candle_device = parse_device(&device).map_err(model_load_error)?;
-    let vl = PaddleOcrVl::from_dir(model_dir, candle_device).map_err(model_load_error)?;
-    let layout_predictor = load_default_layout_predictor(
-        model_dir,
-        ProviderPolicy::for_model(KnownOcrModel::PpDocLayoutV3, device_preference),
-    )?;
+    let OcrAssets::VisionLanguage { model_dir, layout } = assets else {
+        return Err(asset_kind_error(model, "vision-language"));
+    };
+    let candidates = ProviderPolicy::candidates_for_model(model, device_preference);
+    let vl = try_provider_candidates(&candidates, |provider| {
+        let device = candle_device(provider);
+        let candle_device = parse_device(&device).map_err(model_load_error)?;
+        PaddleOcrVl::from_dir(model_dir, candle_device).map_err(model_load_error)
+    })?;
+    let layout_predictor = load_default_layout_predictor(layout.as_deref(), device_preference)?;
 
     Ok(LoadedOcrRuntime::OcrVl(Arc::new(Mutex::new(
         OcrVlRuntime {
@@ -254,9 +295,10 @@ fn load_vl_runtime(
 }
 
 #[cfg(not(feature = "ocr-vl"))]
+#[allow(clippy::unnecessary_wraps)]
 fn load_vl_runtime(
     model: KnownOcrModel,
-    _model_dir: &Path,
+    _assets: &OcrAssets,
     _device: DevicePreference,
 ) -> Result<LoadedOcrRuntime> {
     Ok(LoadedOcrRuntime::Unsupported {
@@ -271,9 +313,8 @@ fn run_traditional_ocr(
     runtime: &TraditionalRuntime,
     image_path: &Path,
     options: &OcrOptions,
+    limits: OcrLimits,
 ) -> Result<OcrResult> {
-    use oar_ocr::utils::load_image;
-
     if options.layout_model.is_some() {
         let structure = runtime.structure.as_ref().ok_or_else(|| {
             model_load_error(anyhow::anyhow!(
@@ -281,10 +322,10 @@ fn run_traditional_ocr(
                 model.id()
             ))
         })?;
-        return run_layout_ocr(model, structure, image_path, options);
+        return run_layout_ocr(model, structure, image_path, options, limits);
     }
 
-    let image = load_image(image_path).map_err(inference_error)?;
+    let image = decode_ocr_image(image_path, limits.max_pixels)?;
     let ocr = runtime
         .ocr
         .lock()
@@ -327,11 +368,13 @@ fn run_layout_ocr(
     structure: &Mutex<oar_ocr::oarocr::OARStructure>,
     image_path: &Path,
     options: &OcrOptions,
+    limits: OcrLimits,
 ) -> Result<OcrResult> {
     let structure = structure.lock().map_err(|error| OrchionError::Inference {
         message: format!("OCR layout runtime lock poisoned: {error}"),
     })?;
-    let result = structure.predict(image_path).map_err(inference_error)?;
+    let image = decode_ocr_image(image_path, limits.max_pixels)?;
+    let result = structure.predict_image(image).map_err(inference_error)?;
 
     let text = result
         .layout_elements
@@ -371,12 +414,9 @@ fn run_vl_ocr(
     runtime: &Mutex<OcrVlRuntime>,
     image_path: &Path,
     options: &OcrOptions,
+    limits: OcrLimits,
 ) -> Result<OcrResult> {
-    let image = image::open(image_path)
-        .map_err(|error| OrchionError::Inference {
-            message: error.to_string(),
-        })?
-        .to_rgb8();
+    let image = decode_ocr_image(image_path, limits.max_pixels)?;
     let max_tokens = options.max_tokens.unwrap_or(DEFAULT_VL_MAX_TOKENS);
     let runtime = runtime.lock().map_err(|error| OrchionError::Inference {
         message: format!("OCR-VL runtime lock poisoned: {error}"),
@@ -482,6 +522,64 @@ fn should_use_vl_layout_pipeline(options: &OcrOptions) -> bool {
         )
 }
 
+#[cfg(any(feature = "ocr", feature = "ocr-vl"))]
+fn decode_ocr_image(image_path: &Path, max_pixels: Option<u64>) -> Result<image::RgbImage> {
+    let dimensions = image_dimensions(image_path)?;
+    if let Some(max_pixels) = max_pixels {
+        validate_pixel_count(dimensions, max_pixels)?;
+    }
+    let mut reader = image_reader(image_path)?;
+    if let Some(max_pixels) = max_pixels {
+        reader.limits(image_limits(max_pixels));
+    }
+    reader
+        .decode()
+        .map(image::DynamicImage::into_rgb8)
+        .map_err(invalid_image_error)
+}
+
+fn image_dimensions(image_path: &Path) -> Result<(u32, u32)> {
+    image_reader(image_path)?
+        .into_dimensions()
+        .map_err(invalid_image_error)
+}
+
+fn image_reader(image_path: &Path) -> Result<ImageReader<std::io::BufReader<std::fs::File>>> {
+    ImageReader::open(image_path)
+        .map_err(invalid_image_error)?
+        .with_guessed_format()
+        .map_err(invalid_image_error)
+}
+
+fn validate_pixel_count((width, height): (u32, u32), max_pixels: u64) -> Result<()> {
+    let pixels = u64::from(width) * u64::from(height);
+    if pixels > max_pixels {
+        return Err(OrchionError::InvalidImage {
+            reason: format!(
+                "image contains {pixels} pixels, exceeding the configured limit of {max_pixels}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn image_limits(max_pixels: u64) -> Limits {
+    let max_dimension = u32::try_from(max_pixels).unwrap_or(u32::MAX);
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(max_dimension);
+    limits.max_image_height = Some(max_dimension);
+    limits.max_alloc = limits
+        .max_alloc
+        .map(|default| default.min(max_pixels.saturating_mul(16)));
+    limits
+}
+
+fn invalid_image_error(error: impl std::fmt::Display) -> OrchionError {
+    OrchionError::InvalidImage {
+        reason: error.to_string(),
+    }
+}
+
 #[cfg(feature = "ocr-vl")]
 fn html_tables_to_markdown(input: &str) -> String {
     htmd::convert(input).unwrap_or_else(|_| input.to_string())
@@ -509,8 +607,12 @@ fn render_layout_html<'a>(
                     .lines()
                     .map(str::trim)
                     .filter(|item| !item.is_empty())
-                    .map(|item| format!("<li>{}</li>", escape_html(item)))
-                    .collect::<String>();
+                    .fold(String::new(), |mut items, item| {
+                        items.push_str("<li>");
+                        items.push_str(&escape_html(item));
+                        items.push_str("</li>");
+                        items
+                    });
                 format!("<ul>{items}</ul>")
             }
             "algorithm" => format!("<pre><code>{escaped}</code></pre>"),
@@ -552,55 +654,22 @@ fn html_lines(escaped_text: &str) -> String {
 
 #[cfg(feature = "ocr-vl")]
 fn load_default_layout_predictor(
-    vl_model_dir: &Path,
-    provider_policy: ProviderPolicy,
+    layout_model: Option<&Path>,
+    device: DevicePreference,
 ) -> Result<Option<oar_ocr::predictors::LayoutDetectionPredictor>> {
-    let layout_model = KnownOcrModel::PpDocLayoutV3;
-    let layout_dir = related_model_dir(vl_model_dir, layout_model)?;
-    let layout_path = layout_model_path(&layout_dir)?;
-    if !layout_path.is_file() {
+    let Some(layout_model) = layout_model else {
         return Ok(None);
-    }
-
-    let predictor = oar_ocr::predictors::LayoutDetectionPredictor::builder()
-        .model_name("pp-doclayoutv3")
-        .with_ort_config(ort_session_config(provider_policy))
-        .build(layout_path)
-        .map_err(model_load_error)?;
-    Ok(Some(predictor))
-}
-
-#[cfg(any(feature = "ocr", feature = "ocr-vl"))]
-fn related_model_dir(vl_model_dir: &Path, model: KnownOcrModel) -> Result<PathBuf> {
-    let Some(model_root) = vl_model_dir.parent().and_then(Path::parent) else {
-        return Err(model_load_error(anyhow::anyhow!(
-            "cannot derive shared model root from OCR model cache path `{}`",
-            vl_model_dir.display()
-        )));
     };
-    Ok(model.cache_path(model_root))
-}
 
-#[cfg(any(feature = "ocr", feature = "ocr-vl"))]
-fn model_cache_root(model_dir: &Path) -> Result<&Path> {
-    model_dir.parent().and_then(Path::parent).ok_or_else(|| {
-        model_load_error(anyhow::anyhow!(
-            "cannot derive shared model root from OCR model cache path `{}`",
-            model_dir.display()
-        ))
-    })
-}
-
-#[cfg(any(feature = "ocr", feature = "ocr-vl"))]
-fn layout_model_path(model_dir: &Path) -> Result<PathBuf> {
-    let root = model_cache_root(model_dir)?;
-    let repo = KnownOcrModel::PpDocLayoutV3
-        .pp_doclayoutv3_onnx_repo()
-        .expect("PP-DocLayoutV3 has an ONNX repo");
-    Ok(repo
-        .split('/')
-        .fold(root.to_path_buf(), |path, segment| path.join(segment))
-        .join("inference.onnx"))
+    let predictor =
+        try_ort_provider_candidates(KnownOcrModel::PpDocLayoutV3, device, |provider| {
+            oar_ocr::predictors::LayoutDetectionPredictor::builder()
+                .model_name("pp-doclayoutv3")
+                .with_ort_config(ort_session_config(provider))
+                .build(layout_model)
+                .map_err(model_load_error)
+        })?;
+    Ok(Some(predictor))
 }
 
 #[cfg(feature = "ocr")]
@@ -611,46 +680,35 @@ struct TraditionalAssets {
 }
 
 #[cfg(feature = "ocr")]
-fn traditional_assets(model: KnownOcrModel, model_dir: &Path) -> Result<TraditionalAssets> {
-    if model == KnownOcrModel::PpOcrV5Mobile {
-        let root = model_cache_root(model_dir)?;
-        let registry_dir = root.join("greatv").join("oar-ocr");
-        return Ok(TraditionalAssets {
-            detector: registry_dir.join("pp-ocrv5_mobile_det.onnx"),
-            recognizer: registry_dir.join("pp-ocrv5_mobile_rec.onnx"),
-            dictionary: registry_dir.join("ppocrv5_dict.txt"),
-        });
-    }
+fn traditional_assets(
+    model: KnownOcrModel,
+    assets: &OcrAssets,
+) -> Result<(TraditionalAssets, Option<&Path>)> {
+    let OcrAssets::Traditional {
+        detector,
+        recognizer,
+        dictionary,
+        layout,
+    } = assets
+    else {
+        return Err(asset_kind_error(model, "traditional"));
+    };
+    Ok((
+        TraditionalAssets {
+            detector: detector.clone(),
+            recognizer: recognizer.clone(),
+            dictionary: dictionary.clone(),
+        },
+        layout.as_deref(),
+    ))
+}
 
-    if let (Some(detector_repo), Some(recognizer_repo)) =
-        (model.pp_ocr_detector_repo(), model.pp_ocr_recognizer_repo())
-    {
-        let root = model_cache_root(model_dir)?;
-        let detector = detector_repo
-            .split('/')
-            .fold(root.to_path_buf(), |path, segment| path.join(segment))
-            .join("inference.onnx");
-        let recognizer = recognizer_repo
-            .split('/')
-            .fold(root.to_path_buf(), |path, segment| path.join(segment))
-            .join("inference.onnx");
-        let dictionary = model.dictionary_file().ok_or_else(|| {
-            model_load_error(anyhow::anyhow!(
-                "missing OCR dictionary metadata for `{}`",
-                model.id()
-            ))
-        })?;
-        return Ok(TraditionalAssets {
-            detector,
-            recognizer,
-            dictionary: model_dir.join(dictionary),
-        });
-    }
-
-    Err(model_load_error(anyhow::anyhow!(
-        "missing OCR component repo metadata for `{}`",
+#[cfg(any(feature = "ocr", feature = "ocr-vl"))]
+fn asset_kind_error(model: KnownOcrModel, expected: &str) -> OrchionError {
+    model_load_error(anyhow::anyhow!(
+        "OCR model `{}` requires a {expected} asset bundle",
         model.id()
-    )))
+    ))
 }
 
 #[cfg(any(feature = "ocr", feature = "ocr-vl"))]
@@ -668,11 +726,93 @@ fn ort_session_config(policy: ProviderPolicy) -> oar_ocr::core::config::OrtSessi
         },
         ProviderPolicy::OrtWebGpu => OrtExecutionProvider::WebGPU,
         ProviderPolicy::CandleCpu | ProviderPolicy::CandleCuda(_) | ProviderPolicy::CandleMetal => {
-            OrtExecutionProvider::CPU
+            unreachable!("Candle provider passed to ONNX Runtime configuration")
         }
     };
 
     OrtSessionConfig::new().with_execution_providers(vec![provider])
+}
+
+#[cfg(any(feature = "ocr", feature = "ocr-vl"))]
+fn try_ort_provider_candidates<T>(
+    model: KnownOcrModel,
+    device: DevicePreference,
+    mut build: impl FnMut(ProviderPolicy) -> Result<T>,
+) -> Result<T> {
+    let candidates = ProviderPolicy::candidates_for_model(model, device);
+    try_provider_candidates(&candidates, |provider| {
+        probe_ort_provider(provider)?;
+        build(provider)
+    })
+}
+
+#[cfg(any(feature = "ocr", feature = "ocr-vl"))]
+fn probe_ort_provider(provider: ProviderPolicy) -> Result<()> {
+    match provider {
+        ProviderPolicy::OrtCpu => Ok(()),
+        ProviderPolicy::OrtCuda(index) => probe_ort_cuda(index),
+        ProviderPolicy::OrtWebGpu => probe_ort_webgpu(),
+        ProviderPolicy::CandleCpu | ProviderPolicy::CandleCuda(_) | ProviderPolicy::CandleMetal => {
+            Err(model_load_error(anyhow::anyhow!(
+                "Candle provider passed to ONNX Runtime"
+            )))
+        }
+    }
+}
+
+#[cfg(all(any(feature = "ocr", feature = "ocr-vl"), feature = "cuda"))]
+fn probe_ort_cuda(index: Option<usize>) -> Result<()> {
+    let index = i32::try_from(index.unwrap_or(0))
+        .map_err(|error| model_load_error(anyhow::anyhow!("invalid CUDA device index: {error}")))?;
+    let provider = ort::ep::CUDA::default()
+        .with_device_id(index)
+        .build()
+        .error_on_failure();
+    let builder = ort::session::Session::builder().map_err(|error| {
+        model_load_error(anyhow::anyhow!(
+            "failed to create ONNX Runtime session builder: {error}"
+        ))
+    })?;
+    builder
+        .with_execution_providers([provider])
+        .map(|_| ())
+        .map_err(|error| {
+            model_load_error(anyhow::anyhow!(
+                "failed to initialize ONNX Runtime CUDA provider: {error}"
+            ))
+        })
+}
+
+#[cfg(all(any(feature = "ocr", feature = "ocr-vl"), not(feature = "cuda")))]
+fn probe_ort_cuda(_index: Option<usize>) -> Result<()> {
+    Err(model_load_error(anyhow::anyhow!(
+        "ONNX Runtime CUDA provider requested but the cuda feature is not enabled"
+    )))
+}
+
+#[cfg(all(any(feature = "ocr", feature = "ocr-vl"), feature = "metal"))]
+fn probe_ort_webgpu() -> Result<()> {
+    let provider = ort::ep::WebGPU::default().build().error_on_failure();
+    let builder = ort::session::Session::builder().map_err(|error| {
+        model_load_error(anyhow::anyhow!(
+            "failed to create ONNX Runtime session builder: {error}"
+        ))
+    })?;
+    builder
+        .with_execution_providers([provider])
+        .map(|_| ())
+        .map_err(|error| {
+            model_load_error(anyhow::anyhow!(
+                "failed to initialize ONNX Runtime WebGPU provider: {error}"
+            ))
+        })
+}
+
+#[cfg(all(any(feature = "ocr", feature = "ocr-vl"), not(feature = "metal")))]
+fn probe_ort_webgpu() -> Result<()> {
+    Err(model_load_error(anyhow::anyhow!(
+        "ONNX Runtime WebGPU provider requested but the metal feature is not enabled"
+    )))
 }
 
 #[cfg(feature = "ocr-vl")]
@@ -683,7 +823,7 @@ fn candle_device(policy: ProviderPolicy) -> String {
         ProviderPolicy::CandleCuda(Some(index)) => format!("cuda:{index}"),
         ProviderPolicy::CandleMetal => "metal".to_string(),
         ProviderPolicy::OrtCpu | ProviderPolicy::OrtCuda(_) | ProviderPolicy::OrtWebGpu => {
-            "cpu".to_string()
+            unreachable!("ONNX Runtime provider passed to Candle device selection")
         }
     }
 }
@@ -834,36 +974,6 @@ mod tests {
         assert_eq!(
             html_tables_to_markdown(html),
             "| Name | Value |\n| ---- | ----- |\n| A    | 1     |"
-        );
-    }
-}
-
-#[cfg(all(test, feature = "ocr"))]
-mod ocr_tests {
-    use super::*;
-
-    #[test]
-    fn pp_ocrv5_mobile_assets_use_oar_registry_filenames() {
-        let assets = traditional_assets(
-            KnownOcrModel::PpOcrV5Mobile,
-            Path::new("models/PaddlePaddle/PP-OCRv5_mobile"),
-        )
-        .unwrap();
-
-        assert!(
-            assets
-                .detector
-                .ends_with("greatv/oar-ocr/pp-ocrv5_mobile_det.onnx")
-        );
-        assert!(
-            assets
-                .recognizer
-                .ends_with("greatv/oar-ocr/pp-ocrv5_mobile_rec.onnx")
-        );
-        assert!(
-            assets
-                .dictionary
-                .ends_with("greatv/oar-ocr/ppocrv5_dict.txt")
         );
     }
 }

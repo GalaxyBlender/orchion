@@ -1,4 +1,7 @@
-use super::{ModelCategory, ModelId, ModelSpec, ParseModelIdError};
+use super::{
+    ModelCapabilities, ModelCategory, ModelDescriptor, ModelId, ModelSpec, ParseModelIdError,
+    model_descriptor,
+};
 use std::fmt;
 use std::str::FromStr;
 
@@ -18,16 +21,42 @@ impl TtsModel {
         self.id.as_str()
     }
 
+    pub fn descriptor(&self) -> Option<ModelDescriptor> {
+        model_descriptor(self.as_str())
+            .filter(|descriptor| descriptor.category == ModelCategory::Tts)
+    }
+
     pub fn supports_voice_cloning(&self) -> bool {
-        self.id.name().ends_with("-Base")
+        self.descriptor().map_or_else(
+            || self.as_str().ends_with("-Base"),
+            |descriptor| {
+                descriptor
+                    .capabilities
+                    .contains(ModelCapabilities::TTS_VOICE_CLONING)
+            },
+        )
     }
 
     pub fn supports_preset_speakers(&self) -> bool {
-        self.id.name().ends_with("-CustomVoice")
+        self.descriptor().map_or_else(
+            || self.as_str().ends_with("-CustomVoice"),
+            |descriptor| {
+                descriptor
+                    .capabilities
+                    .contains(ModelCapabilities::TTS_PRESET_SPEAKERS)
+            },
+        )
     }
 
     pub fn supports_voice_design(&self) -> bool {
-        self.id.name().ends_with("-VoiceDesign")
+        self.descriptor().map_or_else(
+            || self.as_str().ends_with("-VoiceDesign"),
+            |descriptor| {
+                descriptor
+                    .capabilities
+                    .contains(ModelCapabilities::TTS_VOICE_DESIGN)
+            },
+        )
     }
 }
 
@@ -49,11 +78,15 @@ impl ModelSpec for TtsModel {
     }
 
     fn huggingface_repo(&self) -> &str {
-        self.as_str()
+        self.descriptor().map_or(self.as_str(), |descriptor| {
+            descriptor.source_locators.hugging_face
+        })
     }
 
     fn modelscope_repo(&self) -> &str {
-        self.huggingface_repo()
+        self.descriptor().map_or(self.as_str(), |descriptor| {
+            descriptor.source_locators.model_scope
+        })
     }
 }
 
@@ -90,7 +123,7 @@ mod tests {
     }
 
     #[test]
-    fn infers_custom_tts_capabilities_from_model_name() {
+    fn custom_qwen_compatible_model_names_preserve_legacy_capabilities() {
         let base = TtsModel::from_str("Acme/New-TTS-Base").unwrap();
         assert!(base.supports_voice_cloning());
         assert!(!base.supports_preset_speakers());

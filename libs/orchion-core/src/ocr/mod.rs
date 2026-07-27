@@ -56,6 +56,11 @@ impl Default for OcrOptions {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OcrLimits {
+    pub max_pixels: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(
     feature = "serde",

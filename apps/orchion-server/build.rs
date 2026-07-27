@@ -6,7 +6,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
 use flate2::read::GzDecoder;
+use pdfium_provisioning::is_pdfium_install_reusable;
 use sha2::{Digest, Sha256};
+
+mod pdfium_provisioning;
 
 const FRONTEND_INPUTS: &[&str] = &[
     "../../web/package.json",
@@ -59,12 +62,11 @@ fn main() {
     run_bun_command(&web_dir, &["run", "build"], "bun run build");
 
     let dist_dir = web_dir.join("dist");
-    if !dist_dir.is_dir() {
-        panic!(
-            "web/dist does not exist after `bun run build`: {}",
-            dist_dir.display()
-        );
-    }
+    assert!(
+        dist_dir.is_dir(),
+        "web/dist does not exist after `bun run build`: {}",
+        dist_dir.display()
+    );
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is unavailable"));
     let target_dir = out_dir.join("ui-dist");
@@ -182,12 +184,26 @@ fn target_profile_dir() -> io::Result<PathBuf> {
 fn provision_pdfium() -> io::Result<()> {
     let asset = pdfium_asset()?;
     let target_library_path = target_profile_dir()?.join(asset.library_name);
-    let checksum_path =
+    let source_checksum_path =
         target_library_path.with_file_name(format!("{}.source.sha256", asset.library_name));
-    let installed_checksum = fs::read_to_string(&checksum_path).ok();
-    if target_library_path.is_file()
-        && installed_checksum.as_deref().map(str::trim) == Some(asset.sha256)
+    let library_checksum_path =
+        target_library_path.with_file_name(format!("{}.sha256", asset.library_name));
+    let installed_source_checksum = fs::read_to_string(&source_checksum_path).ok();
+    let recorded_library_checksum = fs::read_to_string(&library_checksum_path).ok();
+    let actual_library_checksum = if target_library_path.is_file()
+        && installed_source_checksum.as_deref().map(str::trim) == Some(asset.sha256)
+        && recorded_library_checksum.is_some()
     {
+        Some(sha256_file(&target_library_path)?)
+    } else {
+        None
+    };
+    if is_pdfium_install_reusable(
+        asset.sha256,
+        installed_source_checksum.as_deref(),
+        recorded_library_checksum.as_deref(),
+        actual_library_checksum.as_deref(),
+    ) {
         println!(
             "cargo:warning=using verified PDFium library {}",
             target_library_path.display()
@@ -234,8 +250,16 @@ fn provision_pdfium() -> io::Result<()> {
             ),
         )
     })?;
+    let library_checksum = sha256_file(&library_path)?;
     copy_file_overwrite(&library_path, &target_library_path)?;
-    fs::write(&checksum_path, format!("{}\n", asset.sha256))?;
+    write_file_overwrite(
+        &source_checksum_path,
+        format!("{}\n", asset.sha256).as_bytes(),
+    )?;
+    write_file_overwrite(
+        &library_checksum_path,
+        format!("{library_checksum}\n").as_bytes(),
+    )?;
     println!(
         "cargo:warning=copied PDFium library to {}",
         target_library_path.display()
@@ -245,17 +269,7 @@ fn provision_pdfium() -> io::Result<()> {
 }
 
 fn verify_pdfium_archive(archive_path: &Path, expected_sha256: &str) -> io::Result<()> {
-    let mut file = fs::File::open(archive_path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 16 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    let actual_sha256 = format!("{:x}", hasher.finalize());
+    let actual_sha256 = sha256_file(archive_path)?;
     if actual_sha256 != expected_sha256 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -266,6 +280,20 @@ fn verify_pdfium_archive(archive_path: &Path, expected_sha256: &str) -> io::Resu
         ));
     }
     Ok(())
+}
+
+fn sha256_file(path: &Path) -> io::Result<String> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn download_pdfium_archive(url: &str, archive_path: &Path) -> io::Result<()> {
@@ -323,6 +351,24 @@ fn copy_file_overwrite(source: &Path, destination: &Path) -> io::Result<()> {
     fs::rename(&temporary_path, destination)
 }
 
+fn write_file_overwrite(destination: &Path, contents: &[u8]) -> io::Result<()> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let file_name = destination.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("destination has no file name: {}", destination.display()),
+        )
+    })?;
+    let temporary_path = destination.with_file_name(format!("{}.tmp", file_name.to_string_lossy()));
+    remove_existing(&temporary_path)?;
+    fs::write(&temporary_path, contents)?;
+    remove_existing(destination)?;
+    fs::rename(&temporary_path, destination)
+}
+
 fn io_other(error: impl std::fmt::Display) -> io::Error {
     io::Error::other(error.to_string())
 }
@@ -339,13 +385,12 @@ fn run_bun_command(web_dir: &Path, args: &[&str], command_name: &str) {
             );
         });
 
-    if !status.success() {
-        panic!(
-            "`{command_name}` failed in {} with status {}",
-            web_dir.display(),
-            display_status(status)
-        );
-    }
+    assert!(
+        status.success(),
+        "`{command_name}` failed in {} with status {}",
+        web_dir.display(),
+        display_status(status)
+    );
 }
 
 fn display_status(status: ExitStatus) -> String {

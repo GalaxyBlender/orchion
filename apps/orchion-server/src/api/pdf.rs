@@ -4,10 +4,16 @@ use orchion::docs;
 
 pub use docs::{PageSelection, PdfImageFormat, PdfRenderLimits, PdfRenderRequest, RenderedZip};
 
+/// # Errors
+///
+/// Returns [`ApiError`] when the PDF request cannot be rendered.
 pub fn render_pdf_to_zip(request: PdfRenderRequest) -> Result<RenderedZip, ApiError> {
     docs::render_pdf_to_zip(request).map_err(map_pdf_error)
 }
 
+/// # Errors
+///
+/// Returns [`ApiError`] when rendering fails or a resource limit is exceeded.
 pub fn render_pdf_to_zip_with_limits(
     request: PdfRenderRequest,
     limits: PdfRenderLimits,
@@ -15,14 +21,23 @@ pub fn render_pdf_to_zip_with_limits(
     docs::render_pdf_to_zip_with_limits(request, limits).map_err(map_pdf_error)
 }
 
+/// # Errors
+///
+/// Returns [`ApiError`] when the image format is unsupported.
 pub fn parse_pdf_image_format(value: Option<&str>) -> Result<PdfImageFormat, ApiError> {
     docs::parse_pdf_image_format(value).map_err(map_pdf_error)
 }
 
+/// # Errors
+///
+/// Returns [`ApiError`] when the page selection is malformed.
 pub fn parse_page_selection(value: Option<&str>) -> Result<PageSelection, ApiError> {
     docs::parse_page_selection(value).map_err(map_pdf_error)
 }
 
+/// # Errors
+///
+/// Returns [`ApiError`] when the page selection is malformed or exceeds `max_pages`.
 pub fn parse_page_selection_with_max_pages(
     value: Option<&str>,
     max_pages: usize,
@@ -30,6 +45,9 @@ pub fn parse_page_selection_with_max_pages(
     docs::parse_page_selection_with_max_pages(value, max_pages).map_err(map_pdf_error)
 }
 
+/// # Errors
+///
+/// Returns [`ApiError`] when the scale is outside the supported range.
 pub fn parse_scale(value: Option<&str>) -> Result<f32, ApiError> {
     docs::parse_scale(value).map_err(map_pdf_error)
 }

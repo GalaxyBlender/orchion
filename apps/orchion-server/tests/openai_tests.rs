@@ -2,6 +2,13 @@ use axum::http::StatusCode;
 use orchion::{TtsLanguage, TtsOptions, TtsSpeaker, TtsVoice};
 use orchion_server::openai::{ApiError, SpeechFormat, SpeechRequest};
 
+fn assert_f64_close(actual: f64, expected: f64) {
+    assert!(
+        (actual - expected).abs() <= f64::EPSILON,
+        "expected {actual} to be within f64::EPSILON of {expected}"
+    );
+}
+
 #[test]
 fn error_response_uses_openai_shape() {
     let error = ApiError::invalid_request(
@@ -184,12 +191,12 @@ fn speech_options_default_to_seed_42_and_upstream_sampling_defaults() {
 
     assert_eq!(options.seed, Some(42));
     assert_eq!(options.max_length, upstream_defaults.max_length);
-    assert_eq!(options.temperature, upstream_defaults.temperature);
+    assert_f64_close(options.temperature, upstream_defaults.temperature);
     assert_eq!(options.top_k, upstream_defaults.top_k);
-    assert_eq!(options.top_p, upstream_defaults.top_p);
-    assert_eq!(
+    assert_f64_close(options.top_p, upstream_defaults.top_p);
+    assert_f64_close(
         options.repetition_penalty,
-        upstream_defaults.repetition_penalty
+        upstream_defaults.repetition_penalty,
     );
 }
 
@@ -217,10 +224,10 @@ fn speech_options_accept_qwen3_tts_sampling_overrides() {
 
     assert_eq!(options.seed, Some(7));
     assert_eq!(options.max_length, 256);
-    assert_eq!(options.temperature, 0.6);
+    assert_f64_close(options.temperature, 0.6);
     assert_eq!(options.top_k, 30);
-    assert_eq!(options.top_p, 0.8);
-    assert_eq!(options.repetition_penalty, 1.1);
+    assert_f64_close(options.top_p, 0.8);
+    assert_f64_close(options.repetition_penalty, 1.1);
 }
 
 #[test]
@@ -265,6 +272,46 @@ fn speech_options_reject_invalid_sampling_values() {
     request.max_length = Some(0);
     let error = request.validate().unwrap_err();
     assert_eq!(error.error.param.as_deref(), Some("max_length"));
+}
+
+#[test]
+fn speech_options_reject_non_finite_values() {
+    let mut request = SpeechRequest {
+        model: "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice".to_string(),
+        input: "Hello".to_string(),
+        voice: "ryan".to_string(),
+        response_format: Some(SpeechFormat::Wav),
+        speed: 1.0,
+        language: Some("english".to_string()),
+        reference_audio: None,
+        reference_text: None,
+        voice_prompt: None,
+        seed: None,
+        temperature: None,
+        top_k: None,
+        top_p: None,
+        repetition_penalty: None,
+        max_length: None,
+    };
+    request.speed = f32::NAN;
+    assert_eq!(
+        request.validate().unwrap_err().error.param.as_deref(),
+        Some("speed")
+    );
+
+    request.speed = 1.0;
+    request.temperature = Some(f64::INFINITY);
+    assert_eq!(
+        request.validate().unwrap_err().error.param.as_deref(),
+        Some("temperature")
+    );
+
+    request.temperature = None;
+    request.repetition_penalty = Some(f64::NAN);
+    assert_eq!(
+        request.validate().unwrap_err().error.param.as_deref(),
+        Some("repetition_penalty")
+    );
 }
 
 #[test]

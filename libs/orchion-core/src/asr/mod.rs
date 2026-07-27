@@ -86,6 +86,13 @@ impl Default for AsrStreamingOptions {
 mod tests {
     use super::*;
 
+    fn assert_f32_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() <= f32::EPSILON,
+            "expected {actual} to be within f32::EPSILON of {expected}"
+        );
+    }
+
     #[test]
     fn transcript_segments_preserve_timing_and_text() {
         let transcript = AsrTranscript {
@@ -101,8 +108,8 @@ mod tests {
         };
 
         assert_eq!(transcript.segments[0].id, 0);
-        assert_eq!(transcript.segments[0].start, 1.25);
-        assert_eq!(transcript.segments[0].end, 2.5);
+        assert_f32_close(transcript.segments[0].start, 1.25);
+        assert_f32_close(transcript.segments[0].end, 2.5);
         assert_eq!(transcript.segments[0].text, "hello");
     }
 

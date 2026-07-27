@@ -14,11 +14,13 @@ pub use asr::{
 pub use device::{DevicePreference, ParseDevicePreferenceError};
 pub use error::{DownloadFailure, OrchionError, Result};
 pub use model::{
-    AsrModel, KnownOcrModel, ModelCategory, ModelId, ModelSpec, OcrModelKind, ParseModelIdError,
-    TtsModel,
+    AsrModel, KnownOcrModel, ModelCapabilities, ModelCapabilityRequirement, ModelCategory,
+    ModelDescriptor, ModelId, ModelSourceLocators, ModelSpec, OcrModel, OcrModelAsset,
+    OcrModelAssetKind, OcrModelAssetRole, OcrModelKind, ParseModelIdError, RuntimeProvider,
+    TtsModel, model_descriptor, registered_model_descriptors,
 };
 pub use ocr::{
-    OcrLayoutBlock, OcrOptions, OcrPoint, OcrRegion, OcrResponseFormat, OcrResult, OcrTask,
-    OcrUsage,
+    OcrLayoutBlock, OcrLimits, OcrOptions, OcrPoint, OcrRegion, OcrResponseFormat, OcrResult,
+    OcrTask, OcrUsage,
 };
 pub use tts::{TtsAudio, TtsLanguage, TtsOptions, TtsSpeaker, TtsVoice, ensure_voice_supported};

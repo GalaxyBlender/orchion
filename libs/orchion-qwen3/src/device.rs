@@ -5,7 +5,9 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResolvedDeviceKind {
     Cpu,
+    #[cfg(feature = "metal")]
     Metal,
+    #[cfg(feature = "cuda")]
     Cuda(usize),
 }
 
@@ -25,7 +27,9 @@ impl fmt::Display for ResolvedDeviceKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Cpu => formatter.write_str("cpu"),
+            #[cfg(feature = "metal")]
             Self::Metal => formatter.write_str("metal"),
+            #[cfg(feature = "cuda")]
             Self::Cuda(index) => write!(formatter, "cuda{index}"),
         }
     }
@@ -143,7 +147,9 @@ mod tests {
     #[test]
     fn labels_resolved_device_kinds() {
         assert_eq!(ResolvedDeviceKind::Cpu.to_string(), "cpu");
+        #[cfg(feature = "metal")]
         assert_eq!(ResolvedDeviceKind::Metal.to_string(), "metal");
+        #[cfg(feature = "cuda")]
         assert_eq!(ResolvedDeviceKind::Cuda(2).to_string(), "cuda2");
     }
 

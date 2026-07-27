@@ -11,6 +11,7 @@ members = [
     "libs/orchion-download",
     "libs/orchion-docs",
     "libs/orchion-ocr",
+    "libs/orchion-protocol",
     "libs/orchion-qwen3",
     "libs/orchion",
     "apps/orchion-server",

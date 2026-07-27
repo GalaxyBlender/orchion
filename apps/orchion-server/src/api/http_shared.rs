@@ -1,13 +1,35 @@
 use crate::api::openai::ApiError;
-use crate::infrastructure::orchion::AppState;
+use crate::application::ServerApplication;
+use crate::application::resource_policy::InferenceGuard;
 use axum::extract::multipart::Field;
 use axum::http::HeaderMap;
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
+use std::future::Future;
 use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 use tokio::io::AsyncWriteExt;
 
-pub(super) fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
-    let Some(api_key) = state.config().auth.api_key.as_deref() else {
+pub(super) async fn run_inference_owned<T, F>(
+    permit: Option<InferenceGuard>,
+    operation: F,
+) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: Future<Output = Result<T, ApiError>> + Send + 'static,
+{
+    let permit = permit.ok_or_else(|| ApiError::resource_exhausted("inference"))?;
+    tokio::spawn(async move {
+        let _permit = permit;
+        operation.await
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("inference task failed: {error:#}")))?
+}
+
+pub(super) fn authorize(
+    state: &impl ServerApplication,
+    headers: &HeaderMap,
+) -> Result<(), ApiError> {
+    let Some(api_key) = state.api_policy().api_key.as_deref() else {
         return Ok(());
     };
     let Some(header) = headers
@@ -120,7 +142,7 @@ pub(super) fn multipart_file_suffix(content_type: Option<&str>) -> &'static str 
         .as_deref()
     {
         Some("image/png") => ".png",
-        Some("image/jpeg") | Some("image/jpg") => ".jpg",
+        Some("image/jpeg" | "image/jpg") => ".jpg",
         Some("image/webp") => ".webp",
         Some("image/bmp") => ".bmp",
         Some("image/tiff") => ".tiff",
@@ -130,5 +152,54 @@ pub(super) fn multipart_file_suffix(content_type: Option<&str>) -> &'static str 
         Some("video/webm") => ".webm",
         Some("video/x-matroska") => ".mkv",
         _ => "",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::application::resource_policy::ResourcePolicy;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Notify;
+
+    #[tokio::test]
+    async fn cancelled_waiter_does_not_release_inference_resources_early() {
+        let resources = ResourcePolicy::new(1, 1, 1);
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let finished = Arc::new(Notify::new());
+        let waiter = tokio::spawn({
+            let resources = resources.clone();
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            let finished = Arc::clone(&finished);
+            async move {
+                run_inference_owned(resources.try_acquire_inference(), async move {
+                    let _file = file;
+                    started.notify_one();
+                    release.notified().await;
+                    finished.notify_one();
+                    Ok::<(), ApiError>(())
+                })
+                .await
+            }
+        });
+        started.notified().await;
+
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert!(resources.try_acquire_inference().is_none());
+        assert!(path.exists());
+
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), finished.notified())
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert!(resources.try_acquire_inference().is_some());
+        assert!(!path.exists());
     }
 }

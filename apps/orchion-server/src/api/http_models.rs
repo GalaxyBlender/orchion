@@ -1,92 +1,53 @@
 use crate::api::http_shared::authorize;
 use crate::api::openai::{ApiError, ModelList, ModelObject, ModelSubtype, ModelType};
-use crate::infrastructure::orchion::AppState;
+use crate::application::ServerApplication;
 use axum::Json;
 use axum::extract::State;
 use axum::http::HeaderMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-pub(super) async fn list_models(
-    State(state): State<Arc<AppState>>,
+pub(super) async fn list_models<S>(
+    State(state): State<Arc<S>>,
     headers: HeaderMap,
-) -> Result<Json<ModelList>, ApiError> {
-    authorize(&state, &headers)?;
+) -> Result<Json<ModelList>, ApiError>
+where
+    S: ServerApplication,
+{
+    authorize(state.as_ref(), &headers)?;
+    let policy = state.api_policy();
     let mut data = Vec::new();
-    if state.config().services.asr.enabled {
+    if let Some(asr) = &policy.asr {
         data.extend(
-            state
-                .config()
-                .services
-                .asr
-                .available_models
+            asr.available_models
                 .iter()
                 .cloned()
                 .map(|model| ModelObject::new(model, ModelType::Asr, None)),
         );
     }
-    if state.config().services.tts.enabled {
-        data.extend(
-            state
-                .config()
-                .services
-                .tts
-                .available_models
-                .iter()
-                .cloned()
-                .map(|model| {
-                    let subtype = tts_model_subtype(&model);
-                    ModelObject::new(model, ModelType::Tts, Some(subtype))
-                }),
-        );
+    if let Some(tts_models) = &policy.tts_models {
+        data.extend(tts_models.iter().cloned().map(|model| {
+            let subtype = tts_model_subtype(&model);
+            ModelObject::new(model, ModelType::Tts, subtype)
+        }));
     }
-    if state.config().services.ocr.active() {
-        data.extend(
-            state
-                .config()
-                .services
-                .ocr
-                .available_models
-                .iter()
-                .map(|id| {
-                    ModelObject::from_id(id.as_str(), ModelType::Ocr, Some(ModelSubtype::Standard))
-                }),
-        );
-        data.extend(
-            state
-                .config()
-                .services
-                .ocr
-                .layout_available_models
-                .iter()
-                .map(|id| {
-                    ModelObject::from_id(id.as_str(), ModelType::Ocr, Some(ModelSubtype::Layout))
-                }),
-        );
+    if let Some(ocr) = &policy.ocr {
+        data.extend(ocr.models.iter().map(|id| {
+            ModelObject::from_id(id.as_str(), ModelType::Ocr, Some(ModelSubtype::Standard))
+        }));
+        data.extend(ocr.layout_models.iter().map(|id| {
+            ModelObject::from_id(id.as_str(), ModelType::Ocr, Some(ModelSubtype::Layout))
+        }));
     }
-    if state.config().services.ocr_vl.active() {
+    if let Some(ocr_vl) = &policy.ocr_vl {
         data.extend(
-            state
-                .config()
-                .services
-                .ocr_vl
-                .available_models
-                .iter()
-                .map(|id| {
-                    ModelObject::from_id(id.as_str(), ModelType::Ocr, Some(ModelSubtype::Vl))
-                }),
+            ocr_vl.models.iter().map(|id| {
+                ModelObject::from_id(id.as_str(), ModelType::Ocr, Some(ModelSubtype::Vl))
+            }),
         );
-        data.extend(
-            state
-                .config()
-                .services
-                .ocr_vl
-                .layout_available_models
-                .iter()
-                .map(|id| {
-                    ModelObject::from_id(id.as_str(), ModelType::Ocr, Some(ModelSubtype::Layout))
-                }),
-        );
+        data.extend(ocr_vl.layout_models.iter().map(|id| {
+            ModelObject::from_id(id.as_str(), ModelType::Ocr, Some(ModelSubtype::Layout))
+        }));
     }
     dedupe_model_objects(&mut data);
     Ok(Json(ModelList {
@@ -95,17 +56,31 @@ pub(super) async fn list_models(
     }))
 }
 
-fn tts_model_subtype(model: &orchion::TtsModel) -> ModelSubtype {
+fn tts_model_subtype(model: &orchion::TtsModel) -> Option<ModelSubtype> {
     if model.supports_preset_speakers() {
-        ModelSubtype::PresetVoice
+        Some(ModelSubtype::PresetVoice)
     } else if model.supports_voice_design() {
-        ModelSubtype::VoiceDesign
+        Some(ModelSubtype::VoiceDesign)
+    } else if model.supports_voice_cloning() {
+        Some(ModelSubtype::VoiceClone)
     } else {
-        ModelSubtype::VoiceClone
+        None
     }
 }
 
 fn dedupe_model_objects(models: &mut Vec<ModelObject>) {
     let mut seen = HashSet::new();
     models.retain(|model| seen.insert(model.id.clone()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tts_models_without_registered_capabilities_have_no_subtype() {
+        let model = orchion::TtsModel::parse("Acme/Experimental-TTS").unwrap();
+
+        assert!(tts_model_subtype(&model).is_none());
+    }
 }

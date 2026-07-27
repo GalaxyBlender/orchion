@@ -1,5 +1,10 @@
-use orchion_core::{AsrModel, AsrOptions, AsrTranscript, DevicePreference, Result};
-use std::path::Path;
+use orchion_core::{AsrModel, AsrOptions, AsrStreamingOptions, AsrTranscript, Result};
+#[cfg(feature = "asr-qwen3")]
+use orchion_core::{DevicePreference, OrchionError, RuntimeProvider, model_descriptor};
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
 
 #[cfg(feature = "audio-vad")]
 use crate::audio_vad::{AudioVadSegment, AudioVadSegmenter};
@@ -7,14 +12,59 @@ use crate::audio_vad::{AudioVadSegment, AudioVadSegmenter};
 use orchion_core::{ASR_SAMPLE_RATE, AsrSegment};
 
 #[cfg(feature = "audio-ffmpeg")]
-use std::path::PathBuf;
-
-#[cfg(feature = "audio-ffmpeg")]
 use std::time::Instant;
+
+pub type AsrEngineFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+
+pub trait AsrStreamSession: Send {
+    fn feed(
+        &mut self,
+        samples: Vec<f32>,
+        sample_rate: u32,
+    ) -> AsrEngineFuture<'_, Option<AsrTranscript>>;
+
+    fn finish(self: Box<Self>) -> AsrEngineFuture<'static, AsrTranscript>;
+}
+
+pub trait AsrEngine: Send + Sync {
+    fn model(&self) -> AsrModel;
+
+    fn transcribe_file_with(
+        &self,
+        path: PathBuf,
+        options: AsrOptions,
+    ) -> AsrEngineFuture<'_, AsrTranscript>;
+
+    fn transcribe_samples_with(
+        &self,
+        samples: Vec<f32>,
+        sample_rate: u32,
+        options: AsrOptions,
+    ) -> AsrEngineFuture<'_, AsrTranscript>;
+
+    fn start_streaming_with(
+        &self,
+        options: AsrStreamingOptions,
+    ) -> AsrEngineFuture<'_, Box<dyn AsrStreamSession>>;
+}
 
 #[derive(Clone)]
 pub struct Asr {
+    inner: Arc<dyn AsrEngine>,
+}
+
+pub struct AsrStream {
+    inner: Box<dyn AsrStreamSession>,
+}
+
+#[cfg(feature = "asr-qwen3")]
+struct QwenAsrEngine {
     inner: orchion_qwen3::Asr,
+}
+
+#[cfg(feature = "asr-qwen3")]
+struct QwenAsrStreamSession {
+    inner: orchion_qwen3::AsrStream,
 }
 
 #[cfg(all(test, feature = "audio-vad"))]
@@ -108,21 +158,27 @@ mod tests {
 }
 
 impl Asr {
+    pub fn from_engine(engine: Arc<dyn AsrEngine>) -> Self {
+        Self { inner: engine }
+    }
+
+    #[cfg(feature = "asr-qwen3")]
     pub async fn load(model: AsrModel, model_dir: impl AsRef<Path>) -> Result<Self> {
         Self::load_with_device(model, model_dir, DevicePreference::Auto).await
     }
 
+    #[cfg(feature = "asr-qwen3")]
     pub async fn load_with_device(
         model: AsrModel,
         model_dir: impl AsRef<Path>,
         device: DevicePreference,
     ) -> Result<Self> {
-        Ok(Self {
-            inner: orchion_qwen3::Asr::load_with_device(model, model_dir, device).await?,
-        })
+        ensure_qwen_asr_model(&model)?;
+        let inner = orchion_qwen3::Asr::load_with_device(model, model_dir, device).await?;
+        Ok(Self::from_engine(Arc::new(QwenAsrEngine { inner })))
     }
 
-    #[cfg(feature = "download-all")]
+    #[cfg(all(feature = "asr-qwen3", feature = "download-all"))]
     pub async fn load_or_download(model: AsrModel, cache_dir: impl AsRef<Path>) -> Result<Self> {
         let model_dir = orchion_download::ModelDownloader::default()
             .download(model.clone(), cache_dir)
@@ -135,7 +191,7 @@ impl Asr {
     }
 
     pub async fn transcribe_file(&self, path: impl AsRef<Path>) -> Result<AsrTranscript> {
-        self.inner.transcribe_file(path).await
+        self.transcribe_file_with(path, AsrOptions::default()).await
     }
 
     pub async fn transcribe_file_with(
@@ -143,7 +199,9 @@ impl Asr {
         path: impl AsRef<Path>,
         options: AsrOptions,
     ) -> Result<AsrTranscript> {
-        self.inner.transcribe_file_with(path, options).await
+        self.inner
+            .transcribe_file_with(path.as_ref().to_path_buf(), options)
+            .await
     }
 
     pub async fn transcribe_samples(
@@ -151,7 +209,8 @@ impl Asr {
         samples: &[f32],
         sample_rate: u32,
     ) -> Result<AsrTranscript> {
-        self.inner.transcribe_samples(samples, sample_rate).await
+        self.transcribe_samples_with(samples, sample_rate, AsrOptions::default())
+            .await
     }
 
     pub async fn transcribe_samples_with(
@@ -161,7 +220,7 @@ impl Asr {
         options: AsrOptions,
     ) -> Result<AsrTranscript> {
         self.inner
-            .transcribe_samples_with(samples, sample_rate, options)
+            .transcribe_samples_with(samples.to_vec(), sample_rate, options)
             .await
     }
 
@@ -182,7 +241,6 @@ impl Asr {
         let mut segment_results = Vec::with_capacity(audio_segments.len());
         for segment in audio_segments {
             let segment_transcript = self
-                .inner
                 .transcribe_samples_with(
                     &prepared[segment.start_sample..segment.end_sample],
                     ASR_SAMPLE_RATE,
@@ -220,8 +278,7 @@ impl Asr {
             "ASR audio decode completed"
         );
         let inference_started = Instant::now();
-        self.inner
-            .transcribe_samples_with(&decoded.samples, decoded.sample_rate, options)
+        self.transcribe_samples_with(&decoded.samples, decoded.sample_rate, options)
             .await
             .inspect(|_| {
                 tracing::debug!(
@@ -246,8 +303,7 @@ impl Asr {
             "ASR audio decode completed"
         );
         let inference_started = Instant::now();
-        self.inner
-            .transcribe_samples_with(&decoded.samples, decoded.sample_rate, options)
+        self.transcribe_samples_with(&decoded.samples, decoded.sample_rate, options)
             .await
             .inspect(|_| {
                 tracing::debug!(
@@ -309,15 +365,112 @@ impl Asr {
             })
     }
 
-    pub async fn start_streaming(&self) -> Result<orchion_qwen3::AsrStream> {
-        self.inner.start_streaming().await
+    pub async fn start_streaming(&self) -> Result<AsrStream> {
+        self.start_streaming_with(AsrStreamingOptions::default())
+            .await
     }
 
-    pub async fn start_streaming_with(
+    pub async fn start_streaming_with(&self, options: AsrStreamingOptions) -> Result<AsrStream> {
+        let inner = self.inner.start_streaming_with(options).await?;
+        Ok(AsrStream { inner })
+    }
+}
+
+impl AsrStream {
+    pub async fn feed(
+        &mut self,
+        samples: &[f32],
+        sample_rate: u32,
+    ) -> Result<Option<AsrTranscript>> {
+        self.inner.feed(samples.to_vec(), sample_rate).await
+    }
+
+    pub async fn finish(self) -> Result<AsrTranscript> {
+        self.inner.finish().await
+    }
+}
+
+#[cfg(feature = "asr-qwen3")]
+impl AsrEngine for QwenAsrEngine {
+    fn model(&self) -> AsrModel {
+        self.inner.model()
+    }
+
+    fn transcribe_file_with(
         &self,
-        options: orchion_core::AsrStreamingOptions,
-    ) -> Result<orchion_qwen3::AsrStream> {
-        self.inner.start_streaming_with(options).await
+        path: PathBuf,
+        options: AsrOptions,
+    ) -> AsrEngineFuture<'_, AsrTranscript> {
+        Box::pin(async move { self.inner.transcribe_file_with(path, options).await })
+    }
+
+    fn transcribe_samples_with(
+        &self,
+        samples: Vec<f32>,
+        sample_rate: u32,
+        options: AsrOptions,
+    ) -> AsrEngineFuture<'_, AsrTranscript> {
+        Box::pin(async move {
+            self.inner
+                .transcribe_samples_with(&samples, sample_rate, options)
+                .await
+        })
+    }
+
+    fn start_streaming_with(
+        &self,
+        options: AsrStreamingOptions,
+    ) -> AsrEngineFuture<'_, Box<dyn AsrStreamSession>> {
+        Box::pin(async move {
+            let inner = self.inner.start_streaming_with(options).await?;
+            Ok(Box::new(QwenAsrStreamSession { inner }) as Box<dyn AsrStreamSession>)
+        })
+    }
+}
+
+#[cfg(feature = "asr-qwen3")]
+impl AsrStreamSession for QwenAsrStreamSession {
+    fn feed(
+        &mut self,
+        samples: Vec<f32>,
+        sample_rate: u32,
+    ) -> AsrEngineFuture<'_, Option<AsrTranscript>> {
+        Box::pin(async move { self.inner.feed(&samples, sample_rate).await })
+    }
+
+    fn finish(self: Box<Self>) -> AsrEngineFuture<'static, AsrTranscript> {
+        Box::pin(async move { self.inner.finish().await })
+    }
+}
+
+#[cfg(feature = "asr-qwen3")]
+fn ensure_qwen_asr_model(model: &AsrModel) -> Result<()> {
+    if model_descriptor(model.as_str())
+        .is_none_or(|descriptor| descriptor.runtime_provider == RuntimeProvider::Qwen3)
+    {
+        Ok(())
+    } else {
+        Err(OrchionError::ModelLoad {
+            message: format!("unsupported ASR model `{model}`"),
+        })
+    }
+}
+
+#[cfg(all(test, feature = "asr-qwen3"))]
+mod provider_tests {
+    use super::*;
+
+    #[test]
+    fn qwen_loader_preserves_fallback_for_unregistered_checkpoints() {
+        assert!(ensure_qwen_asr_model(&AsrModel::parse("Acme/New-ASR").unwrap()).is_ok());
+    }
+
+    #[test]
+    fn qwen_loader_rejects_models_registered_to_another_provider() {
+        assert!(
+            ensure_qwen_asr_model(&AsrModel::parse("PaddlePaddle/PaddleOCR-VL-1.6").unwrap())
+                .is_err()
+        );
     }
 }
 

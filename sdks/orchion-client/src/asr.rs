@@ -1,10 +1,20 @@
 use crate::client::{decode_json, decode_text};
 use crate::{Client, ClientError, ServerErrorObject};
 use futures_util::{SinkExt, StreamExt};
+use orchion_protocol::{
+    AsrStreamControlMessage, AsrStreamEvent, AsrStreamStartMessage,
+    CaptionEndpointingValidationError,
+};
+pub use orchion_protocol::{
+    AsrStreamInputAudioFormat as StreamingInputAudioFormat, AsrStreamMode as StreamingMode,
+    CaptionEndpointing,
+};
 use reqwest::multipart::{Form, Part};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use std::fmt;
+use std::future::Future;
 use std::path::Path;
+use std::time::Duration;
 use tokio_tungstenite::tungstenite::Error as TungsteniteError;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message;
@@ -60,8 +70,8 @@ impl<'a> AsrClient<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`] when the request is invalid, the WebSocket cannot be opened, or the
-    /// initial start message cannot be sent.
+    /// Returns [`ClientError`] when the request is invalid, the WebSocket cannot be opened, the
+    /// initial start message cannot be sent, or a configured WebSocket operation times out.
     pub async fn start_streaming(
         &self,
         request: StreamingStartRequest,
@@ -101,29 +111,39 @@ impl<'a> AsrClient<'a> {
             .client
             .websocket_url("/v1/audio/transcriptions/stream")?;
         let headers = self.client.websocket_headers()?;
+        let timeout = self.client.config().timeout;
         let mut websocket_request = url
             .as_str()
             .into_client_request()
             .map_err(websocket_error)?;
         websocket_request.headers_mut().extend(headers);
 
-        let (mut stream, _) = tokio_tungstenite::connect_async(websocket_request)
-            .await
-            .map_err(websocket_connect_error)?;
-        let start_message = serde_json::to_string(&request).map_err(|error| {
+        let (mut stream, _) = websocket_with_timeout(
+            timeout,
+            "websocket connect/handshake",
+            Box::pin(async move {
+                tokio_tungstenite::connect_async(websocket_request)
+                    .await
+                    .map_err(websocket_connect_error)
+            }),
+        )
+        .await?;
+        let start_message = request.to_protocol_message().to_text().map_err(|error| {
             ClientError::decode(format!("invalid streaming start request: {error}"))
         })?;
-        stream
-            .send(Message::Text(start_message.into()))
-            .await
-            .map_err(websocket_error)?;
+        websocket_with_timeout(timeout, "websocket start message", async {
+            stream
+                .send(Message::Text(start_message.into()))
+                .await
+                .map_err(websocket_error)
+        })
+        .await?;
 
-        Ok(StreamingSession { stream })
+        Ok(StreamingSession {
+            io: StreamingSessionIo::new(stream, timeout),
+        })
     }
 }
-
-const CAPTION_VAD_FRAME_DURATION_MS: u32 = 30;
-const CAPTION_VAD_MAX_CANDIDATE_MS: u32 = 60_000;
 
 /// Multipart transcription request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -290,61 +310,33 @@ pub struct AsrSegment {
     pub text: String,
 }
 
-/// Streaming ASR session mode.
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum StreamingMode {
-    Caption,
-}
-
-/// Caption endpointing options sent in a streaming ASR start message.
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-pub struct CaptionEndpointing {
-    pub min_speech_ms: u32,
-    pub min_silence_ms: u32,
-    pub speech_padding_ms: u32,
-}
-
-impl Default for CaptionEndpointing {
-    fn default() -> Self {
-        Self {
-            min_speech_ms: 300,
-            min_silence_ms: 500,
-            speech_padding_ms: 200,
-        }
-    }
-}
-
 /// Start message sent to the ASR streaming WebSocket endpoint.
-#[derive(Clone, Serialize)]
+#[derive(Clone)]
 pub struct StreamingStartRequest {
-    #[serde(rename = "type")]
     message_type: &'static str,
     pub model: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<StreamingMode>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub endpointing: Option<CaptionEndpointing>,
     pub response_format: &'static str,
     pub input_audio_format: StreamingInputAudioFormat,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub sample_rate: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub chunk_size_sec: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub unfixed_chunk_num: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub unfixed_token_num: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_new_tokens_streaming: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_new_tokens_final: Option<usize>,
+}
+
+impl Serialize for StreamingStartRequest {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.to_protocol_message().serialize(serializer)
+    }
 }
 
 impl fmt::Debug for StreamingStartRequest {
@@ -443,65 +435,34 @@ impl StreamingStartRequest {
         self.endpointing = Some(endpointing);
         self
     }
+
+    fn to_protocol_message(&self) -> AsrStreamStartMessage {
+        AsrStreamStartMessage {
+            message_type: Some(self.message_type.to_string()),
+            mode: self.mode.map(|mode| mode.as_str().to_string()),
+            model: Some(self.model.clone()),
+            language: self.language.clone(),
+            prompt: self.prompt.clone(),
+            api_key: self.api_key.clone(),
+            response_format: Some(self.response_format.to_string()),
+            input_audio_format: Some(self.input_audio_format.as_str().to_string()),
+            endpointing: self.endpointing.map(Into::into),
+            sample_rate: self.sample_rate,
+            chunk_size_sec: self.chunk_size_sec,
+            unfixed_chunk_num: self.unfixed_chunk_num,
+            unfixed_token_num: self.unfixed_token_num,
+            max_new_tokens_streaming: self.max_new_tokens_streaming,
+            max_new_tokens_final: self.max_new_tokens_final,
+        }
+    }
 }
 
 fn validate_caption_endpointing(endpointing: CaptionEndpointing) -> Result<(), ClientError> {
-    if endpointing.min_speech_ms == 0 {
-        return Err(ClientError::build_request(
-            "endpointing.min_speech_ms must be greater than zero",
-        ));
-    }
-
-    if endpointing.min_silence_ms == 0 {
-        return Err(ClientError::build_request(
-            "endpointing.min_silence_ms must be greater than zero",
-        ));
-    }
-
-    let candidate_ms = endpointing
-        .speech_padding_ms
-        .checked_add(endpointing.min_speech_ms)
-        .ok_or_else(|| {
-            ClientError::build_request(
-                "endpointing.speech_padding_ms plus endpointing.min_speech_ms is too large",
-            )
-        })?;
-
-    if candidate_ms > CAPTION_VAD_MAX_CANDIDATE_MS {
-        return Err(ClientError::build_request(
-            "endpointing.speech_padding_ms plus endpointing.min_speech_ms must not exceed 60000",
-        ));
-    }
-
-    let rounded_min_speech_ms = endpointing
-        .min_speech_ms
-        .div_ceil(CAPTION_VAD_FRAME_DURATION_MS)
-        .checked_mul(CAPTION_VAD_FRAME_DURATION_MS)
-        .ok_or_else(|| ClientError::build_request("endpointing.min_speech_ms is too large"))?;
-
-    if candidate_ms < rounded_min_speech_ms {
-        return Err(ClientError::build_request(
-            "endpointing.speech_padding_ms plus endpointing.min_speech_ms must hold one rounded VAD speech window",
-        ));
-    }
-
-    Ok(())
-}
-
-/// Input audio format used by the ASR streaming endpoint.
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum StreamingInputAudioFormat {
-    Auto,
-    #[serde(rename = "pcm_s16le")]
-    PcmS16Le,
-    WebmOpus,
-    Mp3,
-    Wav,
-    M4a,
-    Aac,
-    Flac,
-    Ogg,
+    endpointing
+        .validate()
+        .map_err(|error: CaptionEndpointingValidationError| {
+            ClientError::build_request(error.to_string())
+        })
 }
 
 /// Event received from the ASR streaming WebSocket endpoint.
@@ -537,66 +498,63 @@ impl StreamingEvent {
     ///
     /// Returns [`ClientError`] when the event JSON is invalid or contains an unsupported event.
     pub fn from_text(text: &str) -> Result<Self, ClientError> {
-        let event: StreamingEventBody = serde_json::from_str(text)
-            .map_err(|error| ClientError::decode(format!("invalid streaming event: {error}")))?;
+        AsrStreamEvent::from_text(text)
+            .map(Into::into)
+            .map_err(|error| ClientError::decode(format!("invalid streaming event: {error}")))
+    }
+}
 
-        match event.event_type.as_str() {
-            "ready" => Ok(Self::Ready),
-            "partial" => {
-                let text = event
-                    .text
-                    .ok_or_else(|| ClientError::decode("partial streaming event missing text"))?;
-                match event.segment_id {
-                    Some(segment_id) => Ok(Self::CaptionPartial { segment_id, text }),
-                    None => Ok(Self::Partial { text }),
-                }
-            }
-            "final" => event
-                .text
-                .map(|text| Self::Final { text })
-                .ok_or_else(|| ClientError::decode("final streaming event missing text")),
-            "segment_final" => {
-                let segment_id = event.segment_id.ok_or_else(|| {
-                    ClientError::decode("segment_final streaming event missing segment_id")
-                })?;
-                let text = event.text.ok_or_else(|| {
-                    ClientError::decode("segment_final streaming event missing text")
-                })?;
-                Ok(Self::SegmentFinal {
-                    segment_id,
-                    text,
-                    start_ms: event.start_ms,
-                    end_ms: event.end_ms,
-                })
-            }
-            "completed" => Ok(Self::Completed),
-            "error" => event
-                .error
-                .map(|error| Self::Error { error })
-                .ok_or_else(|| ClientError::decode("streaming error event missing error object")),
-            event_type => Err(ClientError::decode(format!(
-                "unsupported streaming event type `{event_type}`"
-            ))),
+impl From<AsrStreamEvent> for StreamingEvent {
+    fn from(event: AsrStreamEvent) -> Self {
+        match event {
+            AsrStreamEvent::Ready => Self::Ready,
+            AsrStreamEvent::Partial {
+                text,
+                segment_id: Some(segment_id),
+            } => Self::CaptionPartial { segment_id, text },
+            AsrStreamEvent::Partial {
+                text,
+                segment_id: None,
+            } => Self::Partial { text },
+            AsrStreamEvent::Final { text } => Self::Final { text },
+            AsrStreamEvent::SegmentFinal {
+                segment_id,
+                text,
+                start_ms,
+                end_ms,
+            } => Self::SegmentFinal {
+                segment_id,
+                text,
+                start_ms,
+                end_ms,
+            },
+            AsrStreamEvent::Completed => Self::Completed,
+            AsrStreamEvent::Error { error } => Self::Error { error },
         }
     }
 }
 
-#[derive(Deserialize)]
-struct StreamingEventBody {
-    #[serde(rename = "type")]
-    event_type: String,
-    text: Option<String>,
-    segment_id: Option<u64>,
-    start_ms: Option<u64>,
-    end_ms: Option<u64>,
-    error: Option<ServerErrorObject>,
-}
-
 /// Active ASR streaming WebSocket session.
 pub struct StreamingSession {
-    stream: tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    io: StreamingSessionIo<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
     >,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamingSessionState {
+    Active,
+    Finishing,
+    Completed,
+    Terminal { failed_operation: &'static str },
+}
+
+struct StreamingSessionIo<S> {
+    stream: S,
+    timeout: Duration,
+    state: StreamingSessionState,
 }
 
 impl StreamingSession {
@@ -604,56 +562,163 @@ impl StreamingSession {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`] when the WebSocket send fails.
+    /// Returns [`ClientError`] when the WebSocket send fails or the operation times out. Either
+    /// failure makes the session terminal; later send, finish, and receive operations return
+    /// [`ClientError::StreamingSessionTerminated`].
     pub async fn send_audio(&mut self, audio: impl Into<Vec<u8>>) -> Result<(), ClientError> {
-        self.stream
-            .send(Message::Binary(audio.into().into()))
-            .await
-            .map_err(websocket_error)
+        self.io.send_audio(audio.into()).await
     }
 
     /// Signals that no more audio will be sent.
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`] when the WebSocket send fails.
+    /// Returns [`ClientError`] when the WebSocket send fails or the operation times out. Either
+    /// failure makes the session terminal; later send, finish, and receive operations return
+    /// [`ClientError::StreamingSessionTerminated`].
     pub async fn finish(&mut self) -> Result<(), ClientError> {
-        self.stream
-            .send(Message::Text(r#"{"type":"end"}"#.to_string().into()))
-            .await
-            .map_err(websocket_error)
+        self.io.finish().await
     }
 
     /// Receives the next streaming event.
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`] when the WebSocket receives an unsupported message or the event
-    /// cannot be decoded.
+    /// Returns [`ClientError`] when the session is terminal, the operation times out, the
+    /// WebSocket receives an unsupported message, or the event cannot be decoded.
     pub async fn next_event(&mut self) -> Result<Option<StreamingEvent>, ClientError> {
-        while let Some(message) = self.stream.next().await {
-            match message.map_err(websocket_error)? {
-                Message::Text(text) => return StreamingEvent::from_text(&text).map(Some),
-                Message::Close(_) => return Ok(None),
-                Message::Ping(_) | Message::Pong(_) => {}
-                Message::Binary(_) | Message::Frame(_) => {
-                    return Err(ClientError::decode(
-                        "unsupported binary streaming WebSocket message",
-                    ));
-                }
-            }
-        }
-
-        Ok(None)
+        self.io.next_event().await
     }
 
     /// Closes the streaming WebSocket session.
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`] when the WebSocket close fails.
+    /// This still attempts to close a session made terminal by a failed or timed-out send.
+    /// Returns [`ClientError`] when the WebSocket close fails or the operation times out.
     pub async fn close(mut self) -> Result<(), ClientError> {
-        self.stream.close(None).await.map_err(websocket_error)
+        self.io.close().await
+    }
+}
+
+impl<S> StreamingSessionIo<S>
+where
+    S: futures_util::Sink<Message, Error = TungsteniteError>
+        + futures_util::Stream<Item = Result<Message, TungsteniteError>>
+        + Unpin,
+{
+    const fn new(stream: S, timeout: Duration) -> Self {
+        Self {
+            stream,
+            timeout,
+            state: StreamingSessionState::Active,
+        }
+    }
+
+    async fn send_audio(&mut self, audio: Vec<u8>) -> Result<(), ClientError> {
+        self.send_message(
+            "send_audio",
+            "websocket send_audio",
+            Message::Binary(audio.into()),
+            StreamingSessionState::Active,
+        )
+        .await
+    }
+
+    async fn finish(&mut self) -> Result<(), ClientError> {
+        self.ensure_writable()?;
+        let end_message = AsrStreamControlMessage::end().to_text().map_err(|error| {
+            ClientError::decode(format!("invalid streaming end message: {error}"))
+        })?;
+        self.send_message(
+            "finish",
+            "websocket finish",
+            Message::Text(end_message.into()),
+            StreamingSessionState::Finishing,
+        )
+        .await
+    }
+
+    async fn send_message(
+        &mut self,
+        failed_operation: &'static str,
+        timeout_operation: &'static str,
+        message: Message,
+        success_state: StreamingSessionState,
+    ) -> Result<(), ClientError> {
+        self.ensure_writable()?;
+        self.state = StreamingSessionState::Terminal { failed_operation };
+        let result = websocket_with_timeout(self.timeout, timeout_operation, async {
+            self.stream.send(message).await.map_err(websocket_error)
+        })
+        .await;
+
+        if result.is_ok() {
+            self.state = success_state;
+        }
+
+        result
+    }
+
+    async fn next_event(&mut self) -> Result<Option<StreamingEvent>, ClientError> {
+        if self.state == StreamingSessionState::Completed {
+            return Ok(None);
+        }
+        self.ensure_readable()?;
+        let result = websocket_with_timeout(self.timeout, "websocket next_event", async {
+            while let Some(message) = self.stream.next().await {
+                match message.map_err(websocket_error)? {
+                    Message::Text(text) => return StreamingEvent::from_text(&text).map(Some),
+                    Message::Close(_) => return Ok(None),
+                    Message::Ping(_) | Message::Pong(_) => {}
+                    Message::Binary(_) | Message::Frame(_) => {
+                        return Err(ClientError::decode(
+                            "unsupported binary streaming WebSocket message",
+                        ));
+                    }
+                }
+            }
+
+            Ok(None)
+        })
+        .await;
+        if matches!(
+            result,
+            Ok(None | Some(StreamingEvent::Final { .. } | StreamingEvent::Completed))
+        ) {
+            self.state = StreamingSessionState::Completed;
+        }
+        result
+    }
+
+    async fn close(&mut self) -> Result<(), ClientError> {
+        websocket_with_timeout(self.timeout, "websocket close", async {
+            self.stream.close().await.map_err(websocket_error)
+        })
+        .await
+    }
+
+    const fn ensure_writable(&self) -> Result<(), ClientError> {
+        match self.state {
+            StreamingSessionState::Active => Ok(()),
+            StreamingSessionState::Finishing | StreamingSessionState::Completed => {
+                Err(ClientError::streaming_session_terminated("finish"))
+            }
+            StreamingSessionState::Terminal { failed_operation } => {
+                Err(ClientError::streaming_session_terminated(failed_operation))
+            }
+        }
+    }
+
+    const fn ensure_readable(&self) -> Result<(), ClientError> {
+        match self.state {
+            StreamingSessionState::Active
+            | StreamingSessionState::Finishing
+            | StreamingSessionState::Completed => Ok(()),
+            StreamingSessionState::Terminal { failed_operation } => {
+                Err(ClientError::streaming_session_terminated(failed_operation))
+            }
+        }
     }
 }
 
@@ -661,6 +726,16 @@ fn websocket_error(error: impl std::fmt::Display) -> ClientError {
     ClientError::WebSocket {
         message: error.to_string(),
     }
+}
+
+async fn websocket_with_timeout<T>(
+    timeout: Duration,
+    operation: &'static str,
+    future: impl Future<Output = Result<T, ClientError>>,
+) -> Result<T, ClientError> {
+    tokio::time::timeout(timeout, future)
+        .await
+        .map_err(|_| ClientError::timeout(operation, timeout))?
 }
 
 fn websocket_connect_error(error: TungsteniteError) -> ClientError {
@@ -701,9 +776,231 @@ fn websocket_connect_error(error: TungsteniteError) -> ClientError {
 #[cfg(test)]
 mod tests {
     use super::{
-        CaptionEndpointing, StreamingEvent, StreamingInputAudioFormat, StreamingStartRequest,
+        CaptionEndpointing, StreamingEvent, StreamingInputAudioFormat, StreamingSessionIo,
+        StreamingSessionState, StreamingStartRequest,
     };
     use crate::{Client, ClientError, ServerErrorObject};
+    use futures_util::{Sink, Stream};
+    use orchion_protocol::{AsrStreamEvent, AsrStreamStartMessage};
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+    use tokio_tungstenite::tungstenite::Error as TungsteniteError;
+    use tokio_tungstenite::tungstenite::protocol::Message;
+
+    const CONTROLLED_IO_TIMEOUT: Duration = Duration::from_millis(10);
+
+    enum ControlledBehavior {
+        Complete,
+        StallBinarySend,
+        StallTextSend,
+        FailBinarySend,
+        FailTextSend,
+        StallClose,
+    }
+
+    struct ControlledWebSocket {
+        behavior: ControlledBehavior,
+        send_stalled: bool,
+        close_polled: Arc<AtomicBool>,
+    }
+
+    impl ControlledWebSocket {
+        fn new(behavior: ControlledBehavior) -> (Self, Arc<AtomicBool>) {
+            let close_polled = Arc::new(AtomicBool::new(false));
+            (
+                Self {
+                    behavior,
+                    send_stalled: false,
+                    close_polled: Arc::clone(&close_polled),
+                },
+                close_polled,
+            )
+        }
+    }
+
+    impl Sink<Message> for ControlledWebSocket {
+        type Error = TungsteniteError;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(mut self: Pin<&mut Self>, message: Message) -> Result<(), Self::Error> {
+            if matches!(
+                (&self.behavior, &message),
+                (ControlledBehavior::FailBinarySend, Message::Binary(_))
+                    | (ControlledBehavior::FailTextSend, Message::Text(_))
+            ) {
+                return Err(TungsteniteError::ConnectionClosed);
+            }
+
+            self.send_stalled = matches!(
+                (&self.behavior, message),
+                (ControlledBehavior::StallBinarySend, Message::Binary(_))
+                    | (ControlledBehavior::StallTextSend, Message::Text(_))
+            );
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            if self.send_stalled {
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            self.close_polled.store(true, Ordering::Relaxed);
+            if matches!(self.behavior, ControlledBehavior::StallClose) {
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
+
+    impl Stream for ControlledWebSocket {
+        type Item = Result<Message, TungsteniteError>;
+
+        fn poll_next(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Pending
+        }
+    }
+
+    fn assert_controlled_timeout(error: &ClientError, operation: &'static str) {
+        assert!(matches!(
+            error,
+            ClientError::Timeout {
+                operation: actual_operation,
+                timeout: CONTROLLED_IO_TIMEOUT,
+            } if *actual_operation == operation
+        ));
+    }
+
+    fn assert_terminal(error: &ClientError, operation: &'static str) {
+        assert!(matches!(
+            error,
+            ClientError::StreamingSessionTerminated {
+                operation: actual_operation,
+            } if *actual_operation == operation
+        ));
+    }
+
+    #[tokio::test]
+    async fn send_audio_timeout_makes_session_terminal_but_close_is_still_attempted() {
+        let (stream, close_polled) = ControlledWebSocket::new(ControlledBehavior::StallBinarySend);
+        let mut session = StreamingSessionIo::new(stream, CONTROLLED_IO_TIMEOUT);
+
+        let error = session.send_audio(vec![1, 2, 3]).await.unwrap_err();
+        assert_controlled_timeout(&error, "websocket send_audio");
+
+        let send_error = session.send_audio(vec![4]).await.unwrap_err();
+        let finish_error = session.finish().await.unwrap_err();
+        let event_error = session.next_event().await.unwrap_err();
+        assert_terminal(&send_error, "send_audio");
+        assert_terminal(&finish_error, "send_audio");
+        assert_terminal(&event_error, "send_audio");
+
+        session.close().await.unwrap();
+        assert!(close_polled.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn finish_timeout_makes_session_terminal_with_a_stable_error() {
+        let (stream, _) = ControlledWebSocket::new(ControlledBehavior::StallTextSend);
+        let mut session = StreamingSessionIo::new(stream, CONTROLLED_IO_TIMEOUT);
+
+        let error = session.finish().await.unwrap_err();
+        assert_controlled_timeout(&error, "websocket finish");
+
+        let send_error = session.send_audio(vec![1]).await.unwrap_err();
+        let finish_error = session.finish().await.unwrap_err();
+        let event_error = session.next_event().await.unwrap_err();
+        assert_terminal(&send_error, "finish");
+        assert_terminal(&finish_error, "finish");
+        assert_terminal(&event_error, "finish");
+    }
+
+    #[tokio::test]
+    async fn send_error_makes_session_terminal() {
+        let (stream, _) = ControlledWebSocket::new(ControlledBehavior::FailBinarySend);
+        let mut session = StreamingSessionIo::new(stream, CONTROLLED_IO_TIMEOUT);
+
+        let error = session.send_audio(vec![1]).await.unwrap_err();
+        assert!(matches!(error, ClientError::WebSocket { .. }));
+        assert_terminal(&session.next_event().await.unwrap_err(), "send_audio");
+    }
+
+    #[tokio::test]
+    async fn finish_send_error_makes_session_terminal() {
+        let (stream, _) = ControlledWebSocket::new(ControlledBehavior::FailTextSend);
+        let mut session = StreamingSessionIo::new(stream, CONTROLLED_IO_TIMEOUT);
+
+        let error = session.finish().await.unwrap_err();
+        assert!(matches!(error, ClientError::WebSocket { .. }));
+        assert_terminal(&session.next_event().await.unwrap_err(), "finish");
+    }
+
+    #[tokio::test]
+    async fn close_uses_its_own_timeout() {
+        let (stream, close_polled) = ControlledWebSocket::new(ControlledBehavior::StallClose);
+        let mut session = StreamingSessionIo::new(stream, CONTROLLED_IO_TIMEOUT);
+
+        let error = session.close().await.unwrap_err();
+
+        assert_controlled_timeout(&error, "websocket close");
+        assert!(close_polled.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn controlled_stream_can_complete_sends() {
+        let (stream, _) = ControlledWebSocket::new(ControlledBehavior::Complete);
+        let mut session = StreamingSessionIo::new(stream, CONTROLLED_IO_TIMEOUT);
+
+        session.send_audio(vec![1]).await.unwrap();
+        session.finish().await.unwrap();
+        assert_terminal(&session.send_audio(vec![2]).await.unwrap_err(), "finish");
+        assert_terminal(&session.finish().await.unwrap_err(), "finish");
+    }
+
+    #[tokio::test]
+    async fn caller_cancelling_send_makes_session_terminal() {
+        let (stream, _) = ControlledWebSocket::new(ControlledBehavior::StallBinarySend);
+        let mut session = StreamingSessionIo::new(stream, CONTROLLED_IO_TIMEOUT);
+
+        tokio::time::timeout(Duration::from_millis(1), session.send_audio(vec![1]))
+            .await
+            .unwrap_err();
+
+        assert_terminal(
+            &session.send_audio(vec![2]).await.unwrap_err(),
+            "send_audio",
+        );
+        assert_terminal(&session.next_event().await.unwrap_err(), "send_audio");
+    }
+
+    #[tokio::test]
+    async fn completed_session_returns_end_of_stream_on_later_reads() {
+        let (stream, _) = ControlledWebSocket::new(ControlledBehavior::Complete);
+        let mut session = StreamingSessionIo::new(stream, CONTROLLED_IO_TIMEOUT);
+        session.state = StreamingSessionState::Completed;
+
+        assert_eq!(session.next_event().await.unwrap(), None);
+        assert_terminal(&session.send_audio(vec![1]).await.unwrap_err(), "finish");
+    }
 
     #[test]
     fn stream_start_serializes_server_protocol_fields() {
@@ -723,6 +1020,26 @@ mod tests {
         assert_eq!(value["language"], "zh");
         assert_eq!(value["prompt"], "context");
         assert_eq!(value["chunk_size_sec"], 2.0);
+    }
+
+    #[test]
+    fn public_stream_start_wrapper_round_trips_through_shared_wire_dto() {
+        let request =
+            StreamingStartRequest::new("Qwen/Qwen3-ASR-Flash", StreamingInputAudioFormat::PcmS16Le)
+                .with_sample_rate(16_000)
+                .with_caption_endpointing(CaptionEndpointing::default());
+
+        let text = serde_json::to_string(&request).unwrap();
+        let wire = AsrStreamStartMessage::from_text(&text).unwrap();
+
+        assert_eq!(wire.message_type.as_deref(), Some("start"));
+        assert_eq!(wire.mode.as_deref(), Some("caption"));
+        assert_eq!(wire.input_audio_format.as_deref(), Some("pcm_s16le"));
+        assert_eq!(wire.sample_rate, Some(16_000));
+        assert_eq!(
+            wire.endpointing.unwrap().min_silence_ms,
+            Some(CaptionEndpointing::default().min_silence_ms)
+        );
     }
 
     #[test]
@@ -967,6 +1284,32 @@ mod tests {
             }
         );
         assert_eq!(completed, StreamingEvent::Completed);
+    }
+
+    #[test]
+    fn shared_wire_events_preserve_public_sdk_variants() {
+        let legacy = AsrStreamEvent::Partial {
+            text: "legacy".to_string(),
+            segment_id: None,
+        };
+        let caption = AsrStreamEvent::Partial {
+            text: "caption".to_string(),
+            segment_id: Some(4),
+        };
+
+        assert_eq!(
+            StreamingEvent::from_text(&legacy.to_text().unwrap()).unwrap(),
+            StreamingEvent::Partial {
+                text: "legacy".to_string(),
+            }
+        );
+        assert_eq!(
+            StreamingEvent::from_text(&caption.to_text().unwrap()).unwrap(),
+            StreamingEvent::CaptionPartial {
+                segment_id: 4,
+                text: "caption".to_string(),
+            }
+        );
     }
 
     #[test]

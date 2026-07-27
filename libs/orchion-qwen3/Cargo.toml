@@ -9,7 +9,7 @@ publish = false
 [features]
 default = []
 asr = ["dep:qwen3-asr"]
-tts = ["dep:qwen3-tts"]
+tts = ["dep:qwen3-tts", "dep:whatlang"]
 cpu = ["qwen3-tts?/cpu"]
 metal = ["candle-core/metal", "qwen3-asr?/metal", "qwen3-tts?/metal"]
 cuda = ["candle-core/cuda", "qwen3-asr?/cuda", "qwen3-tts?/cuda"]
@@ -23,6 +23,7 @@ qwen3-asr = { version = "0.2", optional = true, default-features = false }
 qwen3-tts = { git = "https://github.com/TrevorS/qwen3-tts-rs", optional = true, default-features = false }
 tokio = { version = "1", features = ["rt"] }
 tracing = "0.1"
+whatlang = { version = "0.18", optional = true }
 
 [lints.rust]
 unsafe_code = "warn"

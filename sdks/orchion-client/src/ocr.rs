@@ -32,25 +32,14 @@ impl<'a> OcrClient<'a> {
             .send()
             .await?;
 
-        match response_format {
-            Some(OcrResponseFormat::Json) => {
-                let response = decode_json(response).await?;
-                Ok(OcrResponse::Json(response))
-            }
-            Some(
-                OcrResponseFormat::Text | OcrResponseFormat::Markdown | OcrResponseFormat::Html,
-            ) => {
-                let response = decode_text(response).await?;
-                Ok(OcrResponse::Text(response))
-            }
-            None if response_is_json(&response) => {
-                let response = decode_json(response).await?;
-                Ok(OcrResponse::Json(response))
-            }
-            None => {
-                let response = decode_text(response).await?;
-                Ok(OcrResponse::Text(response))
-            }
+        let decode_as_json = response_format == Some(OcrResponseFormat::Json)
+            || response_format.is_none() && response_is_json(&response);
+        if decode_as_json {
+            let response = decode_json(response).await?;
+            Ok(OcrResponse::Json(response))
+        } else {
+            let response = decode_text(response).await?;
+            Ok(OcrResponse::Text(response))
         }
     }
 }

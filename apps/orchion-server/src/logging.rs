@@ -9,6 +9,9 @@ pub const fn default_rust_log() -> &'static str {
     DEFAULT_RUST_LOG
 }
 
+/// # Errors
+///
+/// Returns an error when the log directive is invalid or tracing initialization fails.
 pub fn init(exe_path: &Path, work_dir: &Path) -> anyhow::Result<String> {
     let explicit = std::env::var("RUST_LOG").ok();
     let directive = rust_log_directive_from_sources(exe_path, work_dir, explicit.as_deref())?;
@@ -20,6 +23,9 @@ pub fn init(exe_path: &Path, work_dir: &Path) -> anyhow::Result<String> {
     Ok(directive)
 }
 
+/// # Errors
+///
+/// Returns an I/O error when a candidate dotenv file cannot be read.
 pub fn rust_log_directive_from_sources(
     exe_path: &Path,
     work_dir: &Path,

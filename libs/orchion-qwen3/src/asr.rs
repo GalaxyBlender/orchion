@@ -210,8 +210,8 @@ fn validate_streaming_options(options: &AsrStreamingOptions) -> Result<()> {
             reason: "streaming chunk_size_sec must be finite and greater than zero".to_string(),
         });
     }
-    let chunk_size_samples = (options.chunk_size_sec * ASR_SAMPLE_RATE as f32) as usize;
-    if chunk_size_samples == 0 {
+    let chunk_size_samples = f64::from(options.chunk_size_sec) * f64::from(ASR_SAMPLE_RATE);
+    if chunk_size_samples < 1.0 {
         return Err(OrchionError::InvalidAudio {
             reason: "streaming chunk_size_sec must produce at least one sample".to_string(),
         });
@@ -246,6 +246,13 @@ fn streaming_options_into_upstream_options(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_f32_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() <= f32::EPSILON,
+            "expected {actual} to be within f32::EPSILON of {expected}"
+        );
+    }
 
     #[test]
     fn asr_options_convert_to_upstream_options() {
@@ -297,7 +304,7 @@ mod tests {
         let upstream = streaming_options_into_upstream_options(options);
 
         assert_eq!(upstream.language.as_deref(), Some("zh"));
-        assert_eq!(upstream.chunk_size_sec, 1.5);
+        assert_f32_close(upstream.chunk_size_sec, 1.5);
         assert_eq!(upstream.unfixed_chunk_num, 3);
         assert_eq!(upstream.unfixed_token_num, 7);
         assert_eq!(upstream.max_new_tokens_streaming, 48);
@@ -305,6 +312,7 @@ mod tests {
         assert_eq!(upstream.initial_text.as_deref(), Some("previous context"));
     }
 
+    #[cfg(feature = "cuda")]
     #[test]
     fn device_label_detects_cuda_index_from_resolver_kind() {
         assert_eq!(

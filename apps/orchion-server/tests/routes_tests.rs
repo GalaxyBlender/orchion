@@ -3,6 +3,7 @@ use axum::http::{Request, StatusCode, header, header::AUTHORIZATION};
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use orchion::{AsrModel, ModelId, TtsModel};
+use orchion_protocol::{AsrStreamEvent, AsrStreamInputAudioFormat, AsrStreamStartMessage};
 use orchion_server::api::ui;
 use orchion_server::config::ServerConfig;
 use orchion_server::routes::{router, router_with_ui_routes};
@@ -261,18 +262,22 @@ async fn transcription_websocket_accepts_api_key_in_start_message() {
             .await
             .unwrap();
 
+    let mut start = AsrStreamStartMessage::new("Acme/Missing-ASR", AsrStreamInputAudioFormat::Mp3);
+    start.api_key = Some("secret".to_string());
     socket
         .send(tokio_tungstenite::tungstenite::Message::Text(
-            r#"{"type":"start","model":"Acme/Missing-ASR","api_key":"secret","input_audio_format":"mp3"}"#
-                .into(),
+            start.to_text().unwrap().into(),
         ))
         .await
         .unwrap();
     let event = socket.next().await.unwrap().unwrap().into_text().unwrap();
-    let event = serde_json::from_str::<Value>(&event).unwrap();
+    let event = AsrStreamEvent::from_text(&event).unwrap();
 
-    assert_eq!(event["type"], "error");
-    assert_eq!(event["error"]["code"], "model_not_available");
+    assert!(matches!(
+        event,
+        AsrStreamEvent::Error { error }
+            if error.code.as_deref() == Some("model_not_available")
+    ));
     server.abort();
 }
 
@@ -669,6 +674,183 @@ async fn ocr_vl_rejects_max_tokens_above_service_limit_before_model_load() {
 }
 
 #[tokio::test]
+async fn traditional_ocr_rejects_html_before_model_load() {
+    let boundary = "orchion-traditional-ocr-html";
+    let body = multipart_body(
+        boundary,
+        &[
+            ("model", "PaddlePaddle/PP-OCRv6_tiny"),
+            ("response_format", "html"),
+        ],
+        "file",
+        "input.png",
+        b"not an image",
+    );
+    let response = router(test_state_with_ocr_services(None))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/ocr")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert_eq!(body["error"]["param"], "response_format");
+    assert_eq!(body["error"]["code"], "unsupported_response_format");
+}
+
+#[tokio::test]
+async fn ocr_rejects_invalid_image_before_model_load() {
+    let boundary = "orchion-invalid-ocr-image";
+    let body = multipart_body(
+        boundary,
+        &[("model", "PaddlePaddle/PP-OCRv6_tiny")],
+        "file",
+        "input.png",
+        b"not an image",
+    );
+    let response = router(test_state_with_ocr_services(None))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/ocr")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert_eq!(body["error"]["param"], "file");
+    assert_eq!(body["error"]["code"], "invalid_file");
+}
+
+#[tokio::test]
+async fn ocr_rejects_images_above_configured_pixel_limit_before_model_load() {
+    let state = test_state_with_ocr_services_config(None, |config| {
+        config.services.ocr.max_pixels = 1;
+    });
+    let boundary = "orchion-ocr-pixel-limit";
+    let body = multipart_body(
+        boundary,
+        &[("model", "PaddlePaddle/PP-OCRv6_tiny")],
+        "file",
+        "input.ppm",
+        b"P6\n2 1\n255\n\0\0\0\0\0\0",
+    );
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/ocr")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert_eq!(body["error"]["param"], "file");
+    assert_eq!(body["error"]["code"], "invalid_file");
+    assert!(body["error"]["message"].as_str().unwrap().contains("pixel"));
+}
+
+#[tokio::test]
+async fn traditional_ocr_markdown_uses_configured_default_layout_model() {
+    let layout_model = ModelId::parse("PaddlePaddle/PP-DocLayoutV3").unwrap();
+    let state = test_state_with_ocr_services_config(None, |config| {
+        config.services.ocr.layout_default_model = Some(layout_model.clone());
+        config.services.ocr.layout_available_models = vec![layout_model];
+    });
+    let boundary = "orchion-ocr-default-layout";
+    let body = multipart_body(
+        boundary,
+        &[
+            ("model", "PaddlePaddle/PP-OCRv6_tiny"),
+            ("response_format", "markdown"),
+        ],
+        "file",
+        "input.png",
+        b"not an image",
+    );
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/ocr")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert_eq!(body["error"]["param"], "file");
+    assert_eq!(body["error"]["code"], "invalid_file");
+}
+
+#[tokio::test]
+async fn ocr_vl_rejects_structured_format_without_layout_before_model_load() {
+    let state = test_state_with_ocr_services_config(None, |config| {
+        config.services.ocr_vl.layout_default_model = None;
+        config.services.ocr_vl.layout_available_models.clear();
+    });
+    let boundary = "orchion-ocr-vl-layout-required";
+    let body = multipart_body(
+        boundary,
+        &[
+            ("model", "PaddlePaddle/PaddleOCR-VL-1.6"),
+            ("response_format", "markdown"),
+        ],
+        "file",
+        "input.png",
+        b"not an image",
+    );
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/ocr")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert_eq!(body["error"]["param"], "response_format");
+    assert_eq!(body["error"]["code"], "unsupported_response_format");
+}
+
+#[tokio::test]
 async fn transcription_rejects_decoded_audio_above_duration_limit_before_model_load() {
     let state = test_state_with_services_config(None, true, false, |config| {
         config.services.asr.max_audio_duration = Duration::from_millis(1);
@@ -963,14 +1145,20 @@ fn multipart_body(
 }
 
 fn wav_bytes() -> Vec<u8> {
-    let samples = (0..2_400)
+    let samples = (0_u16..2_400)
         .map(|index| {
-            let phase = index as f32 / 24_000.0 * 440.0 * std::f32::consts::TAU;
-            (phase.sin() * f32::from(i16::MAX) * 0.25) as i16
+            let phase = f32::from(index) / 24_000.0 * 440.0 * std::f32::consts::TAU;
+            test_sample_to_i16(phase.sin() * 0.25)
         })
         .collect::<Vec<_>>();
-    let data_len = (samples.len() * 2) as u32;
-    let mut bytes = Vec::with_capacity(44 + data_len as usize);
+    let data_len = samples
+        .len()
+        .checked_mul(2)
+        .and_then(|length| u32::try_from(length).ok())
+        .expect("test WAV data length fits u32");
+    let mut bytes = Vec::with_capacity(
+        44 + usize::try_from(data_len).expect("test WAV data length fits usize"),
+    );
     bytes.extend_from_slice(b"RIFF");
     bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
     bytes.extend_from_slice(b"WAVE");
@@ -988,6 +1176,17 @@ fn wav_bytes() -> Vec<u8> {
         bytes.extend_from_slice(&sample.to_le_bytes());
     }
     bytes
+}
+
+fn test_sample_to_i16(sample: f32) -> i16 {
+    let scaled = sample.clamp(-1.0, 1.0) * f32::from(i16::MAX);
+    assert!(scaled.is_finite(), "test sample must be finite");
+
+    // The finite clamped value is in the i16 range; test encoding intentionally truncates it.
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        scaled as i16
+    }
 }
 
 fn test_state(api_key: Option<&str>) -> Arc<AppState> {
@@ -1050,14 +1249,14 @@ fn test_state_with_services_config(
         asr_model("Qwen/Qwen3-ASR-0.6B"),
         asr_model("Qwen/Qwen3-ASR-1.7B"),
     ];
-    config.services.asr.idle_timeout = Duration::from_secs(600);
+    config.services.asr.idle_timeout = Duration::from_mins(10);
     config.services.asr.max_loaded = 2;
     config.services.tts.available_models = vec![
         tts_model("Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"),
         tts_model("Qwen/Qwen3-TTS-12Hz-0.6B-Base"),
         tts_model("Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"),
     ];
-    config.services.tts.idle_timeout = Duration::from_secs(600);
+    config.services.tts.idle_timeout = Duration::from_mins(10);
     config.services.tts.max_loaded = 2;
     configure(&mut config);
     Arc::new(AppState::from_prepared_config(config).unwrap())
@@ -1078,7 +1277,7 @@ fn create_test_dist(test_name: &str, marker: &str) -> PathBuf {
 }
 
 fn create_dist(dist_dir: &Path, marker: &str) {
-    fs::create_dir_all(&dist_dir).unwrap();
+    fs::create_dir_all(dist_dir).unwrap();
     fs::write(
         dist_dir.join("index.html"),
         format!("<!doctype html><html><body>{marker}</body></html>"),

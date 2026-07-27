@@ -1,11 +1,73 @@
-use super::{ModelCategory, ModelId, ModelSpec};
+use super::{
+    ModelCapabilities, ModelCapabilityRequirement, ModelCategory, ModelDescriptor, ModelId,
+    ModelSourceLocators, ModelSpec, RuntimeProvider,
+};
 use crate::{OrchionError, Result};
+use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OcrModelKind {
     TraditionalOcr,
     Layout,
     OcrVl,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct OcrModel {
+    id: ModelId,
+    kind: OcrModelKind,
+}
+
+impl OcrModel {
+    #[must_use]
+    pub const fn new(id: ModelId, kind: OcrModelKind) -> Self {
+        Self { id, kind }
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> &ModelId {
+        &self.id
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> OcrModelKind {
+        self.kind
+    }
+
+    pub fn known(&self) -> Option<KnownOcrModel> {
+        KnownOcrModel::from_model_id(&self.id)
+            .ok()
+            .filter(|model| model.kind() == self.kind)
+    }
+}
+
+impl fmt::Display for OcrModel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.id.fmt(formatter)
+    }
+}
+
+impl ModelSpec for OcrModel {
+    fn category(&self) -> ModelCategory {
+        match self.kind {
+            OcrModelKind::TraditionalOcr | OcrModelKind::Layout => ModelCategory::Ocr,
+            OcrModelKind::OcrVl => ModelCategory::OcrVl,
+        }
+    }
+
+    fn huggingface_repo(&self) -> &str {
+        self.id.as_str()
+    }
+
+    fn modelscope_repo(&self) -> &str {
+        self.id.as_str()
+    }
+
+    fn required_files(&self) -> &'static [&'static str] {
+        self.known().map_or(&["config.json"], |model| {
+            <KnownOcrModel as ModelSpec>::required_files(&model)
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -20,7 +82,167 @@ pub enum KnownOcrModel {
     PaddleOcrVl16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OcrModelAssetKind {
+    RequiredFile,
+    PaddleOcrDictionary { output_file: &'static str },
+    ModelScopeFile { output_file: &'static str },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OcrModelAssetRole {
+    Detector,
+    Recognizer,
+    Dictionary,
+    Layout,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OcrModelAsset {
+    pub repo: &'static str,
+    pub file: &'static str,
+    pub kind: OcrModelAssetKind,
+    pub role: OcrModelAssetRole,
+}
+
+const PP_OCRV5_MOBILE_ASSETS: &[OcrModelAsset] = &[
+    OcrModelAsset {
+        repo: "greatv/oar-ocr",
+        file: "pp-ocrv5_mobile_det.onnx",
+        kind: OcrModelAssetKind::ModelScopeFile {
+            output_file: "pp-ocrv5_mobile_det.onnx",
+        },
+        role: OcrModelAssetRole::Detector,
+    },
+    OcrModelAsset {
+        repo: "greatv/oar-ocr",
+        file: "pp-ocrv5_mobile_rec.onnx",
+        kind: OcrModelAssetKind::ModelScopeFile {
+            output_file: "pp-ocrv5_mobile_rec.onnx",
+        },
+        role: OcrModelAssetRole::Recognizer,
+    },
+    OcrModelAsset {
+        repo: "greatv/oar-ocr",
+        file: "ppocrv5_dict.txt",
+        kind: OcrModelAssetKind::ModelScopeFile {
+            output_file: "ppocrv5_dict.txt",
+        },
+        role: OcrModelAssetRole::Dictionary,
+    },
+];
+
+const PP_OCRV5_SERVER_ASSETS: &[OcrModelAsset] = &[
+    required_ocr_asset(
+        "PaddlePaddle/PP-OCRv5_server_det_onnx",
+        "inference.onnx",
+        OcrModelAssetRole::Detector,
+    ),
+    required_ocr_asset(
+        "PaddlePaddle/PP-OCRv5_server_rec_onnx",
+        "inference.onnx",
+        OcrModelAssetRole::Recognizer,
+    ),
+    dictionary_asset("PaddlePaddle/PP-OCRv5_server_rec_onnx", "ppocrv5_dict.txt"),
+];
+
+const PP_OCRV6_TINY_ASSETS: &[OcrModelAsset] = &[
+    required_ocr_asset(
+        "PaddlePaddle/PP-OCRv6_tiny_det_onnx",
+        "inference.onnx",
+        OcrModelAssetRole::Detector,
+    ),
+    required_ocr_asset(
+        "PaddlePaddle/PP-OCRv6_tiny_rec_onnx",
+        "inference.onnx",
+        OcrModelAssetRole::Recognizer,
+    ),
+    dictionary_asset(
+        "PaddlePaddle/PP-OCRv6_tiny_rec_onnx",
+        "ppocrv6_tiny_dict.txt",
+    ),
+];
+
+const PP_OCRV6_SMALL_ASSETS: &[OcrModelAsset] = &[
+    required_ocr_asset(
+        "PaddlePaddle/PP-OCRv6_small_det_onnx",
+        "inference.onnx",
+        OcrModelAssetRole::Detector,
+    ),
+    required_ocr_asset(
+        "PaddlePaddle/PP-OCRv6_small_rec_onnx",
+        "inference.onnx",
+        OcrModelAssetRole::Recognizer,
+    ),
+    dictionary_asset("PaddlePaddle/PP-OCRv6_small_rec_onnx", "ppocrv6_dict.txt"),
+];
+
+const PP_OCRV6_MEDIUM_ASSETS: &[OcrModelAsset] = &[
+    required_ocr_asset(
+        "PaddlePaddle/PP-OCRv6_medium_det_onnx",
+        "inference.onnx",
+        OcrModelAssetRole::Detector,
+    ),
+    required_ocr_asset(
+        "PaddlePaddle/PP-OCRv6_medium_rec_onnx",
+        "inference.onnx",
+        OcrModelAssetRole::Recognizer,
+    ),
+    dictionary_asset("PaddlePaddle/PP-OCRv6_medium_rec_onnx", "ppocrv6_dict.txt"),
+];
+
+const PP_DOCLAYOUTV3_ASSETS: &[OcrModelAsset] = &[required_ocr_asset(
+    "PaddlePaddle/PP-DocLayoutV3_onnx",
+    "inference.onnx",
+    OcrModelAssetRole::Layout,
+)];
+
+const fn required_ocr_asset(
+    repo: &'static str,
+    file: &'static str,
+    role: OcrModelAssetRole,
+) -> OcrModelAsset {
+    OcrModelAsset {
+        repo,
+        file,
+        kind: OcrModelAssetKind::RequiredFile,
+        role,
+    }
+}
+
+const fn dictionary_asset(repo: &'static str, output_file: &'static str) -> OcrModelAsset {
+    OcrModelAsset {
+        repo,
+        file: "inference.yml",
+        kind: OcrModelAssetKind::PaddleOcrDictionary { output_file },
+        role: OcrModelAssetRole::Dictionary,
+    }
+}
+
 impl KnownOcrModel {
+    const MARKDOWN_REQUIRES_LAYOUT: ModelCapabilityRequirement = ModelCapabilityRequirement {
+        capability: ModelCapabilities::OCR_MARKDOWN,
+        requires: ModelCapabilities::OCR_LAYOUT,
+    };
+    const HTML_REQUIRES_LAYOUT: ModelCapabilityRequirement = ModelCapabilityRequirement {
+        capability: ModelCapabilities::OCR_HTML,
+        requires: ModelCapabilities::OCR_LAYOUT,
+    };
+    const MARKDOWN_REQUIREMENTS: [ModelCapabilityRequirement; 1] = [Self::MARKDOWN_REQUIRES_LAYOUT];
+    const STRUCTURED_OUTPUT_REQUIREMENTS: [ModelCapabilityRequirement; 2] =
+        [Self::MARKDOWN_REQUIRES_LAYOUT, Self::HTML_REQUIRES_LAYOUT];
+
+    pub const ALL: [Self; 8] = [
+        Self::PpOcrV5Mobile,
+        Self::PpOcrV5Server,
+        Self::PpOcrV6Tiny,
+        Self::PpOcrV6Small,
+        Self::PpOcrV6Medium,
+        Self::PpDocLayoutV3,
+        Self::PaddleOcrVl15,
+        Self::PaddleOcrVl16,
+    ];
+
     pub fn from_model_id(id: &ModelId) -> Result<Self> {
         match id.as_str() {
             "PaddlePaddle/PP-OCRv5_mobile" => Ok(Self::PpOcrV5Mobile),
@@ -77,6 +299,18 @@ impl KnownOcrModel {
         }
     }
 
+    /// Converts built-in metadata to the provider-neutral OCR model key.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if a statically declared built-in model ID violates [`ModelId`] syntax.
+    pub fn into_model(self) -> OcrModel {
+        OcrModel::new(
+            ModelId::parse(self.id()).expect("known OCR model id"),
+            self.kind(),
+        )
+    }
+
     pub const fn kind(self) -> OcrModelKind {
         match self {
             Self::PpOcrV5Mobile
@@ -105,40 +339,60 @@ impl KnownOcrModel {
         matches!(self, Self::PaddleOcrVl15 | Self::PaddleOcrVl16)
     }
 
-    pub const fn pp_ocr_detector_repo(self) -> Option<&'static str> {
+    pub const fn download_assets(self) -> &'static [OcrModelAsset] {
         match self {
-            Self::PpOcrV5Server => Some("PaddlePaddle/PP-OCRv5_server_det_onnx"),
-            Self::PpOcrV6Tiny => Some("PaddlePaddle/PP-OCRv6_tiny_det_onnx"),
-            Self::PpOcrV6Small => Some("PaddlePaddle/PP-OCRv6_small_det_onnx"),
-            Self::PpOcrV6Medium => Some("PaddlePaddle/PP-OCRv6_medium_det_onnx"),
-            _ => None,
+            Self::PpOcrV5Mobile => PP_OCRV5_MOBILE_ASSETS,
+            Self::PpOcrV5Server => PP_OCRV5_SERVER_ASSETS,
+            Self::PpOcrV6Tiny => PP_OCRV6_TINY_ASSETS,
+            Self::PpOcrV6Small => PP_OCRV6_SMALL_ASSETS,
+            Self::PpOcrV6Medium => PP_OCRV6_MEDIUM_ASSETS,
+            Self::PpDocLayoutV3 => PP_DOCLAYOUTV3_ASSETS,
+            Self::PaddleOcrVl15 | Self::PaddleOcrVl16 => &[],
         }
     }
 
-    pub const fn pp_ocr_recognizer_repo(self) -> Option<&'static str> {
-        match self {
-            Self::PpOcrV5Server => Some("PaddlePaddle/PP-OCRv5_server_rec_onnx"),
-            Self::PpOcrV6Tiny => Some("PaddlePaddle/PP-OCRv6_tiny_rec_onnx"),
-            Self::PpOcrV6Small => Some("PaddlePaddle/PP-OCRv6_small_rec_onnx"),
-            Self::PpOcrV6Medium => Some("PaddlePaddle/PP-OCRv6_medium_rec_onnx"),
-            _ => None,
-        }
-    }
-
-    pub const fn pp_doclayoutv3_onnx_repo(self) -> Option<&'static str> {
-        match self {
-            Self::PpDocLayoutV3 => Some("PaddlePaddle/PP-DocLayoutV3_onnx"),
-            _ => None,
+    pub const fn descriptor(self) -> ModelDescriptor {
+        let canonical_id = self.id();
+        let (capabilities, requirements): (_, &'static [_]) = match self.kind() {
+            OcrModelKind::TraditionalOcr => {
+                (ModelCapabilities::OCR_TEXT, &Self::MARKDOWN_REQUIREMENTS)
+            }
+            OcrModelKind::Layout => (ModelCapabilities::OCR_LAYOUT, &[]),
+            OcrModelKind::OcrVl => (
+                ModelCapabilities::OCR_TEXT.union(ModelCapabilities::OCR_VISION_LANGUAGE),
+                &Self::STRUCTURED_OUTPUT_REQUIREMENTS,
+            ),
+        };
+        ModelDescriptor {
+            canonical_id,
+            source_locators: ModelSourceLocators {
+                hugging_face: canonical_id,
+                model_scope: canonical_id,
+            },
+            category: match self.kind() {
+                OcrModelKind::TraditionalOcr | OcrModelKind::Layout => ModelCategory::Ocr,
+                OcrModelKind::OcrVl => ModelCategory::OcrVl,
+            },
+            capabilities,
+            requirements,
+            runtime_provider: RuntimeProvider::OarOcr,
         }
     }
 
     pub const fn dictionary_file(self) -> Option<&'static str> {
-        match self {
-            Self::PpOcrV5Mobile | Self::PpOcrV5Server => Some("ppocrv5_dict.txt"),
-            Self::PpOcrV6Tiny => Some("ppocrv6_tiny_dict.txt"),
-            Self::PpOcrV6Small | Self::PpOcrV6Medium => Some("ppocrv6_dict.txt"),
-            _ => None,
+        let assets = self.download_assets();
+        let mut index = 0;
+        while index < assets.len() {
+            if matches!(assets[index].role, OcrModelAssetRole::Dictionary) {
+                return match assets[index].kind {
+                    OcrModelAssetKind::PaddleOcrDictionary { output_file }
+                    | OcrModelAssetKind::ModelScopeFile { output_file } => Some(output_file),
+                    OcrModelAssetKind::RequiredFile => Some(assets[index].file),
+                };
+            }
+            index += 1;
         }
+        None
     }
 }
 
@@ -157,20 +411,21 @@ impl ModelSpec for KnownOcrModel {
     }
 
     fn huggingface_repo(&self) -> &str {
-        (*self).id()
+        (*self).descriptor().source_locators.hugging_face
     }
 
     fn modelscope_repo(&self) -> &str {
-        (*self).id()
+        (*self).descriptor().source_locators.model_scope
     }
 
     fn required_files(&self) -> &'static [&'static str] {
         match self {
-            Self::PpOcrV5Mobile => &[],
-            Self::PpOcrV5Server => &["ppocrv5_dict.txt"],
-            Self::PpOcrV6Tiny => &["ppocrv6_tiny_dict.txt"],
-            Self::PpOcrV6Small | Self::PpOcrV6Medium => &["ppocrv6_dict.txt"],
-            Self::PpDocLayoutV3 => &[],
+            Self::PpOcrV5Mobile
+            | Self::PpOcrV5Server
+            | Self::PpOcrV6Tiny
+            | Self::PpOcrV6Small
+            | Self::PpOcrV6Medium
+            | Self::PpDocLayoutV3 => &[],
             Self::PaddleOcrVl15 | Self::PaddleOcrVl16 => &[
                 "config.json",
                 "preprocessor_config.json",
@@ -222,5 +477,34 @@ mod tests {
         );
         assert!(KnownOcrModel::from_layout_model_id(&traditional).is_err());
         assert!(KnownOcrModel::from_ocr_vl_model_id(&layout).is_err());
+    }
+
+    #[test]
+    fn structured_ocr_capabilities_are_effective_only_with_layout() {
+        let descriptor = KnownOcrModel::PaddleOcrVl16.descriptor();
+
+        assert!(
+            !descriptor
+                .capabilities
+                .contains(ModelCapabilities::OCR_MARKDOWN)
+        );
+        assert!(
+            !descriptor
+                .capabilities
+                .contains(ModelCapabilities::OCR_HTML)
+        );
+        let effective = descriptor.effective_capabilities(ModelCapabilities::OCR_LAYOUT);
+        assert!(effective.contains(ModelCapabilities::OCR_MARKDOWN));
+        assert!(effective.contains(ModelCapabilities::OCR_HTML));
+    }
+
+    #[test]
+    fn layout_model_does_not_claim_ocr_output_capabilities() {
+        let descriptor = KnownOcrModel::PpDocLayoutV3.descriptor();
+        let effective = descriptor.effective_capabilities(ModelCapabilities::NONE);
+
+        assert!(effective.contains(ModelCapabilities::OCR_LAYOUT));
+        assert!(!effective.contains(ModelCapabilities::OCR_MARKDOWN));
+        assert!(!effective.contains(ModelCapabilities::OCR_HTML));
     }
 }

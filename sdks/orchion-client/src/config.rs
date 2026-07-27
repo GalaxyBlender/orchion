@@ -41,7 +41,7 @@ impl ClientConfig {
         self
     }
 
-    /// Sets the request timeout.
+    /// Sets the HTTP request timeout and timeout for each WebSocket operation.
     ///
     /// # Errors
     ///
