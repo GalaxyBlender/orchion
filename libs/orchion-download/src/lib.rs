@@ -24,9 +24,24 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 const READY_MANIFEST_FILE: &str = ".orchion-ready.json";
 const READY_MANIFEST_SCHEMA_VERSION: u64 = 3;
 const READY_MANIFEST_LAYOUT: &str = "model-hub-native";
-const PUBLISH_TRANSACTION_DIR: &str = ".orchion-publish-transaction";
+const CACHE_STATE_DIR: &str = ".orchion";
+const DOWNLOAD_STAGING_DIR: &str = "staging";
+const MODEL_LOCK_DIR: &str = "locks";
+const PUBLICATION_LOCK_FILE: &str = "publish.lock";
+const PUBLISH_TRANSACTION_DIR: &str = "publish-transaction";
 const PUBLISH_TRANSACTION_MANIFEST: &str = "manifest.json";
 const PUBLISH_TRANSACTION_COMMITTED: &str = "committed";
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        encoded.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DownloadEnv {
@@ -294,6 +309,13 @@ impl ModelDownloader {
                 repo: model.huggingface_repo().to_string(),
                 message: error.to_string(),
             })?;
+        ensure_cache_state_dir(cache_dir)
+            .await
+            .map_err(|error| OrchionError::Download {
+                source_name: "cache",
+                repo: model.huggingface_repo().to_string(),
+                message: error.to_string(),
+            })?;
         let model_lock =
             transaction::acquire_model_lock(cache_dir, model.huggingface_repo()).await?;
         for repo in std::iter::once(model.huggingface_repo())
@@ -313,6 +335,16 @@ impl ModelDownloader {
             model_lock,
         )
         .await?;
+        let staging_prefix = transaction::model_staging_prefix(model.huggingface_repo());
+        let staging_dir = cache_state_path(cache_dir, DOWNLOAD_STAGING_DIR);
+        if let Err(error) = cleanup_stale_model_downloads(&staging_dir, &staging_prefix).await {
+            tracing::warn!(
+                model = ?model,
+                path = %cache_dir.display(),
+                %error,
+                "failed to clean stale model download staging directories"
+            );
+        }
 
         let assets = model_hub_assets(&model);
         let cache_sources = self.configured_providers(
@@ -350,6 +382,13 @@ impl ModelDownloader {
             source_count = candidates.len(),
             "ensuring model cache is available"
         );
+        ensure_download_staging_dir(&staging_dir)
+            .await
+            .map_err(|error| OrchionError::Download {
+                source_name: "cache",
+                repo: model.huggingface_repo().to_string(),
+                message: error.to_string(),
+            })?;
         let mut failures = Vec::new();
         for candidate in candidates {
             let source_name = candidate.label();
@@ -357,8 +396,8 @@ impl ModelDownloader {
             let repository_requests =
                 self.repository_requests(&model, candidate.as_ref(), assets)?;
             let staging = tempfile::Builder::new()
-                .prefix(".orchion-download-")
-                .tempdir_in(cache_dir)
+                .prefix(&staging_prefix)
+                .tempdir_in(&staging_dir)
                 .map_err(|error| OrchionError::Download {
                     source_name,
                     repo: model.huggingface_repo().to_string(),
@@ -591,15 +630,20 @@ fn validate_repo_id(repo: &str) -> Result<()> {
     if repo
         .split('/')
         .next()
-        .is_some_and(|segment| segment.to_ascii_lowercase().starts_with(".orchion-"))
+        .is_some_and(is_reserved_cache_namespace)
     {
         return Err(OrchionError::Download {
             source_name: "cache",
             repo: repo.to_string(),
-            message: "repository uses the reserved `.orchion-` cache namespace".to_string(),
+            message: "repository uses the reserved `.orchion` cache namespace".to_string(),
         });
     }
     Ok(())
+}
+
+fn is_reserved_cache_namespace(segment: &str) -> bool {
+    let segment = segment.to_ascii_lowercase();
+    segment == CACHE_STATE_DIR || segment.starts_with(".orchion-")
 }
 
 fn validate_revision(repo: &str, revision: &str) -> Result<()> {
@@ -713,7 +757,7 @@ async fn publish_staged_repositories(
             "a committed cache publication is awaiting cleanup",
         ));
     }
-    let transaction_dir = cache_dir.join(PUBLISH_TRANSACTION_DIR);
+    let transaction_dir = cache_state_path(cache_dir, PUBLISH_TRANSACTION_DIR);
     tokio::fs::create_dir_all(&transaction_dir).await?;
 
     let mut entries = Vec::with_capacity(repos.len());
@@ -739,7 +783,7 @@ async fn publish_staged_repositories(
     )
     .await?;
     sync_directory(&transaction_dir).await?;
-    sync_directory(cache_dir).await?;
+    sync_cache_state(cache_dir).await?;
 
     let publish_result = async {
         for repo in repos {
@@ -810,13 +854,13 @@ async fn publish_staged_repositories(
             "committed cache publication cleanup deferred"
         );
     } else {
-        sync_directory(cache_dir).await?;
+        sync_cache_state(cache_dir).await?;
     }
     Ok(())
 }
 
 async fn recover_interrupted_publication(cache_dir: &Path) -> std::io::Result<bool> {
-    let transaction_dir = cache_dir.join(PUBLISH_TRANSACTION_DIR);
+    let transaction_dir = cache_state_path(cache_dir, PUBLISH_TRANSACTION_DIR);
     if !path_exists(&transaction_dir).await? {
         return Ok(true);
     }
@@ -832,7 +876,7 @@ async fn recover_interrupted_publication(cache_dir: &Path) -> std::io::Result<bo
             );
             return Ok(false);
         }
-        sync_directory(cache_dir).await?;
+        sync_cache_state(cache_dir).await?;
         return Ok(true);
     }
 
@@ -841,7 +885,7 @@ async fn recover_interrupted_publication(cache_dir: &Path) -> std::io::Result<bo
         Ok(manifest) => manifest,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             tokio::fs::remove_dir_all(transaction_dir).await?;
-            sync_directory(cache_dir).await?;
+            sync_cache_state(cache_dir).await?;
             return Ok(true);
         }
         Err(error) => return Err(error),
@@ -865,7 +909,7 @@ async fn recover_interrupted_publication(cache_dir: &Path) -> std::io::Result<bo
             || repo
                 .split('/')
                 .next()
-                .is_some_and(|segment| segment.to_ascii_lowercase().starts_with(".orchion-"))
+                .is_some_and(is_reserved_cache_namespace)
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -902,7 +946,7 @@ async fn recover_interrupted_publication(cache_dir: &Path) -> std::io::Result<bo
         }
     }
     tokio::fs::remove_dir_all(transaction_dir).await?;
-    sync_directory(cache_dir).await?;
+    sync_cache_state(cache_dir).await?;
     Ok(true)
 }
 
@@ -954,6 +998,84 @@ async fn remove_cache_entry(path: &Path) -> std::io::Result<()> {
     }
 }
 
+async fn cleanup_stale_model_downloads(
+    staging_dir: &Path,
+    staging_prefix: &str,
+) -> std::io::Result<()> {
+    if validate_optional_download_staging_dir(staging_dir).await? {
+        let mut entries = tokio::fs::read_dir(staging_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let file_name = entry.file_name();
+            if file_name
+                .to_str()
+                .is_some_and(|name| name.starts_with(staging_prefix))
+            {
+                remove_stale_download_staging(entry.path()).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn remove_stale_download_staging(path: PathBuf) -> std::io::Result<()> {
+    remove_cache_entry(&path).await?;
+    tracing::info!(path = %path.display(), "removed stale model download staging directory");
+    Ok(())
+}
+
+async fn ensure_download_staging_dir(staging_dir: &Path) -> std::io::Result<()> {
+    tokio::fs::create_dir_all(staging_dir).await?;
+    if validate_optional_download_staging_dir(staging_dir).await? {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!(
+            "model download staging directory was not created: {}",
+            staging_dir.display()
+        ),
+    ))
+}
+
+async fn ensure_cache_state_dir(cache_dir: &Path) -> std::io::Result<()> {
+    let state_dir = cache_dir.join(CACHE_STATE_DIR);
+    tokio::fs::create_dir_all(&state_dir).await?;
+    validate_regular_directory(&state_dir, "model cache state").await
+}
+
+async fn validate_optional_download_staging_dir(staging_dir: &Path) -> std::io::Result<bool> {
+    let metadata = match tokio::fs::symlink_metadata(staging_dir).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        return Ok(true);
+    }
+    Err(not_regular_directory_error(
+        staging_dir,
+        "model download staging",
+    ))
+}
+
+async fn validate_regular_directory(path: &Path, label: &str) -> std::io::Result<()> {
+    let metadata = tokio::fs::symlink_metadata(path).await?;
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    Err(not_regular_directory_error(path, label))
+}
+
+fn not_regular_directory_error(path: &Path, label: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "{label} path is not a regular directory: {}",
+            path.display()
+        ),
+    )
+}
+
 async fn write_synced_file(path: &Path, bytes: Vec<u8>) -> std::io::Result<()> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
@@ -976,6 +1098,11 @@ async fn sync_directory(path: &Path) -> std::io::Result<()> {
 #[cfg(not(unix))]
 async fn sync_directory(_path: &Path) -> std::io::Result<()> {
     Ok(())
+}
+
+async fn sync_cache_state(cache_dir: &Path) -> std::io::Result<()> {
+    sync_directory(&cache_dir.join(CACHE_STATE_DIR)).await?;
+    sync_directory(cache_dir).await
 }
 
 async fn is_ready_cache<M: ModelSpec>(
@@ -1242,6 +1369,10 @@ fn model_hub_assets<M: ModelSpec>(model: &M) -> &'static [ModelHubAsset] {
 fn repo_cache_path(cache_dir: &Path, repo: &str) -> PathBuf {
     repo.split('/')
         .fold(cache_dir.to_path_buf(), |path, segment| path.join(segment))
+}
+
+fn cache_state_path(cache_dir: &Path, name: &str) -> PathBuf {
+    cache_dir.join(CACHE_STATE_DIR).join(name)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1607,7 +1738,7 @@ async fn cache_file_integrity(path: PathBuf) -> std::io::Result<(u64, String)> {
                 "required file changed while its integrity was calculated",
             ));
         }
-        Ok((metadata.len(), format!("{:x}", hasher.finalize())))
+        Ok((metadata.len(), encode_hex(&hasher.finalize())))
     })
     .await
     .map_err(std::io::Error::other)?
@@ -1970,11 +2101,11 @@ mod downloader_tests {
         }
 
         fn huggingface_repo(&self) -> &str {
-            ".ORCHION-publish-transaction/Model"
+            ".ORCHION/Model"
         }
 
         fn modelscope_repo(&self) -> &str {
-            ".ORCHION-publish-transaction/Model"
+            ".ORCHION/Model"
         }
     }
 
@@ -2493,7 +2624,7 @@ mod downloader_tests {
             .await
             .unwrap_err();
 
-        assert!(error.to_string().contains("reserved `.orchion-`"));
+        assert!(error.to_string().contains("reserved `.orchion`"));
         assert!(client.calls.lock().unwrap().is_empty());
     }
 
@@ -2531,6 +2662,37 @@ mod downloader_tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
+    async fn downloader_rejects_symlinked_staging_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("models");
+        let external = dir.path().join("external");
+        tokio::fs::create_dir_all(&cache_dir).await.unwrap();
+        tokio::fs::create_dir_all(&external).await.unwrap();
+        tokio::fs::create_dir_all(cache_dir.join(CACHE_STATE_DIR))
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(
+            &external,
+            cache_state_path(&cache_dir, DOWNLOAD_STAGING_DIR),
+        )
+        .unwrap();
+        let client = FakeDownloadClient::default();
+        let env = DownloadEnv {
+            orchion_model_source: Some("huggingface".to_string()),
+            hf_endpoint: None,
+        };
+
+        let error = ModelDownloader::default()
+            .download_with_client(qwen_asr_06b(), &cache_dir, &client, &env)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("not a regular directory"));
+        assert!(client.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn concurrent_downloads_publish_one_complete_cache() {
         let dir = tempfile::tempdir().unwrap();
         let client = FakeDownloadClient {
@@ -2558,11 +2720,79 @@ mod downloader_tests {
     }
 
     #[tokio::test]
+    async fn internal_cache_state_is_contained_in_orchion_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = FakeDownloadClient::default();
+        let env = DownloadEnv {
+            orchion_model_source: Some("huggingface".to_string()),
+            hf_endpoint: None,
+        };
+
+        ModelDownloader::default()
+            .download_with_client(qwen_asr_06b(), dir.path(), &client, &env)
+            .await
+            .unwrap();
+
+        let state_dir = dir.path().join(CACHE_STATE_DIR);
+        assert!(state_dir.join(DOWNLOAD_STAGING_DIR).is_dir());
+        assert!(state_dir.join(MODEL_LOCK_DIR).is_dir());
+        assert!(state_dir.join(PUBLICATION_LOCK_FILE).is_file());
+        assert!(!state_dir.join(PUBLISH_TRANSACTION_DIR).exists());
+
+        let mut entries = tokio::fs::read_dir(dir.path()).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            assert!(name == CACHE_STATE_DIR || !name.starts_with(".orchion"));
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_model_staging_is_removed_without_touching_other_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = FakeDownloadClient::default();
+        let env = DownloadEnv {
+            orchion_model_source: Some("huggingface".to_string()),
+            hf_endpoint: None,
+        };
+        let downloader = ModelDownloader::default();
+        let model = qwen_asr_06b();
+
+        downloader
+            .download_with_client(model.clone(), dir.path(), &client, &env)
+            .await
+            .unwrap();
+
+        let staging_dir = cache_state_path(dir.path(), DOWNLOAD_STAGING_DIR);
+        let stale = staging_dir.join(format!(
+            "{}stale",
+            transaction::model_staging_prefix(model.huggingface_repo())
+        ));
+        let other_model_staging = staging_dir.join(format!(
+            "{}active",
+            transaction::model_staging_prefix(qwen_tts_base().huggingface_repo())
+        ));
+        tokio::fs::create_dir_all(&stale).await.unwrap();
+        tokio::fs::create_dir_all(&other_model_staging)
+            .await
+            .unwrap();
+
+        downloader
+            .download_with_client(model, dir.path(), &client, &env)
+            .await
+            .unwrap();
+
+        assert!(!stale.exists());
+        assert!(other_model_staging.exists());
+    }
+
+    #[tokio::test]
     async fn cancelling_download_does_not_release_publication_resources_early() {
         let dir = tempfile::tempdir().unwrap();
         let cache_dir = dir.path().to_path_buf();
         let model = qwen_asr_06b();
         let model_key = model.huggingface_repo().to_string();
+        let staging_prefix = transaction::model_staging_prefix(&model_key);
         let target = model.cache_path(&cache_dir);
         let client = FakeDownloadClient {
             delay: Duration::from_millis(200),
@@ -2593,13 +2823,16 @@ mod downloader_tests {
                 .unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                let mut entries = tokio::fs::read_dir(&cache_dir).await.unwrap();
+                let mut entries =
+                    tokio::fs::read_dir(cache_state_path(&cache_dir, DOWNLOAD_STAGING_DIR))
+                        .await
+                        .unwrap();
                 let mut manifest_is_staged = false;
                 while let Some(entry) = entries.next_entry().await.unwrap() {
                     let is_staging = entry
                         .file_name()
                         .to_string_lossy()
-                        .starts_with(".orchion-download-");
+                        .starts_with(&staging_prefix);
                     if is_staging
                         && tokio::fs::try_exists(
                             entry.path().join(&model_key).join(READY_MANIFEST_FILE),
@@ -2735,7 +2968,7 @@ mod downloader_tests {
         let dir = tempfile::tempdir().unwrap();
         let model = qwen_asr_06b();
         let target = model.cache_path(dir.path());
-        let transaction_dir = dir.path().join(PUBLISH_TRANSACTION_DIR);
+        let transaction_dir = cache_state_path(dir.path(), PUBLISH_TRANSACTION_DIR);
         let backup = repo_cache_path(&transaction_dir, model.huggingface_repo());
         tokio::fs::create_dir_all(&backup).await.unwrap();
         tokio::fs::write(backup.join("config.json"), "{}")

@@ -3,9 +3,6 @@ use sha2::{Digest, Sha256};
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 
-const MODEL_LOCK_DIR: &str = ".orchion-download-locks";
-const PUBLICATION_LOCK_FILE: &str = ".orchion-publish.lock";
-
 pub(crate) struct CacheLock(std::fs::File);
 
 impl Drop for CacheLock {
@@ -15,23 +12,34 @@ impl Drop for CacheLock {
 }
 
 pub(crate) async fn acquire_model_lock(cache_dir: &Path, model_key: &str) -> Result<CacheLock> {
-    let lock_dir = cache_dir.join(MODEL_LOCK_DIR);
+    let lock_dir = super::cache_state_path(cache_dir, super::MODEL_LOCK_DIR);
     tokio::fs::create_dir_all(&lock_dir)
         .await
         .map_err(|error| lock_error(model_key, &error))?;
-    let digest = Sha256::digest(model_key.as_bytes());
     acquire_lock(
-        lock_dir.join(format!("{digest:x}.lock")),
+        lock_dir.join(format!("{}.lock", model_key_digest(model_key))),
         model_key.to_string(),
     )
     .await
+}
+
+pub(crate) fn model_staging_prefix(model_key: &str) -> String {
+    format!("{}-", model_key_digest(model_key))
+}
+
+fn model_key_digest(model_key: &str) -> String {
+    super::encode_hex(&Sha256::digest(model_key.as_bytes()))
 }
 
 pub(crate) async fn acquire_publication_lock(
     cache_dir: &Path,
     model_key: &str,
 ) -> Result<CacheLock> {
-    acquire_lock(cache_dir.join(PUBLICATION_LOCK_FILE), model_key.to_string()).await
+    acquire_lock(
+        super::cache_state_path(cache_dir, super::PUBLICATION_LOCK_FILE),
+        model_key.to_string(),
+    )
+    .await
 }
 
 async fn acquire_lock(lock_path: PathBuf, model_key: String) -> Result<CacheLock> {

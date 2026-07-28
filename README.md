@@ -15,6 +15,7 @@ Orchion provides a unified Rust API library and an OpenAI-compatible server for 
 ## Requirements
 
 - Rust `1.95` or newer.
+- Bun `1.3.14` available on `PATH` to build the WebUI.
 - `ffmpeg` available on `PATH` for audio decode/encode.
 - Enough local disk space for downloaded models.
 - Optional Metal or CUDA runtime for acceleration.
@@ -22,12 +23,12 @@ Orchion provides a unified Rust API library and an OpenAI-compatible server for 
 ## Run The Server
 
 ```sh
-cargo run -p orchion-server -- --config apps/orchion-server/config.development.toml
-cargo run -p orchion-server --features metal -- --config apps/orchion-server/config.development.toml
-cargo run -p orchion-server --features cuda -- --config apps/orchion-server/config.development.toml
+cargo run -p orchion-server -- --config apps/orchion-server/config.toml --models-dir data/models
+cargo run -p orchion-server --features metal -- --config apps/orchion-server/config.toml --models-dir data/models
+cargo run -p orchion-server --features cuda -- --config apps/orchion-server/config.toml --models-dir data/models
 ```
 
-The development config is under `apps/orchion-server/`. The server defaults to CPU unless a backend feature is enabled.
+The config is under `apps/orchion-server/`. These development commands override its packaged-model default to use `data/models` from the repository root. The server defaults to CPU unless a backend feature is enabled.
 
 ## WebUI
 

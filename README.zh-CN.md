@@ -15,6 +15,7 @@ Orchion 提供统一的 Rust API 库和 OpenAI 兼容服务端，面向本地语
 ## 环境要求
 
 - Rust `1.95` 或更高版本。
+- `PATH` 中可用的 Bun `1.3.14`，用于构建 WebUI。
 - `PATH` 中可用的 `ffmpeg`，用于音频解码/编码。
 - 足够的本地磁盘空间保存模型文件。
 - 如需加速，可准备 Metal 或 CUDA 运行环境。
@@ -22,12 +23,12 @@ Orchion 提供统一的 Rust API 库和 OpenAI 兼容服务端，面向本地语
 ## 运行服务
 
 ```sh
-cargo run -p orchion-server -- --config apps/orchion-server/config.development.toml
-cargo run -p orchion-server --features metal -- --config apps/orchion-server/config.development.toml
-cargo run -p orchion-server --features cuda -- --config apps/orchion-server/config.development.toml
+cargo run -p orchion-server -- --config apps/orchion-server/config.toml --models-dir data/models
+cargo run -p orchion-server --features metal -- --config apps/orchion-server/config.toml --models-dir data/models
+cargo run -p orchion-server --features cuda -- --config apps/orchion-server/config.toml --models-dir data/models
 ```
 
-开发配置位于 `apps/orchion-server/`。未启用后端 feature 时，服务默认使用 CPU。
+配置文件位于 `apps/orchion-server/`。以上开发命令会覆盖发布包使用的默认模型目录，改用仓库根目录下的 `data/models`。未启用后端 feature 时，服务默认使用 CPU。
 
 ## WebUI
 

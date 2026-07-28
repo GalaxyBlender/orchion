@@ -14,7 +14,6 @@ mod pdfium_provisioning;
 const FRONTEND_INPUTS: &[&str] = &[
     "../../web/package.json",
     "../../web/bun.lock",
-    "../../web/bun.lockb",
     "../../web/index.html",
     "../../web/tsconfig.json",
     "../../web/tsconfig.app.json",
@@ -45,10 +44,6 @@ fn main() {
         print_source_rerun_if_changed(&manifest_dir, &web_src);
     }
 
-    if env::var("PROFILE").as_deref() != Ok("release") {
-        return;
-    }
-
     provision_pdfium().unwrap_or_else(|error| {
         panic!("failed to provision PDFium for build: {error}");
     });
@@ -67,6 +62,10 @@ fn main() {
         "web/dist does not exist after `bun run build`: {}",
         dist_dir.display()
     );
+
+    if env::var("PROFILE").as_deref() != Ok("release") {
+        return;
+    }
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is unavailable"));
     let target_dir = out_dir.join("ui-dist");
@@ -188,6 +187,9 @@ fn provision_pdfium() -> io::Result<()> {
         target_library_path.with_file_name(format!("{}.source.sha256", asset.library_name));
     let library_checksum_path =
         target_library_path.with_file_name(format!("{}.sha256", asset.library_name));
+    println!("cargo:rerun-if-changed={}", target_library_path.display());
+    println!("cargo:rerun-if-changed={}", source_checksum_path.display());
+    println!("cargo:rerun-if-changed={}", library_checksum_path.display());
     let installed_source_checksum = fs::read_to_string(&source_checksum_path).ok();
     let recorded_library_checksum = fs::read_to_string(&library_checksum_path).ok();
     let actual_library_checksum = if target_library_path.is_file()
@@ -293,7 +295,18 @@ fn sha256_file(path: &Path) -> io::Result<String> {
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(encode_hex(&hasher.finalize()))
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        encoded.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }
 
 fn download_pdfium_archive(url: &str, archive_path: &Path) -> io::Result<()> {

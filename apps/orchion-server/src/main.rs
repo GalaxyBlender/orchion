@@ -11,6 +11,9 @@ use std::process::ExitCode;
 struct Cli {
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
+
+    #[arg(long, value_name = "PATH")]
+    models_dir: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -37,7 +40,14 @@ async fn run() -> anyhow::Result<()> {
         "logging initialized"
     );
 
-    let config = ServerConfig::load(cli.config).context("load server config")?;
+    let mut config = ServerConfig::load(cli.config).context("load server config")?;
+    if let Some(models_dir) = cli.models_dir {
+        config.models.dir = if models_dir.is_absolute() {
+            models_dir
+        } else {
+            work_dir.join(models_dir)
+        };
+    }
     let bind = config.server.bind;
     tracing::debug!(
         %bind,
