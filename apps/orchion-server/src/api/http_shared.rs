@@ -2,8 +2,8 @@ use crate::api::openai::ApiError;
 use crate::application::ServerApplication;
 use crate::application::resource_policy::InferenceGuard;
 use axum::extract::multipart::Field;
-use axum::http::HeaderMap;
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
+use axum::http::{HeaderMap, HeaderValue};
 use std::future::Future;
 use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 use tokio::io::AsyncWriteExt;
@@ -46,6 +46,12 @@ pub(super) fn authorize(
     } else {
         Err(ApiError::invalid_api_key())
     }
+}
+
+pub(super) fn origin_is_allowed(allowed_origins: &[String], origin: &HeaderValue) -> bool {
+    allowed_origins
+        .iter()
+        .any(|allowed| allowed == "*" || allowed.as_bytes() == origin.as_bytes())
 }
 
 pub(super) fn is_multipart(headers: &HeaderMap) -> bool {

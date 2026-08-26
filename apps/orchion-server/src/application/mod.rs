@@ -33,6 +33,7 @@ pub struct OcrApiModels {
 #[derive(Debug, Clone)]
 pub struct ApiPolicy {
     pub api_key: Option<String>,
+    pub cors_allowed_origins: Vec<String>,
     pub max_upload_size: usize,
     pub max_pdf_pages: usize,
     pub max_pdf_pixels: u64,

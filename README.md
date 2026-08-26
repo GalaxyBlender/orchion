@@ -92,12 +92,12 @@ cargo run -p orchion-example-tts-preset --features cpu -- "Hello from Orchion" o
 
 `apps/orchion-server/config.toml` is the full local example. Key sections:
 
-- `[server]`: bind address, upload limit, and PDF page/pixel/output limits.
+- `[server]`: bind address, CORS allowed origins, upload limit, and PDF page/pixel/output limits. CORS defaults to all origins (`["*"]`).
 - `[models]`: model directory, source, and global residency limit.
 - `[services.asr]`, `[services.tts]`, `[services.ocr]`, `[services.ocr-vl]`: service enablement, defaults, allowlists, device, and per-service residency. ASR batch audio uses `max_audio_duration`; streaming captions use `stream_target_segment` and `stream_max_segment`; sessions use `stream_idle_timeout` and `stream_max_duration`. TTS uses `max_length` and `max_reference_audio_duration`; OCR-VL uses `max_tokens`.
 - `[auth]`: optional API key.
 
-`ORCHION_MODEL_SOURCE` and `models.source` accept `auto`, `huggingface`, or `modelscope`. `RUST_LOG` controls runtime logging.
+`CORS_ALLOWED_ORIGINS` overrides `server.cors_allowed_origins` with a comma-separated origin list, for example `https://app.example.com,https://admin.example.com`; use `*` to allow all origins. `ORCHION_MODEL_SOURCE` and `models.source` accept `auto`, `huggingface`, or `modelscope`. `RUST_LOG` controls runtime logging.
 
 ## Development
 

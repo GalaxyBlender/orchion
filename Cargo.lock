@@ -3521,6 +3521,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
+ "url",
  "utoipa",
  "utoipa-swagger-ui",
 ]

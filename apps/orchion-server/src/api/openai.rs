@@ -77,6 +77,20 @@ impl ApiError {
     }
 
     #[must_use]
+    pub fn forbidden_origin() -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            error: ErrorObject {
+                message: "origin is not allowed".to_string(),
+                error_type: "invalid_request_error",
+                param: None,
+                code: Some("cors_origin_forbidden".to_string()),
+            },
+            log_message: None,
+        }
+    }
+
+    #[must_use]
     pub fn resource_exhausted(resource: &'static str) -> Self {
         Self {
             status: StatusCode::TOO_MANY_REQUESTS,

@@ -1,4 +1,4 @@
-use crate::api::http_shared::authorize;
+use crate::api::http_shared::{authorize, origin_is_allowed};
 use crate::api::openai::ApiError;
 use crate::application::streaming_transcription::{
     self, AsrPcmBuffer, LeasedAsrModel, LeasedAsrStream, TranscriptionStreamBudget,
@@ -9,7 +9,7 @@ use crate::settings::parse_asr_model;
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::HeaderMap;
-use axum::http::header::AUTHORIZATION;
+use axum::http::header::{AUTHORIZATION, ORIGIN};
 use axum::response::Response;
 use orchion::{AudioVadStreamingEndpoint, StreamingAudioDecoder};
 use std::sync::Arc;
@@ -79,6 +79,7 @@ pub(in crate::api) async fn create_transcription_ws<S>(
 where
     S: ServerApplication,
 {
+    validate_websocket_origin(&state.api_policy().cors_allowed_origins, &headers)?;
     let header_authorized = if headers.contains_key(AUTHORIZATION) {
         authorize(state.as_ref(), &headers)?;
         true
@@ -95,6 +96,20 @@ where
         .on_upgrade(move |socket| {
             handle_transcription_ws(socket, state, header_authorized, pending_connection_permit)
         }))
+}
+
+fn validate_websocket_origin(
+    allowed_origins: &[String],
+    headers: &HeaderMap,
+) -> Result<(), ApiError> {
+    if headers
+        .get(ORIGIN)
+        .is_none_or(|origin| origin_is_allowed(allowed_origins, origin))
+    {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden_origin())
+    }
 }
 
 #[allow(
@@ -301,6 +316,31 @@ fn transcription_stream_start_timeout_error() -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn websocket_origin_must_match_cors_allowlist() {
+        let mut headers = HeaderMap::new();
+        headers.insert(ORIGIN, "https://other.example.com".parse().unwrap());
+
+        let error = validate_websocket_origin(&["https://app.example.com".to_string()], &headers)
+            .unwrap_err();
+        let (status, body) = error.into_status_body();
+
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(body.error.code.as_deref(), Some("cors_origin_forbidden"));
+    }
+
+    #[test]
+    fn websocket_origin_allows_wildcard_and_non_browser_clients() {
+        let mut browser_headers = HeaderMap::new();
+        browser_headers.insert(ORIGIN, "https://app.example.com".parse().unwrap());
+
+        assert!(validate_websocket_origin(&["*".to_string()], &browser_headers).is_ok());
+        assert!(
+            validate_websocket_origin(&["https://app.example.com".to_string()], &HeaderMap::new(),)
+                .is_ok()
+        );
+    }
 
     #[test]
     fn stream_start_accepts_openai_fields_and_stream_audio_format() {

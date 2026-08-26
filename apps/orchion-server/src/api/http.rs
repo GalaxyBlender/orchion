@@ -2,6 +2,7 @@ use crate::api::http_audio::{create_speech, create_transcription, create_transcr
 use crate::api::http_models::list_models;
 use crate::api::http_ocr::create_ocr;
 use crate::api::http_pdf_images::create_pdf_images;
+use crate::api::http_shared::origin_is_allowed;
 use crate::api::{docs, ui};
 use crate::application::ServerApplication;
 use axum::Router;
@@ -11,6 +12,7 @@ use axum::http::{HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use std::sync::Arc;
+use tower_http::cors::{AllowHeaders, AllowOrigin, Any, CorsLayer};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
 use tracing::Level;
 
@@ -27,6 +29,7 @@ where
 {
     let policy = state.api_policy();
     let max_upload_size = policy.max_upload_size;
+    let cors = cors_layer(&policy.cors_allowed_origins);
     let tts_enabled = policy.tts_models.is_some();
     let asr_enabled = policy.asr.is_some();
     let ocr_enabled = policy.ocr.is_some() || policy.ocr_vl.is_some();
@@ -55,6 +58,7 @@ where
         .merge(ui_routes)
         .merge(docs::swagger_ui())
         .layer(DefaultBodyLimit::max(max_upload_size))
+        .layer(cors)
         .with_state(state)
         .layer(
             TraceLayer::new_for_http()
@@ -62,6 +66,21 @@ where
                 .on_request(DefaultOnRequest::new().level(Level::DEBUG))
                 .on_response(DefaultOnResponse::new().level(Level::INFO)),
         )
+}
+
+fn cors_layer(allowed_origins: &[String]) -> CorsLayer {
+    let layer = CorsLayer::new()
+        .allow_methods(Any)
+        .allow_headers(AllowHeaders::mirror_request())
+        .expose_headers(Any);
+    if allowed_origins == ["*"] {
+        layer.allow_origin(Any)
+    } else {
+        let allowed_origins = allowed_origins.to_vec();
+        layer.allow_origin(AllowOrigin::predicate(move |origin, _| {
+            origin_is_allowed(&allowed_origins, origin)
+        }))
+    }
 }
 
 async fn root_redirect() -> impl IntoResponse {
@@ -83,8 +102,11 @@ mod tests {
     use crate::infrastructure::orchion::AppState;
     use crate::settings::ServerConfig;
     use axum::body::Body;
-    use axum::http::header::CONTENT_TYPE;
-    use axum::http::{Request, StatusCode};
+    use axum::http::header::{
+        ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
+        ACCESS_CONTROL_REQUEST_HEADERS, ACCESS_CONTROL_REQUEST_METHOD, CONTENT_TYPE, ORIGIN,
+    };
+    use axum::http::{Method, Request, StatusCode};
     use axum::response::Response;
     use http_body_util::BodyExt;
     use orchion::{AsrModel, ModelId, TtsModel};
@@ -131,6 +153,85 @@ mod tests {
         assert_eq!(multipart_file_suffix(Some("video/mp4")), ".mp4");
         assert_eq!(multipart_file_suffix(Some("text/plain")), "");
         assert_eq!(multipart_file_suffix(None), "");
+    }
+
+    #[tokio::test]
+    async fn cors_allows_every_origin_by_default() {
+        let response = router_with_ui_routes(test_state(false, false), Router::new())
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .header(ORIGIN, "https://app.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+    }
+
+    #[tokio::test]
+    async fn cors_only_echoes_configured_origins() {
+        let state = test_state_with_config(false, false, |config| {
+            config.server.cors_allowed_origins = vec!["https://app.example.com".to_string()];
+        });
+        let allowed = router_with_ui_routes(state.clone(), Router::new())
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .header(ORIGIN, "https://app.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let denied = router_with_ui_routes(state, Router::new())
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .header(ORIGIN, "https://other.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            allowed.headers()[ACCESS_CONTROL_ALLOW_ORIGIN],
+            "https://app.example.com"
+        );
+        assert!(!denied.headers().contains_key(ACCESS_CONTROL_ALLOW_ORIGIN));
+    }
+
+    #[tokio::test]
+    async fn cors_handles_authorization_preflight_requests() {
+        let response = router_with_ui_routes(test_state(false, false), Router::new())
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/healthz")
+                    .header(ORIGIN, "https://app.example.com")
+                    .header(ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                    .header(ACCESS_CONTROL_REQUEST_HEADERS, "authorization")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+        assert!(
+            response
+                .headers()
+                .contains_key(ACCESS_CONTROL_ALLOW_METHODS)
+        );
+        assert_eq!(
+            response.headers()[ACCESS_CONTROL_ALLOW_HEADERS],
+            "authorization"
+        );
     }
 
     #[tokio::test]

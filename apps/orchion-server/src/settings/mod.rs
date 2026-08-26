@@ -20,6 +20,7 @@ pub const DEFAULT_MAX_CONCURRENT_INFERENCE: usize = 2;
 pub const DEFAULT_MAX_WEBSOCKET_CONNECTIONS: usize = 64;
 pub const DEFAULT_MAX_PENDING_WEBSOCKET_CONNECTIONS: usize = 16;
 pub const DEFAULT_MAX_WEBSOCKET_MESSAGE_SIZE: usize = 2 * 1024 * 1024;
+pub const CORS_ALLOWED_ORIGINS_ENV: &str = "CORS_ALLOWED_ORIGINS";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelSource {
@@ -50,6 +51,7 @@ pub struct ServerConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerSection {
     pub bind: SocketAddr,
+    pub cors_allowed_origins: Vec<String>,
     pub max_upload_size: usize,
     pub max_pdf_pages: usize,
     pub max_pdf_pixels: u64,
@@ -191,6 +193,12 @@ pub enum ConfigError {
         value: String,
         source: std::net::AddrParseError,
     },
+    #[error("invalid CORS origin `{value}`: {message}")]
+    InvalidCorsOrigin { value: String, message: String },
+    #[error("invalid CORS origins: wildcard `*` cannot be combined with specific origins")]
+    CorsWildcardWithSpecificOrigins,
+    #[error("environment variable `{key}` contains non-Unicode data")]
+    InvalidEnvironmentVariable { key: &'static str },
     #[error("invalid upload size `{value}`: {message}")]
     InvalidUploadSize { value: String, message: String },
     #[error("unknown model source `{0}`; expected auto, huggingface, or modelscope")]
@@ -279,6 +287,7 @@ impl ServerConfig {
             config_path: exe_dir.join("config.toml"),
             server: ServerSection {
                 bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9090),
+                cors_allowed_origins: vec!["*".to_string()],
                 max_upload_size: 30 * 1024 * 1024,
                 max_pdf_pages: 100,
                 max_pdf_pixels: 200_000_000,
@@ -357,18 +366,21 @@ impl ServerConfig {
         let default = Self::default_for_exe(&exe_path);
         let explicit_path = config_path.is_some();
         let path = config_path.unwrap_or_else(|| default.config_path.clone());
-        if !explicit_path && !path.exists() {
-            return Ok(Self {
+        let mut config = if !explicit_path && !path.exists() {
+            Self {
                 config_path: path,
                 ..default
-            });
-        }
-        let document = std::fs::read_to_string(&path).map_err(|source| ConfigError::Read {
-            path: path.clone(),
-            source,
-        })?;
-        let mut config = Self::from_toml_str(&document, &exe_path)?;
-        config.config_path = path;
+            }
+        } else {
+            let document = std::fs::read_to_string(&path).map_err(|source| ConfigError::Read {
+                path: path.clone(),
+                source,
+            })?;
+            let mut config = Self::from_toml_str(&document, &exe_path)?;
+            config.config_path = path;
+            config
+        };
+        apply_cors_environment_override(&mut config)?;
         Ok(config)
     }
 
@@ -390,6 +402,10 @@ impl ServerConfig {
                     value: bind,
                     source,
                 })?;
+            }
+            if let Some(cors_allowed_origins) = server.cors_allowed_origins {
+                config.server.cors_allowed_origins =
+                    parse_cors_allowed_origins(cors_allowed_origins)?;
             }
             if let Some(max_upload_size) = server.max_upload_size {
                 config.server.max_upload_size = parse_upload_size(&max_upload_size)?;
@@ -866,6 +882,87 @@ fn validate_nonzero_resource_limit(
     Ok(value)
 }
 
+fn apply_cors_environment_override(config: &mut ServerConfig) -> Result<(), ConfigError> {
+    let value = match std::env::var(CORS_ALLOWED_ORIGINS_ENV) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(()),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(ConfigError::InvalidEnvironmentVariable {
+                key: CORS_ALLOWED_ORIGINS_ENV,
+            });
+        }
+    };
+    apply_cors_allowed_origins_override(config, &value)?;
+    Ok(())
+}
+
+fn apply_cors_allowed_origins_override(
+    config: &mut ServerConfig,
+    value: &str,
+) -> Result<(), ConfigError> {
+    config.server.cors_allowed_origins =
+        parse_cors_allowed_origins(value.split(',').map(str::to_string))?;
+    Ok(())
+}
+
+fn parse_cors_allowed_origins(
+    values: impl IntoIterator<Item = String>,
+) -> Result<Vec<String>, ConfigError> {
+    let origins = values
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .map(|value| normalize_cors_origin(&value))
+        .collect::<Result<Vec<_>, _>>()?;
+    if origins.is_empty() {
+        return Err(ConfigError::InvalidCorsOrigin {
+            value: String::new(),
+            message: "at least one origin is required".to_string(),
+        });
+    }
+    if origins.len() > 1 && origins.iter().any(|origin| origin == "*") {
+        return Err(ConfigError::CorsWildcardWithSpecificOrigins);
+    }
+    Ok(origins)
+}
+
+fn normalize_cors_origin(value: &str) -> Result<String, ConfigError> {
+    if value.is_empty() {
+        return Err(invalid_cors_origin(value, "value must not be empty"));
+    }
+    if matches!(value, "*" | "null") {
+        return Ok(value.to_string());
+    }
+    let url =
+        url::Url::parse(value).map_err(|error| invalid_cors_origin(value, &error.to_string()))?;
+    if url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(invalid_cors_origin(
+            value,
+            "expected scheme://host[:port] without credentials, path, query, or fragment",
+        ));
+    }
+    let origin = url.origin().ascii_serialization();
+    if origin == "null" {
+        return Err(invalid_cors_origin(
+            value,
+            "opaque origins must be configured as `null`",
+        ));
+    }
+    Ok(origin)
+}
+
+fn invalid_cors_origin(value: &str, message: &str) -> ConfigError {
+    ConfigError::InvalidCorsOrigin {
+        value: value.to_string(),
+        message: message.to_string(),
+    }
+}
+
 fn validate_ocr_service(
     category: &'static str,
     section: &'static str,
@@ -1209,6 +1306,7 @@ struct RawConfig {
 #[serde(deny_unknown_fields)]
 struct RawServer {
     bind: Option<String>,
+    cors_allowed_origins: Option<Vec<String>>,
     max_upload_size: Option<String>,
     max_pdf_pages: Option<usize>,
     max_pdf_pixels: Option<u64>,
@@ -1326,6 +1424,29 @@ mod tests {
         assert!(
             matches!(error, ConfigError::Read { path: error_path, source }
             if error_path == path && source.kind() == std::io::ErrorKind::NotFound)
+        );
+    }
+
+    #[test]
+    fn cors_environment_value_overrides_toml_origins() {
+        let mut config = ServerConfig::from_toml_str(
+            r#"
+            [server]
+            cors_allowed_origins = ["https://toml.example.com"]
+            "#,
+            Path::new("/tmp/orchion-server"),
+        )
+        .unwrap();
+
+        apply_cors_allowed_origins_override(
+            &mut config,
+            "https://app.example.com, https://admin.example.com",
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.server.cors_allowed_origins,
+            ["https://app.example.com", "https://admin.example.com"]
         );
     }
 

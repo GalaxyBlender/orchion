@@ -1207,6 +1207,7 @@ fn validate_runtime_factory(
 fn api_policy(config: &ServerConfig) -> ApiPolicy {
     ApiPolicy {
         api_key: config.auth.api_key.clone(),
+        cors_allowed_origins: config.server.cors_allowed_origins.clone(),
         max_upload_size: config.server.max_upload_size,
         max_pdf_pages: config.server.max_pdf_pages,
         max_pdf_pixels: config.server.max_pdf_pixels,

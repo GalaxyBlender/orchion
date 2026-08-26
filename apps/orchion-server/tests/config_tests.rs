@@ -74,11 +74,94 @@ fn defaults_are_executable_relative() {
     assert_eq!(config.services.ocr_vl.max_pixels, 100_000_000);
     assert!(!config.services.ocr_vl.active());
     assert_eq!(config.auth.api_key, None);
+    assert_eq!(config.server.cors_allowed_origins, ["*"]);
     assert_eq!(config.server.max_upload_size, 30 * 1024 * 1024);
     assert_eq!(config.server.max_concurrent_inference, 2);
     assert_eq!(config.server.max_websocket_connections, 64);
     assert_eq!(config.server.max_pending_websocket_connections, 16);
     assert_eq!(config.server.max_websocket_message_size, 2 * 1024 * 1024);
+}
+
+#[test]
+fn cors_allowed_origins_are_parsed_from_toml() {
+    let config = ServerConfig::from_toml_str(
+        r#"
+[server]
+cors_allowed_origins = ["https://app.example.com", "https://admin.example.com"]
+"#,
+        std::path::Path::new("/tmp/orchion-server"),
+    )
+    .unwrap();
+
+    assert_eq!(
+        config.server.cors_allowed_origins,
+        ["https://app.example.com", "https://admin.example.com"]
+    );
+}
+
+#[test]
+fn cors_wildcard_cannot_be_combined_with_specific_origins() {
+    let error = ServerConfig::from_toml_str(
+        r#"
+[server]
+cors_allowed_origins = ["*", "https://app.example.com"]
+"#,
+        std::path::Path::new("/tmp/orchion-server"),
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ConfigError::CorsWildcardWithSpecificOrigins
+    ));
+}
+
+#[test]
+fn cors_origins_reject_paths() {
+    let error = ServerConfig::from_toml_str(
+        r#"
+[server]
+cors_allowed_origins = ["https://app.example.com/path"]
+"#,
+        std::path::Path::new("/tmp/orchion-server"),
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, ConfigError::InvalidCorsOrigin { .. }));
+}
+
+#[test]
+fn cors_origins_are_normalized_for_browser_matching() {
+    let config = ServerConfig::from_toml_str(
+        r#"
+[server]
+cors_allowed_origins = ["HTTPS://APP.EXAMPLE.COM:443", "http://LOCALHOST:3000"]
+"#,
+        std::path::Path::new("/tmp/orchion-server"),
+    )
+    .unwrap();
+
+    assert_eq!(
+        config.server.cors_allowed_origins,
+        ["https://app.example.com", "http://localhost:3000"]
+    );
+}
+
+#[test]
+fn cors_origins_use_whatwg_host_normalization() {
+    let config = ServerConfig::from_toml_str(
+        r#"
+[server]
+cors_allowed_origins = ["http://127.1", "https://%65xample.com"]
+"#,
+        std::path::Path::new("/tmp/orchion-server"),
+    )
+    .unwrap();
+
+    assert_eq!(
+        config.server.cors_allowed_origins,
+        ["http://127.0.0.1", "https://example.com"]
+    );
 }
 
 #[test]
