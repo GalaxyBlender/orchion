@@ -14,7 +14,7 @@ use orchion_core::{ModelId, OcrLayoutBlock, OcrResponseFormat, OcrUsage};
 use std::path::Path;
 #[cfg(feature = "ocr")]
 use std::path::PathBuf;
-#[cfg(any(feature = "ocr", feature = "ocr-vl"))]
+#[cfg(any(feature = "ocr", all(feature = "ocr-vl", not(feature = "cuda"))))]
 use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "ocr-vl")]
@@ -26,8 +26,10 @@ pub enum LoadedOcrRuntime {
     Traditional(Arc<TraditionalRuntime>),
     #[cfg(feature = "ocr")]
     Layout(Arc<Mutex<oar_ocr::oarocr::OARStructure>>),
-    #[cfg(feature = "ocr-vl")]
+    #[cfg(all(feature = "ocr-vl", not(feature = "cuda")))]
     OcrVl(Arc<Mutex<OcrVlRuntime>>),
+    #[cfg(all(feature = "ocr-vl", feature = "cuda"))]
+    OcrVl(crate::vl_worker::OcrVlWorker),
     #[cfg(any(not(feature = "ocr"), not(feature = "ocr-vl")))]
     Unsupported {
         model: KnownOcrModel,
@@ -42,7 +44,7 @@ pub struct TraditionalRuntime {
 }
 
 #[cfg(feature = "ocr-vl")]
-pub struct OcrVlRuntime {
+pub(crate) struct OcrVlRuntime {
     model: oar_ocr_vl::PaddleOcrVl,
     layout_predictor: Option<oar_ocr::predictors::LayoutDetectionPredictor>,
 }
@@ -85,6 +87,15 @@ pub async fn run_ocr(
     limits: OcrLimits,
 ) -> Result<OcrResult> {
     let image_path = image_path.to_path_buf();
+    #[cfg(all(feature = "ocr-vl", feature = "cuda"))]
+    if let (
+        KnownOcrModel::PaddleOcrVl15 | KnownOcrModel::PaddleOcrVl16,
+        LoadedOcrRuntime::OcrVl(worker),
+    ) = (model, &runtime)
+    {
+        return worker.run(model, image_path, options, limits).await;
+    }
+
     tokio::task::spawn_blocking(move || {
         run_ocr_blocking(model, &runtime, &image_path, &options, limits)
     })
@@ -116,7 +127,7 @@ fn run_ocr_blocking(
     options: &OcrOptions,
     limits: OcrLimits,
 ) -> Result<OcrResult> {
-    #[cfg(not(any(feature = "ocr", feature = "ocr-vl")))]
+    #[cfg(not(feature = "ocr"))]
     let _ = (image_path, options, limits);
 
     match (model, runtime) {
@@ -133,11 +144,11 @@ fn run_ocr_blocking(
         (KnownOcrModel::PpDocLayoutV3, LoadedOcrRuntime::Layout(structure)) => {
             run_layout_ocr(model, structure, image_path, options, limits)
         }
-        #[cfg(feature = "ocr-vl")]
+        #[cfg(all(feature = "ocr-vl", not(feature = "cuda")))]
         (
             KnownOcrModel::PaddleOcrVl15 | KnownOcrModel::PaddleOcrVl16,
             LoadedOcrRuntime::OcrVl(vl),
-        ) => run_vl_ocr(model, vl, image_path, options, limits),
+        ) => run_vl_ocr_locked(model, vl, image_path, options, limits),
         #[cfg(any(not(feature = "ocr"), not(feature = "ocr-vl")))]
         (_, LoadedOcrRuntime::Unsupported { model, capability }) => {
             Err(OrchionError::UnsupportedCapability {
@@ -273,6 +284,21 @@ fn load_vl_runtime(
     assets: &OcrAssets,
     device_preference: DevicePreference,
 ) -> Result<LoadedOcrRuntime> {
+    #[cfg(feature = "cuda")]
+    return crate::vl_worker::OcrVlWorker::load(model, assets.clone(), device_preference)
+        .map(LoadedOcrRuntime::OcrVl);
+
+    #[cfg(not(feature = "cuda"))]
+    build_vl_runtime(model, assets, device_preference)
+        .map(|runtime| LoadedOcrRuntime::OcrVl(Arc::new(Mutex::new(runtime))))
+}
+
+#[cfg(feature = "ocr-vl")]
+pub(crate) fn build_vl_runtime(
+    model: KnownOcrModel,
+    assets: &OcrAssets,
+    device_preference: DevicePreference,
+) -> Result<OcrVlRuntime> {
     use oar_ocr_vl::{PaddleOcrVl, utils::parse_device};
 
     let OcrAssets::VisionLanguage { model_dir, layout } = assets else {
@@ -286,12 +312,10 @@ fn load_vl_runtime(
     })?;
     let layout_predictor = load_default_layout_predictor(layout.as_deref(), device_preference)?;
 
-    Ok(LoadedOcrRuntime::OcrVl(Arc::new(Mutex::new(
-        OcrVlRuntime {
-            model: vl,
-            layout_predictor,
-        },
-    ))))
+    Ok(OcrVlRuntime {
+        model: vl,
+        layout_predictor,
+    })
 }
 
 #[cfg(not(feature = "ocr-vl"))]
@@ -408,8 +432,8 @@ fn run_layout_ocr(
     ))
 }
 
-#[cfg(feature = "ocr-vl")]
-fn run_vl_ocr(
+#[cfg(all(feature = "ocr-vl", not(feature = "cuda")))]
+fn run_vl_ocr_locked(
     model: KnownOcrModel,
     runtime: &Mutex<OcrVlRuntime>,
     image_path: &Path,
@@ -417,16 +441,38 @@ fn run_vl_ocr(
     limits: OcrLimits,
 ) -> Result<OcrResult> {
     let image = decode_ocr_image(image_path, limits.max_pixels)?;
-    let max_tokens = options.max_tokens.unwrap_or(DEFAULT_VL_MAX_TOKENS);
     let runtime = runtime.lock().map_err(|error| OrchionError::Inference {
         message: format!("OCR-VL runtime lock poisoned: {error}"),
     })?;
+    run_vl_ocr_with_image(model, &runtime, image, options)
+}
+
+#[cfg(all(feature = "ocr-vl", feature = "cuda"))]
+pub(crate) fn run_vl_ocr(
+    model: KnownOcrModel,
+    runtime: &OcrVlRuntime,
+    image_path: &Path,
+    options: &OcrOptions,
+    limits: OcrLimits,
+) -> Result<OcrResult> {
+    let image = decode_ocr_image(image_path, limits.max_pixels)?;
+    run_vl_ocr_with_image(model, runtime, image, options)
+}
+
+#[cfg(feature = "ocr-vl")]
+fn run_vl_ocr_with_image(
+    model: KnownOcrModel,
+    runtime: &OcrVlRuntime,
+    image: image::RgbImage,
+    options: &OcrOptions,
+) -> Result<OcrResult> {
+    let max_tokens = options.max_tokens.unwrap_or(DEFAULT_VL_MAX_TOKENS);
 
     if should_use_vl_layout_pipeline(options) {
         let layout_predictor = runtime.layout_predictor.as_ref().ok_or_else(|| {
             model_load_error(anyhow::anyhow!("OCR-VL layout model is not loaded"))
         })?;
-        return run_vl_layout_ocr(model, &runtime, layout_predictor, image, options);
+        return run_vl_layout_ocr(model, runtime, layout_predictor, image, options);
     }
 
     let task = vl_task(options.task);

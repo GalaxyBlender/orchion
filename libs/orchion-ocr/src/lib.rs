@@ -3,6 +3,8 @@ mod assets;
 mod device;
 mod result;
 mod runtime;
+#[cfg(all(feature = "ocr-vl", feature = "cuda"))]
+mod vl_worker;
 
 pub use assets::OcrAssets;
 pub use result::validate_image_file;
@@ -129,5 +131,13 @@ mod tests {
 
         assert_eq!(result, Err("unavailable"));
         assert_eq!(attempted, [device::ProviderPolicy::OrtCuda(Some(2))]);
+    }
+
+    #[cfg(all(feature = "ocr-vl", feature = "cuda"))]
+    #[test]
+    fn cuda_ocr_engine_handle_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<OcrEngine>();
     }
 }
