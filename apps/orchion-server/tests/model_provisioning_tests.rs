@@ -97,9 +97,32 @@ available_models = ["Qwen/Qwen3-ASR-0.6B", "Qwen/Qwen3-ASR-1.7B"]
     };
 
     let calls = provisioner.calls();
-    assert!(calls.contains(&"Qwen/Qwen3-ASR-0.6B".to_string()));
     assert!(calls.contains(&"Qwen/Qwen3-ASR-1.7B".to_string()));
     assert!(format!("{error:#}").contains("injected download failure for Qwen/Qwen3-ASR-1.7B"));
+}
+
+#[tokio::test]
+async fn all_available_asr_models_are_provisioned_at_startup() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let config = ServerConfig::from_toml_str(
+        r#"
+[services.asr]
+enabled = true
+default_model = "Qwen/Qwen3-ASR-0.6B"
+available_models = ["Qwen/Qwen3-ASR-0.6B", "Qwen/Qwen3-ASR-1.7B"]
+"#,
+        &temp_dir.path().join("orchion-server"),
+    )
+    .unwrap();
+    let provisioner = Arc::new(FakeProvisioner::default());
+
+    AppState::load_with_provisioner(config, Arc::clone(&provisioner))
+        .await
+        .unwrap();
+
+    let calls = provisioner.calls();
+    assert!(calls.contains(&"Qwen/Qwen3-ASR-0.6B".to_string()));
+    assert!(calls.contains(&"Qwen/Qwen3-ASR-1.7B".to_string()));
 }
 
 #[tokio::test]
