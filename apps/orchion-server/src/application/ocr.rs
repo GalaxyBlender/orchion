@@ -1,4 +1,6 @@
-use super::{RuntimeError, UseCaseError};
+use super::{
+    RuntimeError, UseCaseError, finish_owned_file_operation, protect_owned_file_operation,
+};
 use orchion::{ModelId, OcrLimits, OcrOptions, OcrResponseFormat, OcrResult, OcrTask};
 use std::future::Future;
 use std::path::PathBuf;
@@ -91,11 +93,17 @@ pub async fn recognize(
     };
     let image_path = command.image_path;
     let validation_path = image_path.clone();
-    tokio::task::spawn_blocking(move || {
+    if !protect_owned_file_operation() {
+        return Err(UseCaseError::Internal("request cancelled".into()));
+    }
+    let validation = tokio::task::spawn_blocking(move || {
         orchion::validate_ocr_image_file(&validation_path, max_pixels)
     })
-    .await
-    .map_err(|error| UseCaseError::Internal(error.to_string()))??;
+    .await;
+    if finish_owned_file_operation() {
+        return Err(UseCaseError::Internal("request cancelled".into()));
+    }
+    validation.map_err(|error| UseCaseError::Internal(error.to_string()))??;
 
     let options = OcrOptions {
         response_format,

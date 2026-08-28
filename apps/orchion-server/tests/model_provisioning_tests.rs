@@ -78,7 +78,7 @@ impl ModelProvisioner<OcrModel> for FakeProvisioner {
 }
 
 #[tokio::test]
-async fn optional_model_download_failure_does_not_block_startup() {
+async fn available_model_download_failure_blocks_startup() {
     let temp_dir = tempfile::tempdir().unwrap();
     let config = ServerConfig::from_toml_str(
         r#"
@@ -92,15 +92,18 @@ available_models = ["Qwen/Qwen3-ASR-0.6B", "Qwen/Qwen3-ASR-1.7B"]
     .unwrap();
     let provisioner = Arc::new(FakeProvisioner::failing("Qwen/Qwen3-ASR-1.7B"));
 
-    AppState::load_with_provisioner(config, Arc::clone(&provisioner))
-        .await
-        .unwrap();
+    let Err(error) = AppState::load_with_provisioner(config, Arc::clone(&provisioner)).await else {
+        panic!("available model failure should block startup");
+    };
 
-    assert_eq!(provisioner.calls(), ["Qwen/Qwen3-ASR-0.6B"]);
+    let calls = provisioner.calls();
+    assert!(calls.contains(&"Qwen/Qwen3-ASR-0.6B".to_string()));
+    assert!(calls.contains(&"Qwen/Qwen3-ASR-1.7B".to_string()));
+    assert!(format!("{error:#}").contains("injected download failure for Qwen/Qwen3-ASR-1.7B"));
 }
 
 #[tokio::test]
-async fn effective_ocr_default_is_the_only_main_model_provisioned_at_startup() {
+async fn all_available_ocr_models_are_provisioned_at_startup() {
     let temp_dir = tempfile::tempdir().unwrap();
     let config = ServerConfig::from_toml_str(
         r#"
@@ -111,13 +114,15 @@ available_models = ["PaddlePaddle/PP-OCRv6_tiny", "PaddlePaddle/PP-OCRv6_small"]
         &temp_dir.path().join("orchion-server"),
     )
     .unwrap();
-    let provisioner = Arc::new(FakeProvisioner::failing("PaddlePaddle/PP-OCRv6_small"));
+    let provisioner = Arc::new(FakeProvisioner::default());
 
     AppState::load_with_provisioner(config, Arc::clone(&provisioner))
         .await
         .unwrap();
 
-    assert_eq!(provisioner.calls(), ["PaddlePaddle/PP-OCRv6_tiny"]);
+    let calls = provisioner.calls();
+    assert!(calls.contains(&"PaddlePaddle/PP-OCRv6_tiny".to_string()));
+    assert!(calls.contains(&"PaddlePaddle/PP-OCRv6_small".to_string()));
 }
 
 #[tokio::test]

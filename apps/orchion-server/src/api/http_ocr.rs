@@ -1,6 +1,5 @@
 use crate::api::http_shared::{
-    authorize, parse_multipart_value, read_text_field, run_inference_owned,
-    write_multipart_file_to_temp_file,
+    authorize, parse_multipart_value, read_text_field, run_owned, write_multipart_file_to_temp_file,
 };
 use crate::api::openai::{ApiError, OcrApiFormat, OcrJsonResponse};
 use crate::application::ServerApplication;
@@ -88,7 +87,7 @@ where
 
     let image_path = image_file.path().to_path_buf();
     let operation_state = Arc::clone(&state);
-    let output = run_inference_owned(state.acquire_inference(), async move {
+    let output = run_owned(async move {
         let _image_file = image_file;
         recognize(
             operation_state.as_ref(),

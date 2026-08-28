@@ -1,15 +1,17 @@
+use crate::api::http_models::{ModelControlRequest, ModelStatusList};
 use crate::api::openai::{
     ErrorBody, ModelList, OcrApiFormat, OcrJsonResponse, SpeechRequest, TranscriptionJson,
     TranscriptionVerboseJson,
 };
+use crate::application::model_lifecycle::ModelStatus;
 use orchion::docs::PdfImageFormat;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(healthz_doc, list_models_doc, create_speech_doc, create_transcription_doc, create_ocr_doc, create_pdf_images_doc),
-    components(schemas(SpeechRequest, ErrorBody, ModelList, TranscriptionJson, TranscriptionVerboseJson, OcrJsonResponse, OcrApiFormat, PdfImageFormat, PdfImagesMultipartRequest)),
+    paths(healthz_doc, list_models_doc, list_model_statuses_doc, prewarm_model_doc, unload_model_doc, create_speech_doc, create_transcription_doc, create_ocr_doc, create_pdf_images_doc),
+    components(schemas(SpeechRequest, ErrorBody, ModelList, ModelStatusList, ModelStatus, ModelControlRequest, TranscriptionJson, TranscriptionVerboseJson, OcrJsonResponse, OcrApiFormat, PdfImageFormat, PdfImagesMultipartRequest)),
     tags(
         (name = "audio", description = "OpenAI-compatible audio APIs"),
         (name = "ocr", description = "OCR and OCR-VL APIs"),
@@ -84,6 +86,17 @@ mod tests {
                 "voice_design"
             ])
         );
+    }
+
+    #[test]
+    fn openapi_includes_model_lifecycle_paths_and_schemas() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+
+        assert!(spec["paths"]["/v1/models/status"]["get"].is_object());
+        assert!(spec["paths"]["/v1/models/prewarm"]["post"].is_object());
+        assert!(spec["paths"]["/v1/models/unload"]["post"].is_object());
+        assert!(spec["components"]["schemas"]["ModelStatus"].is_object());
+        assert!(spec["components"]["schemas"]["ModelControlRequest"].is_object());
     }
 
     #[test]
@@ -187,6 +200,46 @@ fn healthz_doc() {}
 )]
 #[allow(dead_code)]
 fn list_models_doc() {}
+
+#[utoipa::path(
+    get,
+    path = "/v1/models/status",
+    responses(
+        (status = 200, description = "Configured model runtime residency", body = ModelStatusList),
+        (status = 401, description = "OpenAI-compatible error", body = ErrorBody)
+    ),
+    tag = "models"
+)]
+#[allow(dead_code)]
+fn list_model_statuses_doc() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/models/prewarm",
+    request_body = ModelControlRequest,
+    responses(
+        (status = 200, description = "Loaded model runtime", body = ModelStatus),
+        (status = 400, description = "OpenAI-compatible error", body = ErrorBody),
+        (status = 401, description = "OpenAI-compatible error", body = ErrorBody)
+    ),
+    tag = "models"
+)]
+#[allow(dead_code)]
+fn prewarm_model_doc() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/models/unload",
+    request_body = ModelControlRequest,
+    responses(
+        (status = 200, description = "Unloaded model runtime", body = ModelStatus),
+        (status = 400, description = "OpenAI-compatible error", body = ErrorBody),
+        (status = 401, description = "OpenAI-compatible error", body = ErrorBody)
+    ),
+    tag = "models"
+)]
+#[allow(dead_code)]
+fn unload_model_doc() {}
 
 #[utoipa::path(
     post,

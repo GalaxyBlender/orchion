@@ -1,4 +1,6 @@
-use super::{RuntimeError, UseCaseError};
+use super::{
+    RuntimeError, UseCaseError, finish_owned_file_operation, protect_owned_file_operation,
+};
 use orchion::{AsrModel, AsrOptions, AsrTranscript, decode_audio_file_with_max_samples};
 use std::future::Future;
 use std::path::PathBuf;
@@ -56,7 +58,14 @@ pub async fn transcribe(
     }
 
     let max_samples = max_audio_samples(policy.max_audio_duration, orchion::ASR_SAMPLE_RATE)?;
-    let decoded = decode_audio_file_with_max_samples(command.audio_path, max_samples).await?;
+    if !protect_owned_file_operation() {
+        return Err(UseCaseError::Internal("request cancelled".into()));
+    }
+    let decoded = decode_audio_file_with_max_samples(command.audio_path, max_samples).await;
+    if finish_owned_file_operation() {
+        return Err(UseCaseError::Internal("request cancelled".into()));
+    }
+    let decoded = decoded?;
     let duration = transcription_duration(decoded.samples.len(), decoded.sample_rate)?;
     let options = AsrOptions {
         language: command.language,

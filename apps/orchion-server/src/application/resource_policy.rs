@@ -1,14 +1,28 @@
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-#[derive(Clone)]
 pub struct InferenceGuard {
-    _permit: Arc<OwnedSemaphorePermit>,
+    _permit: OwnedSemaphorePermit,
+}
+
+#[derive(Clone)]
+pub(crate) struct InferenceLimiter {
+    permits: Arc<Semaphore>,
+}
+
+impl InferenceLimiter {
+    pub(crate) async fn acquire(&self) -> InferenceGuard {
+        let permit = Arc::clone(&self.permits)
+            .acquire_owned()
+            .await
+            .expect("inference semaphore must remain open");
+        InferenceGuard { _permit: permit }
+    }
 }
 
 #[derive(Clone)]
 pub struct ResourcePolicy {
-    inference: Arc<Semaphore>,
+    inference: InferenceLimiter,
     websocket_connections: Arc<Semaphore>,
     pending_websocket_connections: Arc<Semaphore>,
 }
@@ -21,7 +35,9 @@ impl ResourcePolicy {
         max_pending_websocket_connections: usize,
     ) -> Self {
         Self {
-            inference: Arc::new(Semaphore::new(max_concurrent_inference)),
+            inference: InferenceLimiter {
+                permits: Arc::new(Semaphore::new(max_concurrent_inference)),
+            },
             websocket_connections: Arc::new(Semaphore::new(max_websocket_connections)),
             pending_websocket_connections: Arc::new(Semaphore::new(
                 max_pending_websocket_connections,
@@ -35,13 +51,11 @@ impl ResourcePolicy {
     ///
     /// Panics if the private inference semaphore is closed. `ResourcePolicy` never closes it.
     pub async fn acquire_inference(&self) -> InferenceGuard {
-        let permit = Arc::clone(&self.inference)
-            .acquire_owned()
-            .await
-            .expect("inference semaphore must remain open");
-        InferenceGuard {
-            _permit: Arc::new(permit),
-        }
+        self.inference.acquire().await
+    }
+
+    pub(crate) fn inference_limiter(&self) -> InferenceLimiter {
+        self.inference.clone()
     }
 
     #[must_use]
@@ -90,27 +104,6 @@ mod tests {
             .unwrap();
         assert!(policy.try_acquire_websocket().is_some());
         assert!(policy.try_acquire_pending_websocket().is_some());
-    }
-
-    #[tokio::test]
-    async fn cloned_inference_guard_holds_permit_until_last_clone_drops() {
-        let policy = ResourcePolicy::new(1, 1, 1);
-        let inference = policy.acquire_inference().await;
-        let clone = inference.clone();
-        let queued = policy.acquire_inference();
-        tokio::pin!(queued);
-
-        drop(inference);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), &mut queued)
-                .await
-                .is_err()
-        );
-
-        drop(clone);
-        tokio::time::timeout(Duration::from_secs(1), queued)
-            .await
-            .unwrap();
     }
 
     #[tokio::test]

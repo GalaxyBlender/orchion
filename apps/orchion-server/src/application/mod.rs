@@ -1,10 +1,12 @@
 pub mod model_cache;
+pub mod model_lifecycle;
 pub mod ocr;
 pub mod resource_policy;
 pub mod speech;
 pub mod streaming_transcription;
 pub mod transcription;
 
+use crate::application::model_lifecycle::ModelLifecycleRuntime;
 use crate::application::ocr::OcrRuntime;
 use crate::application::resource_policy::InferenceGuard;
 use crate::application::speech::SpeechRuntime;
@@ -13,8 +15,81 @@ use crate::application::transcription::TranscriptionRuntime;
 use orchion::{AsrModel, ModelId, TtsModel};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 use tokio::sync::OwnedSemaphorePermit;
+
+pub(crate) struct OwnedOperationState {
+    state: AtomicU8,
+}
+
+impl OwnedOperationState {
+    const CANCELLED: u8 = 1;
+    const PROTECTED: u8 = 2;
+
+    pub(crate) fn new() -> Self {
+        Self {
+            state: AtomicU8::new(0),
+        }
+    }
+
+    pub(crate) fn cancel(&self) -> bool {
+        self.state.fetch_or(Self::CANCELLED, Ordering::AcqRel) & Self::PROTECTED == 0
+    }
+
+    fn protect(&self) -> bool {
+        let mut state = self.state.load(Ordering::Acquire);
+        loop {
+            if state & Self::CANCELLED != 0 {
+                return false;
+            }
+            match self.state.compare_exchange_weak(
+                state,
+                state | Self::PROTECTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(current) => state = current,
+            }
+        }
+    }
+
+    fn finish_protected(&self) -> bool {
+        self.state.fetch_and(!Self::PROTECTED, Ordering::AcqRel) & Self::CANCELLED != 0
+    }
+}
+
+tokio::task_local! {
+    static OWNED_OPERATION: Arc<OwnedOperationState>;
+}
+
+pub(crate) async fn track_owned_operation<F>(
+    state: Arc<OwnedOperationState>,
+    operation: F,
+) -> F::Output
+where
+    F: Future,
+{
+    OWNED_OPERATION.scope(state, operation).await
+}
+
+pub(crate) fn mark_owned_operation_dispatched() -> bool {
+    OWNED_OPERATION
+        .try_with(|state| state.protect())
+        .unwrap_or(true)
+}
+
+pub(crate) fn protect_owned_file_operation() -> bool {
+    mark_owned_operation_dispatched()
+}
+
+pub(crate) fn finish_owned_file_operation() -> bool {
+    OWNED_OPERATION
+        .try_with(|state| state.finish_protected())
+        .unwrap_or(false)
+}
 
 pub type InferenceGuardFuture<'a> = Pin<Box<dyn Future<Output = InferenceGuard> + Send + 'a>>;
 
@@ -50,7 +125,12 @@ pub struct ApiPolicy {
 }
 
 pub trait ServerApplication:
-    TranscriptionRuntime + SpeechRuntime + OcrRuntime + StreamingTranscriptionRuntime + 'static
+    TranscriptionRuntime
+    + SpeechRuntime
+    + OcrRuntime
+    + StreamingTranscriptionRuntime
+    + ModelLifecycleRuntime
+    + 'static
 {
     fn api_policy(&self) -> &ApiPolicy;
     fn acquire_inference(&self) -> InferenceGuardFuture<'_>;
@@ -109,5 +189,27 @@ impl From<RuntimeError> for UseCaseError {
             RuntimeError::Core(error) => Self::Core(error),
             RuntimeError::ResourceExhausted(resource) => Self::ResourceExhausted(resource),
         }
+    }
+}
+
+#[cfg(test)]
+mod owned_operation_tests {
+    use super::OwnedOperationState;
+
+    #[test]
+    fn cancellation_prevents_later_protection() {
+        let state = OwnedOperationState::new();
+
+        assert!(state.cancel());
+        assert!(!state.protect());
+    }
+
+    #[test]
+    fn protection_defers_cancellation_until_the_operation_finishes() {
+        let state = OwnedOperationState::new();
+
+        assert!(state.protect());
+        assert!(!state.cancel());
+        assert!(state.finish_protected());
     }
 }

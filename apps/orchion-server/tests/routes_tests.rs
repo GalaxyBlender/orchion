@@ -78,6 +78,97 @@ async fn models_endpoint_returns_configured_models() {
 }
 
 #[tokio::test]
+async fn model_status_endpoint_reports_runtime_residency_by_service() {
+    let response = router(test_state(None))
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["object"], "list");
+    let statuses = body["data"].as_array().unwrap();
+    assert_eq!(statuses.len(), 5);
+    assert!(
+        statuses
+            .iter()
+            .all(|model| { model["object"] == "model_status" && model["status"] == "unloaded" })
+    );
+    assert_eq!(statuses[0]["id"], "Qwen/Qwen3-ASR-0.6B");
+    assert_eq!(statuses[0]["service"], "asr");
+    assert_eq!(statuses[2]["service"], "tts");
+}
+
+#[tokio::test]
+async fn model_unload_is_idempotent_for_configured_unloaded_model() {
+    let response = router(test_state(None))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/models/unload")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"model":"Qwen/Qwen3-ASR-0.6B","service":"asr"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["id"], "Qwen/Qwen3-ASR-0.6B");
+    assert_eq!(body["service"], "asr");
+    assert_eq!(body["status"], "unloaded");
+}
+
+#[tokio::test]
+async fn model_control_rejects_wrong_service_and_invalid_json() {
+    let app = router(test_state(None));
+    let wrong_service = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/models/prewarm")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"model":"Qwen/Qwen3-ASR-0.6B","service":"ocr"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wrong_service.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_body(wrong_service).await["error"]["code"],
+        "model_not_available"
+    );
+
+    let invalid_json = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/models/unload")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid_json.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_body(invalid_json).await["error"]["code"],
+        "invalid_json"
+    );
+}
+
+#[tokio::test]
 async fn models_endpoint_excludes_disabled_services() {
     let response = router(test_state_with_services(None, true, false))
         .oneshot(

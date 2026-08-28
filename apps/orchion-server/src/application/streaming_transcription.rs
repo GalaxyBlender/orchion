@@ -1,5 +1,5 @@
 use super::model_cache::ModelLease;
-use super::resource_policy::InferenceGuard;
+use super::resource_policy::InferenceLimiter;
 use super::{RuntimeError, UseCaseError};
 use orchion::{
     ASR_SAMPLE_RATE, Asr, AsrModel, AsrStreamingOptions, AsrTranscript, AudioVadStreamingEvent,
@@ -210,16 +210,13 @@ fn stream_audio_too_long_error(max_duration: Duration) -> UseCaseError {
 #[derive(Clone)]
 pub struct LeasedAsrModel {
     model: ModelLease<Asr>,
-    inference_guard: InferenceGuard,
+    inference: InferenceLimiter,
 }
 
 impl LeasedAsrModel {
     #[must_use]
-    pub(crate) fn new(model: ModelLease<Asr>, inference_guard: InferenceGuard) -> Self {
-        Self {
-            model,
-            inference_guard,
-        }
+    pub(crate) fn new(model: ModelLease<Asr>, inference: InferenceLimiter) -> Self {
+        Self { model, inference }
     }
 
     /// # Errors
@@ -229,11 +226,9 @@ impl LeasedAsrModel {
         &self,
         options: AsrStreamingOptions,
     ) -> Result<LeasedAsrStream, UseCaseError> {
-        let operation_guard = self.inference_guard.clone();
         let stream = self
             .model
-            .run(move |model| async move {
-                let _guard = operation_guard;
+            .run_with_inference(self.inference.clone(), move |model| async move {
                 model.start_streaming_with(options).await
             })
             .await
@@ -263,12 +258,10 @@ impl LeasedAsrStream {
     ) -> Result<Option<AsrTranscript>, UseCaseError> {
         let mut stream = self.take_stream()?;
         let samples = samples.to_vec();
-        let operation_guard = self.model.inference_guard.clone();
         let (stream, result) = self
             .model
             .model
-            .run(move |model| async move {
-                let _guard = operation_guard;
+            .run_with_inference(self.model.inference.clone(), move |model| async move {
                 let result = stream.feed(&samples, sample_rate).await;
                 drop(model);
                 (stream, result)
@@ -286,11 +279,9 @@ impl LeasedAsrStream {
     /// Returns a use-case error when final streaming inference fails.
     pub async fn finish(mut self) -> Result<AsrTranscript, UseCaseError> {
         let stream = self.take_stream()?;
-        let operation_guard = self.model.inference_guard.clone();
         self.model
             .model
-            .run(move |model| async move {
-                let _guard = operation_guard;
+            .run_with_inference(self.model.inference.clone(), move |model| async move {
                 let result = stream.finish().await;
                 drop(model);
                 result
@@ -971,12 +962,13 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let guard = ResourcePolicy::new(1, 1, 1).acquire_inference().await;
+        let inference = ResourcePolicy::new(1, 1, 1).inference_limiter();
         let options = AsrStreamingOptions {
             chunk_size_sec: 1.0,
             ..AsrStreamingOptions::default()
         };
-        let mut session = CaptionSession::new(LeasedAsrModel::new(lease, guard), options, 1_000);
+        let mut session =
+            CaptionSession::new(LeasedAsrModel::new(lease, inference), options, 1_000);
 
         let first = session
             .apply_vad_events(

@@ -1,5 +1,5 @@
 use crate::api::http_shared::{
-    authorize, read_text_field, run_inference_owned, write_multipart_file_to_temp_file,
+    authorize, read_text_field, run_owned, write_multipart_file_to_temp_file,
 };
 use crate::api::openai::{
     ApiError, TranscriptionFormat, TranscriptionJson, TranscriptionVerboseJson,
@@ -98,7 +98,7 @@ where
         "transcription request received"
     );
     let operation_state = Arc::clone(&state);
-    let result = run_inference_owned(state.acquire_inference(), async move {
+    let result = run_owned(async move {
         let _audio_file = audio_file;
         transcribe(
             operation_state.as_ref(),

@@ -1,4 +1,6 @@
-use super::{RuntimeError, UseCaseError};
+use super::{
+    RuntimeError, UseCaseError, finish_owned_file_operation, protect_owned_file_operation,
+};
 use orchion::{
     AudioOutputFormat, TtsAudio, TtsLanguage, TtsModel, TtsOptions, TtsSpeaker, TtsVoice,
     decode_audio_file_with_max_samples, encode_tts_audio,
@@ -122,16 +124,26 @@ async fn transcode_reference_audio(
     max_duration: Duration,
 ) -> Result<(), UseCaseError> {
     let max_samples = max_audio_samples(max_duration, orchion::ASR_SAMPLE_RATE)?;
-    let decoded = decode_audio_file_with_max_samples(input, max_samples)
-        .await
-        .map_err(UseCaseError::ReferenceAudio)?;
+    if !protect_owned_file_operation() {
+        return Err(UseCaseError::Internal("request cancelled".into()));
+    }
+    let decoded = decode_audio_file_with_max_samples(input, max_samples).await;
+    if finish_owned_file_operation() {
+        return Err(UseCaseError::Internal("request cancelled".into()));
+    }
+    let decoded = decoded.map_err(UseCaseError::ReferenceAudio)?;
     let audio = TtsAudio::new(decoded.samples, decoded.sample_rate);
     let encoded = encode_tts_audio(&audio, AudioOutputFormat::Wav)
         .await
         .map_err(UseCaseError::ReferenceAudio)?;
-    tokio::fs::write(output, encoded.bytes)
-        .await
-        .map_err(|error| UseCaseError::Internal(error.to_string()))
+    if !protect_owned_file_operation() {
+        return Err(UseCaseError::Internal("request cancelled".into()));
+    }
+    let write = tokio::fs::write(output, encoded.bytes).await;
+    if finish_owned_file_operation() {
+        return Err(UseCaseError::Internal("request cancelled".into()));
+    }
+    write.map_err(|error| UseCaseError::Internal(error.to_string()))
 }
 
 /// # Errors

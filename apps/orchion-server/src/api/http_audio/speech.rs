@@ -1,6 +1,6 @@
 use crate::api::http_shared::{
     authorize, is_multipart, parse_multipart_value, read_text_field, required_multipart_field,
-    run_inference_owned, write_multipart_file_to_temp_file,
+    run_owned, write_multipart_file_to_temp_file,
 };
 use crate::api::openai::{ApiError, SpeechFormat, SpeechRequest};
 use crate::application::ServerApplication;
@@ -180,7 +180,7 @@ where
         "speech request received"
     );
     let operation_state = Arc::clone(&state);
-    let result = run_inference_owned(state.acquire_inference(), async move {
+    let result = run_owned(async move {
         let _temporary_files = temporary_files;
         synthesize(operation_state.as_ref(), command)
             .await

@@ -1,6 +1,11 @@
 use crate::application::model_cache::{
     AsrModelCache, CacheTracker, GlobalModelCacheLimiter, ModelCache, ModelLease,
-    ModelProvisionFuture, ModelProvisioner, OcrModelCache, OcrVlModelCache, TtsModelCache,
+    ModelProvisionFuture, ModelProvisioner, ModelResidencyStatus, OcrModelCache, OcrVlModelCache,
+    ResidencyDomain, TtsModelCache,
+};
+use crate::application::model_lifecycle::{
+    ModelControlFuture, ModelLifecycleRuntime, ModelResidency, ModelSelector, ModelService,
+    ModelStatus, ModelStatusesFuture,
 };
 use crate::application::ocr::{
     OcrFuture, OcrPolicy, OcrRuntime, OcrServiceChoice, OcrServicePolicy, OcrVlServicePolicy,
@@ -24,9 +29,9 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
-use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
+use std::sync::{Arc, Mutex as StdMutex};
+use tokio::sync::{Semaphore, watch};
+use tokio::task::{JoinHandle, JoinSet};
 
 const MAX_CONCURRENT_MODEL_PROVISIONS: usize = 2;
 type LayoutModelCache = ModelCache<OcrModel, ()>;
@@ -167,14 +172,20 @@ pub struct AppState {
     ocr_vl_models: OcrVlModelCache,
     layout_models: LayoutModelCache,
     global_models: GlobalModelCacheLimiter,
+    model_residency: ResidencyDomain,
     resources: ResourcePolicy,
     runtime_factory: Arc<dyn ModelRuntimeFactory>,
+    cleanup_shutdown: watch::Sender<bool>,
+    cleanup_task: Arc<StdMutex<Option<JoinHandle<()>>>>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orchion::KnownOcrModel;
+    use orchion::{
+        AsrEngine, AsrEngineFuture, AsrOptions, AsrStreamSession, AsrStreamingOptions,
+        AsrTranscript, KnownOcrModel,
+    };
 
     #[tokio::test]
     async fn disabled_ocr_services_skip_empty_caches() {
@@ -278,6 +289,86 @@ mod tests {
 
     struct FailingRuntimeFactory;
 
+    struct TestAsrEngine {
+        model: AsrModel,
+    }
+
+    impl AsrEngine for TestAsrEngine {
+        fn model(&self) -> AsrModel {
+            self.model.clone()
+        }
+
+        fn transcribe_file_with(
+            &self,
+            _path: PathBuf,
+            _options: AsrOptions,
+        ) -> AsrEngineFuture<'_, AsrTranscript> {
+            Box::pin(async { Ok(test_transcript()) })
+        }
+
+        fn transcribe_samples_with(
+            &self,
+            _samples: Vec<f32>,
+            _sample_rate: u32,
+            _options: AsrOptions,
+        ) -> AsrEngineFuture<'_, AsrTranscript> {
+            Box::pin(async { Ok(test_transcript()) })
+        }
+
+        fn start_streaming_with(
+            &self,
+            _options: AsrStreamingOptions,
+        ) -> AsrEngineFuture<'_, Box<dyn AsrStreamSession>> {
+            Box::pin(async {
+                Err(orchion::OrchionError::InvalidAudio {
+                    reason: "streaming is not used by this test engine".to_string(),
+                })
+            })
+        }
+    }
+
+    fn test_transcript() -> AsrTranscript {
+        AsrTranscript {
+            text: "test".to_string(),
+            language: "en".to_string(),
+            raw_output: "test".to_string(),
+            segments: Vec::new(),
+        }
+    }
+
+    struct SuccessfulAsrRuntimeFactory;
+
+    impl ModelRuntimeFactory for SuccessfulAsrRuntimeFactory {
+        fn load_asr(
+            &self,
+            model: AsrModel,
+            _path: PathBuf,
+            _device: DevicePreference,
+        ) -> AsrRuntimeFuture<'_> {
+            Box::pin(async move { Ok(Asr::from_engine(Arc::new(TestAsrEngine { model }))) })
+        }
+
+        fn load_tts(
+            &self,
+            _model: TtsModel,
+            _path: PathBuf,
+            _device: DevicePreference,
+        ) -> TtsRuntimeFuture<'_> {
+            Box::pin(async { anyhow::bail!("TTS is not used by this test factory") })
+        }
+
+        fn load_ocr(
+            &self,
+            _model: OcrModel,
+            _model_dir: PathBuf,
+            _cache_root: PathBuf,
+            _layout_models: Vec<(OcrModel, PathBuf)>,
+            _device: DevicePreference,
+        ) -> OcrRuntimeFuture<'_> {
+            Box::pin(async { anyhow::bail!("OCR is not used by this test factory") })
+        }
+    }
+
     impl ModelRuntimeFactory for FailingRuntimeFactory {
         fn load_asr(
             &self,
@@ -325,6 +416,92 @@ mod tests {
         };
 
         assert!(format!("{error:#}").contains("injected ASR runtime factory"));
+    }
+
+    #[tokio::test]
+    async fn model_lifecycle_prewarms_reports_and_unloads_runtime() {
+        let mut config = test_config();
+        config.services.asr.enabled = true;
+        let model = config.services.asr.default_model.clone();
+        let state = AppState::from_prepared_config_with_runtime_factory(
+            config,
+            Arc::new(SuccessfulAsrRuntimeFactory),
+        )
+        .unwrap();
+        let selector = ModelSelector {
+            model: model.as_str().to_string(),
+            service: ModelService::Asr,
+        };
+
+        let prewarmed = state
+            .prewarm_model(selector.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(prewarmed.status, ModelResidency::Loaded);
+        assert!(state.model_statuses().await.iter().any(|status| {
+            status.id == model.as_str() && status.status == ModelResidency::Loaded
+        }));
+
+        let unloaded = state.unload_model(selector).await.unwrap().unwrap();
+        assert_eq!(unloaded.status, ModelResidency::Unloaded);
+        assert!(state.model_statuses().await.iter().any(|status| {
+            status.id == model.as_str() && status.status == ModelResidency::Unloaded
+        }));
+
+        state
+            .prewarm_model(ModelSelector {
+                model: model.as_str().to_string(),
+                service: ModelService::Asr,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        state.shutdown().await;
+        assert_eq!(
+            state.asr_models.status(&model).await,
+            Some(ModelResidencyStatus::Unloaded)
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_cleanup_uses_model_deadline_and_joins_on_shutdown() {
+        let mut config = test_config();
+        config.services.asr.enabled = true;
+        config.services.asr.idle_timeout = std::time::Duration::from_millis(20);
+        let model = config.services.asr.default_model.clone();
+        let state = Arc::new(
+            AppState::from_prepared_config_with_runtime_factory(
+                config,
+                Arc::new(SuccessfulAsrRuntimeFactory),
+            )
+            .unwrap(),
+        );
+        state.spawn_idle_cleanup();
+
+        let lease = state.asr(model.clone()).await.unwrap().unwrap();
+        drop(lease);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if state.asr_models.status(&model).await == Some(ModelResidencyStatus::Unloaded) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), state.shutdown())
+            .await
+            .unwrap();
+        assert!(
+            state
+                .cleanup_task
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none()
+        );
     }
 
     #[test]
@@ -479,6 +656,7 @@ impl AppState {
         runtime_factory: Arc<dyn ModelRuntimeFactory>,
     ) -> Self {
         let api_policy = api_policy(&config);
+        let model_residency = ResidencyDomain::new();
         let asr_models = build_model_cache(
             "asr",
             config.services.asr.available_models.clone(),
@@ -488,6 +666,7 @@ impl AppState {
             provisioners
                 .as_ref()
                 .map(|provisioners| Arc::clone(&provisioners.asr)),
+            model_residency.clone(),
         );
         let tts_models = build_model_cache(
             "tts",
@@ -498,6 +677,7 @@ impl AppState {
             provisioners
                 .as_ref()
                 .map(|provisioners| Arc::clone(&provisioners.tts)),
+            model_residency.clone(),
         );
         let ocr_models = build_model_cache(
             "ocr",
@@ -508,6 +688,7 @@ impl AppState {
             provisioners
                 .as_ref()
                 .map(|provisioners| Arc::clone(&provisioners.ocr)),
+            model_residency.clone(),
         );
         let ocr_vl_models = build_model_cache(
             "ocr-vl",
@@ -518,6 +699,7 @@ impl AppState {
             provisioners
                 .as_ref()
                 .map(|provisioners| Arc::clone(&provisioners.ocr)),
+            model_residency.clone(),
         );
         let layout_models = build_model_cache(
             "ocr-layout",
@@ -532,8 +714,13 @@ impl AppState {
             provisioners
                 .as_ref()
                 .map(|provisioners| Arc::clone(&provisioners.ocr)),
+            model_residency.clone(),
         );
-        let global_models = GlobalModelCacheLimiter::new(config.models.max_loaded);
+        let global_models = GlobalModelCacheLimiter::new_in_domain(
+            config.models.max_loaded,
+            model_residency.clone(),
+        );
+        let (cleanup_shutdown, _) = watch::channel(false);
         let resources = ResourcePolicy::new(
             config.server.max_concurrent_inference,
             config.server.max_websocket_connections,
@@ -548,8 +735,11 @@ impl AppState {
             ocr_vl_models,
             layout_models,
             global_models,
+            model_residency,
             resources,
             runtime_factory,
+            cleanup_shutdown,
+            cleanup_task: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -558,68 +748,64 @@ impl AppState {
         let mut tasks = JoinSet::new();
 
         if self.config.services.asr.enabled {
-            spawn_model_provision(
-                &mut tasks,
-                Arc::clone(&semaphore),
-                self.asr_models.clone(),
-                self.config.services.asr.default_model.clone(),
-                ProvisionedModelKind::Asr,
-                "provision ASR default model",
-            );
+            for model in &self.config.services.asr.available_models {
+                spawn_model_provision(
+                    &mut tasks,
+                    Arc::clone(&semaphore),
+                    self.asr_models.clone(),
+                    model.clone(),
+                    ProvisionedModelKind::Asr,
+                    "provision configured ASR model",
+                );
+            }
         }
         if self.config.services.tts.enabled {
-            spawn_model_provision(
-                &mut tasks,
-                Arc::clone(&semaphore),
-                self.tts_models.clone(),
-                self.config.services.tts.default_model.clone(),
-                ProvisionedModelKind::Tts,
-                "provision TTS default model",
-            );
+            for model in &self.config.services.tts.available_models {
+                spawn_model_provision(
+                    &mut tasks,
+                    Arc::clone(&semaphore),
+                    self.tts_models.clone(),
+                    model.clone(),
+                    ProvisionedModelKind::Tts,
+                    "provision configured TTS model",
+                );
+            }
         }
         if self.config.services.ocr.active() {
-            let default = self
-                .config
-                .services
-                .ocr
-                .effective_default_model()
-                .context("active OCR service has no effective default model")?;
-            spawn_model_provision(
-                &mut tasks,
-                Arc::clone(&semaphore),
-                self.ocr_models.clone(),
-                OcrModel::new(default.clone(), OcrModelKind::TraditionalOcr),
-                ProvisionedModelKind::Ocr,
-                "provision OCR default model",
-            );
+            for model in &self.config.services.ocr.available_models {
+                spawn_model_provision(
+                    &mut tasks,
+                    Arc::clone(&semaphore),
+                    self.ocr_models.clone(),
+                    OcrModel::new(model.clone(), OcrModelKind::TraditionalOcr),
+                    ProvisionedModelKind::Ocr,
+                    "provision configured OCR model",
+                );
+            }
         }
         if self.config.services.ocr_vl.active() {
-            let default = self
-                .config
-                .services
-                .ocr_vl
-                .effective_default_model()
-                .context("active OCR-VL service has no effective default model")?;
-            spawn_model_provision(
-                &mut tasks,
-                Arc::clone(&semaphore),
-                self.ocr_vl_models.clone(),
-                OcrModel::new(default.clone(), OcrModelKind::OcrVl),
-                ProvisionedModelKind::OcrVl,
-                "provision OCR-VL default model",
-            );
+            for model in &self.config.services.ocr_vl.available_models {
+                spawn_model_provision(
+                    &mut tasks,
+                    Arc::clone(&semaphore),
+                    self.ocr_vl_models.clone(),
+                    OcrModel::new(model.clone(), OcrModelKind::OcrVl),
+                    ProvisionedModelKind::OcrVl,
+                    "provision configured OCR-VL model",
+                );
+            }
         }
 
         let mut required_layouts = HashSet::new();
-        if self.config.services.ocr.active()
-            && let Some(model) = self.config.services.ocr.layout_default_model.as_ref()
-        {
-            required_layouts.insert(OcrModel::new(model.clone(), OcrModelKind::Layout));
+        if self.config.services.ocr.active() {
+            required_layouts.extend(resolve_layout_models(
+                &self.config.services.ocr.layout_available_models,
+            ));
         }
-        if self.config.services.ocr_vl.active()
-            && let Some(model) = self.config.services.ocr_vl.layout_default_model.as_ref()
-        {
-            required_layouts.insert(OcrModel::new(model.clone(), OcrModelKind::Layout));
+        if self.config.services.ocr_vl.active() {
+            required_layouts.extend(resolve_layout_models(
+                &self.config.services.ocr_vl.layout_available_models,
+            ));
         }
         for layout in required_layouts {
             spawn_model_provision(
@@ -628,7 +814,7 @@ impl AppState {
                 self.layout_models.clone(),
                 layout,
                 ProvisionedModelKind::Layout,
-                "provision default OCR layout model",
+                "provision configured OCR layout model",
             );
         }
 
@@ -794,43 +980,141 @@ impl AppState {
     }
 
     fn spawn_idle_cleanup(self: &Arc<Self>) {
-        let asr_enabled = self.config.services.asr.enabled;
-        let tts_enabled = self.config.services.tts.enabled;
-        let ocr_active = self.config.services.ocr.active();
-        let ocr_vl_active = self.config.services.ocr_vl.active();
-
-        let cleanup_interval = [
-            asr_enabled.then_some(self.config.services.asr.idle_timeout),
-            tts_enabled.then_some(self.config.services.tts.idle_timeout),
-            ocr_active.then_some(self.config.services.ocr.idle_timeout),
-            ocr_vl_active.then_some(self.config.services.ocr_vl.idle_timeout),
-        ]
-        .into_iter()
-        .flatten()
-        .min();
-        let Some(cleanup_interval) = cleanup_interval else {
+        let mut task = self
+            .cleanup_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if task.is_some() {
             return;
-        };
+        }
 
-        let state = Arc::clone(self);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(cleanup_interval);
+        let state = Arc::downgrade(self);
+        let mut shutdown = self.cleanup_shutdown.subscribe();
+        let mut residency = self.model_residency.subscribe();
+        *task = Some(tokio::spawn(async move {
             loop {
-                interval.tick().await;
-                if asr_enabled {
-                    state.asr_models.cleanup_idle().await;
-                }
-                if tts_enabled {
-                    state.tts_models.cleanup_idle().await;
-                }
-                if ocr_active {
-                    state.ocr_models.cleanup_idle().await;
-                }
-                if ocr_vl_active {
-                    state.ocr_vl_models.cleanup_idle().await;
+                let Some(current) = state.upgrade() else {
+                    break;
+                };
+                let deadline = current.next_idle_deadline().await;
+                drop(current);
+
+                let due = if let Some(deadline) = deadline {
+                    tokio::select! {
+                        () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => true,
+                        changed = residency.changed() => {
+                            if changed.is_err() { break; }
+                            false
+                        }
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() { break; }
+                            false
+                        }
+                    }
+                } else {
+                    tokio::select! {
+                        changed = residency.changed() => {
+                            if changed.is_err() { break; }
+                            false
+                        }
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() { break; }
+                            false
+                        }
+                    }
+                };
+                if due {
+                    let Some(current) = state.upgrade() else {
+                        break;
+                    };
+                    current.cleanup_idle_models().await;
                 }
             }
-        });
+        }));
+    }
+
+    async fn next_idle_deadline(&self) -> Option<std::time::Instant> {
+        let mut deadline = None;
+        if self.config.services.asr.enabled {
+            deadline = earlier_deadline(deadline, self.asr_models.next_idle_deadline().await);
+        }
+        if self.config.services.tts.enabled {
+            deadline = earlier_deadline(deadline, self.tts_models.next_idle_deadline().await);
+        }
+        if self.config.services.ocr.active() {
+            deadline = earlier_deadline(deadline, self.ocr_models.next_idle_deadline().await);
+        }
+        if self.config.services.ocr_vl.active() {
+            deadline = earlier_deadline(deadline, self.ocr_vl_models.next_idle_deadline().await);
+        }
+        deadline
+    }
+
+    async fn cleanup_idle_models(&self) {
+        if self.config.services.asr.enabled {
+            self.asr_models.cleanup_idle().await;
+        }
+        if self.config.services.tts.enabled {
+            self.tts_models.cleanup_idle().await;
+        }
+        if self.config.services.ocr.active() {
+            self.ocr_models.cleanup_idle().await;
+        }
+        if self.config.services.ocr_vl.active() {
+            self.ocr_vl_models.cleanup_idle().await;
+        }
+    }
+
+    pub async fn shutdown(&self) {
+        self.global_models.close_and_drain().await;
+        self.cleanup_shutdown.send_replace(true);
+        let task = self
+            .cleanup_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(task) = task
+            && let Err(error) = task.await
+        {
+            tracing::error!(%error, "model cleanup task failed during shutdown");
+        }
+        self.unload_all_models().await;
+    }
+
+    async fn unload_all_models(&self) {
+        for model in &self.config.services.asr.available_models {
+            if let Err(error) = self.asr_models.unload(model.clone()).await {
+                tracing::error!(model = %model, %error, "failed to unload ASR model during shutdown");
+            }
+        }
+        for model in &self.config.services.tts.available_models {
+            if let Err(error) = self.tts_models.unload(model.clone()).await {
+                tracing::error!(model = %model, %error, "failed to unload TTS model during shutdown");
+            }
+        }
+        for id in &self.config.services.ocr.available_models {
+            let model = OcrModel::new(id.clone(), OcrModelKind::TraditionalOcr);
+            if let Err(error) = self.ocr_models.unload(model).await {
+                tracing::error!(model = %id, %error, "failed to unload OCR model during shutdown");
+            }
+        }
+        for id in &self.config.services.ocr_vl.available_models {
+            let model = OcrModel::new(id.clone(), OcrModelKind::OcrVl);
+            if let Err(error) = self.ocr_vl_models.unload(model).await {
+                tracing::error!(model = %id, %error, "failed to unload OCR-VL model during shutdown");
+            }
+        }
+    }
+}
+
+fn earlier_deadline(
+    current: Option<std::time::Instant>,
+    candidate: Option<std::time::Instant>,
+) -> Option<std::time::Instant> {
+    match (current, candidate) {
+        (Some(current), Some(candidate)) => Some(current.min(candidate)),
+        (Some(current), None) => Some(current),
+        (None, candidate) => candidate,
     }
 }
 
@@ -850,6 +1134,203 @@ impl ServerApplication for AppState {
     fn try_acquire_pending_websocket(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
         self.resources.try_acquire_pending_websocket()
     }
+}
+
+impl ModelLifecycleRuntime for AppState {
+    fn model_statuses(&self) -> ModelStatusesFuture<'_> {
+        Box::pin(async move {
+            let mut statuses = Vec::new();
+            if self.config.services.asr.enabled {
+                for model in &self.config.services.asr.available_models {
+                    if let Some(status) = self.asr_models.status(model).await {
+                        statuses.push(model_status(model.as_str(), ModelService::Asr, status));
+                    }
+                }
+            }
+            if self.config.services.tts.enabled {
+                for model in &self.config.services.tts.available_models {
+                    if let Some(status) = self.tts_models.status(model).await {
+                        statuses.push(model_status(model.as_str(), ModelService::Tts, status));
+                    }
+                }
+            }
+            if self.config.services.ocr.active() {
+                for id in &self.config.services.ocr.available_models {
+                    let model = OcrModel::new(id.clone(), OcrModelKind::TraditionalOcr);
+                    if let Some(status) = self.ocr_models.status(&model).await {
+                        statuses.push(model_status(id.as_str(), ModelService::Ocr, status));
+                    }
+                }
+            }
+            if self.config.services.ocr_vl.active() {
+                for id in &self.config.services.ocr_vl.available_models {
+                    let model = OcrModel::new(id.clone(), OcrModelKind::OcrVl);
+                    if let Some(status) = self.ocr_vl_models.status(&model).await {
+                        statuses.push(model_status(id.as_str(), ModelService::OcrVl, status));
+                    }
+                }
+            }
+            statuses
+        })
+    }
+
+    fn prewarm_model(&self, selector: ModelSelector) -> ModelControlFuture<'_> {
+        Box::pin(async move {
+            let status = match selector.service {
+                ModelService::Asr => {
+                    let Ok(model) = AsrModel::parse(&selector.model) else {
+                        return Ok(None);
+                    };
+                    let Some(lease) = self
+                        .asr(model.clone())
+                        .await
+                        .map_err(|error| model_lifecycle_error(&error))?
+                    else {
+                        return Ok(None);
+                    };
+                    drop(lease);
+                    self.asr_models.status(&model).await
+                }
+                ModelService::Tts => {
+                    let Ok(model) = TtsModel::parse(&selector.model) else {
+                        return Ok(None);
+                    };
+                    let Some(lease) = self
+                        .tts(model.clone())
+                        .await
+                        .map_err(|error| model_lifecycle_error(&error))?
+                    else {
+                        return Ok(None);
+                    };
+                    drop(lease);
+                    self.tts_models.status(&model).await
+                }
+                ModelService::Ocr => {
+                    let Some(model) = selected_ocr_model(
+                        &selector.model,
+                        &self.config.services.ocr.available_models,
+                        OcrModelKind::TraditionalOcr,
+                    ) else {
+                        return Ok(None);
+                    };
+                    let Some(lease) = self
+                        .ocr(model.clone())
+                        .await
+                        .map_err(|error| model_lifecycle_error(&error))?
+                    else {
+                        return Ok(None);
+                    };
+                    drop(lease);
+                    self.ocr_models.status(&model).await
+                }
+                ModelService::OcrVl => {
+                    let Some(model) = selected_ocr_model(
+                        &selector.model,
+                        &self.config.services.ocr_vl.available_models,
+                        OcrModelKind::OcrVl,
+                    ) else {
+                        return Ok(None);
+                    };
+                    let Some(lease) = self
+                        .ocr_vl(model.clone())
+                        .await
+                        .map_err(|error| model_lifecycle_error(&error))?
+                    else {
+                        return Ok(None);
+                    };
+                    drop(lease);
+                    self.ocr_vl_models.status(&model).await
+                }
+            };
+            Ok(status.map(|status| model_status(&selector.model, selector.service, status)))
+        })
+    }
+
+    fn unload_model(&self, selector: ModelSelector) -> ModelControlFuture<'_> {
+        Box::pin(async move {
+            let status = match selector.service {
+                ModelService::Asr if self.config.services.asr.enabled => {
+                    let Ok(model) = AsrModel::parse(&selector.model) else {
+                        return Ok(None);
+                    };
+                    if self
+                        .asr_models
+                        .unload(model.clone())
+                        .await
+                        .map_err(|error| model_lifecycle_error(&error))?
+                        .is_none()
+                    {
+                        return Ok(None);
+                    }
+                    Some(ModelResidencyStatus::Unloaded)
+                }
+                ModelService::Tts if self.config.services.tts.enabled => {
+                    let Ok(model) = TtsModel::parse(&selector.model) else {
+                        return Ok(None);
+                    };
+                    if self
+                        .tts_models
+                        .unload(model)
+                        .await
+                        .map_err(|error| model_lifecycle_error(&error))?
+                        .is_none()
+                    {
+                        return Ok(None);
+                    }
+                    Some(ModelResidencyStatus::Unloaded)
+                }
+                ModelService::Ocr if self.config.services.ocr.active() => {
+                    let Some(model) = selected_ocr_model(
+                        &selector.model,
+                        &self.config.services.ocr.available_models,
+                        OcrModelKind::TraditionalOcr,
+                    ) else {
+                        return Ok(None);
+                    };
+                    self.ocr_models
+                        .unload(model)
+                        .await
+                        .map_err(|error| model_lifecycle_error(&error))?;
+                    Some(ModelResidencyStatus::Unloaded)
+                }
+                ModelService::OcrVl if self.config.services.ocr_vl.active() => {
+                    let Some(model) = selected_ocr_model(
+                        &selector.model,
+                        &self.config.services.ocr_vl.available_models,
+                        OcrModelKind::OcrVl,
+                    ) else {
+                        return Ok(None);
+                    };
+                    self.ocr_vl_models
+                        .unload(model)
+                        .await
+                        .map_err(|error| model_lifecycle_error(&error))?;
+                    Some(ModelResidencyStatus::Unloaded)
+                }
+                _ => return Ok(None),
+            };
+            Ok(status.map(|status| model_status(&selector.model, selector.service, status)))
+        })
+    }
+}
+
+fn selected_ocr_model(value: &str, available: &[ModelId], kind: OcrModelKind) -> Option<OcrModel> {
+    let id = ModelId::parse(value).ok()?;
+    available.contains(&id).then(|| OcrModel::new(id, kind))
+}
+
+fn model_status(id: &str, service: ModelService, status: ModelResidencyStatus) -> ModelStatus {
+    let status = match status {
+        ModelResidencyStatus::Unloaded => ModelResidency::Unloaded,
+        ModelResidencyStatus::Loading => ModelResidency::Loading,
+        ModelResidencyStatus::Loaded => ModelResidency::Loaded,
+        ModelResidencyStatus::Unloading => ModelResidency::Unloading,
+    };
+    ModelStatus::new(id, service, status)
+}
+
+fn model_lifecycle_error(error: &anyhow::Error) -> RuntimeError {
+    RuntimeError::Internal(format!("{error:#}"))
 }
 
 impl TranscriptionRuntime for AppState {
@@ -875,8 +1356,9 @@ impl TranscriptionRuntime for AppState {
             else {
                 return Ok(None);
             };
+            let inference = self.resources.inference_limiter();
             let transcript = asr
-                .run(move |asr| async move {
+                .run_with_inference(inference, move |asr| async move {
                     if with_segments {
                         asr.transcribe_samples_with_segments(&samples, sample_rate, options)
                             .await
@@ -898,14 +1380,16 @@ impl TranscriptionRuntime for AppState {
 impl StreamingTranscriptionRuntime for AppState {
     fn lease_streaming_model(&self, model: AsrModel) -> StreamingModelFuture<'_> {
         Box::pin(async move {
-            let inference_guard = self.resources.acquire_inference().await;
             let Some(asr) = AppState::asr(self, model)
                 .await
                 .map_err(|error| RuntimeError::Internal(format!("{error:#}")))?
             else {
                 return Ok(None);
             };
-            Ok(Some(LeasedAsrModel::new(asr, inference_guard)))
+            Ok(Some(LeasedAsrModel::new(
+                asr,
+                self.resources.inference_limiter(),
+            )))
         })
     }
 }
@@ -939,8 +1423,11 @@ impl SpeechRuntime for AppState {
             else {
                 return Ok(None);
             };
+            let inference = self.resources.inference_limiter();
             let audio = tts
-                .run(move |tts| async move { tts.synthesize_with(input, voice, options).await })
+                .run_with_inference(inference, move |tts| async move {
+                    tts.synthesize_with(input, voice, options).await
+                })
                 .await
                 .map_err(|error| {
                     RuntimeError::Internal(format!("TTS operation task failed: {error:#}"))
@@ -998,8 +1485,9 @@ impl OcrRuntime for AppState {
             let Some(ocr) = ocr else {
                 return Ok(None);
             };
+            let inference = self.resources.inference_limiter();
             let result = ocr
-                .run(move |ocr| async move {
+                .run_with_inference(inference, move |ocr| async move {
                     ocr.recognize_file_with_limits(image_path, options, limits)
                         .await
                 })
@@ -1041,22 +1529,21 @@ fn build_model_cache<M, E>(
     max_loaded: usize,
     dir: PathBuf,
     provisioner: Option<Arc<dyn ModelProvisioner<M>>>,
+    residency: ResidencyDomain,
 ) -> ModelCache<M, E>
 where
     M: ModelSpec + std::hash::Hash,
     E: Clone,
 {
-    match provisioner {
-        Some(provisioner) => ModelCache::new_with_dyn_provisioner(
-            cache_id,
-            available_models,
-            idle_timeout,
-            max_loaded,
-            dir,
-            provisioner,
-        ),
-        None => ModelCache::new(cache_id, available_models, idle_timeout, max_loaded, dir),
-    }
+    ModelCache::new_in_domain(
+        cache_id,
+        available_models,
+        idle_timeout,
+        max_loaded,
+        dir,
+        provisioner,
+        residency,
+    )
 }
 
 fn spawn_model_provision<M, E>(
@@ -1081,7 +1568,7 @@ fn spawn_model_provision<M, E>(
             .with_context(|| context)?
             .is_none()
         {
-            anyhow::bail!("{context}: default model is not in the service allowlist");
+            anyhow::bail!("{context}: model is not in the service allowlist");
         }
         Ok(kind)
     });
