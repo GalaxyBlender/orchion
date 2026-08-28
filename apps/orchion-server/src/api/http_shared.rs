@@ -8,15 +8,13 @@ use std::future::Future;
 use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 use tokio::io::AsyncWriteExt;
 
-pub(super) async fn run_inference_owned<T, F>(
-    permit: Option<InferenceGuard>,
-    operation: F,
-) -> Result<T, ApiError>
+pub(super) async fn run_inference_owned<T, F, P>(permit: P, operation: F) -> Result<T, ApiError>
 where
     T: Send + 'static,
     F: Future<Output = Result<T, ApiError>> + Send + 'static,
+    P: Future<Output = InferenceGuard> + Send,
 {
-    let permit = permit.ok_or_else(|| ApiError::resource_exhausted("inference"))?;
+    let permit = permit.await;
     tokio::spawn(async move {
         let _permit = permit;
         operation.await
@@ -183,7 +181,7 @@ mod tests {
             let release = Arc::clone(&release);
             let finished = Arc::clone(&finished);
             async move {
-                run_inference_owned(resources.try_acquire_inference(), async move {
+                run_inference_owned(resources.acquire_inference(), async move {
                     let _file = file;
                     started.notify_one();
                     release.notified().await;
@@ -197,7 +195,13 @@ mod tests {
 
         waiter.abort();
         assert!(waiter.await.unwrap_err().is_cancelled());
-        assert!(resources.try_acquire_inference().is_none());
+        let queued = resources.acquire_inference();
+        tokio::pin!(queued);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut queued)
+                .await
+                .is_err()
+        );
         assert!(path.exists());
 
         release.notify_one();
@@ -205,7 +209,9 @@ mod tests {
             .await
             .unwrap();
         tokio::task::yield_now().await;
-        assert!(resources.try_acquire_inference().is_some());
+        tokio::time::timeout(Duration::from_secs(1), queued)
+            .await
+            .unwrap();
         assert!(!path.exists());
     }
 }

@@ -4,7 +4,7 @@ use crate::application::streaming_transcription::{
     self, AsrPcmBuffer, LeasedAsrModel, LeasedAsrStream, TranscriptionStreamBudget,
     TranscriptionStreamLimits,
 };
-use crate::application::{RuntimeError, ServerApplication, UseCaseError};
+use crate::application::{ServerApplication, UseCaseError};
 use crate::settings::parse_asr_model;
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -181,20 +181,21 @@ async fn handle_transcription_ws<S>(
     let asr = match await_stream_operation(
         &budget,
         limits,
-        load_stream_model(Arc::clone(&state), requested),
+        await_stream_model_while_connected(&mut socket, state.lease_streaming_model(requested)),
     )
     .await
     {
-        Ok(Ok(Some(asr))) => asr,
-        Ok(Ok(None)) => {
+        Ok(PendingStreamModel::Loaded(Ok(Some(asr)))) => asr,
+        Ok(PendingStreamModel::Loaded(Ok(None))) => {
             let _ = send_stream_error(&mut socket, ApiError::model_not_available(&model)).await;
             return;
         }
-        Ok(Err(error)) => {
+        Ok(PendingStreamModel::Loaded(Err(error))) => {
             let _ = send_stream_error(&mut socket, ApiError::from(UseCaseError::from(error))).await;
             return;
         }
-        Err(error) => {
+        Ok(PendingStreamModel::Disconnected) => return,
+        Ok(PendingStreamModel::InvalidMessage(error)) | Err(error) => {
             let _ = send_stream_error(&mut socket, error).await;
             return;
         }
@@ -218,18 +219,36 @@ async fn handle_transcription_ws<S>(
     }
 }
 
-async fn load_stream_model<S>(
-    state: Arc<S>,
-    requested: orchion::AsrModel,
-) -> Result<Option<LeasedAsrModel>, RuntimeError>
-where
-    S: ServerApplication,
-{
-    tokio::spawn(async move { state.lease_streaming_model(requested).await })
-        .await
-        .map_err(|error| {
-            RuntimeError::Internal(format!("stream model load task failed: {error:#}"))
-        })?
+enum PendingStreamModel<T> {
+    Loaded(T),
+    Disconnected,
+    InvalidMessage(ApiError),
+}
+
+async fn await_stream_model_while_connected<T>(
+    socket: &mut WebSocket,
+    operation: impl std::future::Future<Output = T>,
+) -> PendingStreamModel<T> {
+    tokio::pin!(operation);
+    loop {
+        tokio::select! {
+            biased;
+            message = socket.recv() => match message {
+                None | Some(Ok(Message::Close(_)) | Err(_)) => {
+                    return PendingStreamModel::Disconnected;
+                }
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                Some(Ok(Message::Binary(_) | Message::Text(_))) => {
+                    return PendingStreamModel::InvalidMessage(ApiError::invalid_request(
+                        "wait for `ready` before sending stream data",
+                        None,
+                        Some("invalid_stream_state"),
+                    ));
+                }
+            },
+            result = &mut operation => return PendingStreamModel::Loaded(result),
+        }
+    }
 }
 
 async fn receive_transcription_stream_message(

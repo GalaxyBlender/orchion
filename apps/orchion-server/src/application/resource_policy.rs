@@ -29,14 +29,19 @@ impl ResourcePolicy {
         }
     }
 
-    #[must_use]
-    pub fn try_acquire_inference(&self) -> Option<InferenceGuard> {
-        Arc::clone(&self.inference)
-            .try_acquire_owned()
-            .ok()
-            .map(|permit| InferenceGuard {
-                _permit: Arc::new(permit),
-            })
+    /// Waits until global inference capacity is available.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the private inference semaphore is closed. `ResourcePolicy` never closes it.
+    pub async fn acquire_inference(&self) -> InferenceGuard {
+        let permit = Arc::clone(&self.inference)
+            .acquire_owned()
+            .await
+            .expect("inference semaphore must remain open");
+        InferenceGuard {
+            _permit: Arc::new(permit),
+        }
     }
 
     #[must_use]
@@ -57,37 +62,83 @@ impl ResourcePolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+    use tokio::sync::Notify;
 
-    #[test]
-    fn rejects_work_beyond_each_configured_limit() {
+    #[tokio::test]
+    async fn queues_inference_beyond_the_configured_limit() {
         let policy = ResourcePolicy::new(1, 1, 1);
-        let inference = policy.try_acquire_inference().unwrap();
+        let inference = policy.acquire_inference().await;
         let websocket = policy.try_acquire_websocket().unwrap();
         let pending_websocket = policy.try_acquire_pending_websocket().unwrap();
+        let queued = policy.acquire_inference();
+        tokio::pin!(queued);
 
-        assert!(policy.try_acquire_inference().is_none());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut queued)
+                .await
+                .is_err()
+        );
         assert!(policy.try_acquire_websocket().is_none());
         assert!(policy.try_acquire_pending_websocket().is_none());
 
         drop(inference);
         drop(websocket);
         drop(pending_websocket);
-        assert!(policy.try_acquire_inference().is_some());
+        tokio::time::timeout(Duration::from_secs(1), queued)
+            .await
+            .unwrap();
         assert!(policy.try_acquire_websocket().is_some());
         assert!(policy.try_acquire_pending_websocket().is_some());
     }
 
-    #[test]
-    fn cloned_inference_guard_holds_permit_until_last_clone_drops() {
+    #[tokio::test]
+    async fn cloned_inference_guard_holds_permit_until_last_clone_drops() {
         let policy = ResourcePolicy::new(1, 1, 1);
-        let inference = policy.try_acquire_inference().unwrap();
+        let inference = policy.acquire_inference().await;
         let clone = inference.clone();
+        let queued = policy.acquire_inference();
+        tokio::pin!(queued);
 
         drop(inference);
-        assert!(policy.try_acquire_inference().is_none());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut queued)
+                .await
+                .is_err()
+        );
 
         drop(clone);
-        assert!(policy.try_acquire_inference().is_some());
+        tokio::time::timeout(Duration::from_secs(1), queued)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_inference_waiter_does_not_consume_capacity() {
+        let policy = ResourcePolicy::new(1, 1, 1);
+        let inference = policy.acquire_inference().await;
+        let started = Arc::new(Notify::new());
+        let waiter = tokio::spawn({
+            let policy = policy.clone();
+            let started = Arc::clone(&started);
+            async move {
+                started.notify_one();
+                policy.acquire_inference().await
+            }
+        });
+        started.notified().await;
+        tokio::task::yield_now().await;
+
+        waiter.abort();
+        let Err(error) = waiter.await else {
+            panic!("aborted inference waiter must be cancelled");
+        };
+        assert!(error.is_cancelled());
+        drop(inference);
+
+        tokio::time::timeout(Duration::from_secs(1), policy.acquire_inference())
+            .await
+            .unwrap();
     }
 
     #[test]

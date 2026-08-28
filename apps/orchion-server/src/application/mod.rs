@@ -11,8 +11,12 @@ use crate::application::speech::SpeechRuntime;
 use crate::application::streaming_transcription::StreamingTranscriptionRuntime;
 use crate::application::transcription::TranscriptionRuntime;
 use orchion::{AsrModel, ModelId, TtsModel};
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 use tokio::sync::OwnedSemaphorePermit;
+
+pub type InferenceGuardFuture<'a> = Pin<Box<dyn Future<Output = InferenceGuard> + Send + 'a>>;
 
 #[derive(Debug, Clone)]
 pub struct AsrApiPolicy {
@@ -49,7 +53,7 @@ pub trait ServerApplication:
     TranscriptionRuntime + SpeechRuntime + OcrRuntime + StreamingTranscriptionRuntime + 'static
 {
     fn api_policy(&self) -> &ApiPolicy;
-    fn try_acquire_inference(&self) -> Option<InferenceGuard>;
+    fn acquire_inference(&self) -> InferenceGuardFuture<'_>;
     fn try_acquire_websocket(&self) -> Option<OwnedSemaphorePermit>;
     fn try_acquire_pending_websocket(&self) -> Option<OwnedSemaphorePermit>;
 }

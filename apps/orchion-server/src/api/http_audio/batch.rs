@@ -98,7 +98,7 @@ where
         "transcription request received"
     );
     let operation_state = Arc::clone(&state);
-    let result = run_inference_owned(state.try_acquire_inference(), async move {
+    let result = run_inference_owned(state.acquire_inference(), async move {
         let _audio_file = audio_file;
         transcribe(
             operation_state.as_ref(),

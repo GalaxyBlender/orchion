@@ -88,7 +88,7 @@ where
 
     let image_path = image_file.path().to_path_buf();
     let operation_state = Arc::clone(&state);
-    let output = run_inference_owned(state.try_acquire_inference(), async move {
+    let output = run_inference_owned(state.acquire_inference(), async move {
         let _image_file = image_file;
         recognize(
             operation_state.as_ref(),

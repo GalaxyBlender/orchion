@@ -839,8 +839,8 @@ impl ServerApplication for AppState {
         &self.api_policy
     }
 
-    fn try_acquire_inference(&self) -> Option<crate::application::resource_policy::InferenceGuard> {
-        self.resources.try_acquire_inference()
+    fn acquire_inference(&self) -> crate::application::InferenceGuardFuture<'_> {
+        Box::pin(self.resources.acquire_inference())
     }
 
     fn try_acquire_websocket(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
@@ -898,10 +898,7 @@ impl TranscriptionRuntime for AppState {
 impl StreamingTranscriptionRuntime for AppState {
     fn lease_streaming_model(&self, model: AsrModel) -> StreamingModelFuture<'_> {
         Box::pin(async move {
-            let inference_guard = self
-                .resources
-                .try_acquire_inference()
-                .ok_or(RuntimeError::ResourceExhausted("inference"))?;
+            let inference_guard = self.resources.acquire_inference().await;
             let Some(asr) = AppState::asr(self, model)
                 .await
                 .map_err(|error| RuntimeError::Internal(format!("{error:#}")))?

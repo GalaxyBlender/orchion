@@ -971,9 +971,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let guard = ResourcePolicy::new(1, 1, 1)
-            .try_acquire_inference()
-            .unwrap();
+        let guard = ResourcePolicy::new(1, 1, 1).acquire_inference().await;
         let options = AsrStreamingOptions {
             chunk_size_sec: 1.0,
             ..AsrStreamingOptions::default()

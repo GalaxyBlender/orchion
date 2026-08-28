@@ -180,7 +180,7 @@ where
         "speech request received"
     );
     let operation_state = Arc::clone(&state);
-    let result = run_inference_owned(state.try_acquire_inference(), async move {
+    let result = run_inference_owned(state.acquire_inference(), async move {
         let _temporary_files = temporary_files;
         synthesize(operation_state.as_ref(), command)
             .await

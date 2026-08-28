@@ -108,10 +108,13 @@ mod tests {
     };
     use axum::http::{Method, Request, StatusCode};
     use axum::response::Response;
+    use futures_util::SinkExt;
     use http_body_util::BodyExt;
     use orchion::{AsrModel, ModelId, TtsModel};
     use serde_json::Value;
     use std::time::Duration;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::{connect_async, tungstenite::Message};
     use tower::ServiceExt;
 
     #[test]
@@ -280,6 +283,64 @@ mod tests {
         assert_eq!(old_response.status(), StatusCode::METHOD_NOT_ALLOWED);
         assert_ne!(stream_response.status(), StatusCode::NOT_FOUND);
         assert_ne!(stream_response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn disconnected_websocket_leaves_the_inference_queue() {
+        let state = test_state_with_config(false, false, |config| {
+            config.services.asr.enabled = true;
+            config.server.max_concurrent_inference = 1;
+            config.server.max_websocket_connections = 1;
+        });
+        let inference = state.acquire_inference().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = router_with_ui_routes(Arc::clone(&state), Router::new());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (mut socket, _) =
+            connect_async(format!("ws://{address}/v1/audio/transcriptions/stream"))
+                .await
+                .unwrap();
+        socket
+            .send(Message::Text(
+                r#"{"type":"start","model":"Qwen/Qwen3-ASR-0.6B","input_audio_format":"pcm_s16le","sample_rate":16000}"#
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let Some(permit) = state.try_acquire_websocket() else {
+                    break;
+                };
+                drop(permit);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        socket.send(Message::Close(None)).await.unwrap();
+        drop(socket);
+        let websocket = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(permit) = state.try_acquire_websocket() {
+                    break permit;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(websocket);
+
+        drop(inference);
+        tokio::time::timeout(Duration::from_secs(1), state.acquire_inference())
+            .await
+            .unwrap();
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]

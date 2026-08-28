@@ -29,7 +29,7 @@ where
         max_pixels: policy.max_pdf_pixels,
         max_output_bytes: policy.max_pdf_output_size,
     };
-    let rendered = run_inference_owned(state.try_acquire_inference(), async move {
+    let rendered = run_inference_owned(state.acquire_inference(), async move {
         tokio::task::spawn_blocking(move || {
             let rendered = pdf::render_pdf_to_zip_with_limits(request, limits);
             drop(pdf_file);
