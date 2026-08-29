@@ -11,7 +11,6 @@ export function buildOcrFormData(input: OcrRequestInput): FormData {
   formData.append("model", input.model.trim());
   formData.append("response_format", input.responseFormat);
   appendNonblank(formData, "task", input.task);
-  appendNonblank(formData, "layout_model", input.layoutModel);
   appendNonblank(formData, "max_tokens", input.maxTokens);
 
   return formData;
@@ -22,7 +21,6 @@ interface OcrSummaryText {
   file: (file: string) => string;
   responseFormat: (format: string) => string;
   task: (task: string) => string;
-  layoutModel: (model: string) => string;
   maxTokens: (value: string) => string;
 }
 
@@ -31,7 +29,6 @@ const defaultSummaryText: OcrSummaryText = {
   file: (file) => `File: ${file}`,
   responseFormat: (format) => `Response format: ${format}`,
   task: (task) => `Task: ${task}`,
-  layoutModel: (model) => `Layout model: ${model}`,
   maxTokens: (value) => `Max tokens: ${value}`,
 };
 
@@ -42,12 +39,8 @@ export function summarizeOcrRequest(input: OcrRequestInput, text: OcrSummaryText
     text.responseFormat(input.responseFormat),
     text.task(input.task),
   ];
-  const layoutModel = input.layoutModel.trim();
   const maxTokens = input.maxTokens.trim();
 
-  if (layoutModel !== "") {
-    lines.push(text.layoutModel(layoutModel));
-  }
   if (maxTokens !== "") {
     lines.push(text.maxTokens(maxTokens));
   }
@@ -69,7 +62,6 @@ export function buildOcrCurl(settings: ApiSettings, input: OcrRequestInput): str
   }
 
   parts.push("-F", quote(`file=@${input.file.name}`));
-  pushOptionalField(fields, "layout_model", input.layoutModel);
   pushOptionalField(fields, "max_tokens", input.maxTokens);
 
   for (const [name, value] of fields) {

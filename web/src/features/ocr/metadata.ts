@@ -41,15 +41,6 @@ export const ocrParameterMetadata: ParameterMetadata[] = [
     notice: "Traditional OCR accepts only the ocr task. Other tasks require OCR-VL models.",
   },
   {
-    name: "layout_model",
-    label: "Layout model",
-    defaultValue: "",
-    description: "Layout detector model; required for Markdown and HTML responses.",
-    required: false,
-    supported: true,
-    notice: "Only configured layout models returned by /v1/models can be selected.",
-  },
-  {
     name: "max_tokens",
     label: "Max tokens",
     defaultValue: "",

@@ -6,7 +6,6 @@ export interface OcrFormState {
   model: string;
   responseFormat: OcrResponseFormat;
   task: OcrTask;
-  layoutModel: string;
   maxTokens: string;
 }
 

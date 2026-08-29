@@ -48,32 +48,98 @@ async fn models_endpoint_returns_configured_models() {
         ]
     );
     assert!(body["data"].as_array().unwrap().iter().all(|model| {
-        model["object"] == "model" && model["created"] == 0 && model["owned_by"] == "orchion"
+        model["object"] == "model"
+            && model["created"] == 0
+            && model["owned_by"] == "orchion"
+            && model.get("model").is_none()
+            && model.get("path").is_none()
+            && model.get("digest").is_none()
     }));
     assert_eq!(model_type(&body, "Qwen/Qwen3-ASR-0.6B"), "asr");
-    assert_eq!(model_subtype(&body, "Qwen/Qwen3-ASR-0.6B"), None);
+    assert_eq!(
+        model_capabilities(&body, "Qwen/Qwen3-ASR-0.6B"),
+        vec!["asr_transcription", "asr_streaming"]
+    );
     assert_eq!(model_type(&body, "Qwen/Qwen3-ASR-1.7B"), "asr");
-    assert_eq!(model_subtype(&body, "Qwen/Qwen3-ASR-1.7B"), None);
+    assert_eq!(
+        model_capabilities(&body, "Qwen/Qwen3-ASR-1.7B"),
+        vec!["asr_transcription", "asr_streaming"]
+    );
     assert_eq!(
         model_type(&body, "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"),
         "tts"
     );
     assert_eq!(
-        model_subtype(&body, "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"),
-        Some("preset_voice")
+        model_capabilities(&body, "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"),
+        vec!["tts_preset_speakers"]
     );
     assert_eq!(model_type(&body, "Qwen/Qwen3-TTS-12Hz-0.6B-Base"), "tts");
     assert_eq!(
-        model_subtype(&body, "Qwen/Qwen3-TTS-12Hz-0.6B-Base"),
-        Some("voice_clone")
+        model_capabilities(&body, "Qwen/Qwen3-TTS-12Hz-0.6B-Base"),
+        vec!["tts_voice_cloning"]
     );
     assert_eq!(
         model_type(&body, "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"),
         "tts"
     );
     assert_eq!(
-        model_subtype(&body, "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"),
-        Some("voice_design")
+        model_capabilities(&body, "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"),
+        vec!["tts_voice_design"]
+    );
+}
+
+#[tokio::test]
+async fn models_endpoint_returns_optional_deployment_display_name() {
+    let state = test_state_with_services_config(None, true, false, |config| {
+        config.services.asr.models[0].name = Some("Fast transcription".to_string());
+    });
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    let models = body["data"].as_array().unwrap();
+    assert_eq!(models[0]["name"], "Fast transcription");
+    assert!(models[1].get("name").is_none());
+}
+
+#[tokio::test]
+async fn unregistered_speech_deployments_publish_only_conservative_base_capabilities() {
+    let state = test_state_with_services_config(None, true, true, |config| {
+        let asr = asr_model("Acme/Private-ASR");
+        config.services.asr.default_model = asr.clone();
+        config.services.asr.models = vec![ModelDeployment::from_asr_runtime(asr)];
+
+        let tts = tts_model("Acme/Private-TTS-Base");
+        config.services.tts.default_model = tts.clone();
+        config.services.tts.models = vec![ModelDeployment::from_tts_runtime(tts)];
+    });
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(
+        model_capabilities(&body, "Acme/Private-ASR"),
+        vec!["asr_transcription"]
+    );
+    assert_eq!(
+        model_capabilities(&body, "Acme/Private-TTS-Base"),
+        Vec::<&str>::new()
     );
 }
 
@@ -254,18 +320,18 @@ async fn models_endpoint_includes_active_ocr_model_ids() {
     assert!(ids.contains(&"PaddlePaddle/PaddleOCR-VL-1.6".to_string()));
     assert_eq!(model_type(&body, "PaddlePaddle/PP-OCRv6_tiny"), "ocr");
     assert_eq!(
-        model_subtype(&body, "PaddlePaddle/PP-OCRv6_tiny"),
-        Some("standard")
+        model_capabilities(&body, "PaddlePaddle/PP-OCRv6_tiny"),
+        vec!["ocr_text"]
     );
     assert_eq!(model_type(&body, "PaddlePaddle/PaddleOCR-VL-1.6"), "ocr");
     assert_eq!(
-        model_subtype(&body, "PaddlePaddle/PaddleOCR-VL-1.6"),
-        Some("vl")
+        model_capabilities(&body, "PaddlePaddle/PaddleOCR-VL-1.6"),
+        vec!["ocr_text", "ocr_vision_language"]
     );
 }
 
 #[tokio::test]
-async fn models_endpoint_includes_configured_ocr_layout_model_ids() {
+async fn models_endpoint_exposes_layout_as_primary_deployment_capabilities() {
     let state = test_state_with_ocr_services_config(None, |config| {
         config.services.ocr.models[0] = config.services.ocr.models[0]
             .clone()
@@ -288,17 +354,21 @@ async fn models_endpoint_includes_configured_ocr_layout_model_ids() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = json_body(response).await;
     let ids = model_ids(&body);
-    assert!(ids.contains(&"PaddlePaddle/PP-DocLayoutV3"));
+    assert_eq!(ids.len(), 2);
+    assert!(!ids.contains(&"PaddlePaddle/PP-DocLayoutV3"));
     assert_eq!(
-        ids.iter()
-            .filter(|id| **id == "PaddlePaddle/PP-DocLayoutV3")
-            .count(),
-        1
+        model_capabilities(&body, "PaddlePaddle/PP-OCRv6_tiny"),
+        vec!["ocr_text", "ocr_layout", "ocr_markdown"]
     );
-    assert_eq!(model_type(&body, "PaddlePaddle/PP-DocLayoutV3"), "ocr");
     assert_eq!(
-        model_subtype(&body, "PaddlePaddle/PP-DocLayoutV3"),
-        Some("layout")
+        model_capabilities(&body, "PaddlePaddle/PaddleOCR-VL-1.6"),
+        vec![
+            "ocr_text",
+            "ocr_layout",
+            "ocr_vision_language",
+            "ocr_markdown",
+            "ocr_html"
+        ]
     );
 }
 
@@ -958,7 +1028,7 @@ async fn ocr_requires_an_explicit_model() {
 }
 
 #[tokio::test]
-async fn traditional_ocr_markdown_does_not_use_startup_default_layout_model() {
+async fn traditional_ocr_markdown_uses_the_deployment_layout_model() {
     let state = test_state_with_ocr_services_config(None, |config| {
         config.services.ocr.models[0] = config.services.ocr.models[0]
             .clone()
@@ -992,12 +1062,51 @@ async fn traditional_ocr_markdown_does_not_use_startup_default_layout_model() {
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = json_body(response).await;
-    assert_eq!(body["error"]["param"], "layout_model");
-    assert_eq!(body["error"]["code"], "missing_required_parameter");
+    assert_eq!(body["error"]["param"], "file");
+    assert_eq!(body["error"]["code"], "invalid_file");
 }
 
 #[tokio::test]
-async fn traditional_ocr_markdown_accepts_an_explicit_layout_model() {
+async fn traditional_ocr_html_is_rejected_even_with_a_deployment_layout_model() {
+    let state = test_state_with_ocr_services_config(None, |config| {
+        config.services.ocr.models[0] = config.services.ocr.models[0]
+            .clone()
+            .with_supported_layout();
+    });
+    let boundary = "orchion-ocr-traditional-html";
+    let body = multipart_body(
+        boundary,
+        &[
+            ("model", "PaddlePaddle/PP-OCRv6_tiny"),
+            ("response_format", "html"),
+        ],
+        "file",
+        "input.png",
+        b"not an image",
+    );
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/ocr")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert_eq!(body["error"]["param"], "response_format");
+    assert_eq!(body["error"]["code"], "unsupported_response_format");
+}
+
+#[tokio::test]
+async fn ocr_rejects_the_removed_layout_model_request_parameter() {
     let state = test_state_with_ocr_services_config(None, |config| {
         config.services.ocr.models[0] = config.services.ocr.models[0]
             .clone()
@@ -1032,8 +1141,8 @@ async fn traditional_ocr_markdown_accepts_an_explicit_layout_model() {
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = json_body(response).await;
-    assert_eq!(body["error"]["param"], "file");
-    assert_eq!(body["error"]["code"], "invalid_file");
+    assert_eq!(body["error"]["param"], "layout_model");
+    assert_eq!(body["error"]["code"], "unsupported_ocr_parameter");
 }
 
 #[tokio::test]
@@ -1070,8 +1179,8 @@ async fn ocr_vl_rejects_structured_format_without_layout_before_model_load() {
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = json_body(response).await;
-    assert_eq!(body["error"]["param"], "layout_model");
-    assert_eq!(body["error"]["code"], "missing_required_parameter");
+    assert_eq!(body["error"]["param"], "response_format");
+    assert_eq!(body["error"]["code"], "unsupported_response_format");
 }
 
 #[tokio::test]
@@ -1269,7 +1378,7 @@ async fn multipart_speech_rejects_invalid_reference_audio_before_inference() {
     let body = multipart_body(
         boundary,
         &[
-            ("model", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"),
+            ("model", "Qwen/Qwen3-TTS-12Hz-0.6B-Base"),
             ("input", "hello"),
             ("voice", "clone"),
             ("reference_text", "hello"),
@@ -1325,14 +1434,18 @@ fn model_type<'a>(body: &'a Value, expected_id: &str) -> &'a str {
         .unwrap()
 }
 
-fn model_subtype<'a>(body: &'a Value, expected_id: &str) -> Option<&'a str> {
+fn model_capabilities<'a>(body: &'a Value, expected_id: &str) -> Vec<&'a str> {
     body["data"]
         .as_array()
         .unwrap()
         .iter()
         .find(|model| model["id"] == expected_id)
-        .unwrap_or_else(|| panic!("model `{expected_id}` was not returned"))["subtype"]
-        .as_str()
+        .unwrap_or_else(|| panic!("model `{expected_id}` was not returned"))["capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|capability| capability.as_str().unwrap())
+        .collect()
 }
 
 async fn text_body(response: axum::response::Response) -> String {

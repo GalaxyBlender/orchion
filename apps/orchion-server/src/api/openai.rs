@@ -1,7 +1,9 @@
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use orchion::{AsrSegment, AudioOutputFormat, ModelSpec, OcrResponseFormat, TtsOptions, TtsVoice};
+use orchion::{
+    AsrSegment, AudioOutputFormat, ModelCapabilities, OcrResponseFormat, TtsOptions, TtsVoice,
+};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::path::PathBuf;
 use utoipa::ToSchema;
@@ -156,13 +158,17 @@ pub enum ModelType {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum ModelSubtype {
-    Standard,
-    Vl,
-    Layout,
-    PresetVoice,
-    VoiceClone,
-    VoiceDesign,
+pub enum ModelCapability {
+    AsrTranscription,
+    AsrStreaming,
+    TtsVoiceCloning,
+    TtsPresetSpeakers,
+    TtsVoiceDesign,
+    OcrText,
+    OcrLayout,
+    OcrVisionLanguage,
+    OcrMarkdown,
+    OcrHtml,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -174,31 +180,16 @@ pub struct ModelObject {
     #[serde(rename = "type")]
     pub model_type: ModelType,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub subtype: Option<ModelSubtype>,
+    pub name: Option<String>,
+    pub capabilities: Vec<ModelCapability>,
 }
 
 impl ModelObject {
     pub fn new(
-        model: impl ModelSpec,
-        model_type: ModelType,
-        subtype: Option<ModelSubtype>,
-    ) -> Self {
-        let id = model.huggingface_repo().to_string();
-        drop(model);
-        Self {
-            id,
-            object: "model",
-            created: 0,
-            owned_by: "orchion",
-            model_type,
-            subtype,
-        }
-    }
-
-    pub fn from_id(
         id: impl Into<String>,
+        name: Option<String>,
         model_type: ModelType,
-        subtype: Option<ModelSubtype>,
+        capabilities: ModelCapabilities,
     ) -> Self {
         Self {
             id: id.into(),
@@ -206,8 +197,35 @@ impl ModelObject {
             created: 0,
             owned_by: "orchion",
             model_type,
-            subtype,
+            name,
+            capabilities: ModelCapability::from_core(capabilities),
         }
+    }
+}
+
+impl ModelCapability {
+    fn from_core(capabilities: ModelCapabilities) -> Vec<Self> {
+        [
+            (ModelCapabilities::ASR_TRANSCRIPTION, Self::AsrTranscription),
+            (ModelCapabilities::ASR_STREAMING, Self::AsrStreaming),
+            (ModelCapabilities::TTS_VOICE_CLONING, Self::TtsVoiceCloning),
+            (
+                ModelCapabilities::TTS_PRESET_SPEAKERS,
+                Self::TtsPresetSpeakers,
+            ),
+            (ModelCapabilities::TTS_VOICE_DESIGN, Self::TtsVoiceDesign),
+            (ModelCapabilities::OCR_TEXT, Self::OcrText),
+            (ModelCapabilities::OCR_LAYOUT, Self::OcrLayout),
+            (
+                ModelCapabilities::OCR_VISION_LANGUAGE,
+                Self::OcrVisionLanguage,
+            ),
+            (ModelCapabilities::OCR_MARKDOWN, Self::OcrMarkdown),
+            (ModelCapabilities::OCR_HTML, Self::OcrHtml),
+        ]
+        .into_iter()
+        .filter_map(|(capability, value)| capabilities.contains(capability).then_some(value))
+        .collect()
     }
 }
 

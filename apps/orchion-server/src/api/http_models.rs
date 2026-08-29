@@ -1,5 +1,5 @@
 use crate::api::http_shared::authorize;
-use crate::api::openai::{ApiError, ModelList, ModelObject, ModelSubtype, ModelType};
+use crate::api::openai::{ApiError, ModelList, ModelObject, ModelType};
 use crate::application::model_lifecycle::{ModelSelector, ModelService, ModelStatus};
 use crate::application::{ServerApplication, UseCaseError};
 use axum::Json;
@@ -7,7 +7,6 @@ use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
 use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::sync::Arc;
 
 pub(super) async fn list_models<S>(
@@ -19,40 +18,23 @@ where
 {
     authorize(state.as_ref(), &headers)?;
     let policy = state.api_policy();
-    let mut data = Vec::new();
-    if let Some(asr) = &policy.asr {
-        data.extend(
-            asr.models
-                .iter()
-                .cloned()
-                .map(|model| ModelObject::new(model, ModelType::Asr, None)),
-        );
-    }
-    if let Some(tts_models) = &policy.tts_models {
-        data.extend(tts_models.iter().cloned().map(|model| {
-            let subtype = tts_model_subtype(&model);
-            ModelObject::new(model, ModelType::Tts, subtype)
-        }));
-    }
-    if let Some(ocr) = &policy.ocr {
-        data.extend(ocr.models.iter().map(|id| {
-            ModelObject::from_id(id.as_str(), ModelType::Ocr, Some(ModelSubtype::Standard))
-        }));
-        data.extend(ocr.layout_models.iter().map(|id| {
-            ModelObject::from_id(id.as_str(), ModelType::Ocr, Some(ModelSubtype::Layout))
-        }));
-    }
-    if let Some(ocr_vl) = &policy.ocr_vl {
-        data.extend(
-            ocr_vl.models.iter().map(|id| {
-                ModelObject::from_id(id.as_str(), ModelType::Ocr, Some(ModelSubtype::Vl))
-            }),
-        );
-        data.extend(ocr_vl.layout_models.iter().map(|id| {
-            ModelObject::from_id(id.as_str(), ModelType::Ocr, Some(ModelSubtype::Layout))
-        }));
-    }
-    dedupe_model_objects(&mut data);
+    let data = policy
+        .models
+        .iter()
+        .map(|model| {
+            let model_type = match model.service {
+                ModelService::Asr => ModelType::Asr,
+                ModelService::Tts => ModelType::Tts,
+                ModelService::Ocr | ModelService::OcrVl => ModelType::Ocr,
+            };
+            ModelObject::new(
+                model.id.to_string(),
+                model.name.clone(),
+                model_type,
+                model.capabilities,
+            )
+        })
+        .collect();
     Ok(Json(ModelList {
         object: "list",
         data,
@@ -135,33 +117,4 @@ fn parse_control_request(
     request
         .map(|Json(request)| request)
         .map_err(|error| ApiError::invalid_request(error.to_string(), None, Some("invalid_json")))
-}
-
-fn tts_model_subtype(model: &orchion::TtsModel) -> Option<ModelSubtype> {
-    if model.supports_preset_speakers() {
-        Some(ModelSubtype::PresetVoice)
-    } else if model.supports_voice_design() {
-        Some(ModelSubtype::VoiceDesign)
-    } else if model.supports_voice_cloning() {
-        Some(ModelSubtype::VoiceClone)
-    } else {
-        None
-    }
-}
-
-fn dedupe_model_objects(models: &mut Vec<ModelObject>) {
-    let mut seen = HashSet::new();
-    models.retain(|model| seen.insert(model.id.clone()));
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tts_models_without_registered_capabilities_have_no_subtype() {
-        let model = orchion::TtsModel::parse("Acme/Experimental-TTS").unwrap();
-
-        assert!(tts_model_subtype(&model).is_none());
-    }
 }

@@ -6,13 +6,13 @@ pub mod speech;
 pub mod streaming_transcription;
 pub mod transcription;
 
-use crate::application::model_lifecycle::ModelLifecycleRuntime;
+use crate::application::model_lifecycle::{ModelLifecycleRuntime, ModelService};
 use crate::application::ocr::OcrRuntime;
 use crate::application::resource_policy::InferenceGuard;
 use crate::application::speech::SpeechRuntime;
 use crate::application::streaming_transcription::StreamingTranscriptionRuntime;
 use crate::application::transcription::TranscriptionRuntime;
-use orchion::{AsrModel, ModelId, TtsModel};
+use orchion::{AsrModel, ModelCapabilities, ModelId, TtsModel};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -104,9 +104,11 @@ pub struct AsrApiPolicy {
 }
 
 #[derive(Debug, Clone)]
-pub struct OcrApiModels {
-    pub models: Vec<ModelId>,
-    pub layout_models: Vec<ModelId>,
+pub struct ApiModel {
+    pub id: ModelId,
+    pub name: Option<String>,
+    pub service: ModelService,
+    pub capabilities: ModelCapabilities,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -125,10 +127,10 @@ pub struct ApiPolicy {
     pub max_pdf_output_size: usize,
     pub max_websocket_message_size: usize,
     pub activity: ActivityPolicy,
+    pub models: Vec<ApiModel>,
     pub asr: Option<AsrApiPolicy>,
     pub tts_models: Option<Vec<TtsModel>>,
-    pub ocr: Option<OcrApiModels>,
-    pub ocr_vl: Option<OcrApiModels>,
+    pub ocr_enabled: bool,
 }
 
 pub trait ServerApplication:

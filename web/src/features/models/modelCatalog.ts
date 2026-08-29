@@ -1,4 +1,4 @@
-import type { ModelObject, ModelSubtype, ModelType } from "@/shared/api/types";
+import type { ModelCapability, ModelObject, ModelType } from "@/shared/api/types";
 
 export type ModelKind = ModelType | "other";
 
@@ -11,7 +11,6 @@ export interface ClassifiedModels {
   ocr: ModelObject[];
   ocrStandard: ModelObject[];
   ocrVl: ModelObject[];
-  ocrLayout: ModelObject[];
   other: ModelObject[];
   all: ModelObject[];
 }
@@ -27,18 +26,8 @@ export function modelKind(model: ModelObject): ModelKind {
   }
 }
 
-export function modelSubtype(model: ModelObject): ModelSubtype | undefined {
-  switch (model.subtype) {
-    case "standard":
-    case "vl":
-    case "layout":
-    case "preset_voice":
-    case "voice_clone":
-    case "voice_design":
-      return model.subtype;
-    default:
-      return undefined;
-  }
+export function hasCapability(model: ModelObject, capability: ModelCapability): boolean {
+  return model.capabilities.includes(capability);
 }
 
 export function classifyModels(models: ModelObject[]): ClassifiedModels {
@@ -51,7 +40,6 @@ export function classifyModels(models: ModelObject[]): ClassifiedModels {
     ocr: [],
     ocrStandard: [],
     ocrVl: [],
-    ocrLayout: [],
     other: [],
     all: [...models],
   };
@@ -63,30 +51,16 @@ export function classifyModels(models: ModelObject[]): ClassifiedModels {
         break;
       case "tts":
         classified.tts.push(model);
-        switch (modelSubtype(model)) {
-          case "preset_voice":
-            classified.ttsPresetVoice.push(model);
-            break;
-          case "voice_clone":
-            classified.ttsVoiceClone.push(model);
-            break;
-          case "voice_design":
-            classified.ttsVoiceDesign.push(model);
-            break;
-        }
+        if (hasCapability(model, "tts_preset_speakers")) classified.ttsPresetVoice.push(model);
+        if (hasCapability(model, "tts_voice_cloning")) classified.ttsVoiceClone.push(model);
+        if (hasCapability(model, "tts_voice_design")) classified.ttsVoiceDesign.push(model);
         break;
       case "ocr":
         classified.ocr.push(model);
-        switch (modelSubtype(model)) {
-          case "standard":
-            classified.ocrStandard.push(model);
-            break;
-          case "vl":
-            classified.ocrVl.push(model);
-            break;
-          case "layout":
-            classified.ocrLayout.push(model);
-            break;
+        if (hasCapability(model, "ocr_vision_language")) {
+          classified.ocrVl.push(model);
+        } else if (hasCapability(model, "ocr_text")) {
+          classified.ocrStandard.push(model);
         }
         break;
       case "other":

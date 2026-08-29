@@ -69,8 +69,6 @@ struct OcrMultipartRequest {
     model: String,
     response_format: Option<OcrApiFormat>,
     task: Option<OcrTask>,
-    #[schema(example = "PaddlePaddle/PP-DocLayoutV3")]
-    layout_model: Option<String>,
     #[schema(minimum = 1)]
     max_tokens: Option<usize>,
 }
@@ -124,24 +122,21 @@ mod tests {
             spec["components"]["schemas"]["ModelType"]["enum"],
             serde_json::json!(["asr", "tts", "ocr"])
         );
-        let subtype_schema = &model_object["properties"]["subtype"];
-        let subtype_ref = subtype_schema["$ref"].as_str().or_else(|| {
-            ["anyOf", "allOf", "oneOf"].iter().find_map(|key| {
-                subtype_schema[*key]
-                    .as_array()
-                    .and_then(|schemas| schemas.iter().find_map(|schema| schema["$ref"].as_str()))
-            })
-        });
-        assert_eq!(subtype_ref, Some("#/components/schemas/ModelSubtype"));
+        assert!(model_object["properties"].get("subtype").is_none());
+        assert!(model_object["properties"]["name"].is_object());
         assert_eq!(
-            spec["components"]["schemas"]["ModelSubtype"]["enum"],
+            spec["components"]["schemas"]["ModelCapability"]["enum"],
             serde_json::json!([
-                "standard",
-                "vl",
-                "layout",
-                "preset_voice",
-                "voice_clone",
-                "voice_design"
+                "asr_transcription",
+                "asr_streaming",
+                "tts_voice_cloning",
+                "tts_preset_speakers",
+                "tts_voice_design",
+                "ocr_text",
+                "ocr_layout",
+                "ocr_vision_language",
+                "ocr_markdown",
+                "ocr_html"
             ])
         );
     }
@@ -388,7 +383,7 @@ fn create_transcription_doc() {}
     request_body(
         content = OcrMultipartRequest,
         content_type = "multipart/form-data",
-        description = "POST /v1/ocr accepts multipart/form-data with required file and model fields plus optional response_format, task, layout_model, and max_tokens fields. layout_model is required for markdown and html responses. Response formats are json, text, markdown, and html. Model IDs use {vendor}/{name}. Traditional metal maps to CoreML; OCR-VL metal maps to Candle Metal."
+        description = "POST /v1/ocr accepts multipart/form-data with required file and model fields plus optional response_format, task, and max_tokens fields. Structured response formats are available when the selected deployment reports the matching capability. Response formats are json, text, markdown, and html. Model IDs use {vendor}/{name}. Traditional metal maps to CoreML; OCR-VL metal maps to Candle Metal."
     ),
     responses(
         (status = 200, description = "OCR response. JSON requests return OcrJsonResponse; text requests return text/plain; markdown requests return text/markdown; html requests return text/html.", body = OcrJsonResponse),

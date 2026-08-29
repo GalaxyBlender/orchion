@@ -10,7 +10,7 @@ use axum::extract::{Extension, Multipart, State};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, HeaderValue};
 use axum::response::{IntoResponse, Response};
-use orchion::{ModelId, OcrResponseFormat, OcrTask};
+use orchion::{OcrResponseFormat, OcrTask};
 use std::sync::Arc;
 
 #[allow(
@@ -31,7 +31,6 @@ where
     let mut model = None;
     let mut response_format = None;
     let mut task = OcrTask::Ocr;
-    let mut layout_model = None;
     let mut max_tokens = None;
 
     while let Some(field) = multipart.next_field().await.map_err(|error| {
@@ -52,8 +51,12 @@ where
                 task = parse_ocr_task(&value)?;
             }
             "layout_model" => {
-                let value = read_text_field(field, "layout_model").await?;
-                layout_model = Some(parse_ocr_model_id(&value, "layout_model")?);
+                let _ = field.text().await;
+                return Err(ApiError::invalid_request(
+                    "`layout_model` is not supported; configure the layout model on the deployment",
+                    Some("layout_model"),
+                    Some("unsupported_ocr_parameter"),
+                ));
             }
             "max_tokens" => {
                 let value: usize = parse_multipart_value(field, "max_tokens").await?;
@@ -111,7 +114,6 @@ where
                 model,
                 response_format: response_format.map(OcrResponseFormat::from),
                 task,
-                layout_model,
                 max_tokens,
             },
         )
@@ -194,14 +196,4 @@ pub(super) fn parse_ocr_task(value: &str) -> Result<OcrTask, ApiError> {
             Some("unsupported_ocr_parameter"),
         )),
     }
-}
-
-fn parse_ocr_model_id(value: &str, param: &'static str) -> Result<ModelId, ApiError> {
-    ModelId::parse(value).map_err(|_| {
-        ApiError::invalid_request(
-            format!("invalid `{param}`; expected vendor/name"),
-            Some(param),
-            Some("invalid_multipart_field"),
-        )
-    })
 }

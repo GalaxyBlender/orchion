@@ -42,7 +42,6 @@ export interface PersistentOcrState {
   model: string;
   responseFormat: "json" | "text" | "markdown" | "html";
   task: "ocr" | "table" | "formula" | "chart" | "spotting" | "seal";
-  layoutModel: string;
   maxTokens: string;
 }
 
@@ -170,7 +169,6 @@ function createDefaultPersistentState(): PersistentState {
       model: "",
       responseFormat: "json",
       task: "ocr",
-      layoutModel: "",
       maxTokens: "",
     },
     ui: {
@@ -334,7 +332,7 @@ function parseTtsModels(value: unknown): PersistentTtsModels | null {
 }
 
 function parseOcrState(value: unknown): Partial<PersistentOcrState> | null {
-  const state = parseStringFields<PersistentOcrState>(value, ["model", "layoutModel", "maxTokens"]);
+  const state = parseStringFields<PersistentOcrState>(value, ["model", "maxTokens"]);
   if (state === null || value === undefined) {
     return state;
   }
@@ -466,7 +464,7 @@ function isPersistentState(value: unknown): value is PersistentState {
       "maxLength",
     ]) &&
     (!("models" in value.tts) || isTtsModels(value.tts.models)) &&
-    hasStringFields(ocr, ["model", "responseFormat", "task", "layoutModel", "maxTokens"]) &&
+    hasStringFields(ocr, ["model", "responseFormat", "task", "maxTokens"]) &&
     hasStringFields(ui, ["theme", "activePage"]) &&
     (!("language" in value.ui) || isOneOf(value.ui.language, ["en", "zh-CN", "zh-TW"]))
   );

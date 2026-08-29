@@ -84,7 +84,7 @@ where
     let cors = cors_layer(&policy.cors_allowed_origins);
     let tts_enabled = policy.tts_models.is_some();
     let asr_enabled = policy.asr.is_some();
-    let ocr_enabled = policy.ocr.is_some() || policy.ocr_vl.is_some();
+    let ocr_enabled = policy.ocr_enabled;
     let activity = ActivityHub::new(policy.activity);
     let mut router = Router::new()
         .route("/", get(root_redirect))

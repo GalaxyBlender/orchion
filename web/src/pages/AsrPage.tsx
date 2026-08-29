@@ -19,6 +19,7 @@ import {
   waitForAsrStreamWritable,
 } from "@/features/asr/streaming";
 import type { AsrCaptionEndpointingOptions, AsrFormState, AsrMode, AsrRequestInput, AsrResponseFormat, AsrStreamEvent, AsrStreamInputFormat, AsrStreamInputMode, AsrStreamOutputMode } from "@/features/asr/types";
+import { hasCapability } from "@/features/models/modelCatalog";
 import { useModels } from "@/features/models/useModels";
 import { apiUrl, authHeaders } from "@/shared/api/client";
 import { parseApiError } from "@/shared/api/errors";
@@ -87,7 +88,9 @@ export function AsrPage() {
   const streamSessionRef = useRef(0);
   const settings = persistentState.settings;
   const models = useModels(settings);
-  const asrModelIds = models.classified.asr.map((model) => model.id);
+  const asrModelIds = models.classified.asr
+    .filter((model) => hasCapability(model, mode === "stream" ? "asr_streaming" : "asr_transcription"))
+    .map((model) => model.id);
   
   const previewInput = useMemo(() => buildRequestInput(form, file ?? previewFile), [file, form]);
   

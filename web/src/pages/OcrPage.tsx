@@ -1,7 +1,7 @@
 import { type FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { ocrParameterMetadata, ocrResponseFormats, ocrTaskOptions } from "@/features/ocr/metadata";
-import { formToOcrState, normalizeOcrFormForSubtype, ocrStateToForm } from "@/features/ocr/form";
+import { ocrParameterMetadata, ocrTaskOptions } from "@/features/ocr/metadata";
+import { formToOcrState, normalizeOcrFormForCapabilities, ocrResponseFormatsForCapabilities, ocrStateToForm } from "@/features/ocr/form";
 import { buildOcrCurl, buildOcrFormData, summarizeOcrRequest } from "@/features/ocr/request";
 import type { OcrFormState, OcrRequestInput, OcrResponseFormat, OcrTask } from "@/features/ocr/types";
 import { useModels } from "@/features/models/useModels";
@@ -34,18 +34,19 @@ export function OcrPage() {
   const settings = persistentState.settings;
   const models = useModels(settings);
   const ocrModelIds = useMemo(
-    () => [...models.classified.ocrStandard, ...models.classified.ocrVl].map((model) => model.id),
-    [models.classified.ocrStandard, models.classified.ocrVl],
+    () => models.classified.ocr.map((model) => model.id),
+    [models.classified.ocr],
   );
-  const layoutModelIds = useMemo(
-    () => models.classified.ocrLayout.map((model) => model.id),
-    [models.classified.ocrLayout],
+  const selectedModel = models.classified.ocr.find((model) => model.id === form.model.trim());
+  const selectedCapabilities = selectedModel?.capabilities ?? [];
+  const supportsOcrVlParameters = selectedCapabilities.includes("ocr_vision_language");
+  const responseFormats = useMemo(
+    () => ocrResponseFormatsForCapabilities(selectedCapabilities),
+    [selectedCapabilities],
   );
-  const selectedModelSubtype = models.classified.ocr.find((model) => model.id === form.model.trim())?.subtype;
-  const supportsOcrVlParameters = selectedModelSubtype !== "standard";
   const effectiveForm = useMemo(
-    () => normalizeOcrFormForSubtype(form, selectedModelSubtype),
-    [form, selectedModelSubtype],
+    () => normalizeOcrFormForCapabilities(form, selectedCapabilities),
+    [form, selectedCapabilities],
   );
 
   const previewInput = useMemo(() => buildRequestInput(effectiveForm, file ?? previewFile), [effectiveForm, file]);
@@ -55,7 +56,6 @@ export function OcrPage() {
       file: (selectedFile) => t("ocr.summary.file", { file: selectedFile }),
       responseFormat: (format) => t("ocr.summary.responseFormat", { format }),
       task: (task) => t("ocr.summary.task", { task }),
-      layoutModel: (model) => t("ocr.summary.layoutModel", { model }),
       maxTokens: (value) => t("ocr.summary.maxTokens", { value }),
     }),
     [previewInput, t],
@@ -74,8 +74,8 @@ export function OcrPage() {
     setResult("");
     setForm((currentForm) => {
       const updatedForm = { ...currentForm, [field]: value };
-      const subtype = models.classified.ocr.find((model) => model.id === updatedForm.model.trim())?.subtype;
-      const nextForm = normalizeOcrFormForSubtype(updatedForm, subtype);
+      const capabilities = models.classified.ocr.find((model) => model.id === updatedForm.model.trim())?.capabilities ?? [];
+      const nextForm = normalizeOcrFormForCapabilities(updatedForm, capabilities);
       setPersistentState((currentState) => {
         const nextState: PersistentState = {
           ...currentState,
@@ -109,11 +109,6 @@ export function OcrPage() {
       showValidationError(t("ocr.missingModel"));
       return;
     }
-    if ((form.responseFormat === "markdown" || form.responseFormat === "html") && form.layoutModel.trim() === "") {
-      showValidationError(t("ocr.missingLayoutModel"));
-      return;
-    }
-
     setValidationError("");
     setIsSubmitting(true);
     const abortController = new AbortController();
@@ -131,7 +126,7 @@ export function OcrPage() {
         throw parseApiError(response, await readResponsePayload(response));
       }
 
-      setResult(await formatResponse(response, form.responseFormat));
+      setResult(await formatResponse(response, effectiveForm.responseFormat));
       toast.success(t("common.success", "OCR completed successfully!"));
     } catch (caughtError) {
       if (isAbortError(caughtError)) {
@@ -245,9 +240,9 @@ export function OcrPage() {
                     id="ocr-response-format"
                     name="response_format"
                     onChange={(event) => updateForm("responseFormat", event.target.value as OcrResponseFormat)}
-                    value={form.responseFormat}
+                    value={effectiveForm.responseFormat}
                   >
-                    {ocrResponseFormats.map((format) => (
+                    {responseFormats.map((format) => (
                       <option key={format} value={format}>
                         {format}
                       </option>
@@ -272,22 +267,6 @@ export function OcrPage() {
                   </FormField>
                 )}
               </div>
-
-              <FormField label={t("ocr.metadata.layout_model.0")} description={t("ocr.layoutModelDescription")}>
-                <Select
-                  id="ocr-layout-model"
-                  name="layout_model"
-                  onChange={(event) => updateForm("layoutModel", event.target.value)}
-                  value={form.layoutModel}
-                >
-                  <option value="">{t("ocr.layoutModelPlaceholder")}</option>
-                  {layoutModelIds.map((modelId) => (
-                    <option key={modelId} value={modelId}>
-                      {modelId}
-                    </option>
-                  ))}
-                </Select>
-              </FormField>
 
               {supportsOcrVlParameters && (
                 <FormField label={t("ocr.metadata.max_tokens.0")} description={t("ocr.maxTokensDescription")}>
@@ -361,7 +340,7 @@ export function OcrPage() {
           ) : (
             <div className="stack gap-sm">
               <span className="card-eyebrow">{t("ocr.resultLabel")}</span>
-              {form.responseFormat === "json" ? (
+              {effectiveForm.responseFormat === "json" ? (
                 <pre className="code-preview"><code>{result}</code></pre>
               ) : (
                 <div className="result-block stack gap-sm">

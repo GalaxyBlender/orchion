@@ -130,11 +130,11 @@ mod tests {
     }
 
     #[test]
-    fn unregistered_qwen_compatible_tts_names_keep_legacy_capabilities() {
+    fn unregistered_qwen_compatible_tts_names_have_no_capabilities() {
         let model = TtsModel::parse("Acme/Experimental-TTS-Base").unwrap();
 
         assert!(model.descriptor().is_none());
-        assert!(model.supports_voice_cloning());
+        assert!(!model.supports_voice_cloning());
         assert!(!model.supports_preset_speakers());
         assert!(!model.supports_voice_design());
     }

@@ -139,4 +139,40 @@ mod tests {
             .is_err()
         );
     }
+
+    #[test]
+    fn unregistered_model_suffixes_do_not_enable_voice_variants() {
+        let voices = [
+            (
+                "Acme/Private-TTS-CustomVoice",
+                TtsVoice::Preset {
+                    speaker: TtsSpeaker::Ryan,
+                    language: TtsLanguage::English,
+                },
+            ),
+            (
+                "Acme/Private-TTS-Base",
+                TtsVoice::Clone {
+                    reference_audio: PathBuf::from("reference.wav"),
+                    reference_text: "reference".into(),
+                    language: TtsLanguage::English,
+                },
+            ),
+            (
+                "Acme/Private-TTS-VoiceDesign",
+                TtsVoice::Design {
+                    prompt: "calm voice".into(),
+                    language: TtsLanguage::English,
+                },
+            ),
+        ];
+
+        for (model_id, voice) in voices {
+            let model = TtsModel::parse(model_id).unwrap();
+            assert!(matches!(
+                ensure_voice_supported(&model, &voice),
+                Err(OrchionError::UnsupportedCapability { .. })
+            ));
+        }
+    }
 }

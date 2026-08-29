@@ -122,17 +122,6 @@ export function ModelsPage() {
               </Card.Body>
             </Card>
 
-            <Card>
-              <Card.Header eyebrow={t("models.classified")} title={t("models.ocrLayoutModels")} />
-              <Card.Body>
-                <ModelGroup
-                  emptyText={t("models.noOcrLayout")}
-                  icon={<ScanText size={16} className="text-accent" />}
-                  models={catalog.classified.ocrLayout}
-                  badgeVariant="accent"
-                />
-              </Card.Body>
-            </Card>
           </div>
 
           <Card>
@@ -172,6 +161,7 @@ interface ModelGroupProps {
 }
 
 function ModelGroup({ emptyText, icon, models, badgeVariant }: ModelGroupProps) {
+  const { t } = useTranslation();
   if (models.length === 0) {
     return <p className="text-sm text-muted">{emptyText}</p>;
   }
@@ -192,13 +182,20 @@ function ModelGroup({ emptyText, icon, models, badgeVariant }: ModelGroupProps) 
             borderRadius: "var(--radius-md)"
           }}
         >
-          <div className="hstack gap-sm">
+          <div className="hstack gap-sm min-w-0">
             {icon}
-            <span className="text-sm font-semibold text-mono truncate" style={{ maxWidth: "300px" }}>
-              {model.id}
-            </span>
+            <div className="stack gap-xs min-w-0">
+              <span className="text-sm font-semibold truncate" style={{ maxWidth: "300px" }}>
+                {model.name ?? model.id}
+              </span>
+              {model.name && <span className="text-xs text-muted text-mono truncate">{model.id}</span>}
+            </div>
           </div>
-          <Badge variant={badgeVariant}>{model.owned_by ? String(model.owned_by) : "system"}</Badge>
+          <div className="hstack gap-xs" style={{ flexWrap: "wrap", justifyContent: "flex-end" }}>
+            {model.capabilities.map((capability) => (
+              <Badge key={capability} variant={badgeVariant}>{t(`models.capabilities.${capability}`)}</Badge>
+            ))}
+          </div>
         </div>
       ))}
     </div>

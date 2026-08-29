@@ -27,36 +27,27 @@ impl TtsModel {
     }
 
     pub fn supports_voice_cloning(&self) -> bool {
-        self.descriptor().map_or_else(
-            || self.as_str().ends_with("-Base"),
-            |descriptor| {
-                descriptor
-                    .capabilities
-                    .contains(ModelCapabilities::TTS_VOICE_CLONING)
-            },
-        )
+        self.descriptor().is_some_and(|descriptor| {
+            descriptor
+                .capabilities
+                .contains(ModelCapabilities::TTS_VOICE_CLONING)
+        })
     }
 
     pub fn supports_preset_speakers(&self) -> bool {
-        self.descriptor().map_or_else(
-            || self.as_str().ends_with("-CustomVoice"),
-            |descriptor| {
-                descriptor
-                    .capabilities
-                    .contains(ModelCapabilities::TTS_PRESET_SPEAKERS)
-            },
-        )
+        self.descriptor().is_some_and(|descriptor| {
+            descriptor
+                .capabilities
+                .contains(ModelCapabilities::TTS_PRESET_SPEAKERS)
+        })
     }
 
     pub fn supports_voice_design(&self) -> bool {
-        self.descriptor().map_or_else(
-            || self.as_str().ends_with("-VoiceDesign"),
-            |descriptor| {
-                descriptor
-                    .capabilities
-                    .contains(ModelCapabilities::TTS_VOICE_DESIGN)
-            },
-        )
+        self.descriptor().is_some_and(|descriptor| {
+            descriptor
+                .capabilities
+                .contains(ModelCapabilities::TTS_VOICE_DESIGN)
+        })
     }
 }
 
@@ -123,21 +114,18 @@ mod tests {
     }
 
     #[test]
-    fn custom_qwen_compatible_model_names_preserve_legacy_capabilities() {
-        let base = TtsModel::from_str("Acme/New-TTS-Base").unwrap();
-        assert!(base.supports_voice_cloning());
-        assert!(!base.supports_preset_speakers());
-        assert!(!base.supports_voice_design());
-
-        let custom_voice = TtsModel::from_str("Acme/New-TTS-CustomVoice").unwrap();
-        assert!(!custom_voice.supports_voice_cloning());
-        assert!(custom_voice.supports_preset_speakers());
-        assert!(!custom_voice.supports_voice_design());
-
-        let voice_design = TtsModel::from_str("Acme/New-TTS-VoiceDesign").unwrap();
-        assert!(!voice_design.supports_voice_cloning());
-        assert!(!voice_design.supports_preset_speakers());
-        assert!(voice_design.supports_voice_design());
+    fn unregistered_model_suffixes_do_not_forge_capabilities() {
+        for id in [
+            "Acme/New-TTS-Base",
+            "Acme/New-TTS-CustomVoice",
+            "Acme/New-TTS-VoiceDesign",
+        ] {
+            let model = TtsModel::from_str(id).unwrap();
+            assert!(model.descriptor().is_none());
+            assert!(!model.supports_voice_cloning());
+            assert!(!model.supports_preset_speakers());
+            assert!(!model.supports_voice_design());
+        }
     }
 
     #[test]

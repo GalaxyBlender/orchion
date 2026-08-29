@@ -19,14 +19,14 @@ use crate::application::transcription::{
     TranscriptionFuture, TranscriptionPolicy, TranscriptionRuntime,
 };
 use crate::application::{
-    ActivityPolicy, ApiPolicy, AsrApiPolicy, OcrApiModels, RuntimeError, ServerApplication,
+    ActivityPolicy, ApiModel, ApiPolicy, AsrApiPolicy, RuntimeError, ServerApplication,
 };
 use crate::settings::ServerConfig;
 use anyhow::Context;
 use orchion::{
     ArtifactRequest, Asr, AsrModel, DeploymentSourcePlan, DevicePreference, DownloadSource,
-    ModelCategory, ModelDownloader, ModelId, ModelSpec, ModelUrlSource, Ocr, OcrAssets, OcrModel,
-    OcrModelKind, RuntimeProvider, Tts, TtsModel, model_descriptor,
+    ModelCapabilities, ModelCategory, ModelDownloader, ModelId, ModelSpec, ModelUrlSource, Ocr,
+    OcrAssets, OcrModel, OcrModelKind, RuntimeProvider, Tts, TtsModel, model_descriptor,
 };
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -510,7 +510,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ocr_runtime_cache_keys_include_the_requested_layout_model() {
+    async fn ocr_runtime_cache_keys_include_the_deployment_layout_model() {
         let mut config = test_config();
         config.models.max_loaded = 3;
         config.services.ocr.enabled = true;
@@ -2068,7 +2068,6 @@ impl OcrRuntime for AppState {
             ocr: OcrServicePolicy {
                 active: ocr.active(),
                 models: ocr.model_ids(),
-                layout_models: ocr.layout_ids(),
                 model_layouts: ocr.model_layouts(),
                 format: ocr.format,
                 max_pixels: ocr.max_pixels,
@@ -2076,7 +2075,6 @@ impl OcrRuntime for AppState {
             ocr_vl: OcrVlServicePolicy {
                 active: ocr_vl.active(),
                 models: ocr_vl.model_ids(),
-                layout_models: ocr_vl.layout_ids(),
                 model_layouts: ocr_vl.model_layouts(),
                 format: ocr_vl.format,
                 max_tokens: ocr_vl.max_tokens,
@@ -2701,6 +2699,57 @@ fn validate_runtime_factory(
 }
 
 fn api_policy(config: &ServerConfig) -> ApiPolicy {
+    let mut models = Vec::new();
+    if config.services.asr.enabled {
+        models.extend(config.services.asr.models.iter().map(|deployment| {
+            ApiModel {
+                id: deployment.id.clone(),
+                name: deployment.name.clone(),
+                service: ModelService::Asr,
+                capabilities: deployment
+                    .runtime
+                    .descriptor()
+                    .map_or(ModelCapabilities::ASR_TRANSCRIPTION, |descriptor| {
+                        descriptor.capabilities
+                    }),
+            }
+        }));
+    }
+    if config.services.tts.enabled {
+        models.extend(config.services.tts.models.iter().map(|deployment| {
+            ApiModel {
+                id: deployment.id.clone(),
+                name: deployment.name.clone(),
+                service: ModelService::Tts,
+                capabilities: deployment
+                    .runtime
+                    .descriptor()
+                    .map_or(ModelCapabilities::NONE, |descriptor| {
+                        descriptor.capabilities
+                    }),
+            }
+        }));
+    }
+    if config.services.ocr.active() {
+        models.extend(
+            config
+                .services
+                .ocr
+                .models
+                .iter()
+                .map(|deployment| ocr_api_model(deployment, ModelService::Ocr)),
+        );
+    }
+    if config.services.ocr_vl.active() {
+        models.extend(
+            config
+                .services
+                .ocr_vl
+                .models
+                .iter()
+                .map(|deployment| ocr_api_model(deployment, ModelService::OcrVl)),
+        );
+    }
     ApiPolicy {
         api_key: config.auth.api_key.clone(),
         cors_allowed_origins: config.server.cors_allowed_origins.clone(),
@@ -2713,6 +2762,7 @@ fn api_policy(config: &ServerConfig) -> ApiPolicy {
             enabled: config.activity.enabled,
             history_capacity: config.activity.history_capacity,
         },
+        models,
         asr: config.services.asr.enabled.then(|| AsrApiPolicy {
             models: config.services.asr.runtime_models(),
             stream_target_segment: config.services.asr.stream_target_segment,
@@ -2726,14 +2776,30 @@ fn api_policy(config: &ServerConfig) -> ApiPolicy {
             .tts
             .enabled
             .then(|| config.services.tts.runtime_models()),
-        ocr: config.services.ocr.active().then(|| OcrApiModels {
-            models: config.services.ocr.model_ids(),
-            layout_models: config.services.ocr.layout_ids(),
-        }),
-        ocr_vl: config.services.ocr_vl.active().then(|| OcrApiModels {
-            models: config.services.ocr_vl.model_ids(),
-            layout_models: config.services.ocr_vl.layout_ids(),
-        }),
+        ocr_enabled: config.services.ocr.active() || config.services.ocr_vl.active(),
+    }
+}
+
+fn ocr_api_model(
+    deployment: &crate::settings::OcrModelDeployment,
+    service: ModelService,
+) -> ApiModel {
+    let available = deployment
+        .layout_runtime
+        .as_ref()
+        .map_or(ModelCapabilities::NONE, |_| ModelCapabilities::OCR_LAYOUT);
+    let capabilities = deployment
+        .runtime
+        .known()
+        .expect("validated OCR deployment has a registered runtime")
+        .descriptor()
+        .effective_capabilities(available)
+        .union(available);
+    ApiModel {
+        id: deployment.id.clone(),
+        name: deployment.name.clone(),
+        service,
+        capabilities,
     }
 }
 

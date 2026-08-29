@@ -41,7 +41,9 @@ pub struct ModelObject {
     #[serde(rename = "type")]
     pub model_type: ModelType,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subtype: Option<ModelSubtype>,
+    pub name: Option<String>,
+    #[serde(default)]
+    pub capabilities: Vec<ModelCapability>,
 }
 
 /// Top-level model capability type.
@@ -53,14 +55,18 @@ pub enum ModelType {
     Ocr,
 }
 
-/// Model subtype reported by the API.
+/// Capability supported by a configured model deployment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ModelSubtype {
-    Standard,
-    Vl,
-    Layout,
-    PresetVoice,
-    VoiceClone,
-    VoiceDesign,
+pub enum ModelCapability {
+    AsrTranscription,
+    AsrStreaming,
+    TtsVoiceCloning,
+    TtsPresetSpeakers,
+    TtsVoiceDesign,
+    OcrText,
+    OcrLayout,
+    OcrVisionLanguage,
+    OcrMarkdown,
+    OcrHtml,
 }

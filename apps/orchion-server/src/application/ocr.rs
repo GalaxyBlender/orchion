@@ -1,7 +1,10 @@
 use super::{
     RuntimeError, UseCaseError, finish_owned_file_operation, protect_owned_file_operation,
 };
-use orchion::{ModelId, OcrLimits, OcrOptions, OcrResponseFormat, OcrResult, OcrTask};
+use orchion::{
+    KnownOcrModel, ModelCapabilities, ModelId, OcrLimits, OcrOptions, OcrResponseFormat, OcrResult,
+    OcrTask,
+};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -13,7 +16,6 @@ pub type OcrFuture<'a> =
 pub struct OcrServicePolicy {
     pub active: bool,
     pub models: Vec<ModelId>,
-    pub layout_models: Vec<ModelId>,
     pub model_layouts: Vec<(ModelId, ModelId)>,
     pub format: OcrResponseFormat,
     pub max_pixels: u64,
@@ -23,7 +25,6 @@ pub struct OcrServicePolicy {
 pub struct OcrVlServicePolicy {
     pub active: bool,
     pub models: Vec<ModelId>,
-    pub layout_models: Vec<ModelId>,
     pub model_layouts: Vec<(ModelId, ModelId)>,
     pub format: OcrResponseFormat,
     pub max_tokens: usize,
@@ -54,7 +55,6 @@ pub struct OcrCommand {
     pub model: String,
     pub response_format: Option<OcrResponseFormat>,
     pub task: OcrTask,
-    pub layout_model: Option<ModelId>,
     pub max_tokens: Option<usize>,
 }
 
@@ -74,11 +74,12 @@ pub async fn recognize(
     let policy = runtime.ocr_policy();
     let choice = resolve_service_choice(&policy, &command.model)?;
     let response_format = resolve_response_format(&policy, &choice, command.response_format);
+    let layout_model = configured_layout_model(&policy, &choice);
     validate_parameters(
         &choice,
         response_format,
         command.task,
-        command.layout_model.as_ref(),
+        layout_model.as_ref(),
         command.max_tokens,
         &policy,
     )?;
@@ -104,7 +105,7 @@ pub async fn recognize(
     let options = OcrOptions {
         response_format,
         task: command.task,
-        layout_model: command.layout_model,
+        layout_model,
         max_tokens,
     };
     let unavailable_model = choice.model().to_string();
@@ -203,7 +204,10 @@ pub fn validate_parameters(
     max_tokens: Option<usize>,
     policy: &OcrPolicy,
 ) -> Result<(), UseCaseError> {
-    if choice.is_ocr_vl() && max_tokens.is_some_and(|value| value > policy.ocr_vl.max_tokens) {
+    let capabilities = effective_capabilities(choice, layout_model.is_some());
+    let supports_vision_language = capabilities.contains(ModelCapabilities::OCR_VISION_LANGUAGE);
+    if supports_vision_language && max_tokens.is_some_and(|value| value > policy.ocr_vl.max_tokens)
+    {
         return Err(UseCaseError::invalid(
             format!(
                 "`max_tokens` must not exceed the configured limit of {}",
@@ -213,42 +217,20 @@ pub fn validate_parameters(
             "max_tokens_exceeded",
         ));
     }
-    if !choice.is_ocr_vl() && response_format == OcrResponseFormat::Html {
+    let required_format_capability = match response_format {
+        OcrResponseFormat::Json | OcrResponseFormat::Text => ModelCapabilities::OCR_TEXT,
+        OcrResponseFormat::Markdown => ModelCapabilities::OCR_MARKDOWN,
+        OcrResponseFormat::Html => ModelCapabilities::OCR_HTML,
+    };
+    if !capabilities.contains(required_format_capability) {
         return Err(UseCaseError::invalid(
-            "selected OCR model does not support HTML responses",
+            "selected OCR deployment does not support the requested response format",
             Some("response_format"),
             "unsupported_response_format",
         ));
     }
-    if matches!(
-        response_format,
-        OcrResponseFormat::Markdown | OcrResponseFormat::Html
-    ) && layout_model.is_none()
-    {
-        return Err(UseCaseError::invalid(
-            "`layout_model` is required for structured response formats",
-            Some("layout_model"),
-            "missing_required_parameter",
-        ));
-    }
-    if choice.is_ocr_vl() {
-        if let Some(layout_model) = layout_model {
-            validate_configured_layout_model(
-                &policy.ocr_vl.model_layouts,
-                choice.model(),
-                layout_model,
-                "OCR-VL",
-            )?;
-        }
+    if supports_vision_language {
         return Ok(());
-    }
-    if let Some(layout_model) = layout_model {
-        validate_configured_layout_model(
-            &policy.ocr.model_layouts,
-            choice.model(),
-            layout_model,
-            "OCR",
-        )?;
     }
     if task != OcrTask::Ocr || max_tokens.is_some() {
         return Err(UseCaseError::invalid(
@@ -266,7 +248,9 @@ pub fn resolve_max_tokens(
     requested: Option<usize>,
     policy: &OcrPolicy,
 ) -> Option<usize> {
-    if choice.is_ocr_vl() {
+    if effective_capabilities(choice, configured_layout_model(policy, choice).is_some())
+        .contains(ModelCapabilities::OCR_VISION_LANGUAGE)
+    {
         Some(
             requested
                 .unwrap_or(policy.ocr_vl.max_tokens)
@@ -277,25 +261,30 @@ pub fn resolve_max_tokens(
     }
 }
 
-fn validate_configured_layout_model(
-    model_layouts: &[(ModelId, ModelId)],
-    model: &ModelId,
-    layout_model: &ModelId,
-    service_name: &str,
-) -> Result<(), UseCaseError> {
-    if model_layouts
+fn effective_capabilities(choice: &OcrServiceChoice, has_layout: bool) -> ModelCapabilities {
+    let available = if has_layout {
+        ModelCapabilities::OCR_LAYOUT
+    } else {
+        ModelCapabilities::NONE
+    };
+    KnownOcrModel::from_model_id(choice.model()).map_or(ModelCapabilities::NONE, |model| {
+        model
+            .descriptor()
+            .effective_capabilities(available)
+            .union(available)
+    })
+}
+
+fn configured_layout_model(policy: &OcrPolicy, choice: &OcrServiceChoice) -> Option<ModelId> {
+    let model_layouts = match choice {
+        OcrServiceChoice::Ocr { .. } => &policy.ocr.model_layouts,
+        OcrServiceChoice::OcrVl { .. } => &policy.ocr_vl.model_layouts,
+    };
+    model_layouts
         .iter()
-        .any(|(configured_model, configured_layout)| {
-            configured_model == model && configured_layout == layout_model
+        .find_map(|(configured_model, configured_layout)| {
+            (configured_model == choice.model()).then(|| configured_layout.clone())
         })
-    {
-        return Ok(());
-    }
-    Err(UseCaseError::invalid(
-        format!("`layout_model` is not configured for the {service_name} service"),
-        Some("layout_model"),
-        "model_not_available",
-    ))
 }
 
 #[cfg(test)]
@@ -315,7 +304,6 @@ mod tests {
             ocr: OcrServicePolicy {
                 active: true,
                 models: vec![ModelId::parse("PaddlePaddle/PP-OCRv6_tiny").unwrap()],
-                layout_models: Vec::new(),
                 model_layouts: Vec::new(),
                 format: OcrResponseFormat::Json,
                 max_pixels: 1_000,
@@ -323,7 +311,6 @@ mod tests {
             ocr_vl: OcrVlServicePolicy {
                 active: true,
                 models: vec![ModelId::parse("PaddlePaddle/PaddleOCR-VL-1.6").unwrap()],
-                layout_models: Vec::new(),
                 model_layouts: Vec::new(),
                 format: OcrResponseFormat::Markdown,
                 max_tokens: 64,
@@ -377,14 +364,17 @@ mod tests {
     }
 
     #[test]
-    fn traditional_layout_must_be_configured() {
+    fn traditional_structured_formats_follow_deployment_layout() {
         let layout = ModelId::parse("PaddlePaddle/PP-DocLayoutV3").unwrap();
         let choice = OcrServiceChoice::Ocr {
             model: traditional_model(),
         };
         let mut policy = policy();
-        policy.ocr.layout_models = vec![layout.clone()];
         policy.ocr.model_layouts = vec![(traditional_model(), layout.clone())];
+        assert_eq!(
+            configured_layout_model(&policy, &choice),
+            Some(layout.clone())
+        );
         validate_parameters(
             &choice,
             OcrResponseFormat::Markdown,
@@ -395,11 +385,9 @@ mod tests {
         )
         .unwrap();
 
-        policy.ocr.layout_models.clear();
-        policy.ocr.model_layouts.clear();
         let error = validate_parameters(
             &choice,
-            OcrResponseFormat::Json,
+            OcrResponseFormat::Html,
             OcrTask::Ocr,
             Some(&layout),
             None,
@@ -409,8 +397,26 @@ mod tests {
         assert!(matches!(
             error,
             UseCaseError::InvalidRequest {
-                param: Some("layout_model"),
-                code: "model_not_available",
+                param: Some("response_format"),
+                code: "unsupported_response_format",
+                ..
+            }
+        ));
+
+        policy.ocr.model_layouts.clear();
+        let error = validate_parameters(
+            &choice,
+            OcrResponseFormat::Markdown,
+            OcrTask::Ocr,
+            None,
+            None,
+            &policy,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            UseCaseError::InvalidRequest {
+                code: "unsupported_response_format",
                 ..
             }
         ));
@@ -422,27 +428,10 @@ mod tests {
         let other = ModelId::parse("PaddlePaddle/PP-OCRv6_small").unwrap();
         let mut policy = policy();
         policy.ocr.models.push(other.clone());
-        policy.ocr.layout_models = vec![layout.clone()];
         policy.ocr.model_layouts = vec![(traditional_model(), layout.clone())];
+        let other_choice = OcrServiceChoice::Ocr { model: other };
 
-        let error = validate_parameters(
-            &OcrServiceChoice::Ocr { model: other },
-            OcrResponseFormat::Markdown,
-            OcrTask::Ocr,
-            Some(&layout),
-            None,
-            &policy,
-        )
-        .unwrap_err();
-
-        assert!(matches!(
-            error,
-            UseCaseError::InvalidRequest {
-                param: Some("layout_model"),
-                code: "model_not_available",
-                ..
-            }
-        ));
+        assert_eq!(configured_layout_model(&policy, &other_choice), None);
     }
 
     #[test]
@@ -462,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    fn structured_response_requires_explicit_layout_model() {
+    fn structured_response_requires_deployment_layout_capability() {
         let choice = OcrServiceChoice::OcrVl {
             model: ocr_vl_model(),
         };
@@ -479,8 +468,8 @@ mod tests {
         assert!(matches!(
             error,
             UseCaseError::InvalidRequest {
-                param: Some("layout_model"),
-                code: "missing_required_parameter",
+                param: Some("response_format"),
+                code: "unsupported_response_format",
                 ..
             }
         ));

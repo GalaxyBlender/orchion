@@ -481,21 +481,17 @@ mod tests {
 
     #[test]
     fn structured_ocr_capabilities_are_effective_only_with_layout() {
-        let descriptor = KnownOcrModel::PaddleOcrVl16.descriptor();
+        let traditional = KnownOcrModel::PpOcrV6Tiny
+            .descriptor()
+            .effective_capabilities(ModelCapabilities::OCR_LAYOUT);
+        assert!(traditional.contains(ModelCapabilities::OCR_MARKDOWN));
+        assert!(!traditional.contains(ModelCapabilities::OCR_HTML));
 
-        assert!(
-            !descriptor
-                .capabilities
-                .contains(ModelCapabilities::OCR_MARKDOWN)
-        );
-        assert!(
-            !descriptor
-                .capabilities
-                .contains(ModelCapabilities::OCR_HTML)
-        );
-        let effective = descriptor.effective_capabilities(ModelCapabilities::OCR_LAYOUT);
-        assert!(effective.contains(ModelCapabilities::OCR_MARKDOWN));
-        assert!(effective.contains(ModelCapabilities::OCR_HTML));
+        let ocr_vl = KnownOcrModel::PaddleOcrVl16
+            .descriptor()
+            .effective_capabilities(ModelCapabilities::OCR_LAYOUT);
+        assert!(ocr_vl.contains(ModelCapabilities::OCR_MARKDOWN));
+        assert!(ocr_vl.contains(ModelCapabilities::OCR_HTML));
     }
 
     #[test]

@@ -69,6 +69,7 @@ pub async fn synthesize(
     validate_request_limit(&command, policy.max_length)?;
     let model = TtsModel::parse(&command.model)
         .map_err(|_| UseCaseError::ModelNotAvailable(command.model.clone()))?;
+    let _ = supported_voice(&model, &command)?;
 
     if let (Some(reference_audio), Some(reference_audio_output)) = (
         command.reference_audio.as_ref(),
@@ -84,7 +85,7 @@ pub async fn synthesize(
     }
 
     let format = command.output_format.unwrap_or(policy.default_format);
-    let voice = to_tts_voice(&command)?;
+    let voice = supported_voice(&model, &command)?;
     let mut options = to_tts_options(&command);
     options.max_length = options.max_length.min(policy.max_length);
     let input = command.input;
@@ -116,6 +117,12 @@ pub async fn synthesize(
         bytes: encoded.bytes,
         format,
     })
+}
+
+fn supported_voice(model: &TtsModel, command: &SpeechCommand) -> Result<TtsVoice, UseCaseError> {
+    let voice = to_tts_voice(command)?;
+    orchion::ensure_voice_supported(model, &voice)?;
+    Ok(voice)
 }
 
 async fn transcode_reference_audio(
@@ -392,5 +399,30 @@ mod tests {
                 language: TtsLanguage::Auto,
             }
         );
+    }
+
+    #[test]
+    fn private_tts_suffixes_cannot_enable_request_capabilities() {
+        let cases = [
+            ("Acme/Private-TTS-CustomVoice", "ryan"),
+            ("Acme/Private-TTS-Base", "clone"),
+            ("Acme/Private-TTS-VoiceDesign", "design"),
+        ];
+
+        for (model_id, voice) in cases {
+            let mut command = command();
+            command.model = model_id.into();
+            command.voice = voice.into();
+            command.reference_audio = Some(PathBuf::from("reference.wav"));
+            command.reference_text = Some("reference".into());
+            command.voice_prompt = Some("calm voice".into());
+            let model = TtsModel::parse(model_id).unwrap();
+
+            let error = supported_voice(&model, &command).unwrap_err();
+            assert!(matches!(
+                error,
+                UseCaseError::Core(orchion::OrchionError::UnsupportedCapability { .. })
+            ));
+        }
     }
 }

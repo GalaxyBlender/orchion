@@ -1,7 +1,7 @@
 #[cfg(feature = "models")]
 #[tokio::test]
 async fn list_models_sends_auth_and_decodes_typed_models() {
-    use orchion_client::models::{ModelSubtype, ModelType};
+    use orchion_client::models::{ModelCapability, ModelType};
     use orchion_client::{Client, ClientConfig};
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -12,14 +12,25 @@ async fn list_models_sends_auth_and_decodes_typed_models() {
         .and(header("Authorization", "Bearer secret"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "object": "list",
-            "data": [{
-                "id": "Qwen/Qwen3-ASR-Flash",
-                "object": "model",
-                "created": 0,
-                "owned_by": "orchion",
-                "type": "asr",
-                "subtype": "standard"
-            }]
+            "data": [
+                {
+                    "id": "Qwen/Qwen3-ASR-Flash",
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "orchion",
+                    "type": "asr",
+                    "name": "Fast ASR",
+                    "capabilities": ["asr_transcription", "asr_streaming"]
+                },
+                {
+                    "id": "Acme/Private-TTS",
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "orchion",
+                    "type": "tts",
+                    "capabilities": []
+                }
+            ]
         })))
         .mount(&server)
         .await;
@@ -34,7 +45,15 @@ async fn list_models_sends_auth_and_decodes_typed_models() {
     assert_eq!(models.object, "list");
     assert_eq!(models.data[0].id, "Qwen/Qwen3-ASR-Flash");
     assert_eq!(models.data[0].model_type, ModelType::Asr);
-    assert_eq!(models.data[0].subtype, Some(ModelSubtype::Standard));
+    assert_eq!(models.data[0].name.as_deref(), Some("Fast ASR"));
+    assert_eq!(
+        models.data[0].capabilities,
+        vec![
+            ModelCapability::AsrTranscription,
+            ModelCapability::AsrStreaming
+        ]
+    );
+    assert!(models.data[1].capabilities.is_empty());
 }
 
 #[cfg(feature = "models")]

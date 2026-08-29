@@ -4,7 +4,7 @@
 
 Orchion 通过 `POST /v1/ocr` 和 `multipart/form-data` 提供传统 OCR 与 OCR-VL 能力。
 
-服务端的 `default_model` 从 `[[services.ocr.models]]` 或 `[[services.ocr-vl.models]]` deployment 中选择启动预置项；每个 deployment 可配置自己的 `layout_model` artifact。本阶段请求仍须显式传入 `model`，结构化响应仍须传入现有的 `layout_model` runtime ID。
+服务端的 `default_model` 从 `[[services.ocr.models]]` 或 `[[services.ocr-vl.models]]` deployment 中选择启动预置项；每个 deployment 可配置自己的 `layout_model` artifact。请求只通过 `model` 选择 primary deployment，服务端会自动加载并使用该 deployment 的 layout asset。
 
 ## 传统 OCR
 
@@ -15,7 +15,7 @@ curl -X POST http://127.0.0.1:9090/v1/ocr \
   -F response_format=json
 ```
 
-传统 OCR 返回结构化文本区域和纯文本。
+传统 OCR 始终支持 JSON 和纯文本。配置了 layout asset 的 deployment 还会发布并接受 Markdown；HTML 仍仅属于 OCR-VL 能力。传统 OCR 未配置 layout 时会拒绝 Markdown。
 
 ## OCR-VL
 
@@ -23,7 +23,6 @@ curl -X POST http://127.0.0.1:9090/v1/ocr \
 curl -X POST http://127.0.0.1:9090/v1/ocr \
   -F file=@document.png \
   -F model=PaddlePaddle/PaddleOCR-VL-1.6 \
-  -F layout_model=PaddlePaddle/PP-DocLayoutV3 \
   -F response_format=markdown
 ```
 
@@ -33,7 +32,8 @@ curl -X POST http://127.0.0.1:9090/v1/ocr \
 
 - `file`：图片或文档图片文件。
 - `model`：必填模型 ID，格式为 `{vendor}/{name}`。
-- `response_format`：`json`、`text`、`markdown` 或 `html`。
+- `response_format`：`json`、`text`、`markdown` 或 `html`，具体以所选 deployment 在 `/v1/models` 中发布的能力为准。
 - `task`：可选 OCR-VL 任务。
-- `layout_model`：版面模型；`markdown` 和 `html` 响应必须显式传入。
 - `max_tokens`：可选 OCR-VL 生成长度上限。
+
+`layout_model` 属于 deployment 配置，不是请求参数。multipart 请求若仍发送 `layout_model` 字段，服务端会以 `unsupported_ocr_parameter` 拒绝。

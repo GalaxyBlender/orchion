@@ -44,7 +44,7 @@ API key 和表单偏好会存储在浏览器 `localStorage`；不要在共享或
 ## API 路由
 
 - `GET /healthz`：健康检查。
-- `GET /v1/models`：已配置模型列表。
+- `GET /v1/models`：已配置 primary deployment ID、可选展示名称和派生能力。
 - `GET /api/models/status`：已配置模型的运行时驻留状态。
 - `POST /api/models/load`：加载已配置模型的运行时。
 - `POST /api/models/unload`：卸载已配置模型的运行时。

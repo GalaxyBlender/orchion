@@ -52,7 +52,6 @@ pub struct OcrRequest {
     pub model: String,
     pub response_format: Option<OcrResponseFormat>,
     pub task: Option<OcrTask>,
-    pub layout_model: Option<String>,
     pub max_tokens: Option<usize>,
 }
 
@@ -66,7 +65,6 @@ impl OcrRequest {
             model: model.into(),
             response_format: None,
             task: None,
-            layout_model: None,
             max_tokens: None,
         }
     }
@@ -104,13 +102,6 @@ impl OcrRequest {
         self
     }
 
-    /// Sets the optional layout model.
-    #[must_use]
-    pub fn with_layout_model(mut self, layout_model: impl Into<String>) -> Self {
-        self.layout_model = Some(layout_model.into());
-        self
-    }
-
     /// Sets the optional token limit.
     #[must_use]
     pub const fn with_max_tokens(mut self, max_tokens: usize) -> Self {
@@ -129,22 +120,6 @@ impl OcrRequest {
         if self.model.trim().is_empty() {
             return Err(ClientError::build_request("model must not be empty"));
         }
-        if self
-            .layout_model
-            .as_ref()
-            .is_some_and(|layout_model| layout_model.trim().is_empty())
-        {
-            return Err(ClientError::build_request("layout model must not be empty"));
-        }
-        if matches!(
-            self.response_format,
-            Some(OcrResponseFormat::Markdown | OcrResponseFormat::Html)
-        ) && self.layout_model.is_none()
-        {
-            return Err(ClientError::build_request(
-                "layout model is required for markdown and html responses",
-            ));
-        }
         if self.max_tokens == Some(0) {
             return Err(ClientError::build_request(
                 "max tokens must be greater than 0",
@@ -162,10 +137,6 @@ impl OcrRequest {
             form = form.text("task", task.as_str());
         }
 
-        if let Some(layout_model) = self.layout_model {
-            form = form.text("layout_model", layout_model);
-        }
-
         if let Some(max_tokens) = self.max_tokens {
             form = form.text("max_tokens", max_tokens.to_string());
         }
@@ -179,27 +150,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn structured_response_requires_layout_model() {
+    fn structured_response_is_accepted_without_a_request_layout_model() {
         for format in [OcrResponseFormat::Markdown, OcrResponseFormat::Html] {
-            let error = OcrRequest::new("document.png", "Acme/OCR")
+            OcrRequest::new("document.png", "Acme/OCR")
                 .with_file_bytes(vec![1])
                 .with_response_format(format)
                 .into_form()
-                .unwrap_err();
-
-            assert!(error.to_string().contains("layout model is required"));
+                .unwrap();
         }
-    }
-
-    #[test]
-    fn blank_layout_model_is_rejected() {
-        let error = OcrRequest::new("document.png", "Acme/OCR")
-            .with_file_bytes(vec![1])
-            .with_layout_model("  ")
-            .into_form()
-            .unwrap_err();
-
-        assert!(error.to_string().contains("layout model must not be empty"));
     }
 
     #[test]

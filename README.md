@@ -44,7 +44,7 @@ API keys and form preferences are stored in browser `localStorage`; do not save 
 ## API Routes
 
 - `GET /healthz`: health check.
-- `GET /v1/models`: configured model list.
+- `GET /v1/models`: configured primary deployment IDs, optional display names, and derived capabilities.
 - `GET /api/models/status`: configured model runtime residency.
 - `POST /api/models/load`: load a configured model runtime.
 - `POST /api/models/unload`: unload a configured model runtime.
