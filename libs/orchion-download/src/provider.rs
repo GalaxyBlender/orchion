@@ -1,4 +1,4 @@
-use orchion_core::{DownloadRetryability, OrchionError, Result};
+use orchion_core::{DownloadRetryability, ModelId, OrchionError, Result};
 use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -14,16 +14,35 @@ pub type PreflightFuture<'a> =
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderPreflightResult {
     files: Vec<String>,
+    resolved_revision: Option<String>,
 }
 
 impl ProviderPreflightResult {
     pub(crate) fn new(files: Vec<String>) -> Self {
-        Self { files }
+        Self {
+            files,
+            resolved_revision: None,
+        }
+    }
+
+    pub(crate) fn with_resolved_revision(
+        files: Vec<String>,
+        resolved_revision: impl Into<String>,
+    ) -> Self {
+        Self {
+            files,
+            resolved_revision: Some(resolved_revision.into()),
+        }
     }
 
     #[must_use]
     pub fn files(&self) -> &[String] {
         &self.files
+    }
+
+    #[must_use]
+    pub fn resolved_revision(&self) -> Option<&str> {
+        self.resolved_revision.as_deref()
     }
 }
 
@@ -301,6 +320,7 @@ pub struct HubProviderOptions {
     token: Option<String>,
     concurrency: Option<usize>,
     max_retries: Option<u32>,
+    metadata_endpoint: Option<String>,
 }
 
 impl HubProviderOptions {
@@ -319,6 +339,12 @@ impl HubProviderOptions {
     #[must_use]
     pub const fn with_max_retries(mut self, max_retries: u32) -> Self {
         self.max_retries = Some(max_retries);
+        self
+    }
+
+    #[must_use]
+    pub fn with_metadata_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.metadata_endpoint = Some(endpoint.into());
         self
     }
 
@@ -349,6 +375,7 @@ impl fmt::Debug for HubProviderOptions {
             .field("token", &self.token.as_ref().map(|_| Redacted))
             .field("concurrency", &self.concurrency)
             .field("max_retries", &self.max_retries)
+            .field("metadata_endpoint", &self.metadata_endpoint)
             .finish()
     }
 }
@@ -507,20 +534,71 @@ impl DownloadProvider for ModelScopeProvider {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "resolves revision metadata before paginating the immutable tree"
+)]
 fn preflight_hugging_face<'a>(
     provider: &'a HuggingFaceProvider,
     request: ProviderPreflightRequest<'a>,
 ) -> PreflightFuture<'a> {
     Box::pin(async move {
-        let endpoint =
-            std::env::var("HF_ENDPOINT").unwrap_or_else(|_| "https://huggingface.co".to_string());
-        let url = format!(
-            "{endpoint}/api/models/{}/tree/{}?recursive=1",
-            request.repository(),
-            request.revision()
-        );
+        let endpoint = provider
+            .options
+            .metadata_endpoint
+            .clone()
+            .unwrap_or_else(|| {
+                std::env::var("HF_ENDPOINT")
+                    .unwrap_or_else(|_| "https://huggingface.co".to_string())
+            });
         let client = preflight_client(provider.label(), request.repository(), &provider.options)?;
-        let mut next = Some(url);
+        let revision_url = hugging_face_api_url(
+            provider.label(),
+            request.repository(),
+            request.revision(),
+            &endpoint,
+            "revision",
+            request.revision(),
+            false,
+        )?;
+        let revision_response = client.get(revision_url).send().await.map_err(|error| {
+            classify_reqwest_error(provider.label(), request.repository(), &error)
+        })?;
+        let revision_response =
+            require_preflight_success(provider.label(), request.repository(), revision_response)?;
+        let revision_metadata = revision_response
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|error| {
+                classify_reqwest_error(provider.label(), request.repository(), &error)
+            })?;
+        let resolved_revision = revision_metadata["sha"].as_str().ok_or_else(|| {
+            provider_error(
+                provider.label(),
+                request.repository(),
+                "Hugging Face revision metadata omitted immutable sha",
+                DownloadRetryability::Terminal,
+            )
+        })?;
+        if !is_immutable_revision(resolved_revision) {
+            return Err(provider_error(
+                provider.label(),
+                request.repository(),
+                "Hugging Face revision metadata returned malformed sha",
+                DownloadRetryability::Terminal,
+            ));
+        }
+        let resolved_revision = resolved_revision.to_string();
+        let tree_url = hugging_face_api_url(
+            provider.label(),
+            request.repository(),
+            request.revision(),
+            &endpoint,
+            "tree",
+            &resolved_revision,
+            true,
+        )?;
+        let mut next = Some(tree_url.to_string());
         let mut available = Vec::new();
         while let Some(url) = next.take() {
             let response = client.get(url).send().await.map_err(|error| {
@@ -528,6 +606,19 @@ fn preflight_hugging_face<'a>(
             })?;
             let response =
                 require_preflight_success(provider.label(), request.repository(), response)?;
+            if let Some(revision) = response
+                .headers()
+                .get("x-repo-commit")
+                .and_then(|value| value.to_str().ok())
+            {
+                let mut expected = Some(resolved_revision.clone());
+                require_consistent_immutable_revision(
+                    provider.label(),
+                    request.repository(),
+                    &mut expected,
+                    revision,
+                )?;
+            }
             next = response
                 .headers()
                 .get(reqwest::header::LINK)
@@ -555,8 +646,81 @@ fn preflight_hugging_face<'a>(
                     .filter_map(|entry| entry["path"].as_str().map(str::to_string)),
             );
         }
-        resolve_preflight_files(provider.label(), request, available)
+        let result = resolve_preflight_files(provider.label(), request, available)?;
+        Ok(ProviderPreflightResult::with_resolved_revision(
+            result.files,
+            resolved_revision,
+        ))
     })
+}
+
+fn hugging_face_api_url(
+    source_name: &'static str,
+    repository: &str,
+    requested_revision: &str,
+    endpoint: &str,
+    operation: &str,
+    operation_revision: &str,
+    recursive: bool,
+) -> Result<reqwest::Url> {
+    let repository_id = ModelId::parse(repository).map_err(|error| {
+        provider_error(
+            source_name,
+            repository,
+            format!("invalid repository path: {error}"),
+            DownloadRetryability::Terminal,
+        )
+    })?;
+    if !valid_requested_revision(requested_revision)
+        || !valid_requested_revision(operation_revision)
+    {
+        return Err(provider_error(
+            source_name,
+            repository,
+            "invalid revision path",
+            DownloadRetryability::Terminal,
+        ));
+    }
+    let mut url = reqwest::Url::parse(endpoint).map_err(|error| {
+        provider_error(
+            source_name,
+            repository,
+            format!("invalid metadata endpoint: {error}"),
+            DownloadRetryability::Terminal,
+        )
+    })?;
+    {
+        let mut segments = url.path_segments_mut().map_err(|()| {
+            provider_error(
+                source_name,
+                repository,
+                "metadata endpoint cannot contain path segments",
+                DownloadRetryability::Terminal,
+            )
+        })?;
+        segments.pop_if_empty();
+        segments.extend([
+            "api",
+            "models",
+            repository_id.vendor(),
+            repository_id.name(),
+        ]);
+        segments.push(operation);
+        segments.push(operation_revision);
+    }
+    if recursive {
+        url.query_pairs_mut().append_pair("recursive", "1");
+    }
+    Ok(url)
+}
+
+fn valid_requested_revision(revision: &str) -> bool {
+    !revision.trim().is_empty()
+        && !revision.contains(['%', '\\', '?', '#'])
+        && !revision.chars().any(char::is_control)
+        && revision
+            .split('/')
+            .all(|segment| !segment.is_empty() && !matches!(segment, "." | ".."))
 }
 
 fn preflight_model_scope<'a>(
@@ -564,8 +728,14 @@ fn preflight_model_scope<'a>(
     request: ProviderPreflightRequest<'a>,
 ) -> PreflightFuture<'a> {
     Box::pin(async move {
+        let endpoint = provider
+            .options
+            .metadata_endpoint
+            .as_deref()
+            .unwrap_or("https://modelscope.cn");
         let url = format!(
-            "https://modelscope.cn/api/v1/models/{}/repo/files?Recursive=true&Revision={}",
+            "{}/api/v1/models/{}/repo/files?Recursive=true&Revision={}",
+            endpoint.trim_end_matches('/'),
             request.repository(),
             request.revision()
         );
@@ -605,8 +775,80 @@ fn preflight_model_scope<'a>(
             .filter(|entry| entry["Type"].as_str().is_none_or(|kind| kind == "blob"))
             .filter_map(|entry| entry["Path"].as_str().map(str::to_string))
             .collect::<Vec<_>>();
-        resolve_preflight_files(provider.label(), request, available)
+        let resolved_revision = modelscope_resolved_revision(&metadata).ok_or_else(|| {
+            provider_error(
+                provider.label(),
+                request.repository(),
+                "ModelScope metadata did not resolve the revision to an immutable commit",
+                DownloadRetryability::Terminal,
+            )
+        })?;
+        let result = resolve_preflight_files(provider.label(), request, available)?;
+        Ok(ProviderPreflightResult::with_resolved_revision(
+            result.files,
+            resolved_revision,
+        ))
     })
+}
+
+fn require_consistent_immutable_revision(
+    source_name: &'static str,
+    repo: &str,
+    current: &mut Option<String>,
+    revision: &str,
+) -> Result<()> {
+    if !is_immutable_revision(revision) {
+        return Err(provider_error(
+            source_name,
+            repo,
+            "provider metadata returned a mutable or invalid revision",
+            DownloadRetryability::Terminal,
+        ));
+    }
+    if current
+        .as_deref()
+        .is_some_and(|current| current != revision)
+    {
+        return Err(provider_error(
+            source_name,
+            repo,
+            "provider metadata pages returned inconsistent revisions",
+            DownloadRetryability::Terminal,
+        ));
+    }
+    *current = Some(revision.to_string());
+    Ok(())
+}
+
+fn modelscope_resolved_revision(metadata: &serde_json::Value) -> Option<String> {
+    for pointer in [
+        "/Data/Revision",
+        "/Data/CommitId",
+        "/Data/Commit/Id",
+        "/Data/LatestCommitter/Id",
+    ] {
+        if let Some(revision) = metadata
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_str)
+            && is_immutable_revision(revision)
+        {
+            return Some(revision.to_string());
+        }
+    }
+    let short = metadata["Data"]["LatestCommitter"]["ShortId"].as_str()?;
+    if short.is_empty() || !short.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut revisions = metadata["Data"]["Files"]
+        .as_array()?
+        .iter()
+        .filter_map(|file| file["Revision"].as_str())
+        .filter(|revision| revision.starts_with(short) && is_immutable_revision(revision))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    revisions.sort();
+    revisions.dedup();
+    (revisions.len() == 1).then(|| revisions.remove(0))
 }
 
 fn preflight_client(
@@ -857,6 +1099,32 @@ fn repo_cache_path(cache_dir: &Path, repo: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    fn serve_metadata_responses(
+        build: impl FnOnce(&str) -> Vec<String>,
+    ) -> (String, Arc<Mutex<Vec<String>>>, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let responses = build(&endpoint);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        let task = std::thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 4096];
+                let read = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..read]);
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(request.lines().next().unwrap_or_default().to_string());
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (endpoint, requests, task)
+    }
 
     struct DownloadOnlyProvider;
 
@@ -905,6 +1173,159 @@ mod tests {
     fn mutable_or_abbreviated_refs_are_not_immutable_revisions() {
         assert!(!is_immutable_revision("main"));
         assert!(!is_immutable_revision("0123456789abcdef"));
+    }
+
+    #[tokio::test]
+    async fn hugging_face_preflight_resolves_main_then_lists_tree_without_commit_header() {
+        let revision = "1111111111111111111111111111111111111111";
+        let (endpoint, requests, task) = serve_metadata_responses(|_| {
+            let metadata = serde_json::json!({"sha": revision}).to_string();
+            let tree = r#"[{"type":"file","path":"model.onnx"}]"#;
+            vec![
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{metadata}",
+                    metadata.len()
+                ),
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{tree}",
+                    tree.len()
+                ),
+            ]
+        });
+        let provider = HuggingFaceProvider::with_options(
+            HubProviderOptions::default().with_metadata_endpoint(endpoint.clone()),
+        );
+
+        let result = provider
+            .preflight(ProviderPreflightRequest::new(
+                "Owner/Repo",
+                "main",
+                Some(&["model.onnx"]),
+            ))
+            .await
+            .unwrap();
+        task.join().unwrap();
+
+        assert_eq!(result.files(), ["model.onnx"]);
+        assert_eq!(result.resolved_revision(), Some(revision));
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![
+                "GET /api/models/Owner/Repo/revision/main HTTP/1.1".to_string(),
+                format!("GET /api/models/Owner/Repo/tree/{revision}?recursive=1 HTTP/1.1")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn hugging_face_tree_commit_header_must_match_revision_metadata() {
+        let revision = "1111111111111111111111111111111111111111";
+        let conflict = "2222222222222222222222222222222222222222";
+        let (endpoint, _, task) = serve_metadata_responses(|_| {
+            let metadata = serde_json::json!({"sha": revision}).to_string();
+            let tree = r#"[{"type":"file","path":"model.onnx"}]"#;
+            vec![
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{metadata}",
+                    metadata.len()
+                ),
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Repo-Commit: {conflict}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{tree}",
+                    tree.len()
+                ),
+            ]
+        });
+        let provider = HuggingFaceProvider::with_options(
+            HubProviderOptions::default().with_metadata_endpoint(endpoint),
+        );
+        let error = provider
+            .preflight(ProviderPreflightRequest::new(
+                "Owner/Repo",
+                "main",
+                Some(&["model.onnx"]),
+            ))
+            .await
+            .unwrap_err();
+        task.join().unwrap();
+        assert!(error.to_string().contains("inconsistent revisions"));
+    }
+
+    #[tokio::test]
+    async fn hugging_face_paginated_tree_does_not_require_commit_headers() {
+        let revision = "1111111111111111111111111111111111111111";
+        let (endpoint, _, task) = serve_metadata_responses(|endpoint| {
+            let metadata = serde_json::json!({"sha": revision}).to_string();
+            let first = r#"[{"type":"file","path":"first.onnx"}]"#;
+            let second = r#"[{"type":"file","path":"second.txt"}]"#;
+            vec![
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{metadata}",
+                    metadata.len()
+                ),
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nLink: <{endpoint}/page-2>; rel=\"next\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{first}",
+                    first.len()
+                ),
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{second}",
+                    second.len()
+                ),
+            ]
+        });
+        let provider = HuggingFaceProvider::with_options(
+            HubProviderOptions::default().with_metadata_endpoint(endpoint),
+        );
+        let requested = ["first.onnx", "second.txt"];
+        let result = provider
+            .preflight(ProviderPreflightRequest::new(
+                "Owner/Repo",
+                "main",
+                Some(&requested),
+            ))
+            .await
+            .unwrap();
+        task.join().unwrap();
+        assert_eq!(result.files(), requested);
+        assert_eq!(result.resolved_revision(), Some(revision));
+    }
+
+    #[tokio::test]
+    async fn modelscope_preflight_resolves_master_from_file_metadata() {
+        let revision = "2222222222222222222222222222222222222222";
+        let body = serde_json::json!({
+            "Code": 200,
+            "Success": true,
+            "Data": {
+                "LatestCommitter": {"ShortId": "22222222", "Id": ""},
+                "Files": [{
+                    "Type": "blob",
+                    "Path": "model.onnx",
+                    "Revision": revision
+                }]
+            }
+        })
+        .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (endpoint, _, task) = serve_metadata_responses(|_| vec![response]);
+        let provider = ModelScopeProvider::with_options(
+            HubProviderOptions::default().with_metadata_endpoint(endpoint),
+        );
+
+        let result = provider
+            .preflight(ProviderPreflightRequest::new(
+                "Owner/Repo",
+                "master",
+                Some(&["model.onnx"]),
+            ))
+            .await
+            .unwrap();
+        task.join().unwrap();
+
+        assert_eq!(result.files(), ["model.onnx"]);
+        assert_eq!(result.resolved_revision(), Some(revision));
     }
 
     #[test]

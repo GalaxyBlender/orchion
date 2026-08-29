@@ -2,10 +2,12 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header, header::AUTHORIZATION};
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
-use orchion::{AsrModel, ModelId, OcrModel, OcrModelKind, TtsModel};
+use orchion::{AsrModel, ModelId, ModelUrl, OcrModel, OcrModelKind, TtsModel};
 use orchion_protocol::{AsrStreamEvent, AsrStreamInputAudioFormat, AsrStreamStartMessage};
 use orchion_server::api::ui;
-use orchion_server::config::{ModelDeployment, OcrModelDeployment, ServerConfig};
+use orchion_server::config::{
+    ModelDeployment, OcrModelDeployment, ServerConfig, TableStructureConfig, TableStructureType,
+};
 use orchion_server::routes::{router, router_with_ui_routes};
 use orchion_server::state::AppState;
 use serde_json::Value;
@@ -370,6 +372,45 @@ async fn models_endpoint_exposes_layout_as_primary_deployment_capabilities() {
             "ocr_html"
         ]
     );
+}
+
+#[tokio::test]
+async fn models_endpoint_does_not_expose_unloaded_table_structure() {
+    let state = test_state_with_ocr_services_config(None, |config| {
+        config.services.ocr.models[0] = config.services.ocr.models[0]
+            .clone()
+            .with_supported_layout();
+        config.services.ocr.models[0].table_structure = Some(TableStructureConfig {
+            model: ModelUrl::parse("//Acme/Table/table.onnx").unwrap(),
+            dictionary: ModelUrl::parse("//Acme/Table/table_dict.txt").unwrap(),
+            table_type: TableStructureType::Wired,
+            score_threshold: 0.5,
+            max_structure_length: 500,
+        });
+    });
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = json_body(response).await;
+    assert_eq!(model_ids(&body).len(), 2);
+    assert_eq!(
+        model_capabilities(&body, "PaddlePaddle/PP-OCRv6_tiny"),
+        vec!["ocr_text", "ocr_layout", "ocr_markdown"]
+    );
+    let model = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["id"] == "PaddlePaddle/PP-OCRv6_tiny")
+        .unwrap();
+    assert!(model.get("table_structure").is_none());
+    assert!(model.get("artifacts").is_none());
 }
 
 #[tokio::test]

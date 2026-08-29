@@ -17,10 +17,10 @@ where
     S: ServerApplication,
 {
     authorize(state.as_ref(), &headers)?;
-    let policy = state.api_policy();
-    let data = policy
-        .models
-        .iter()
+    let data = state
+        .model_catalog()
+        .await
+        .into_iter()
         .map(|model| {
             let model_type = match model.service {
                 ModelService::Asr => ModelType::Asr,
@@ -29,7 +29,7 @@ where
             };
             ModelObject::new(
                 model.id.to_string(),
-                model.name.clone(),
+                model.name,
                 model_type,
                 model.capabilities,
             )

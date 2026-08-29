@@ -4,6 +4,7 @@ use orchion::{
 };
 use serde::Deserialize;
 use std::collections::HashSet;
+use std::hash::Hash;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -280,12 +281,60 @@ impl ModelDeployment<TtsModel> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TableStructureType {
+    Wired,
+    Wireless,
+}
+
+impl TableStructureType {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Wired => "wired",
+            Self::Wireless => "wireless",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TableStructureConfig {
+    pub model: ModelUrl,
+    pub dictionary: ModelUrl,
+    pub table_type: TableStructureType,
+    pub score_threshold: f32,
+    pub max_structure_length: usize,
+}
+
+impl PartialEq for TableStructureConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.model == other.model
+            && self.dictionary == other.dictionary
+            && self.table_type == other.table_type
+            && self.score_threshold.to_bits() == other.score_threshold.to_bits()
+            && self.max_structure_length == other.max_structure_length
+    }
+}
+
+impl Eq for TableStructureConfig {}
+
+impl std::hash::Hash for TableStructureConfig {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.model.hash(state);
+        self.dictionary.hash(state);
+        self.table_type.hash(state);
+        self.score_threshold.to_bits().hash(state);
+        self.max_structure_length.hash(state);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OcrModelDeployment {
     pub id: ModelId,
     pub name: Option<String>,
     pub model: ModelUrl,
     pub layout_model: Option<ModelUrl>,
+    pub table_structure: Option<TableStructureConfig>,
     pub runtime: OcrModel,
     pub layout_runtime: Option<OcrModel>,
 }
@@ -306,6 +355,7 @@ impl OcrModelDeployment {
             name: None,
             model,
             layout_model: None,
+            table_structure: None,
             runtime,
             layout_runtime: None,
         }
@@ -490,6 +540,30 @@ pub enum ConfigError {
         section: &'static str,
         value: String,
     },
+    #[error(
+        "invalid {section}.models.table_structure.table_type `{value}`; expected wired or wireless"
+    )]
+    InvalidTableStructureType {
+        section: &'static str,
+        value: String,
+    },
+    #[error(
+        "invalid {section}.models.table_structure.score_threshold `{value}`: expected a finite value in [0, 1]"
+    )]
+    InvalidTableStructureThreshold {
+        section: &'static str,
+        value: String,
+    },
+    #[error(
+        "invalid {section}.models.table_structure.max_structure_length `0`: value must be greater than zero"
+    )]
+    InvalidTableStructureLength { section: &'static str },
+    #[error("invalid {section}.models table_structure: layout_model must also be configured")]
+    TableStructureRequiresLayout { section: &'static str },
+    #[error(
+        "invalid {section}.models table_structure: only traditional OCR deployments support table structure recognition"
+    )]
+    UnsupportedTableStructurePipeline { section: &'static str },
     #[error("invalid {section}.models model locator `{value}`: {message}")]
     UnsupportedModelLocator {
         section: &'static str,
@@ -1169,6 +1243,10 @@ fn parse_ocr_deployment(
         .as_ref()
         .map(|url| resolve_layout_recipe(section, url))
         .transpose()?;
+    let table_structure = raw
+        .table_structure
+        .map(|table| parse_table_structure(section, table))
+        .transpose()?;
     Ok(OcrModelDeployment {
         runtime: OcrModel::new(id.clone(), kind),
         layout_runtime,
@@ -1176,7 +1254,49 @@ fn parse_ocr_deployment(
         id,
         model: raw.model,
         layout_model: raw.layout_model,
+        table_structure,
     })
+}
+
+fn parse_table_structure(
+    section: &'static str,
+    raw: RawTableStructure,
+) -> Result<TableStructureConfig, ConfigError> {
+    let table_type = match raw.table_type.as_str() {
+        "wired" => TableStructureType::Wired,
+        "wireless" => TableStructureType::Wireless,
+        _ => {
+            return Err(ConfigError::InvalidTableStructureType {
+                section,
+                value: raw.table_type,
+            });
+        }
+    };
+    let table = TableStructureConfig {
+        model: raw.model,
+        dictionary: raw.dictionary,
+        table_type,
+        score_threshold: raw.score_threshold.unwrap_or(0.5),
+        max_structure_length: raw.max_structure_length.unwrap_or(500),
+    };
+    validate_table_structure_config(section, &table)?;
+    Ok(table)
+}
+
+fn validate_table_structure_config(
+    section: &'static str,
+    table: &TableStructureConfig,
+) -> Result<(), ConfigError> {
+    if !table.score_threshold.is_finite() || !(0.0..=1.0).contains(&table.score_threshold) {
+        return Err(ConfigError::InvalidTableStructureThreshold {
+            section,
+            value: table.score_threshold.to_string(),
+        });
+    }
+    if table.max_structure_length == 0 {
+        return Err(ConfigError::InvalidTableStructureLength { section });
+    }
+    Ok(())
 }
 
 fn resolve_layout_recipe(section: &'static str, url: &ModelUrl) -> Result<OcrModel, ConfigError> {
@@ -1369,6 +1489,24 @@ fn validate_ocr_deployments(
             });
         }
         validate_ocr_model_locator(section, deployment, kind)?;
+        if let Some(table) = &deployment.table_structure {
+            if kind != OcrModelKind::TraditionalOcr {
+                return Err(ConfigError::UnsupportedTableStructurePipeline { section });
+            }
+            if deployment.layout_model.is_none() {
+                return Err(ConfigError::TableStructureRequiresLayout { section });
+            }
+            validate_table_structure_config(section, table)?;
+            for url in [&table.model, &table.dictionary] {
+                if url.source() != orchion::ModelUrlSource::File && url.path().is_none() {
+                    return Err(ConfigError::UnsupportedModelLocator {
+                        section,
+                        value: url.to_string(),
+                        message: "table structure artifacts must use exact-file locators",
+                    });
+                }
+            }
+        }
         match (&deployment.layout_model, &deployment.layout_runtime) {
             (Some(url), Some(runtime)) if runtime.known() == Some(KnownOcrModel::PpDocLayoutV3) => {
                 resolve_layout_recipe(section, url)?;
@@ -1842,6 +1980,17 @@ struct RawOcrModelDeployment {
     name: Option<String>,
     model: ModelUrl,
     layout_model: Option<ModelUrl>,
+    table_structure: Option<RawTableStructure>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTableStructure {
+    model: ModelUrl,
+    dictionary: ModelUrl,
+    table_type: String,
+    score_threshold: Option<f32>,
+    max_structure_length: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -66,6 +66,7 @@ pub enum ModelCapability {
     TtsVoiceDesign,
     OcrText,
     OcrLayout,
+    OcrTableStructure,
     OcrVisionLanguage,
     OcrMarkdown,
     OcrHtml,

@@ -1,24 +1,113 @@
-use orchion::{AsrModel, ModelSpec, OcrModel, TtsModel};
+use orchion::{
+    ArtifactRole, AsrModel, DeploymentArtifactPlan, DeploymentArtifactSource,
+    DeploymentPublication, DevicePreference, ModelCapabilities, ModelId, ModelSpec, Ocr, OcrEngine,
+    OcrEngineFuture, OcrLimits, OcrModel, OcrOptions, OcrResult, PublishedDeploymentArtifact,
+    TableStructureAssets, TtsModel,
+};
+use orchion_server::application::ServerApplication;
+use orchion_server::application::model_lifecycle::{
+    ModelLifecycleRuntime, ModelSelector, ModelService,
+};
 use orchion_server::config::ServerConfig;
 use orchion_server::model_cache::{
     ModelCache, ModelProvisionFuture, ModelProvisioner, ModelProvisioning,
 };
-use orchion_server::state::AppState;
+use orchion_server::routes::router;
+use orchion_server::state::{
+    AppState, AsrRuntimeFuture, ModelRuntimeFactory, OcrDeploymentFuture, OcrDeploymentProvisioner,
+    OcrRuntimeFuture, TtsRuntimeFuture,
+};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tower::ServiceExt;
 
 #[derive(Default)]
 struct FakeProvisioner {
     calls: Mutex<Vec<String>>,
     locators: Mutex<Vec<Option<String>>>,
     sources: Mutex<Vec<Vec<orchion::DownloadSource>>>,
+    deployment_plans: Mutex<Vec<DeploymentArtifactPlan>>,
     failures: Mutex<HashSet<String>>,
+    locator_failures: Mutex<HashSet<String>>,
     active: AtomicUsize,
     max_active: AtomicUsize,
     delay: Mutex<Option<Duration>>,
+}
+
+struct TestOcrEngine {
+    model: ModelId,
+}
+
+impl OcrEngine for TestOcrEngine {
+    fn model(&self) -> &ModelId {
+        &self.model
+    }
+
+    fn recognize_file_with_limits(
+        &self,
+        _path: PathBuf,
+        _options: OcrOptions,
+        _limits: OcrLimits,
+    ) -> OcrEngineFuture<'_, OcrResult> {
+        Box::pin(async {
+            Err(orchion::OrchionError::Inference {
+                message: "inference is not used by this test".to_string(),
+            })
+        })
+    }
+}
+
+struct SuccessfulOcrRuntimeFactory {
+    fail: bool,
+}
+
+impl ModelRuntimeFactory for SuccessfulOcrRuntimeFactory {
+    fn load_asr(
+        &self,
+        _model: AsrModel,
+        _path: PathBuf,
+        _device: DevicePreference,
+    ) -> AsrRuntimeFuture<'_> {
+        Box::pin(async { anyhow::bail!("ASR is not used by this test") })
+    }
+
+    fn load_tts(
+        &self,
+        _model: TtsModel,
+        _path: PathBuf,
+        _device: DevicePreference,
+    ) -> TtsRuntimeFuture<'_> {
+        Box::pin(async { anyhow::bail!("TTS is not used by this test") })
+    }
+
+    fn load_ocr(
+        &self,
+        model: OcrModel,
+        _model_dir: PathBuf,
+        _cache_root: PathBuf,
+        layout: Option<(OcrModel, PathBuf)>,
+        table: Option<TableStructureAssets>,
+        _device: DevicePreference,
+    ) -> OcrRuntimeFuture<'_> {
+        let fail = self.fail;
+        Box::pin(async move {
+            anyhow::ensure!(!fail, "injected OCR runtime probe failure");
+            let (_, layout_path) = layout.context("layout was not assembled")?;
+            anyhow::ensure!(layout_path.is_file(), "layout path was not published");
+            let table = table.context("table structure was not assembled")?;
+            anyhow::ensure!(table.model.is_file(), "table model path was not published");
+            anyhow::ensure!(
+                table.dictionary.is_file(),
+                "table dictionary path was not published"
+            );
+            Ok(Ocr::from_engine(Arc::new(TestOcrEngine {
+                model: model.id().clone(),
+            })))
+        })
+    }
 }
 
 impl FakeProvisioner {
@@ -36,6 +125,13 @@ impl FakeProvisioner {
         }
     }
 
+    fn failing_locator(locator: impl Into<String>) -> Self {
+        Self {
+            locator_failures: Mutex::new(HashSet::from([locator.into()])),
+            ..Self::default()
+        }
+    }
+
     fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
     }
@@ -48,6 +144,10 @@ impl FakeProvisioner {
         self.sources.lock().unwrap().clone()
     }
 
+    fn deployment_plans(&self) -> Vec<DeploymentArtifactPlan> {
+        self.deployment_plans.lock().unwrap().clone()
+    }
+
     fn provision<M: ModelSpec>(
         &self,
         model: M,
@@ -55,18 +155,20 @@ impl FakeProvisioner {
         models_dir: PathBuf,
     ) -> ModelProvisionFuture<'_> {
         let id = model.huggingface_repo().to_string();
+        let locator = provisioning
+            .as_ref()
+            .map(|provisioning| provisioning.model_url.to_string());
         self.calls.lock().unwrap().push(id.clone());
-        self.locators.lock().unwrap().push(
-            provisioning
-                .as_ref()
-                .map(|provisioning| provisioning.model_url.to_string()),
-        );
+        self.locators.lock().unwrap().push(locator.clone());
         self.sources.lock().unwrap().push(
             provisioning
                 .and_then(|provisioning| provisioning.source_plan)
                 .map_or_else(Vec::new, |plan| plan.candidates),
         );
-        let should_fail = self.failures.lock().unwrap().contains(&id);
+        let should_fail = self.failures.lock().unwrap().contains(&id)
+            || locator
+                .as_ref()
+                .is_some_and(|locator| self.locator_failures.lock().unwrap().contains(locator));
         let delay = *self.delay.lock().unwrap();
         let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_active.fetch_max(active, Ordering::SeqCst);
@@ -84,6 +186,304 @@ impl FakeProvisioner {
             Ok(path)
         })
     }
+}
+
+#[tokio::test]
+async fn table_structure_uses_exact_model_and_dictionary_deployment_plan() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let config = ServerConfig::from_toml_str(
+        r#"
+[models]
+source = "modelscope"
+[services.ocr]
+enabled = true
+default_model = "PaddlePaddle/PP-OCRv6_tiny"
+[[services.ocr.models]]
+id = "PaddlePaddle/PP-OCRv6_tiny"
+model = "//PaddlePaddle/PP-OCRv6_tiny"
+layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
+table_structure = { model = "//Acme/Table/table.onnx", dictionary = "//Acme/Table/table_dict.txt", table_type = "wireless" }
+"#,
+        &temp_dir.path().join("orchion-server"),
+    )
+    .unwrap();
+    let provisioner = Arc::new(FakeProvisioner::default());
+
+    AppState::load_with_provisioner(config, Arc::clone(&provisioner))
+        .await
+        .unwrap();
+
+    let plans = provisioner.deployment_plans();
+    let plan = &plans[0];
+    assert!(plan.artifacts.iter().any(|artifact| {
+        artifact.role == ArtifactRole::OcrTableStructureModel
+            && artifact.repository.as_deref() == Some("Acme/Table")
+            && artifact.files == ["table.onnx".to_string()]
+    }));
+    assert!(plan.artifacts.iter().any(|artifact| {
+        artifact.role == ArtifactRole::OcrTableStructureDictionary
+            && artifact.repository.as_deref() == Some("Acme/Table")
+            && artifact.files == ["table_dict.txt".to_string()]
+    }));
+    assert!(
+        plan.artifacts
+            .iter()
+            .all(|artifact| !artifact.files.is_empty())
+    );
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "covers capability absence, failed probe, successful load, HTTP publication, and unload"
+)]
+async fn table_capability_appears_only_after_successful_runtime_load() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let config = ServerConfig::from_toml_str(
+        r#"
+[services.asr]
+enabled = false
+[services.tts]
+enabled = false
+[services.ocr]
+enabled = true
+default_model = "PaddlePaddle/PP-OCRv6_tiny"
+[[services.ocr.models]]
+id = "PaddlePaddle/PP-OCRv6_tiny"
+model = "//PaddlePaddle/PP-OCRv6_tiny"
+layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
+table_structure = { model = "//Acme/Table/table.onnx", dictionary = "//Acme/Table/table_dict.txt", table_type = "wired" }
+"#,
+        &temp_dir.path().join("orchion-server"),
+    )
+    .unwrap();
+    let primary = OcrModel::new(
+        ModelId::parse("PaddlePaddle/PP-OCRv6_tiny").unwrap(),
+        orchion::OcrModelKind::TraditionalOcr,
+    );
+    let layout = OcrModel::new(
+        ModelId::parse("PaddlePaddle/PP-DocLayoutV3").unwrap(),
+        orchion::OcrModelKind::Layout,
+    );
+    let failed_state = AppState::load_with_components(
+        config.clone(),
+        Arc::new(FakeProvisioner::default()),
+        Arc::new(SuccessfulOcrRuntimeFactory { fail: true }),
+    )
+    .await
+    .unwrap();
+    assert!(
+        failed_state
+            .ocr(primary.clone(), Some(layout.clone()))
+            .await
+            .is_err()
+    );
+    assert!(
+        !failed_state.model_catalog().await[0]
+            .capabilities
+            .contains(ModelCapabilities::OCR_TABLE_STRUCTURE)
+    );
+    let state = AppState::load_with_components(
+        config,
+        Arc::new(FakeProvisioner::default()),
+        Arc::new(SuccessfulOcrRuntimeFactory { fail: false }),
+    )
+    .await
+    .unwrap();
+
+    let before = state.model_catalog().await;
+    assert_eq!(before.len(), 1);
+    assert!(
+        !before[0]
+            .capabilities
+            .contains(ModelCapabilities::OCR_TABLE_STRUCTURE)
+    );
+
+    let lease = state.ocr(primary, Some(layout)).await.unwrap().unwrap();
+
+    let after = state.model_catalog().await;
+    assert_eq!(after.len(), 1);
+    assert!(
+        after[0]
+            .capabilities
+            .contains(ModelCapabilities::OCR_TABLE_STRUCTURE)
+    );
+    let response = router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["data"].as_array().unwrap().len(), 1);
+    assert!(
+        body["data"][0]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|capability| capability == "ocr_table_structure")
+    );
+    assert!(body["data"][0].get("artifacts").is_none());
+    drop(lease);
+    state
+        .unload_model(ModelSelector {
+            model: "PaddlePaddle/PP-OCRv6_tiny".to_string(),
+            service: ModelService::Ocr,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !state.model_catalog().await[0]
+            .capabilities
+            .contains(ModelCapabilities::OCR_TABLE_STRUCTURE)
+    );
+}
+
+#[tokio::test]
+async fn explicit_table_artifact_failure_blocks_the_default_deployment() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let dictionary = "ms://Acme/Table/table_dict.txt";
+    let config = ServerConfig::from_toml_str(
+        &format!(
+            r#"
+[services.ocr]
+enabled = true
+default_model = "PaddlePaddle/PP-OCRv6_tiny"
+[[services.ocr.models]]
+id = "PaddlePaddle/PP-OCRv6_tiny"
+model = "hf://PaddlePaddle/PP-OCRv6_tiny"
+layout_model = "hf://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
+table_structure = {{ model = "hf://Acme/Table/table.onnx", dictionary = "{dictionary}", table_type = "wired" }}
+"#
+        ),
+        &temp_dir.path().join("orchion-server"),
+    )
+    .unwrap();
+    let provisioner = Arc::new(FakeProvisioner::failing_locator(dictionary));
+
+    let Err(error) = AppState::load_with_provisioner(config, Arc::clone(&provisioner)).await else {
+        panic!("table dictionary failure should block the deployment");
+    };
+    assert!(format!("{error:#}").contains("injected download failure"));
+    assert_eq!(provisioner.deployment_plans().len(), 1);
+}
+
+#[tokio::test]
+async fn explicit_table_artifacts_preserve_intentional_mixed_providers() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let config = ServerConfig::from_toml_str(
+        r#"
+[services.ocr]
+enabled = true
+default_model = "PaddlePaddle/PP-OCRv6_tiny"
+[[services.ocr.models]]
+id = "PaddlePaddle/PP-OCRv6_tiny"
+model = "hf://PaddlePaddle/PP-OCRv6_tiny"
+layout_model = "ms://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
+table_structure = { model = "hf://Acme/Table/table.onnx", dictionary = "ms://Acme/Table/table_dict.txt", table_type = "wireless" }
+"#,
+        &temp_dir.path().join("orchion-server"),
+    )
+    .unwrap();
+    let provisioner = Arc::new(FakeProvisioner::default());
+    AppState::load_with_provisioner(config, Arc::clone(&provisioner))
+        .await
+        .unwrap();
+    let plans = provisioner.deployment_plans();
+    let plan = &plans[0];
+    assert!(plan.artifacts.iter().any(|artifact| {
+        artifact.role == ArtifactRole::OcrTableStructureModel
+            && artifact.source == DeploymentArtifactSource::HuggingFace
+    }));
+    assert!(plan.artifacts.iter().any(|artifact| {
+        artifact.role == ArtifactRole::OcrTableStructureDictionary
+            && artifact.source == DeploymentArtifactSource::ModelScope
+    }));
+}
+
+#[tokio::test]
+async fn prepared_load_rejects_missing_deployment_publication() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let layout = temp_dir.path().join("layout.onnx");
+    let dictionary = temp_dir.path().join("table_dict.txt");
+    std::fs::write(&layout, b"layout").unwrap();
+    std::fs::write(&dictionary, b"dictionary").unwrap();
+    let config = ServerConfig::from_toml_str(
+        &format!(
+            r#"
+[services.ocr]
+enabled = true
+default_model = "PaddlePaddle/PP-OCRv6_tiny"
+[[services.ocr.models]]
+id = "PaddlePaddle/PP-OCRv6_tiny"
+model = "//PaddlePaddle/PP-OCRv6_tiny"
+layout_model = "file://{}"
+table_structure = {{ model = "file://{}", dictionary = "file://{}", table_type = "wired" }}
+"#,
+            layout.display(),
+            temp_dir.path().join("missing-table.onnx").display(),
+            dictionary.display(),
+        ),
+        &temp_dir.path().join("orchion-server"),
+    )
+    .unwrap();
+
+    let state = AppState::from_prepared_config(config).unwrap();
+    let model = OcrModel::new(
+        orchion::ModelId::parse("PaddlePaddle/PP-OCRv6_tiny").unwrap(),
+        orchion::OcrModelKind::TraditionalOcr,
+    );
+    let layout = OcrModel::new(
+        orchion::ModelId::parse("PaddlePaddle/PP-DocLayoutV3").unwrap(),
+        orchion::OcrModelKind::Layout,
+    );
+    let Err(error) = state.ocr(model, Some(layout)).await else {
+        panic!("incomplete prepared deployment should fail to load");
+    };
+    assert!(format!("{error:#}").contains("orchion-deployment.json"));
+}
+
+#[tokio::test]
+async fn table_structure_config_changes_source_intent() {
+    async fn intent_for(table_model: &str, extra: &str) -> String {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let document = format!(
+            r#"
+[models]
+source = "modelscope"
+[services.ocr]
+enabled = true
+default_model = "PaddlePaddle/PP-OCRv6_tiny"
+[[services.ocr.models]]
+id = "PaddlePaddle/PP-OCRv6_tiny"
+model = "//PaddlePaddle/PP-OCRv6_tiny"
+layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
+table_structure = {{ model = "//Acme/Table/{table_model}", dictionary = "//Acme/Table/table_dict.txt", table_type = "wired"{extra} }}
+"#
+        );
+        let config =
+            ServerConfig::from_toml_str(&document, &temp_dir.path().join("orchion-server"))
+                .unwrap();
+        let provisioner = Arc::new(FakeProvisioner::default());
+        AppState::load_with_provisioner(config, Arc::clone(&provisioner))
+            .await
+            .unwrap();
+        provisioner.deployment_plans()[0].source_intent.clone()
+    }
+
+    assert_ne!(
+        intent_for("table.onnx", "").await,
+        intent_for("table.onnx", ", score_threshold = 0.8").await
+    );
+    assert_ne!(
+        intent_for("table.onnx", "").await,
+        intent_for("table-v2.onnx", "").await
+    );
 }
 
 impl ModelProvisioner<AsrModel> for FakeProvisioner {
@@ -116,6 +516,67 @@ impl ModelProvisioner<OcrModel> for FakeProvisioner {
         models_dir: PathBuf,
     ) -> ModelProvisionFuture<'_> {
         self.provision(model, provisioning, models_dir)
+    }
+}
+
+impl OcrDeploymentProvisioner for FakeProvisioner {
+    fn provision_deployment(
+        &self,
+        _primary: OcrModel,
+        plan: DeploymentArtifactPlan,
+        models_dir: PathBuf,
+    ) -> OcrDeploymentFuture<'_> {
+        self.deployment_plans.lock().unwrap().push(plan.clone());
+        let failed = plan.artifacts.iter().find_map(|artifact| {
+            let repository = artifact.repository.as_deref()?;
+            let source = match artifact.source {
+                DeploymentArtifactSource::Neutral => "//",
+                DeploymentArtifactSource::HuggingFace => "hf://",
+                DeploymentArtifactSource::ModelScope => "ms://",
+                DeploymentArtifactSource::File(_) => return None,
+            };
+            artifact.files.iter().find_map(|file| {
+                let locator = format!("{source}{repository}/{file}");
+                self.locator_failures
+                    .lock()
+                    .unwrap()
+                    .contains(&locator)
+                    .then_some(locator)
+            })
+        });
+        Box::pin(async move {
+            if let Some(locator) = failed {
+                anyhow::bail!("injected download failure for {locator}");
+            }
+            let root = models_dir.join("fake-ocr-deployment");
+            let mut published = Vec::new();
+            for (index, artifact) in plan.artifacts.into_iter().enumerate() {
+                let role = format!("{:?}", artifact.role);
+                let role_root = root.join(format!("{index}-{role}"));
+                let mut files = Vec::new();
+                for file in &artifact.files {
+                    let path = role_root.join(file);
+                    if let Some(parent) = path.parent() {
+                        tokio::fs::create_dir_all(parent).await?;
+                    }
+                    tokio::fs::write(&path, b"artifact").await?;
+                    files.push(path);
+                }
+                published.push(PublishedDeploymentArtifact {
+                    role: artifact.role,
+                    source: match artifact.source {
+                        DeploymentArtifactSource::Neutral => DeploymentArtifactSource::ModelScope,
+                        source => source,
+                    },
+                    repository: artifact.repository,
+                    files,
+                    source_files: artifact.files,
+                    requested_revision: None,
+                    resolved_revision: None,
+                });
+            }
+            Ok(DeploymentPublication::from_artifacts(root, published))
+        })
     }
 }
 
@@ -475,3 +936,7 @@ layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
         2
     );
 }
+use anyhow::Context;
+use axum::body::Body;
+use axum::http::Request;
+use http_body_util::BodyExt;

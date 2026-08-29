@@ -11,7 +11,7 @@ pub use provider::{
 use assets::{ModelHubAsset, ModelHubAssetKind, uses_modelscope_file_assets};
 use orchion_core::{
     DownloadFailure, DownloadRetryability, KnownOcrModel, ModelCategory, ModelId, ModelSpec,
-    ModelUrl, ModelUrlSource, OrchionError, Result,
+    ModelUrl, ModelUrlSource, OcrModelAssetRole, OrchionError, Result,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -27,6 +27,8 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 const READY_MANIFEST_FILE: &str = ".orchion-ready.json";
 const READY_MANIFEST_SCHEMA_VERSION: u64 = 3;
 const READY_MANIFEST_LAYOUT: &str = "model-hub-native";
+const DEPLOYMENT_MANIFEST_FILE: &str = "orchion-deployment.json";
+const DEPLOYMENT_MANIFEST_SCHEMA_VERSION: u64 = 1;
 const CACHE_STATE_DIR: &str = ".orchion";
 const DOWNLOAD_STAGING_DIR: &str = "staging";
 const MODEL_LOCK_DIR: &str = "locks";
@@ -76,6 +78,22 @@ struct RepositoryRequest {
 struct RepositoryDownload {
     request: RepositoryRequest,
     resolved_revision: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedDeploymentArtifact {
+    role: ArtifactRole,
+    source: DeploymentArtifactSource,
+    repository: Option<String>,
+    files: Vec<String>,
+    resolved_revision: Option<String>,
+}
+
+struct ResolvedDeploymentGroup<'a> {
+    repository: String,
+    files: Vec<String>,
+    artifacts: Vec<&'a ResolvedDeploymentArtifact>,
+    resolved_revision: String,
 }
 
 impl ResolvedSource {
@@ -178,9 +196,110 @@ pub struct DeploymentSourcePlan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactRequest {
+    pub role: ArtifactRole,
     pub repository: String,
     pub files: Option<Vec<String>>,
     pub required_source: Option<DownloadSource>,
+    pub resolved_revision: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactRole {
+    Model,
+    OcrDetector,
+    OcrRecognizer,
+    OcrDictionary,
+    OcrLayout,
+    OcrTableStructureModel,
+    OcrTableStructureDictionary,
+}
+
+impl ArtifactRole {
+    const fn path_segment(self) -> &'static str {
+        match self {
+            Self::Model => "primary",
+            Self::OcrDetector => "ocr-detector",
+            Self::OcrRecognizer => "ocr-recognizer",
+            Self::OcrDictionary => "ocr-dictionary",
+            Self::OcrLayout => "layout",
+            Self::OcrTableStructureModel => "table-structure-model",
+            Self::OcrTableStructureDictionary => "table-structure-dictionary",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeploymentArtifactSource {
+    Neutral,
+    HuggingFace,
+    ModelScope,
+    File(PathBuf),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentArtifactRequest {
+    pub role: ArtifactRole,
+    pub source: DeploymentArtifactSource,
+    pub repository: Option<String>,
+    pub files: Vec<String>,
+    pub required_source: Option<DownloadSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentArtifactPlan {
+    pub deployment_id: ModelId,
+    pub category: ModelCategory,
+    pub source_intent: String,
+    pub artifacts: Vec<DeploymentArtifactRequest>,
+    pub neutral_candidates: Vec<DownloadSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedDeploymentArtifact {
+    pub role: ArtifactRole,
+    pub source: DeploymentArtifactSource,
+    pub repository: Option<String>,
+    pub files: Vec<PathBuf>,
+    pub source_files: Vec<String>,
+    pub requested_revision: Option<String>,
+    pub resolved_revision: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentPublication {
+    root: PathBuf,
+    artifacts: Vec<PublishedDeploymentArtifact>,
+}
+
+impl DeploymentPublication {
+    #[must_use]
+    pub fn from_artifacts(root: PathBuf, artifacts: Vec<PublishedDeploymentArtifact>) -> Self {
+        Self { root, artifacts }
+    }
+
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    #[must_use]
+    pub fn role_root(&self, role: ArtifactRole) -> PathBuf {
+        self.root.join(role.path_segment())
+    }
+
+    #[must_use]
+    pub fn artifact_file(&self, role: ArtifactRole) -> Option<&Path> {
+        self.artifacts
+            .iter()
+            .find(|artifact| artifact.role == role)
+            .and_then(|artifact| artifact.files.first())
+            .map(PathBuf::as_path)
+    }
+
+    #[must_use]
+    pub fn artifacts(&self) -> &[PublishedDeploymentArtifact] {
+        &self.artifacts
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -224,6 +343,153 @@ impl Default for ModelDownloader {
 }
 
 impl ModelDownloader {
+    /// Provisions every artifact in one deployment and atomically publishes its manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the plan is invalid, provider resolution or download fails, a local
+    /// artifact is invalid, or the complete deployment cannot be atomically published.
+    pub async fn provision_deployment<M: ModelSpec>(
+        &self,
+        primary: M,
+        plan: &DeploymentArtifactPlan,
+        cache_dir: impl AsRef<Path>,
+    ) -> Result<DeploymentPublication> {
+        self.provision_deployment_with_client(
+            primary,
+            plan,
+            cache_dir.as_ref(),
+            &LibraryDownloadClient,
+            &DownloadEnv::current(),
+        )
+        .await
+    }
+
+    /// Resolves a previously atomically published deployment without network access.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the expected deployment manifest is missing, does not match the
+    /// source intent and role plan, or references an invalid artifact file.
+    pub fn resolve_prepared_deployment<M: ModelSpec>(
+        primary: &M,
+        plan: &DeploymentArtifactPlan,
+        cache_dir: impl AsRef<Path>,
+    ) -> Result<DeploymentPublication> {
+        validate_deployment_plan(primary, plan)?;
+        let cache_dir = cache_dir.as_ref();
+        let relative = deployment_publication_relative_path(plan);
+        validate_cache_relative_ancestors_sync(cache_dir, Path::new(CACHE_STATE_DIR), true)
+            .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
+        let lock_relative = PathBuf::from(CACHE_STATE_DIR).join(MODEL_LOCK_DIR);
+        validate_cache_relative_ancestors_sync(cache_dir, &lock_relative, true)
+            .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
+        let lock_key = deployment_model_lock_key(plan);
+        let _model_lock = transaction::acquire_model_lock_sync(cache_dir, &lock_key)?;
+        validate_cache_relative_ancestors_sync(cache_dir, &lock_relative, true)
+            .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
+        if publication_transaction_targets_path_sync(cache_dir, &relative)
+            .map_err(|error| deployment_cache_error(plan, error.to_string()))?
+        {
+            let _publication_lock =
+                transaction::acquire_publication_lock_sync(cache_dir, &lock_key)?;
+            if publication_transaction_targets_path_sync(cache_dir, &relative)
+                .map_err(|error| deployment_cache_error(plan, error.to_string()))?
+            {
+                recover_interrupted_publication_sync(cache_dir)
+                    .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
+            }
+        }
+        validate_cache_relative_ancestors_sync(cache_dir, &relative, true)
+            .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
+        read_deployment_publication(&cache_dir.join(relative), plan, true)
+    }
+
+    async fn provision_deployment_with_client<M: ModelSpec, C: DownloadClient>(
+        &self,
+        primary: M,
+        plan: &DeploymentArtifactPlan,
+        cache_dir: &Path,
+        client: &C,
+        env: &DownloadEnv,
+    ) -> Result<DeploymentPublication> {
+        validate_deployment_plan(&primary, plan)?;
+        let target_relative = deployment_publication_relative_path(plan);
+        let target = cache_dir.join(&target_relative);
+        let lock_key = deployment_model_lock_key(plan);
+        ensure_cache_state_dir(cache_dir)
+            .await
+            .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
+        let model_lock = transaction::acquire_model_lock(cache_dir, &lock_key).await?;
+        let (model_lock, publication_clean) =
+            recover_with_owned_locks(cache_dir.to_path_buf(), lock_key.clone(), model_lock).await?;
+        if !publication_clean {
+            return Err(deployment_cache_error(
+                plan,
+                "a committed cache publication is awaiting cleanup",
+            ));
+        }
+        validate_cache_relative_ancestors(cache_dir, &target_relative, true)
+            .await
+            .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
+        if let Ok(publication) = read_deployment_publication(&target, plan, true) {
+            return Ok(publication);
+        }
+
+        let resolved = self.resolve_deployment_artifacts(plan, client, env).await?;
+        let staging_dir = cache_state_path(cache_dir, DOWNLOAD_STAGING_DIR);
+        validate_cache_relative_ancestors(
+            cache_dir,
+            &PathBuf::from(CACHE_STATE_DIR).join(DOWNLOAD_STAGING_DIR),
+            true,
+        )
+        .await
+        .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
+        ensure_download_staging_dir(&staging_dir)
+            .await
+            .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
+        let staging = tempfile::Builder::new()
+            .prefix(&transaction::model_staging_prefix(&lock_key))
+            .tempdir_in(&staging_dir)
+            .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
+        let staged_root = staging.path().join(&target_relative);
+        tokio::fs::create_dir_all(&staged_root)
+            .await
+            .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
+
+        let published = self
+            .download_resolved_deployment_artifacts(
+                &primary,
+                plan,
+                &resolved,
+                &staged_root,
+                client,
+                env,
+            )
+            .await?;
+        write_deployment_manifest(&staged_root, plan, &published).await?;
+        read_deployment_publication(&staged_root, plan, true)?;
+        let (model_lock, publication) = publish_staged_relative_cache(
+            lock_key,
+            vec![target_relative],
+            staging,
+            cache_dir.to_path_buf(),
+            "deployment",
+            model_lock,
+        )
+        .await?;
+        drop(model_lock);
+        publication.map_err(|error| deployment_cache_error(plan, error.to_string()))?;
+        validate_cache_relative_ancestors(
+            cache_dir,
+            &deployment_publication_relative_path(plan),
+            true,
+        )
+        .await
+        .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
+        read_deployment_publication(&target, plan, true)
+    }
+
     /// Expands a configured locator into the repositories and exact files used by provisioning.
     ///
     /// Registered OCR recipes expand through their runtime asset registry. Repository packages
@@ -249,9 +515,11 @@ impl ModelDownloader {
         };
         let repository = format!("{owner}/{repository}");
         Ok(vec![ArtifactRequest {
+            role: ArtifactRole::Model,
             repository,
             files: model_url.path().map(|path| vec![path.to_string()]),
             required_source: None,
+            resolved_revision: None,
         }])
     }
     #[must_use]
@@ -637,9 +905,11 @@ impl ModelDownloader {
                         break;
                     }
                     Ok(result) => resolved_artifacts.push(ArtifactRequest {
+                        role: artifact.role,
                         repository: artifact.repository.clone(),
                         files: Some(result.files().to_vec()),
                         required_source: artifact.required_source,
+                        resolved_revision: result.resolved_revision().map(str::to_string),
                     }),
                     Err(error) => {
                         candidate_error = Some(error);
@@ -662,6 +932,308 @@ impl ModelDownloader {
             repo: plan.key.clone(),
             failures,
         })
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "resolves neutral and explicit deployment roles under one provider policy"
+    )]
+    async fn resolve_deployment_artifacts<C: DownloadClient>(
+        &self,
+        plan: &DeploymentArtifactPlan,
+        client: &C,
+        env: &DownloadEnv,
+    ) -> Result<Vec<ResolvedDeploymentArtifact>> {
+        let neutral_artifacts = plan
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.source == DeploymentArtifactSource::Neutral)
+            .collect::<Vec<_>>();
+        let neutral = group_deployment_preflight_requests(plan, &neutral_artifacts)?;
+        let mut resolved = Vec::with_capacity(plan.artifacts.len());
+        if !neutral.is_empty() {
+            let neutral_plan = DeploymentSourcePlan {
+                key: plan.source_intent.clone(),
+                artifacts: neutral,
+                candidates: plan.neutral_candidates.clone(),
+            };
+            let (source, artifacts) = self
+                .preflight_deployment_candidates(&neutral_plan, &[], client, env)
+                .await?;
+            let source = match source {
+                DownloadSource::HuggingFace => DeploymentArtifactSource::HuggingFace,
+                DownloadSource::ModelScope => DeploymentArtifactSource::ModelScope,
+                DownloadSource::Auto => unreachable!("preflight resolves a concrete provider"),
+            };
+            for request in neutral_artifacts {
+                let repository = request
+                    .repository
+                    .as_deref()
+                    .expect("validated neutral artifact has a repository");
+                let group = artifacts
+                    .iter()
+                    .find(|artifact| artifact.repository == repository)
+                    .expect("grouped preflight preserves every neutral repository");
+                let group_files = group
+                    .files
+                    .as_ref()
+                    .expect("preflight returns an exact nonempty file plan");
+                if request.files.iter().any(|file| !group_files.contains(file)) {
+                    return Err(deployment_cache_error(
+                        plan,
+                        format!("neutral preflight omitted `{repository}` role files"),
+                    ));
+                }
+                resolved.push(ResolvedDeploymentArtifact {
+                    role: request.role,
+                    source: source.clone(),
+                    repository: request.repository.clone(),
+                    files: request.files.clone(),
+                    resolved_revision: Some(require_preflight_immutable_revision(
+                        plan,
+                        repository,
+                        group.resolved_revision.as_deref(),
+                    )?),
+                });
+            }
+        }
+
+        for source in [DownloadSource::HuggingFace, DownloadSource::ModelScope] {
+            let source_kind = concrete_deployment_source(source);
+            let source_artifacts = plan
+                .artifacts
+                .iter()
+                .filter(|artifact| artifact.source == source_kind)
+                .collect::<Vec<_>>();
+            if source_artifacts.is_empty() {
+                continue;
+            }
+            if let Some(artifact) = source_artifacts.iter().find(|artifact| {
+                artifact
+                    .required_source
+                    .is_some_and(|required| required != source)
+            }) {
+                return Err(deployment_cache_error(
+                    plan,
+                    format!(
+                        "artifact `{}` requires {}",
+                        artifact.repository.as_deref().unwrap_or("local"),
+                        download_source_label(
+                            artifact.required_source.expect("checked required source")
+                        )
+                    ),
+                ));
+            }
+            let provider = self
+                .providers
+                .provider(download_source_label(source))
+                .ok_or_else(|| {
+                    deployment_cache_error(
+                        plan,
+                        format!("{} provider is unavailable", download_source_label(source)),
+                    )
+                })?;
+            let groups = group_deployment_preflight_requests(plan, &source_artifacts)?;
+            let mut revisions = HashMap::new();
+            for group in groups {
+                let files = group
+                    .files
+                    .as_ref()
+                    .expect("grouped preflight has exact files");
+                let file_refs = files.iter().map(String::as_str).collect::<Vec<_>>();
+                let preflight = client
+                    .preflight(
+                        provider.as_ref(),
+                        ProviderPreflightRequest::new(
+                            &group.repository,
+                            provider.default_revision(),
+                            Some(&file_refs),
+                        ),
+                    )
+                    .await?;
+                if preflight.files().is_empty()
+                    || files.iter().any(|file| !preflight.files().contains(file))
+                {
+                    return Err(deployment_cache_error(
+                        plan,
+                        format!(
+                            "provider returned an incomplete plan for `{}`",
+                            group.repository
+                        ),
+                    ));
+                }
+                revisions.insert(
+                    group.repository,
+                    require_preflight_immutable_revision(
+                        plan,
+                        "explicit provider repository",
+                        preflight.resolved_revision(),
+                    )?,
+                );
+            }
+            resolved.extend(source_artifacts.into_iter().map(|artifact| {
+                ResolvedDeploymentArtifact {
+                    role: artifact.role,
+                    source: artifact.source.clone(),
+                    repository: artifact.repository.clone(),
+                    files: artifact.files.clone(),
+                    resolved_revision: artifact
+                        .repository
+                        .as_ref()
+                        .and_then(|repository| revisions.get(repository))
+                        .cloned(),
+                }
+            }));
+        }
+        for artifact in plan
+            .artifacts
+            .iter()
+            .filter(|artifact| matches!(artifact.source, DeploymentArtifactSource::File(_)))
+        {
+            resolved.push(ResolvedDeploymentArtifact {
+                role: artifact.role,
+                source: artifact.source.clone(),
+                repository: None,
+                files: artifact.files.clone(),
+                resolved_revision: None,
+            });
+        }
+        Ok(resolved)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "downloads provider/repository groups once and materializes every deployment role"
+    )]
+    async fn download_resolved_deployment_artifacts<M: ModelSpec, C: DownloadClient>(
+        &self,
+        primary: &M,
+        plan: &DeploymentArtifactPlan,
+        resolved: &[ResolvedDeploymentArtifact],
+        staged_root: &Path,
+        client: &C,
+        env: &DownloadEnv,
+    ) -> Result<Vec<PublishedDeploymentArtifact>> {
+        let mut published = Vec::with_capacity(resolved.len());
+        for artifact in resolved
+            .iter()
+            .filter(|artifact| matches!(artifact.source, DeploymentArtifactSource::File(_)))
+        {
+            let DeploymentArtifactSource::File(source) = &artifact.source else {
+                unreachable!();
+            };
+            let target = staged_root
+                .join(artifact.role.path_segment())
+                .join("local")
+                .join(source.file_name().ok_or_else(|| {
+                    deployment_cache_error(plan, "local artifact has no file name")
+                })?);
+            copy_local_deployment_artifact(plan, source, &target).await?;
+            published.push(PublishedDeploymentArtifact {
+                role: artifact.role,
+                source: artifact.source.clone(),
+                repository: None,
+                files: vec![target],
+                source_files: artifact.files.clone(),
+                requested_revision: None,
+                resolved_revision: None,
+            });
+        }
+        for source in [DownloadSource::HuggingFace, DownloadSource::ModelScope] {
+            let source_kind = concrete_deployment_source(source);
+            let source_artifacts = resolved
+                .iter()
+                .filter(|artifact| artifact.source == source_kind)
+                .collect::<Vec<_>>();
+            if source_artifacts.is_empty() {
+                continue;
+            }
+            let provider = self
+                .providers
+                .provider(download_source_label(source))
+                .expect("resolved provider remains registered");
+            for group in group_resolved_deployment_artifacts(plan, &source_artifacts)? {
+                let download_root = staged_root
+                    .join(".downloads")
+                    .join(download_source_label(source));
+                let download_target = repo_cache_path(&download_root, &group.repository);
+                let file_refs = group.files.iter().map(String::as_str).collect::<Vec<_>>();
+                let requested_revision = group.resolved_revision.as_str();
+                let provider_repository =
+                    provider.repository(ProviderModel::for_repository(&group.repository));
+                let result = client
+                    .download(
+                        provider.as_ref(),
+                        &provider_repository,
+                        &download_root,
+                        &download_target,
+                        Some(&file_refs),
+                        requested_revision,
+                        env,
+                    )
+                    .await?;
+                let resolved_revision = result.resolved_revision().ok_or_else(|| {
+                    deployment_cache_error(
+                        plan,
+                        format!(
+                            "provider returned no immutable revision for `{}`",
+                            group.repository
+                        ),
+                    )
+                })?;
+                if resolved_revision != requested_revision {
+                    return Err(deployment_cache_error(
+                        plan,
+                        format!(
+                            "download resolved `{}` to `{resolved_revision}` instead of requested immutable revision `{requested_revision}`",
+                            group.repository
+                        ),
+                    ));
+                }
+                for artifact in group.artifacts {
+                    let role_target = repo_cache_path(
+                        &staged_root.join(artifact.role.path_segment()),
+                        &group.repository,
+                    );
+                    let mut files = Vec::with_capacity(artifact.files.len());
+                    for file in &artifact.files {
+                        let source_path = download_target.join(file);
+                        cache_file_size(&source_path).await.map_err(|error| {
+                            deployment_cache_error(
+                                plan,
+                                format!(
+                                    "invalid downloaded artifact `{}/{file}`: {error}",
+                                    group.repository
+                                ),
+                            )
+                        })?;
+                        let role_path = role_target.join(file);
+                        materialize_deployment_role_file(plan, &source_path, &role_path).await?;
+                        files.push(role_path);
+                    }
+                    published.push(PublishedDeploymentArtifact {
+                        role: artifact.role,
+                        source: artifact.source.clone(),
+                        repository: Some(group.repository.clone()),
+                        files,
+                        source_files: artifact.files.clone(),
+                        requested_revision: Some(requested_revision.to_string()),
+                        resolved_revision: Some(resolved_revision.to_string()),
+                    });
+                }
+            }
+        }
+        let downloads = staged_root.join(".downloads");
+        if path_exists(&downloads)
+            .await
+            .map_err(|error| deployment_cache_error(plan, error.to_string()))?
+        {
+            tokio::fs::remove_dir_all(downloads)
+                .await
+                .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
+        }
+        prepare_deployment_primary(primary, staged_root, plan).await?;
+        Ok(published)
     }
 
     /// Resolves the package path used by prepared and networked provisioning.
@@ -1434,6 +2006,726 @@ fn deployment_cache_root<M: ModelSpec>(
         .join(fingerprint)
 }
 
+#[cfg(test)]
+fn deployment_publication_path(plan: &DeploymentArtifactPlan, cache_dir: &Path) -> PathBuf {
+    cache_dir.join(deployment_publication_relative_path(plan))
+}
+
+fn deployment_publication_relative_path(plan: &DeploymentArtifactPlan) -> PathBuf {
+    let fingerprint = encode_hex(&Sha256::digest(plan.source_intent.as_bytes()));
+    plan.deployment_id
+        .as_str()
+        .split('/')
+        .fold(
+            PathBuf::from(CACHE_STATE_DIR)
+                .join("deployments")
+                .join(plan.category.cache_segment()),
+            |path, segment| path.join(segment),
+        )
+        .join(fingerprint)
+}
+
+fn deployment_model_lock_key(plan: &DeploymentArtifactPlan) -> String {
+    format!("deployment:{}:{}", plan.category, plan.deployment_id)
+}
+
+fn group_deployment_preflight_requests(
+    plan: &DeploymentArtifactPlan,
+    artifacts: &[&DeploymentArtifactRequest],
+) -> Result<Vec<ArtifactRequest>> {
+    let mut groups = Vec::<ArtifactRequest>::new();
+    for artifact in artifacts {
+        let repository = artifact
+            .repository
+            .as_deref()
+            .expect("validated remote deployment artifact has a repository");
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|group| group.repository == repository)
+        {
+            if let (Some(left), Some(right)) = (group.required_source, artifact.required_source)
+                && left != right
+            {
+                return Err(deployment_cache_error(
+                    plan,
+                    format!("repository `{repository}` has conflicting required providers"),
+                ));
+            }
+            group.required_source = group.required_source.or(artifact.required_source);
+            let files = group
+                .files
+                .as_mut()
+                .expect("deployment preflight groups always have exact files");
+            for file in &artifact.files {
+                if !files.contains(file) {
+                    files.push(file.clone());
+                }
+            }
+        } else {
+            groups.push(ArtifactRequest {
+                role: ArtifactRole::Model,
+                repository: repository.to_string(),
+                files: Some(artifact.files.clone()),
+                required_source: artifact.required_source,
+                resolved_revision: None,
+            });
+        }
+    }
+    Ok(groups)
+}
+
+fn group_resolved_deployment_artifacts<'a>(
+    plan: &DeploymentArtifactPlan,
+    artifacts: &[&'a ResolvedDeploymentArtifact],
+) -> Result<Vec<ResolvedDeploymentGroup<'a>>> {
+    let mut groups = Vec::<ResolvedDeploymentGroup<'a>>::new();
+    for artifact in artifacts {
+        let repository = artifact
+            .repository
+            .as_deref()
+            .expect("resolved remote deployment artifact has a repository");
+        let revision = require_preflight_immutable_revision(
+            plan,
+            repository,
+            artifact.resolved_revision.as_deref(),
+        )?;
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|group| group.repository == repository)
+        {
+            if group.resolved_revision != revision {
+                return Err(deployment_cache_error(
+                    plan,
+                    format!("repository `{repository}` preflight revisions are inconsistent"),
+                ));
+            }
+            for file in &artifact.files {
+                if !group.files.contains(file) {
+                    group.files.push(file.clone());
+                }
+            }
+            group.artifacts.push(artifact);
+        } else {
+            groups.push(ResolvedDeploymentGroup {
+                repository: repository.to_string(),
+                files: artifact.files.clone(),
+                artifacts: vec![artifact],
+                resolved_revision: revision,
+            });
+        }
+    }
+    Ok(groups)
+}
+
+const fn concrete_deployment_source(source: DownloadSource) -> DeploymentArtifactSource {
+    match source {
+        DownloadSource::HuggingFace => DeploymentArtifactSource::HuggingFace,
+        DownloadSource::ModelScope => DeploymentArtifactSource::ModelScope,
+        DownloadSource::Auto => panic!("deployment source must be concrete"),
+    }
+}
+
+fn validate_deployment_plan<M: ModelSpec>(
+    primary: &M,
+    plan: &DeploymentArtifactPlan,
+) -> Result<()> {
+    if plan.deployment_id.as_str() != primary.huggingface_repo()
+        || plan.category != primary.category()
+        || plan.source_intent.is_empty()
+        || plan.artifacts.is_empty()
+    {
+        return Err(deployment_cache_error(
+            plan,
+            "deployment identity, category, source intent, and artifact plan must be complete",
+        ));
+    }
+    let has_neutral = plan
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.source == DeploymentArtifactSource::Neutral);
+    if has_neutral
+        && (plan.neutral_candidates.is_empty()
+            || plan.neutral_candidates.contains(&DownloadSource::Auto))
+    {
+        return Err(deployment_cache_error(
+            plan,
+            "neutral deployment artifacts require concrete provider candidates",
+        ));
+    }
+    for (index, artifact) in plan.artifacts.iter().enumerate() {
+        if plan.artifacts[index + 1..]
+            .iter()
+            .any(|candidate| candidate.role == artifact.role)
+        {
+            return Err(deployment_cache_error(
+                plan,
+                "deployment artifact role plan contains a duplicate",
+            ));
+        }
+        if artifact.files.is_empty()
+            || artifact.files.iter().any(|file| {
+                let path = Path::new(file);
+                path.is_absolute()
+                    || !path
+                        .components()
+                        .all(|component| matches!(component, std::path::Component::Normal(_)))
+            })
+        {
+            return Err(deployment_cache_error(
+                plan,
+                "deployment artifacts require nonempty safe exact file lists",
+            ));
+        }
+        if artifact.required_source == Some(DownloadSource::Auto)
+            || matches!(artifact.source, DeploymentArtifactSource::File(_))
+                && artifact.required_source.is_some()
+        {
+            return Err(deployment_cache_error(
+                plan,
+                "deployment artifact has an invalid required provider",
+            ));
+        }
+        if let DeploymentArtifactSource::File(path) = &artifact.source {
+            if artifact.repository.is_some() || artifact.files.len() != 1 || !path.is_absolute() {
+                return Err(deployment_cache_error(
+                    plan,
+                    "local deployment artifacts require one absolute file and no repository",
+                ));
+            }
+        } else {
+            let Some(repository) = artifact.repository.as_deref() else {
+                return Err(deployment_cache_error(
+                    plan,
+                    "remote deployment artifact has no repository",
+                ));
+            };
+            validate_repo_id(repository)?;
+        }
+    }
+    Ok(())
+}
+
+fn deployment_cache_error(
+    plan: &DeploymentArtifactPlan,
+    message: impl Into<String>,
+) -> OrchionError {
+    OrchionError::Download {
+        source_name: "deployment",
+        repo: plan.deployment_id.to_string(),
+        message: message.into(),
+    }
+}
+
+fn require_preflight_immutable_revision(
+    plan: &DeploymentArtifactPlan,
+    repository: &str,
+    revision: Option<&str>,
+) -> Result<String> {
+    revision
+        .filter(|revision| provider::is_immutable_revision(revision))
+        .map(str::to_string)
+        .ok_or_else(|| {
+            deployment_cache_error(
+                plan,
+                format!("preflight did not resolve `{repository}` to an immutable revision"),
+            )
+        })
+}
+
+async fn copy_local_deployment_artifact(
+    plan: &DeploymentArtifactPlan,
+    source: &Path,
+    target: &Path,
+) -> Result<()> {
+    let metadata = tokio::fs::symlink_metadata(source)
+        .await
+        .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 {
+        return Err(deployment_cache_error(
+            plan,
+            format!(
+                "local artifact `{}` must be a nonempty regular file",
+                source.display()
+            ),
+        ));
+    }
+    if let Some(parent) = target.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
+    }
+    tokio::fs::copy(source, target)
+        .await
+        .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
+    Ok(())
+}
+
+async fn materialize_deployment_role_file(
+    plan: &DeploymentArtifactPlan,
+    source: &Path,
+    target: &Path,
+) -> Result<()> {
+    if let Some(parent) = target.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
+    }
+    match tokio::fs::hard_link(source, target).await {
+        Ok(()) => Ok(()),
+        Err(_) => tokio::fs::copy(source, target)
+            .await
+            .map(|_| ())
+            .map_err(|error| deployment_cache_error(plan, error.to_string())),
+    }
+}
+
+async fn prepare_deployment_primary<M: ModelSpec>(
+    primary: &M,
+    root: &Path,
+    plan: &DeploymentArtifactPlan,
+) -> Result<()> {
+    let primary_root = root.join(ArtifactRole::Model.path_segment());
+    let target = repo_cache_path(&primary_root, primary.huggingface_repo());
+    tokio::fs::create_dir_all(&target)
+        .await
+        .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
+    for asset in model_hub_assets(primary) {
+        let role_root = root.join(artifact_role_for_ocr_asset(asset.role).path_segment());
+        let source = repo_cache_path(&role_root, asset.repo).join(asset.file);
+        cache_file_size(&source).await.map_err(|error| {
+            deployment_cache_error(
+                plan,
+                format!(
+                    "primary artifact `{}/{}` is invalid: {error}",
+                    asset.repo, asset.file
+                ),
+            )
+        })?;
+        let consolidated = repo_cache_path(&primary_root, asset.repo).join(asset.file);
+        materialize_deployment_role_file(plan, &source, &consolidated).await?;
+        if let ModelHubAssetKind::PaddleOcrDictionary { output_file } = asset.kind {
+            let dictionary = build_paddle_ocr_dictionary("deployment", asset.repo, &source).await?;
+            tokio::fs::write(target.join(output_file), dictionary)
+                .await
+                .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+const fn artifact_role_for_ocr_asset(role: OcrModelAssetRole) -> ArtifactRole {
+    match role {
+        OcrModelAssetRole::Detector => ArtifactRole::OcrDetector,
+        OcrModelAssetRole::Recognizer => ArtifactRole::OcrRecognizer,
+        OcrModelAssetRole::Dictionary => ArtifactRole::OcrDictionary,
+        OcrModelAssetRole::Layout => ArtifactRole::OcrLayout,
+    }
+}
+
+async fn write_deployment_manifest(
+    root: &Path,
+    plan: &DeploymentArtifactPlan,
+    artifacts: &[PublishedDeploymentArtifact],
+) -> Result<()> {
+    let mut files = Vec::new();
+    collect_deployment_files(root, root, &mut files)
+        .await
+        .map_err(|error| {
+            deployment_cache_error(
+                plan,
+                format!("failed to enumerate deployment files: {error}"),
+            )
+        })?;
+    let mut file_entries = Vec::with_capacity(files.len());
+    for (relative, absolute) in files {
+        let (size, sha256) = cache_file_integrity(absolute)
+            .await
+            .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
+        file_entries.push(serde_json::json!({
+            "path": relative.to_string_lossy(),
+            "size": size,
+            "sha256": sha256,
+        }));
+    }
+    let artifact_entries = artifacts
+        .iter()
+        .map(|artifact| {
+            serde_json::json!({
+                "role": artifact_role_label(artifact.role),
+                "source": deployment_source_label(&artifact.source),
+                "repository": artifact.repository,
+                "source_files": artifact.source_files,
+                "files": artifact.files.iter().map(|path| {
+                    path.strip_prefix(root).expect("published artifact is under deployment root")
+                        .to_string_lossy().to_string()
+                }).collect::<Vec<_>>(),
+                "requested_revision": artifact.requested_revision,
+                "resolved_revision": artifact.resolved_revision,
+            })
+        })
+        .collect::<Vec<_>>();
+    let manifest = serde_json::json!({
+        "schema_version": DEPLOYMENT_MANIFEST_SCHEMA_VERSION,
+        "deployment_id": plan.deployment_id.as_str(),
+        "category": plan.category.cache_segment(),
+        "source_intent": plan.source_intent,
+        "artifacts": artifact_entries,
+        "files": file_entries,
+    });
+    write_synced_file(
+        &root.join(DEPLOYMENT_MANIFEST_FILE),
+        serde_json::to_vec(&manifest).map_err(|error| {
+            deployment_cache_error(
+                plan,
+                format!("failed to encode deployment manifest: {error}"),
+            )
+        })?,
+    )
+    .await
+    .map_err(|error| deployment_cache_error(plan, error.to_string()))
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "validates deployment identity, role mapping, and every manifest digest"
+)]
+fn read_deployment_publication(
+    root: &Path,
+    plan: &DeploymentArtifactPlan,
+    verify_integrity: bool,
+) -> Result<DeploymentPublication> {
+    validate_cache_root_sync(root)
+        .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
+    let manifest_path = root.join(DEPLOYMENT_MANIFEST_FILE);
+    let manifest_metadata = std::fs::symlink_metadata(&manifest_path).map_err(|error| {
+        deployment_cache_error(plan, format!("{}: {error}", manifest_path.display()))
+    })?;
+    if manifest_metadata.file_type().is_symlink() || !manifest_metadata.is_file() {
+        return Err(deployment_cache_error(
+            plan,
+            "deployment manifest is not a regular file",
+        ));
+    }
+    let manifest = std::fs::read_to_string(&manifest_path).map_err(|error| {
+        deployment_cache_error(plan, format!("{}: {error}", manifest_path.display()))
+    })?;
+    let manifest: serde_json::Value = serde_json::from_str(&manifest)
+        .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
+    if manifest["schema_version"].as_u64() != Some(DEPLOYMENT_MANIFEST_SCHEMA_VERSION)
+        || manifest["deployment_id"].as_str() != Some(plan.deployment_id.as_str())
+        || manifest["category"].as_str() != Some(plan.category.cache_segment())
+        || manifest["source_intent"].as_str() != Some(plan.source_intent.as_str())
+    {
+        return Err(deployment_cache_error(
+            plan,
+            "deployment manifest identity mismatch",
+        ));
+    }
+    let entries = manifest["artifacts"]
+        .as_array()
+        .ok_or_else(|| deployment_cache_error(plan, "deployment manifest has no artifacts"))?;
+    if entries.len() != plan.artifacts.len() {
+        return Err(deployment_cache_error(
+            plan,
+            "deployment artifact count mismatch",
+        ));
+    }
+    for (index, entry) in entries.iter().enumerate() {
+        let role = entry["role"].as_str().ok_or_else(|| {
+            deployment_cache_error(plan, "deployment manifest artifact role is invalid")
+        })?;
+        if entries[index + 1..]
+            .iter()
+            .any(|candidate| candidate["role"].as_str() == Some(role))
+        {
+            return Err(deployment_cache_error(
+                plan,
+                "deployment manifest contains a duplicate artifact role",
+            ));
+        }
+    }
+    let mut artifacts = Vec::with_capacity(entries.len());
+    for request in &plan.artifacts {
+        let entry = entries
+            .iter()
+            .find(|entry| {
+                entry["role"].as_str() == Some(artifact_role_label(request.role))
+                    && entry["repository"].as_str() == request.repository.as_deref()
+                    && entry["source_files"].as_array().is_some_and(|files| {
+                        files
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .eq(request.files.iter().map(String::as_str))
+                    })
+            })
+            .ok_or_else(|| deployment_cache_error(plan, "deployment artifact plan mismatch"))?;
+        let source_label = entry["source"]
+            .as_str()
+            .ok_or_else(|| deployment_cache_error(plan, "deployment artifact source is invalid"))?;
+        let source = resolved_manifest_source(request, source_label, plan)?;
+        let requested_revision = entry["requested_revision"].as_str().map(str::to_string);
+        let resolved_revision = entry["resolved_revision"].as_str().map(str::to_string);
+        if matches!(
+            source,
+            DeploymentArtifactSource::HuggingFace | DeploymentArtifactSource::ModelScope
+        ) && (requested_revision.as_deref().is_none_or(str::is_empty)
+            || resolved_revision
+                .as_deref()
+                .is_none_or(|revision| !provider::is_immutable_revision(revision)))
+        {
+            return Err(deployment_cache_error(
+                plan,
+                "hub deployment artifact has no immutable resolved revision",
+            ));
+        }
+        let files = entry["files"]
+            .as_array()
+            .ok_or_else(|| deployment_cache_error(plan, "deployment artifact files are invalid"))?
+            .iter()
+            .map(|file| {
+                let relative = safe_manifest_relative_path(
+                    file.as_str().ok_or_else(|| {
+                        deployment_cache_error(plan, "deployment artifact path is invalid")
+                    })?,
+                    plan,
+                )?;
+                validate_cache_relative_ancestors_sync(root, &relative, true)
+                    .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
+                Ok(root.join(relative))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let role_root = root.join(request.role.path_segment());
+        if files.is_empty() || files.iter().any(|path| !path.starts_with(&role_root)) {
+            return Err(deployment_cache_error(
+                plan,
+                "deployment artifact is outside its role root",
+            ));
+        }
+        artifacts.push(PublishedDeploymentArtifact {
+            role: request.role,
+            source,
+            repository: request.repository.clone(),
+            files,
+            source_files: request.files.clone(),
+            requested_revision,
+            resolved_revision,
+        });
+    }
+    for (index, artifact) in artifacts.iter().enumerate() {
+        if artifacts[index + 1..].iter().any(|candidate| {
+            candidate.source == artifact.source
+                && candidate.repository == artifact.repository
+                && (candidate.requested_revision != artifact.requested_revision
+                    || candidate.resolved_revision != artifact.resolved_revision)
+        }) {
+            return Err(deployment_cache_error(
+                plan,
+                "deployment roles in one provider repository have inconsistent revisions",
+            ));
+        }
+    }
+    let files = manifest["files"]
+        .as_array()
+        .ok_or_else(|| deployment_cache_error(plan, "deployment manifest file list is invalid"))?;
+    if files.is_empty() {
+        return Err(deployment_cache_error(
+            plan,
+            "deployment manifest file list is empty",
+        ));
+    }
+    let mut manifest_paths = Vec::with_capacity(files.len());
+    for file in files {
+        let relative = safe_manifest_relative_path(
+            file["path"].as_str().ok_or_else(|| {
+                deployment_cache_error(plan, "deployment manifest path is invalid")
+            })?,
+            plan,
+        )?;
+        validate_cache_relative_ancestors_sync(root, &relative, true)
+            .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
+        let path = root.join(relative);
+        manifest_paths.push(path.clone());
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 {
+            return Err(deployment_cache_error(
+                plan,
+                "deployment artifact is not a regular file",
+            ));
+        }
+        if verify_integrity {
+            let expected_size = file["size"].as_u64().ok_or_else(|| {
+                deployment_cache_error(plan, "deployment artifact size is invalid")
+            })?;
+            let expected_sha = file["sha256"].as_str().ok_or_else(|| {
+                deployment_cache_error(plan, "deployment artifact digest is invalid")
+            })?;
+            let (size, sha) = cache_file_integrity_sync(&path)
+                .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
+            if size != expected_size || sha != expected_sha {
+                return Err(deployment_cache_error(
+                    plan,
+                    "deployment artifact integrity mismatch",
+                ));
+            }
+        }
+    }
+    if artifacts.iter().any(|artifact| {
+        artifact
+            .files
+            .iter()
+            .any(|path| !manifest_paths.contains(path))
+    }) {
+        return Err(deployment_cache_error(
+            plan,
+            "deployment role artifact is not covered by the manifest digest list",
+        ));
+    }
+    Ok(DeploymentPublication {
+        root: root.to_path_buf(),
+        artifacts,
+    })
+}
+
+fn safe_manifest_relative_path(value: &str, plan: &DeploymentArtifactPlan) -> Result<PathBuf> {
+    let path = Path::new(value);
+    if path.is_absolute()
+        || !path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(deployment_cache_error(
+            plan,
+            "unsafe deployment manifest path",
+        ));
+    }
+    Ok(path.to_path_buf())
+}
+
+fn resolved_manifest_source(
+    request: &DeploymentArtifactRequest,
+    label: &str,
+    plan: &DeploymentArtifactPlan,
+) -> Result<DeploymentArtifactSource> {
+    let source = match label {
+        "huggingface" => DeploymentArtifactSource::HuggingFace,
+        "modelscope" => DeploymentArtifactSource::ModelScope,
+        "file" => request.source.clone(),
+        _ => {
+            return Err(deployment_cache_error(
+                plan,
+                "unknown deployment artifact source",
+            ));
+        }
+    };
+    let valid = match request.source {
+        DeploymentArtifactSource::Neutral => {
+            let actual = match &source {
+                DeploymentArtifactSource::HuggingFace => Some(DownloadSource::HuggingFace),
+                DeploymentArtifactSource::ModelScope => Some(DownloadSource::ModelScope),
+                _ => None,
+            };
+            actual.is_some_and(|actual| plan.neutral_candidates.contains(&actual))
+        }
+        _ => source == request.source,
+    };
+    if !valid {
+        return Err(deployment_cache_error(
+            plan,
+            "deployment artifact provider mismatch",
+        ));
+    }
+    if let Some(required) = request.required_source {
+        let actual = match &source {
+            DeploymentArtifactSource::HuggingFace => DownloadSource::HuggingFace,
+            DeploymentArtifactSource::ModelScope => DownloadSource::ModelScope,
+            _ => {
+                return Err(deployment_cache_error(
+                    plan,
+                    "deployment artifact does not satisfy its required provider",
+                ));
+            }
+        };
+        if actual != required {
+            return Err(deployment_cache_error(
+                plan,
+                "deployment artifact does not satisfy its required provider",
+            ));
+        }
+    }
+    Ok(source)
+}
+
+const fn artifact_role_label(role: ArtifactRole) -> &'static str {
+    match role {
+        ArtifactRole::Model => "model",
+        ArtifactRole::OcrDetector => "ocr_detector",
+        ArtifactRole::OcrRecognizer => "ocr_recognizer",
+        ArtifactRole::OcrDictionary => "ocr_dictionary",
+        ArtifactRole::OcrLayout => "ocr_layout",
+        ArtifactRole::OcrTableStructureModel => "ocr_table_structure_model",
+        ArtifactRole::OcrTableStructureDictionary => "ocr_table_structure_dictionary",
+    }
+}
+
+const fn deployment_source_label(source: &DeploymentArtifactSource) -> &'static str {
+    match source {
+        DeploymentArtifactSource::Neutral => "neutral",
+        DeploymentArtifactSource::HuggingFace => "huggingface",
+        DeploymentArtifactSource::ModelScope => "modelscope",
+        DeploymentArtifactSource::File(_) => "file",
+    }
+}
+
+fn cache_file_integrity_sync(path: &Path) -> std::io::Result<(u64, String)> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "expected a nonempty regular file",
+        ));
+    }
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok((metadata.len(), encode_hex(&hasher.finalize())))
+}
+
+fn collect_deployment_files<'a>(
+    root: &'a Path,
+    directory: &'a Path,
+    files: &'a mut Vec<(PathBuf, PathBuf)>,
+) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+        let mut entries = tokio::fs::read_dir(directory).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            let metadata = entry.metadata().await?;
+            if metadata.is_dir() {
+                collect_deployment_files(root, &path, files).await?;
+            } else if metadata.is_file()
+                && path.file_name().and_then(std::ffi::OsStr::to_str)
+                    != Some(DEPLOYMENT_MANIFEST_FILE)
+            {
+                files.push((
+                    path.strip_prefix(root)
+                        .map_err(std::io::Error::other)?
+                        .to_path_buf(),
+                    path,
+                ));
+            }
+        }
+        Ok(())
+    })
+}
+
 impl<M: ModelSpec> ModelSpec for LocatedRepositoryModel<M> {
     fn category(&self) -> ModelCategory {
         self.model.category()
@@ -1745,11 +3037,49 @@ async fn publish_staged_cache(
     })
 }
 
+async fn publish_staged_relative_cache(
+    model_key: String,
+    relative_paths: Vec<PathBuf>,
+    staging: tempfile::TempDir,
+    cache_dir: PathBuf,
+    source_name: &'static str,
+    model_lock: transaction::CacheLock,
+) -> Result<(transaction::CacheLock, Result<()>)> {
+    let task = tokio::spawn(async move {
+        let publication = async {
+            let _publication_lock =
+                transaction::acquire_publication_lock(&cache_dir, &model_key).await?;
+            publish_staged_relative_paths(staging.path(), &cache_dir, &relative_paths)
+                .await
+                .map_err(|error| OrchionError::Download {
+                    source_name,
+                    repo: model_key,
+                    message: error.to_string(),
+                })
+        }
+        .await;
+        (model_lock, publication)
+    });
+    task.await.map_err(|error| OrchionError::BlockingTask {
+        message: format!("cache publication task failed: {error}"),
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 async fn publish_staged_repositories(
     staging_root: &Path,
     cache_dir: &Path,
     repos: &[String],
+) -> std::io::Result<()> {
+    let relative_paths = repos.iter().map(PathBuf::from).collect::<Vec<_>>();
+    publish_staged_relative_paths(staging_root, cache_dir, &relative_paths).await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn publish_staged_relative_paths(
+    staging_root: &Path,
+    cache_dir: &Path,
+    relative_paths: &[PathBuf],
 ) -> std::io::Result<()> {
     if !recover_interrupted_publication(cache_dir).await? {
         return Err(std::io::Error::new(
@@ -1759,23 +3089,35 @@ async fn publish_staged_repositories(
     }
     let transaction_dir = cache_state_path(cache_dir, PUBLISH_TRANSACTION_DIR);
     tokio::fs::create_dir_all(&transaction_dir).await?;
+    validate_cache_relative_ancestors(
+        cache_dir,
+        &PathBuf::from(CACHE_STATE_DIR).join(PUBLISH_TRANSACTION_DIR),
+        true,
+    )
+    .await?;
 
-    let mut entries = Vec::with_capacity(repos.len());
-    for repo in repos {
-        if ModelId::parse(repo).is_err() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("invalid repository id in publication transaction: {repo}"),
-            ));
-        }
-        validate_repo_cache_ancestors(cache_dir, repo).await?;
-        let target = repo_cache_path(cache_dir, repo);
+    validate_cache_relative_ancestors(
+        cache_dir,
+        &PathBuf::from(CACHE_STATE_DIR).join(PUBLISH_TRANSACTION_DIR),
+        true,
+    )
+    .await?;
+    let mut entries = Vec::with_capacity(relative_paths.len());
+    for relative in relative_paths {
+        validate_safe_cache_relative_path(relative)?;
+        validate_cache_relative_ancestors(cache_dir, relative, true).await?;
+        validate_cache_relative_ancestors(staging_root, relative, true).await?;
+        let target = cache_dir.join(relative);
         let had_target = path_exists(&target).await?;
-        entries.push(serde_json::json!({"repo": repo, "had_target": had_target}));
+        entries.push(serde_json::json!({
+            "path": relative.to_string_lossy(),
+            "had_target": had_target
+        }));
     }
-    let manifest = serde_json::to_vec(&serde_json::json!({"repos": entries}))
+    let manifest = serde_json::to_vec(&serde_json::json!({"paths": entries}))
         .map_err(std::io::Error::other)?;
     let manifest_temp = transaction_dir.join("manifest.tmp");
+    ensure_path_absent(&manifest_temp).await?;
     write_synced_file(&manifest_temp, manifest).await?;
     tokio::fs::rename(
         &manifest_temp,
@@ -1786,17 +3128,20 @@ async fn publish_staged_repositories(
     sync_cache_state(cache_dir).await?;
 
     let publish_result = async {
-        for repo in repos {
-            let target = repo_cache_path(cache_dir, repo);
+        for relative in relative_paths {
+            validate_cache_relative_ancestors(cache_dir, relative, true).await?;
+            let target = cache_dir.join(relative);
             if path_exists(&target).await? {
-                let backup = repo_cache_path(&transaction_dir, repo);
+                let backup = transaction_dir.join(relative);
                 let parent = backup.parent().ok_or_else(|| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
                         "publication backup path has no parent",
                     )
                 })?;
+                validate_cache_relative_ancestors(&transaction_dir, relative, true).await?;
                 tokio::fs::create_dir_all(parent).await?;
+                validate_cache_relative_ancestors(cache_dir, relative, true).await?;
                 tokio::fs::rename(&target, &backup).await?;
                 sync_directory(parent).await?;
                 sync_directory(&transaction_dir).await?;
@@ -1806,9 +3151,11 @@ async fn publish_staged_repositories(
                 sync_directory(cache_dir).await?;
             }
         }
-        for repo in repos {
-            let staged = repo_cache_path(staging_root, repo);
-            let target = repo_cache_path(cache_dir, repo);
+        for relative in relative_paths {
+            validate_cache_relative_ancestors(staging_root, relative, true).await?;
+            validate_cache_relative_ancestors(cache_dir, relative, true).await?;
+            let staged = staging_root.join(relative);
+            let target = cache_dir.join(relative);
             let parent = target.parent().ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -1817,6 +3164,8 @@ async fn publish_staged_repositories(
             })?;
             tokio::fs::create_dir_all(parent).await?;
             let staged_parent = staged.parent().map(Path::to_path_buf);
+            validate_cache_relative_ancestors(staging_root, relative, true).await?;
+            validate_cache_relative_ancestors(cache_dir, relative, false).await?;
             tokio::fs::rename(staged, &target).await?;
             sync_directory(parent).await?;
             sync_directory(cache_dir).await?;
@@ -1825,6 +3174,7 @@ async fn publish_staged_repositories(
             }
         }
         let commit_temp = transaction_dir.join("committed.tmp");
+        ensure_path_absent(&commit_temp).await?;
         write_synced_file(&commit_temp, b"committed\n".to_vec()).await?;
         tokio::fs::rename(
             commit_temp,
@@ -1859,15 +3209,33 @@ async fn publish_staged_repositories(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "recovers both repository and deployment relative-path publication transactions"
+)]
 async fn recover_interrupted_publication(cache_dir: &Path) -> std::io::Result<bool> {
-    let transaction_dir = cache_state_path(cache_dir, PUBLISH_TRANSACTION_DIR);
+    let transaction_relative = PathBuf::from(CACHE_STATE_DIR).join(PUBLISH_TRANSACTION_DIR);
+    validate_cache_relative_ancestors(cache_dir, &transaction_relative, true).await?;
+    let transaction_dir = cache_dir.join(&transaction_relative);
     if !path_exists(&transaction_dir).await? {
         return Ok(true);
     }
-    if tokio::fs::read(transaction_dir.join(PUBLISH_TRANSACTION_COMMITTED))
-        .await
-        .is_ok_and(|marker| marker == b"committed\n")
-    {
+    let committed_path = transaction_dir.join(PUBLISH_TRANSACTION_COMMITTED);
+    let committed = match tokio::fs::symlink_metadata(&committed_path).await {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "publication commit marker is not a regular file",
+            ));
+        }
+        Ok(_) => tokio::fs::read(&committed_path)
+            .await
+            .is_ok_and(|marker| marker == b"committed\n"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    if committed {
+        validate_cache_relative_ancestors(cache_dir, &transaction_relative, true).await?;
         if let Err(error) = tokio::fs::remove_dir_all(&transaction_dir).await {
             tracing::warn!(
                 path = %transaction_dir.display(),
@@ -1881,8 +3249,14 @@ async fn recover_interrupted_publication(cache_dir: &Path) -> std::io::Result<bo
     }
 
     let manifest_path = transaction_dir.join(PUBLISH_TRANSACTION_MANIFEST);
-    let manifest = match tokio::fs::read(&manifest_path).await {
-        Ok(manifest) => manifest,
+    let manifest = match tokio::fs::symlink_metadata(&manifest_path).await {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "publication transaction manifest is not a regular file",
+            ));
+        }
+        Ok(_) => tokio::fs::read(&manifest_path).await?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             tokio::fs::remove_dir_all(transaction_dir).await?;
             sync_cache_state(cache_dir).await?;
@@ -1892,41 +3266,40 @@ async fn recover_interrupted_publication(cache_dir: &Path) -> std::io::Result<bo
     };
     let manifest: serde_json::Value = serde_json::from_slice(&manifest)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    let entries = manifest["repos"].as_array().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "publication transaction manifest has no repos",
-        )
-    })?;
-    for entry in entries {
-        let repo = entry["repo"].as_str().ok_or_else(|| {
+    let entries = manifest["paths"]
+        .as_array()
+        .or_else(|| manifest["repos"].as_array())
+        .ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "publication transaction repo is invalid",
+                "publication transaction manifest has no paths",
             )
         })?;
-        if ModelId::parse(repo).is_err()
-            || repo
-                .split('/')
-                .next()
-                .is_some_and(is_reserved_cache_namespace)
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("publication transaction repo is unsafe: {repo}"),
-            ));
-        }
+    for entry in entries {
+        let relative = entry["path"]
+            .as_str()
+            .or_else(|| entry["repo"].as_str())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "publication transaction path is invalid",
+                )
+            })?;
+        let relative = PathBuf::from(relative);
+        validate_safe_cache_relative_path(&relative)?;
         let had_target = entry["had_target"].as_bool().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "publication transaction target state is invalid",
             )
         })?;
-        validate_repo_cache_ancestors(cache_dir, repo).await?;
-        let target = repo_cache_path(cache_dir, repo);
-        let backup = repo_cache_path(&transaction_dir, repo);
+        validate_cache_relative_ancestors(cache_dir, &relative, true).await?;
+        validate_cache_relative_ancestors(&transaction_dir, &relative, true).await?;
+        let target = cache_dir.join(&relative);
+        let backup = transaction_dir.join(&relative);
         if had_target {
             if path_exists(&backup).await? {
+                validate_cache_relative_ancestors(cache_dir, &relative, true).await?;
                 remove_cache_entry(&target).await?;
                 let parent = target.parent().ok_or_else(|| {
                     std::io::Error::new(
@@ -1935,16 +3308,20 @@ async fn recover_interrupted_publication(cache_dir: &Path) -> std::io::Result<bo
                     )
                 })?;
                 tokio::fs::create_dir_all(parent).await?;
+                validate_cache_relative_ancestors(&transaction_dir, &relative, true).await?;
+                validate_cache_relative_ancestors(cache_dir, &relative, false).await?;
                 tokio::fs::rename(backup, &target).await?;
                 sync_directory(parent).await?;
             }
         } else {
+            validate_cache_relative_ancestors(cache_dir, &relative, true).await?;
             remove_cache_entry(&target).await?;
             if let Some(parent) = target.parent() {
                 sync_directory(parent).await?;
             }
         }
     }
+    validate_cache_relative_ancestors(cache_dir, &transaction_relative, true).await?;
     tokio::fs::remove_dir_all(transaction_dir).await?;
     sync_cache_state(cache_dir).await?;
     Ok(true)
@@ -1958,11 +3335,59 @@ async fn path_exists(path: &Path) -> std::io::Result<bool> {
     }
 }
 
+async fn ensure_path_absent(path: &Path) -> std::io::Result<()> {
+    match tokio::fs::symlink_metadata(path).await {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "transaction temporary path already exists: {}",
+                path.display()
+            ),
+        )),
+    }
+}
+
 async fn validate_repo_cache_ancestors(cache_dir: &Path, repo: &str) -> std::io::Result<()> {
-    let segments = repo.split('/').collect::<Vec<_>>();
+    validate_repo_id(repo).map_err(std::io::Error::other)?;
+    validate_cache_relative_ancestors(cache_dir, Path::new(repo), false).await
+}
+
+fn validate_safe_cache_relative_path(relative: &Path) -> std::io::Result<()> {
+    if relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || !relative
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "unsafe cache-relative publication path: {}",
+                relative.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+async fn validate_cache_relative_ancestors(
+    cache_dir: &Path,
+    relative: &Path,
+    include_leaf: bool,
+) -> std::io::Result<()> {
+    validate_safe_cache_relative_path(relative)?;
+    validate_cache_root(cache_dir).await?;
+    let components = relative.components().collect::<Vec<_>>();
     let mut path = cache_dir.to_path_buf();
-    for segment in segments.iter().take(segments.len().saturating_sub(1)) {
-        path.push(segment);
+    let count = if include_leaf {
+        components.len()
+    } else {
+        components.len().saturating_sub(1)
+    };
+    for (index, component) in components.into_iter().take(count).enumerate() {
+        path.push(component.as_os_str());
         match tokio::fs::symlink_metadata(&path).await {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err(std::io::Error::new(
@@ -1970,6 +3395,7 @@ async fn validate_repo_cache_ancestors(cache_dir: &Path, repo: &str) -> std::io:
                     format!("model cache ancestor is a symlink: {}", path.display()),
                 ));
             }
+            Ok(_) if include_leaf && index + 1 == count => {}
             Ok(metadata) if metadata.is_dir() => {}
             Ok(_) => {
                 return Err(std::io::Error::new(
@@ -1985,6 +3411,223 @@ async fn validate_repo_cache_ancestors(cache_dir: &Path, repo: &str) -> std::io:
         }
     }
     Ok(())
+}
+
+fn validate_cache_relative_ancestors_sync(
+    cache_dir: &Path,
+    relative: &Path,
+    include_leaf: bool,
+) -> std::io::Result<()> {
+    validate_safe_cache_relative_path(relative)?;
+    validate_cache_root_sync(cache_dir)?;
+    let components = relative.components().collect::<Vec<_>>();
+    let mut path = cache_dir.to_path_buf();
+    let count = if include_leaf {
+        components.len()
+    } else {
+        components.len().saturating_sub(1)
+    };
+    for (index, component) in components.into_iter().take(count).enumerate() {
+        path.push(component.as_os_str());
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("model cache ancestor is a symlink: {}", path.display()),
+                ));
+            }
+            Ok(_) if include_leaf && index + 1 == count => {}
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotADirectory,
+                    format!(
+                        "model cache ancestor is not a directory: {}",
+                        path.display()
+                    ),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+async fn validate_cache_root(cache_dir: &Path) -> std::io::Result<()> {
+    match tokio::fs::symlink_metadata(cache_dir).await {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(()),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "model cache root is not a regular directory: {}",
+                cache_dir.display()
+            ),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn validate_cache_root_sync(cache_dir: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(cache_dir) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(()),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "model cache root is not a regular directory: {}",
+                cache_dir.display()
+            ),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[derive(Debug)]
+struct PublicationTransactionEntry {
+    relative: PathBuf,
+    had_target: bool,
+}
+
+fn publication_transaction_targets_path_sync(
+    cache_dir: &Path,
+    target: &Path,
+) -> std::io::Result<bool> {
+    Ok(read_publication_transaction_entries_sync(cache_dir)?
+        .is_some_and(|entries| entries.iter().any(|entry| entry.relative == target)))
+}
+
+fn read_publication_transaction_entries_sync(
+    cache_dir: &Path,
+) -> std::io::Result<Option<Vec<PublicationTransactionEntry>>> {
+    let transaction_relative = PathBuf::from(CACHE_STATE_DIR).join(PUBLISH_TRANSACTION_DIR);
+    validate_cache_relative_ancestors_sync(cache_dir, &transaction_relative, true)?;
+    let transaction_dir = cache_dir.join(&transaction_relative);
+    if !transaction_dir.exists() {
+        return Ok(None);
+    }
+    let manifest_path = transaction_dir.join(PUBLISH_TRANSACTION_MANIFEST);
+    let metadata = match std::fs::symlink_metadata(&manifest_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Some(Vec::new())),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "publication transaction manifest is not a regular file",
+        ));
+    }
+    let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest_path)?)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let entries = manifest["paths"]
+        .as_array()
+        .or_else(|| manifest["repos"].as_array())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "publication transaction manifest has no paths",
+            )
+        })?;
+    entries
+        .iter()
+        .map(|entry| {
+            let relative = entry["path"]
+                .as_str()
+                .or_else(|| entry["repo"].as_str())
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "publication transaction path is invalid",
+                    )
+                })?;
+            let relative = PathBuf::from(relative);
+            validate_safe_cache_relative_path(&relative)?;
+            let had_target = entry["had_target"].as_bool().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "publication transaction target state is invalid",
+                )
+            })?;
+            Ok(PublicationTransactionEntry {
+                relative,
+                had_target,
+            })
+        })
+        .collect::<std::io::Result<Vec<_>>>()
+        .map(Some)
+}
+
+fn recover_interrupted_publication_sync(cache_dir: &Path) -> std::io::Result<bool> {
+    let transaction_relative = PathBuf::from(CACHE_STATE_DIR).join(PUBLISH_TRANSACTION_DIR);
+    validate_cache_relative_ancestors_sync(cache_dir, &transaction_relative, true)?;
+    let transaction_dir = cache_dir.join(&transaction_relative);
+    if !transaction_dir.exists() {
+        return Ok(true);
+    }
+    let committed_path = transaction_dir.join(PUBLISH_TRANSACTION_COMMITTED);
+    let committed = match std::fs::symlink_metadata(&committed_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "publication commit marker is not a regular file",
+            ));
+        }
+        Ok(_) => std::fs::read(&committed_path).is_ok_and(|marker| marker == b"committed\n"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    if committed {
+        validate_cache_relative_ancestors_sync(cache_dir, &transaction_relative, true)?;
+        std::fs::remove_dir_all(&transaction_dir)?;
+        sync_directory_sync(cache_dir.join(CACHE_STATE_DIR).as_path())?;
+        return Ok(true);
+    }
+    let entries = read_publication_transaction_entries_sync(cache_dir)?.unwrap_or_default();
+    for entry in entries {
+        validate_cache_relative_ancestors_sync(cache_dir, &entry.relative, true)?;
+        validate_cache_relative_ancestors_sync(&transaction_dir, &entry.relative, true)?;
+        let target = cache_dir.join(&entry.relative);
+        let backup = transaction_dir.join(&entry.relative);
+        if entry.had_target {
+            if backup.exists() {
+                remove_cache_entry_sync(&target)?;
+                let parent = target.parent().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "cache publication target has no parent",
+                    )
+                })?;
+                std::fs::create_dir_all(parent)?;
+                validate_cache_relative_ancestors_sync(&transaction_dir, &entry.relative, true)?;
+                validate_cache_relative_ancestors_sync(cache_dir, &entry.relative, false)?;
+                std::fs::rename(backup, &target)?;
+                sync_directory_sync(parent)?;
+            }
+        } else {
+            remove_cache_entry_sync(&target)?;
+        }
+    }
+    validate_cache_relative_ancestors_sync(cache_dir, &transaction_relative, true)?;
+    std::fs::remove_dir_all(&transaction_dir)?;
+    sync_directory_sync(cache_dir.join(CACHE_STATE_DIR).as_path())?;
+    Ok(true)
+}
+
+fn remove_cache_entry_sync(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            std::fs::remove_dir_all(path)
+        }
+        Ok(_) => std::fs::remove_file(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn sync_directory_sync(path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
 }
 
 async fn remove_cache_entry(path: &Path) -> std::io::Result<()> {
@@ -2038,8 +3681,13 @@ async fn ensure_download_staging_dir(staging_dir: &Path) -> std::io::Result<()> 
 }
 
 async fn ensure_cache_state_dir(cache_dir: &Path) -> std::io::Result<()> {
+    validate_cache_root(cache_dir).await?;
+    tokio::fs::create_dir_all(cache_dir).await?;
+    validate_cache_root(cache_dir).await?;
+    validate_cache_relative_ancestors(cache_dir, Path::new(CACHE_STATE_DIR), true).await?;
     let state_dir = cache_dir.join(CACHE_STATE_DIR);
     tokio::fs::create_dir_all(&state_dir).await?;
+    validate_cache_relative_ancestors(cache_dir, Path::new(CACHE_STATE_DIR), true).await?;
     validate_regular_directory(&state_dir, "model cache state").await
 }
 
@@ -2378,9 +4026,11 @@ fn artifact_requests_for_assets(assets: &[ModelHubAsset]) -> Vec<ArtifactRequest
             .position(|request| request.repository == asset.repo)
             .unwrap_or_else(|| {
                 requests.push(ArtifactRequest {
+                    role: ArtifactRole::Model,
                     repository: asset.repo.to_string(),
                     files: Some(Vec::new()),
                     required_source: None,
+                    resolved_revision: None,
                 });
                 requests.len() - 1
             });
@@ -2439,12 +4089,20 @@ async fn download_hub_assets<M: ModelSpec, C: DownloadClient>(
         let repo_target = repo_cache_path(cache_dir, &request.identity);
         let repo_files = artifact_requests
             .iter()
-            .find(|artifact| artifact.repository == request.identity)
-            .and_then(|artifact| artifact.files.as_ref())
-            .expect("repository requests and expanded artifact plan must agree")
-            .iter()
+            .filter(|artifact| artifact.repository == request.identity)
+            .flat_map(|artifact| {
+                artifact
+                    .files
+                    .as_ref()
+                    .expect("resolved artifact requests have exact files")
+            })
             .map(String::as_str)
-            .collect::<Vec<_>>();
+            .fold(Vec::new(), |mut files, file| {
+                if !files.contains(&file) {
+                    files.push(file);
+                }
+                files
+            });
         tracing::info!(
             source = provider.label(),
             repo = request.repository,
@@ -3112,8 +4770,23 @@ mod downloader_tests {
     #![allow(clippy::struct_excessive_bools, clippy::unnecessary_literal_bound)]
 
     use super::*;
-    use orchion_core::{AsrModel, DownloadRetryability, KnownOcrModel, TtsModel};
+    use orchion_core::{AsrModel, DownloadRetryability, KnownOcrModel, OcrModel, TtsModel};
+    use std::io::{Read, Write};
     use std::sync::{Arc, Mutex};
+
+    fn serve_preflight_responses(responses: Vec<String>) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let task = std::thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 4096];
+                let _ = stream.read(&mut request).unwrap();
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (endpoint, task)
+    }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct UnsafeModel;
@@ -3203,6 +4876,8 @@ mod downloader_tests {
         omit_resolved_revision: bool,
         delegate_preflight: bool,
         empty_preflight_plan: bool,
+        failure_repo: Option<&'static str>,
+        echo_requested_revision: bool,
     }
 
     struct FakeProbe {
@@ -3322,7 +4997,10 @@ mod downloader_tests {
                         |files| files.iter().map(|file| (*file).to_string()).collect(),
                     )
                 };
-                Ok(ProviderPreflightResult::new(files))
+                Ok(ProviderPreflightResult::with_resolved_revision(
+                    files,
+                    "1111111111111111111111111111111111111111",
+                ))
             })
         }
 
@@ -3369,6 +5047,13 @@ mod downloader_tests {
                             .to_string(),
                     });
                 }
+                if self.failure_repo.is_some_and(|failure| failure == repo) {
+                    return Err(OrchionError::Download {
+                        source_name,
+                        repo: repo.to_string(),
+                        message: "planned deployment artifact failure".to_string(),
+                    });
+                }
                 tokio::fs::create_dir_all(target).await.map_err(|error| {
                     OrchionError::Download {
                         source_name,
@@ -3406,6 +5091,8 @@ mod downloader_tests {
                 }
                 Ok(if self.omit_resolved_revision {
                     ProviderDownloadResult::unresolved()
+                } else if self.echo_requested_revision {
+                    ProviderDownloadResult::with_resolved_revision(revision)
                 } else {
                     ProviderDownloadResult::with_resolved_revision(
                         "1111111111111111111111111111111111111111",
@@ -3413,6 +5100,740 @@ mod downloader_tests {
                 })
             })
         }
+    }
+
+    fn ocr_deployment_plan(
+        source_intent: &str,
+        table_model_source: DeploymentArtifactSource,
+        table_dictionary_source: DeploymentArtifactSource,
+    ) -> (OcrModel, DeploymentArtifactPlan) {
+        let primary = KnownOcrModel::PpOcrV5Mobile.into_model();
+        let mut artifacts = model_hub_assets(&primary)
+            .iter()
+            .map(|artifact| DeploymentArtifactRequest {
+                role: artifact_role_for_ocr_asset(artifact.role),
+                source: DeploymentArtifactSource::Neutral,
+                repository: Some(artifact.repo.to_string()),
+                files: vec![artifact.file.to_string()],
+                required_source: matches!(artifact.kind, ModelHubAssetKind::ModelScopeFile { .. })
+                    .then_some(DownloadSource::ModelScope),
+            })
+            .collect::<Vec<_>>();
+        artifacts.extend([
+            DeploymentArtifactRequest {
+                role: ArtifactRole::OcrLayout,
+                source: DeploymentArtifactSource::Neutral,
+                repository: Some("Acme/Layout".to_string()),
+                files: vec!["layout.onnx".to_string()],
+                required_source: None,
+            },
+            DeploymentArtifactRequest {
+                role: ArtifactRole::OcrTableStructureModel,
+                source: table_model_source,
+                repository: Some("Acme/Table".to_string()),
+                files: vec!["table.onnx".to_string()],
+                required_source: None,
+            },
+            DeploymentArtifactRequest {
+                role: ArtifactRole::OcrTableStructureDictionary,
+                source: table_dictionary_source,
+                repository: Some("Acme/Table".to_string()),
+                files: vec!["table_dict.txt".to_string()],
+                required_source: None,
+            },
+        ]);
+        let plan = DeploymentArtifactPlan {
+            deployment_id: primary.id().clone(),
+            category: ModelCategory::Ocr,
+            source_intent: source_intent.to_string(),
+            artifacts,
+            neutral_candidates: vec![DownloadSource::HuggingFace, DownloadSource::ModelScope],
+        };
+        (primary, plan)
+    }
+
+    #[tokio::test]
+    async fn built_in_preflight_revision_is_used_by_deployment_download() {
+        for (source, revision) in [
+            (
+                DeploymentArtifactSource::HuggingFace,
+                "1111111111111111111111111111111111111111",
+            ),
+            (
+                DeploymentArtifactSource::ModelScope,
+                "2222222222222222222222222222222222222222",
+            ),
+        ] {
+            let bodies = match source {
+                DeploymentArtifactSource::HuggingFace => vec![
+                    serde_json::json!({"sha": revision}).to_string(),
+                    r#"[{"type":"file","path":"model.onnx"}]"#.to_string(),
+                ],
+                DeploymentArtifactSource::ModelScope => vec![
+                    serde_json::json!({
+                        "Code": 200,
+                        "Success": true,
+                        "Data": {
+                            "LatestCommitter": {"ShortId": &revision[..8], "Id": ""},
+                            "Files": [{
+                                "Type": "blob",
+                                "Path": "model.onnx",
+                                "Revision": revision
+                            }]
+                        }
+                    })
+                    .to_string(),
+                ],
+                _ => unreachable!(),
+            };
+            let responses = bodies
+                .into_iter()
+                .map(|body| {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                })
+                .collect();
+            let (endpoint, task) = serve_preflight_responses(responses);
+            let options = HubProviderOptions::default().with_metadata_endpoint(endpoint);
+            let registry = match source {
+                DeploymentArtifactSource::HuggingFace => DownloadProviderRegistry::new()
+                    .with_provider(HuggingFaceProvider::with_options(options)),
+                DeploymentArtifactSource::ModelScope => DownloadProviderRegistry::new()
+                    .with_provider(ModelScopeProvider::with_options(options)),
+                _ => unreachable!(),
+            };
+            let primary = qwen_asr_06b();
+            let plan = DeploymentArtifactPlan {
+                deployment_id: ModelId::parse(primary.huggingface_repo()).unwrap(),
+                category: ModelCategory::Asr,
+                source_intent: format!("built-in-preflight-{revision}"),
+                artifacts: vec![DeploymentArtifactRequest {
+                    role: ArtifactRole::Model,
+                    source: source.clone(),
+                    repository: Some("Owner/Repo".to_string()),
+                    files: vec!["model.onnx".to_string()],
+                    required_source: None,
+                }],
+                neutral_candidates: Vec::new(),
+            };
+            let client = FakeDownloadClient {
+                delegate_preflight: true,
+                echo_requested_revision: true,
+                ..Default::default()
+            };
+            let cache = tempfile::tempdir().unwrap();
+            ModelDownloader::from_registry(registry)
+                .provision_deployment_with_client(
+                    primary,
+                    &plan,
+                    cache.path(),
+                    &client,
+                    &DownloadEnv {
+                        orchion_model_source: None,
+                        hf_endpoint: None,
+                    },
+                )
+                .await
+                .unwrap();
+            task.join().unwrap();
+            assert_eq!(*client.revisions.lock().unwrap(), [revision]);
+        }
+    }
+
+    #[tokio::test]
+    async fn deployment_publication_downloads_neutral_and_same_repo_table_roles() {
+        let cache = tempfile::tempdir().unwrap();
+        let (primary, plan) = ocr_deployment_plan(
+            "ocr-table-neutral",
+            DeploymentArtifactSource::Neutral,
+            DeploymentArtifactSource::Neutral,
+        );
+        let client = FakeDownloadClient::default();
+        let publication = ModelDownloader::new(DownloadSource::Auto)
+            .provision_deployment_with_client(
+                primary,
+                &plan,
+                cache.path(),
+                &client,
+                &DownloadEnv {
+                    orchion_model_source: None,
+                    hf_endpoint: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *client.calls.lock().unwrap(),
+            ["modelscope", "modelscope", "modelscope"]
+        );
+        let repos = client.repos.lock().unwrap();
+        let filters = client.file_filters.lock().unwrap();
+        let table_index = repos.iter().position(|repo| repo == "Acme/Table").unwrap();
+        assert_eq!(
+            filters[table_index].as_ref().unwrap(),
+            &["table.onnx".to_string(), "table_dict.txt".to_string()]
+        );
+        assert!(
+            publication
+                .artifact_file(ArtifactRole::OcrTableStructureModel)
+                .unwrap()
+                .is_file()
+        );
+        assert!(
+            publication
+                .artifact_file(ArtifactRole::OcrTableStructureDictionary)
+                .unwrap()
+                .is_file()
+        );
+        assert_ne!(
+            publication.artifact_file(ArtifactRole::OcrTableStructureModel),
+            publication.artifact_file(ArtifactRole::OcrTableStructureDictionary)
+        );
+        let table_model = publication
+            .artifacts()
+            .iter()
+            .find(|artifact| artifact.role == ArtifactRole::OcrTableStructureModel)
+            .unwrap();
+        let dictionary = publication
+            .artifacts()
+            .iter()
+            .find(|artifact| artifact.role == ArtifactRole::OcrTableStructureDictionary)
+            .unwrap();
+        assert_eq!(table_model.resolved_revision, dictionary.resolved_revision);
+        assert!(
+            table_model
+                .resolved_revision
+                .as_deref()
+                .is_some_and(provider::is_immutable_revision)
+        );
+        assert!(publication.root().join(DEPLOYMENT_MANIFEST_FILE).is_file());
+    }
+
+    #[tokio::test]
+    async fn deployment_same_source_path_is_downloaded_once_for_multiple_roles() {
+        let cache = tempfile::tempdir().unwrap();
+        let (primary, mut plan) = ocr_deployment_plan(
+            "ocr-table-shared-source",
+            DeploymentArtifactSource::Neutral,
+            DeploymentArtifactSource::Neutral,
+        );
+        plan.artifacts
+            .iter_mut()
+            .find(|artifact| artifact.role == ArtifactRole::OcrTableStructureDictionary)
+            .unwrap()
+            .files = vec!["table.onnx".to_string()];
+        let client = FakeDownloadClient::default();
+        let publication = ModelDownloader::new(DownloadSource::Auto)
+            .provision_deployment_with_client(
+                primary,
+                &plan,
+                cache.path(),
+                &client,
+                &DownloadEnv {
+                    orchion_model_source: None,
+                    hf_endpoint: None,
+                },
+            )
+            .await
+            .unwrap();
+        let repos = client.repos.lock().unwrap();
+        let filters = client.file_filters.lock().unwrap();
+        let table_requests = repos
+            .iter()
+            .enumerate()
+            .filter(|(_, repo)| repo.as_str() == "Acme/Table")
+            .collect::<Vec<_>>();
+        assert_eq!(table_requests.len(), 1);
+        assert_eq!(
+            filters[table_requests[0].0].as_ref().unwrap(),
+            &["table.onnx".to_string()]
+        );
+        assert!(
+            publication
+                .artifact_file(ArtifactRole::OcrTableStructureModel)
+                .unwrap()
+                .is_file()
+        );
+        assert!(
+            publication
+                .artifact_file(ArtifactRole::OcrTableStructureDictionary)
+                .unwrap()
+                .is_file()
+        );
+    }
+
+    #[tokio::test]
+    async fn deployment_requires_immutable_resolved_revision() {
+        let cache = tempfile::tempdir().unwrap();
+        let (primary, plan) = ocr_deployment_plan(
+            "ocr-table-unresolved",
+            DeploymentArtifactSource::Neutral,
+            DeploymentArtifactSource::Neutral,
+        );
+        let error = ModelDownloader::new(DownloadSource::Auto)
+            .provision_deployment_with_client(
+                primary.clone(),
+                &plan,
+                cache.path(),
+                &FakeDownloadClient {
+                    omit_resolved_revision: true,
+                    ..Default::default()
+                },
+                &DownloadEnv {
+                    orchion_model_source: None,
+                    hf_endpoint: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("immutable revision"));
+        assert!(
+            ModelDownloader::resolve_prepared_deployment(&primary, &plan, cache.path()).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn deployment_plan_rejects_any_second_singleton_role() {
+        let cache = tempfile::tempdir().unwrap();
+        let (primary, mut plan) = ocr_deployment_plan(
+            "ocr-table-duplicate-role",
+            DeploymentArtifactSource::Neutral,
+            DeploymentArtifactSource::Neutral,
+        );
+        plan.artifacts.push(DeploymentArtifactRequest {
+            role: ArtifactRole::OcrTableStructureModel,
+            source: DeploymentArtifactSource::Neutral,
+            repository: Some("Other/Table".to_string()),
+            files: vec!["different.onnx".to_string()],
+            required_source: None,
+        });
+        let error = ModelDownloader::new(DownloadSource::Auto)
+            .provision_deployment_with_client(
+                primary,
+                &plan,
+                cache.path(),
+                &FakeDownloadClient::default(),
+                &DownloadEnv {
+                    orchion_model_source: None,
+                    hf_endpoint: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("duplicate"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deployment_rejects_symlinked_cache_ancestors_in_normal_and_prepared_modes() {
+        use std::os::unix::fs::symlink;
+
+        let cache = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir_all(cache.path().join(CACHE_STATE_DIR))
+            .await
+            .unwrap();
+        symlink(
+            outside.path(),
+            cache.path().join(CACHE_STATE_DIR).join("deployments"),
+        )
+        .unwrap();
+        let (primary, plan) = ocr_deployment_plan(
+            "ocr-table-symlink",
+            DeploymentArtifactSource::Neutral,
+            DeploymentArtifactSource::Neutral,
+        );
+        let error = ModelDownloader::new(DownloadSource::Auto)
+            .provision_deployment_with_client(
+                primary.clone(),
+                &plan,
+                cache.path(),
+                &FakeDownloadClient::default(),
+                &DownloadEnv {
+                    orchion_model_source: None,
+                    hf_endpoint: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("symlink"));
+        let prepared = ModelDownloader::resolve_prepared_deployment(&primary, &plan, cache.path())
+            .unwrap_err();
+        assert!(prepared.to_string().contains("symlink"));
+        assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepared_deployment_rejects_symlink_inside_publication() {
+        use std::os::unix::fs::symlink;
+
+        let cache = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let (primary, plan) = ocr_deployment_plan(
+            "ocr-table-inner-symlink",
+            DeploymentArtifactSource::Neutral,
+            DeploymentArtifactSource::Neutral,
+        );
+        let publication = ModelDownloader::new(DownloadSource::Auto)
+            .provision_deployment_with_client(
+                primary.clone(),
+                &plan,
+                cache.path(),
+                &FakeDownloadClient::default(),
+                &DownloadEnv {
+                    orchion_model_source: None,
+                    hf_endpoint: None,
+                },
+            )
+            .await
+            .unwrap();
+        let table_file = publication
+            .artifact_file(ArtifactRole::OcrTableStructureModel)
+            .unwrap();
+        let repository_dir = table_file.parent().unwrap();
+        std::fs::write(outside.path().join("table.onnx"), b"asset").unwrap();
+        std::fs::remove_dir_all(repository_dir).unwrap();
+        symlink(outside.path(), repository_dir).unwrap();
+
+        let error = ModelDownloader::resolve_prepared_deployment(&primary, &plan, cache.path())
+            .unwrap_err();
+        assert!(error.to_string().contains("symlink"));
+    }
+
+    #[tokio::test]
+    async fn deployment_publication_keeps_explicit_mixed_provider_roles_together() {
+        let cache = tempfile::tempdir().unwrap();
+        let (primary, plan) = ocr_deployment_plan(
+            "ocr-table-mixed",
+            DeploymentArtifactSource::HuggingFace,
+            DeploymentArtifactSource::ModelScope,
+        );
+        let client = FakeDownloadClient::default();
+        let publication = ModelDownloader::new(DownloadSource::Auto)
+            .provision_deployment_with_client(
+                primary,
+                &plan,
+                cache.path(),
+                &client,
+                &DownloadEnv {
+                    orchion_model_source: None,
+                    hf_endpoint: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let table_model = publication
+            .artifacts()
+            .iter()
+            .find(|artifact| artifact.role == ArtifactRole::OcrTableStructureModel)
+            .unwrap();
+        let dictionary = publication
+            .artifacts()
+            .iter()
+            .find(|artifact| artifact.role == ArtifactRole::OcrTableStructureDictionary)
+            .unwrap();
+        assert_eq!(table_model.source, DeploymentArtifactSource::HuggingFace);
+        assert_eq!(dictionary.source, DeploymentArtifactSource::ModelScope);
+        assert!(table_model.files[0].is_file());
+        assert!(dictionary.files[0].is_file());
+    }
+
+    #[tokio::test]
+    async fn deployment_artifact_failure_never_publishes_ready_manifest() {
+        let cache = tempfile::tempdir().unwrap();
+        let (primary, plan) = ocr_deployment_plan(
+            "ocr-table-failure",
+            DeploymentArtifactSource::HuggingFace,
+            DeploymentArtifactSource::ModelScope,
+        );
+        let client = FakeDownloadClient {
+            failure_repo: Some("Acme/Table"),
+            ..Default::default()
+        };
+        let downloader = ModelDownloader::new(DownloadSource::Auto);
+        let error = downloader
+            .provision_deployment_with_client(
+                primary.clone(),
+                &plan,
+                cache.path(),
+                &client,
+                &DownloadEnv {
+                    orchion_model_source: None,
+                    hf_endpoint: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("planned deployment artifact failure")
+        );
+        assert!(
+            ModelDownloader::resolve_prepared_deployment(&primary, &plan, cache.path()).is_err()
+        );
+        assert!(!deployment_publication_path(&plan, cache.path()).exists());
+    }
+
+    #[tokio::test]
+    async fn failed_deployment_replacement_restores_existing_publication() {
+        let cache = tempfile::tempdir().unwrap();
+        ensure_cache_state_dir(cache.path()).await.unwrap();
+        let relative =
+            PathBuf::from(CACHE_STATE_DIR).join("deployments/ocr/Acme/Model/fingerprint");
+        let target = cache.path().join(&relative);
+        tokio::fs::create_dir_all(&target).await.unwrap();
+        tokio::fs::write(target.join("old"), b"old").await.unwrap();
+        let staging = tempfile::tempdir_in(cache.path()).unwrap();
+
+        let error = publish_staged_relative_paths(staging.path(), cache.path(), &[relative])
+            .await
+            .unwrap_err();
+        assert_eq!(tokio::fs::read(target.join("old")).await.unwrap(), b"old");
+        assert!(!cache_state_path(cache.path(), PUBLISH_TRANSACTION_DIR).exists());
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn interrupted_deployment_replacement_recovers_backup() {
+        let cache = tempfile::tempdir().unwrap();
+        ensure_cache_state_dir(cache.path()).await.unwrap();
+        let relative =
+            PathBuf::from(CACHE_STATE_DIR).join("deployments/ocr/Acme/Model/fingerprint");
+        let target = cache.path().join(&relative);
+        tokio::fs::create_dir_all(&target).await.unwrap();
+        tokio::fs::write(target.join("new"), b"new").await.unwrap();
+        let transaction = cache_state_path(cache.path(), PUBLISH_TRANSACTION_DIR);
+        let backup = transaction.join(&relative);
+        tokio::fs::create_dir_all(&backup).await.unwrap();
+        tokio::fs::write(backup.join("old"), b"old").await.unwrap();
+        tokio::fs::write(
+            transaction.join(PUBLISH_TRANSACTION_MANIFEST),
+            serde_json::json!({
+                "paths": [{"path": relative.to_string_lossy(), "had_target": true}]
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert!(recover_interrupted_publication(cache.path()).await.unwrap());
+        assert_eq!(tokio::fs::read(target.join("old")).await.unwrap(), b"old");
+        assert!(!target.join("new").exists());
+        assert!(!transaction.exists());
+    }
+
+    #[tokio::test]
+    async fn prepared_deployment_uses_manifest_and_table_parameters_invalidate_identity() {
+        let cache = tempfile::tempdir().unwrap();
+        let (primary, plan) = ocr_deployment_plan(
+            "ocr-table|score=3f000000|max=500",
+            DeploymentArtifactSource::Neutral,
+            DeploymentArtifactSource::Neutral,
+        );
+        let publication = ModelDownloader::new(DownloadSource::Auto)
+            .provision_deployment_with_client(
+                primary.clone(),
+                &plan,
+                cache.path(),
+                &FakeDownloadClient::default(),
+                &DownloadEnv {
+                    orchion_model_source: None,
+                    hf_endpoint: None,
+                },
+            )
+            .await
+            .unwrap();
+        let prepared =
+            ModelDownloader::resolve_prepared_deployment(&primary, &plan, cache.path()).unwrap();
+        assert_eq!(prepared, publication);
+
+        let manifest_path = publication.root().join(DEPLOYMENT_MANIFEST_FILE);
+        let original = std::fs::read_to_string(&manifest_path).unwrap();
+        let mut manifest: serde_json::Value = serde_json::from_str(&original).unwrap();
+        manifest["schema_version"] = serde_json::json!(0);
+        std::fs::write(&manifest_path, manifest.to_string()).unwrap();
+        assert!(
+            ModelDownloader::resolve_prepared_deployment(&primary, &plan, cache.path())
+                .unwrap_err()
+                .to_string()
+                .contains("identity mismatch")
+        );
+        manifest = serde_json::from_str(&original).unwrap();
+        manifest["artifacts"][0]["resolved_revision"] = serde_json::Value::Null;
+        std::fs::write(&manifest_path, manifest.to_string()).unwrap();
+        assert!(
+            ModelDownloader::resolve_prepared_deployment(&primary, &plan, cache.path())
+                .unwrap_err()
+                .to_string()
+                .contains("immutable resolved revision")
+        );
+        std::fs::write(&manifest_path, &original).unwrap();
+
+        manifest = serde_json::from_str(&original).unwrap();
+        let artifacts = manifest["artifacts"].as_array_mut().unwrap();
+        let duplicate_role = artifacts[0]["role"].clone();
+        artifacts[1]["role"] = duplicate_role;
+        std::fs::write(&manifest_path, manifest.to_string()).unwrap();
+        assert!(
+            ModelDownloader::resolve_prepared_deployment(&primary, &plan, cache.path())
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate artifact role")
+        );
+        std::fs::write(&manifest_path, &original).unwrap();
+
+        manifest = serde_json::from_str(&original).unwrap();
+        let dictionary = manifest["artifacts"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|artifact| artifact["role"].as_str() == Some("ocr_table_structure_dictionary"))
+            .unwrap();
+        dictionary["resolved_revision"] =
+            serde_json::json!("2222222222222222222222222222222222222222");
+        std::fs::write(&manifest_path, manifest.to_string()).unwrap();
+        assert!(
+            ModelDownloader::resolve_prepared_deployment(&primary, &plan, cache.path())
+                .unwrap_err()
+                .to_string()
+                .contains("inconsistent revisions")
+        );
+        std::fs::write(&manifest_path, &original).unwrap();
+
+        let mut disallowed_provider = plan.clone();
+        disallowed_provider.neutral_candidates = vec![DownloadSource::HuggingFace];
+        assert!(
+            ModelDownloader::resolve_prepared_deployment(
+                &primary,
+                &disallowed_provider,
+                cache.path()
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("provider mismatch")
+        );
+
+        let (_, changed) = ocr_deployment_plan(
+            "ocr-table|score=3f4ccccd|max=640",
+            DeploymentArtifactSource::Neutral,
+            DeploymentArtifactSource::Neutral,
+        );
+        assert_ne!(
+            deployment_publication_path(&plan, cache.path()),
+            deployment_publication_path(&changed, cache.path())
+        );
+        assert!(
+            ModelDownloader::resolve_prepared_deployment(&primary, &changed, cache.path()).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_reader_waits_for_same_deployment_writer_lock() {
+        let cache = tempfile::tempdir().unwrap();
+        let (primary, plan) = ocr_deployment_plan(
+            "ocr-table-reader-lock",
+            DeploymentArtifactSource::Neutral,
+            DeploymentArtifactSource::Neutral,
+        );
+        ModelDownloader::new(DownloadSource::Auto)
+            .provision_deployment_with_client(
+                primary.clone(),
+                &plan,
+                cache.path(),
+                &FakeDownloadClient::default(),
+                &DownloadEnv {
+                    orchion_model_source: None,
+                    hf_endpoint: None,
+                },
+            )
+            .await
+            .unwrap();
+        let writer_lock =
+            transaction::acquire_model_lock_sync(cache.path(), &deployment_model_lock_key(&plan))
+                .unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let cache_path = cache.path().to_path_buf();
+        let reader = std::thread::spawn(move || {
+            sender
+                .send(ModelDownloader::resolve_prepared_deployment(
+                    &primary, &plan, cache_path,
+                ))
+                .unwrap();
+        });
+
+        assert!(receiver.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(writer_lock);
+        assert!(
+            receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .is_ok()
+        );
+        reader.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn unrelated_publication_transaction_does_not_block_prepared_reader() {
+        let cache = tempfile::tempdir().unwrap();
+        let (primary, plan) = ocr_deployment_plan(
+            "ocr-table-unrelated-transaction",
+            DeploymentArtifactSource::Neutral,
+            DeploymentArtifactSource::Neutral,
+        );
+        ModelDownloader::new(DownloadSource::Auto)
+            .provision_deployment_with_client(
+                primary.clone(),
+                &plan,
+                cache.path(),
+                &FakeDownloadClient::default(),
+                &DownloadEnv {
+                    orchion_model_source: None,
+                    hf_endpoint: None,
+                },
+            )
+            .await
+            .unwrap();
+        let transaction_dir = cache_state_path(cache.path(), PUBLISH_TRANSACTION_DIR);
+        std::fs::create_dir_all(&transaction_dir).unwrap();
+        std::fs::write(
+            transaction_dir.join(PUBLISH_TRANSACTION_MANIFEST),
+            serde_json::json!({
+                "paths": [{
+                    "path": ".orchion/deployments/ocr/Other/Model/fingerprint",
+                    "had_target": false
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let publication_lock =
+            transaction::acquire_publication_lock_sync(cache.path(), "unrelated-publication")
+                .unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let cache_path = cache.path().to_path_buf();
+        let reader = std::thread::spawn(move || {
+            sender
+                .send(ModelDownloader::resolve_prepared_deployment(
+                    &primary, &plan, cache_path,
+                ))
+                .unwrap();
+        });
+
+        assert!(
+            receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .is_ok()
+        );
+        reader.join().unwrap();
+        drop(publication_lock);
+        std::fs::remove_dir_all(transaction_dir).unwrap();
     }
 
     #[tokio::test]

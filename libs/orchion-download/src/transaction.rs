@@ -23,6 +23,15 @@ pub(crate) async fn acquire_model_lock(cache_dir: &Path, model_key: &str) -> Res
     .await
 }
 
+pub(crate) fn acquire_model_lock_sync(cache_dir: &Path, model_key: &str) -> Result<CacheLock> {
+    let lock_dir = super::cache_state_path(cache_dir, super::MODEL_LOCK_DIR);
+    std::fs::create_dir_all(&lock_dir).map_err(|error| lock_error(model_key, &error))?;
+    acquire_lock_sync(
+        lock_dir.join(format!("{}.lock", model_key_digest(model_key))),
+        model_key,
+    )
+}
+
 pub(crate) fn model_staging_prefix(model_key: &str) -> String {
     format!("{}-", model_key_digest(model_key))
 }
@@ -42,6 +51,16 @@ pub(crate) async fn acquire_publication_lock(
     .await
 }
 
+pub(crate) fn acquire_publication_lock_sync(
+    cache_dir: &Path,
+    model_key: &str,
+) -> Result<CacheLock> {
+    acquire_lock_sync(
+        super::cache_state_path(cache_dir, super::PUBLICATION_LOCK_FILE),
+        model_key,
+    )
+}
+
 async fn acquire_lock(lock_path: PathBuf, model_key: String) -> Result<CacheLock> {
     tokio::task::spawn_blocking(move || {
         let file = OpenOptions::new()
@@ -58,6 +77,18 @@ async fn acquire_lock(lock_path: PathBuf, model_key: String) -> Result<CacheLock
     .map_err(|error| OrchionError::BlockingTask {
         message: error.to_string(),
     })?
+}
+
+fn acquire_lock_sync(lock_path: PathBuf, model_key: &str) -> Result<CacheLock> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .map_err(|error| lock_error(model_key, &error))?;
+    fs2::FileExt::lock_exclusive(&file).map_err(|error| lock_error(model_key, &error))?;
+    Ok(CacheLock(file))
 }
 
 fn lock_error(model_key: &str, error: &std::io::Error) -> OrchionError {

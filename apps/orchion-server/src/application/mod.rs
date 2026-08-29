@@ -92,6 +92,7 @@ pub(crate) fn finish_owned_file_operation() -> bool {
 }
 
 pub type InferenceGuardFuture<'a> = Pin<Box<dyn Future<Output = InferenceGuard> + Send + 'a>>;
+pub type ModelCatalogFuture<'a> = Pin<Box<dyn Future<Output = Vec<ApiModel>> + Send + 'a>>;
 
 #[derive(Debug, Clone)]
 pub struct AsrApiPolicy {
@@ -142,6 +143,9 @@ pub trait ServerApplication:
     + 'static
 {
     fn api_policy(&self) -> &ApiPolicy;
+    fn model_catalog(&self) -> ModelCatalogFuture<'_> {
+        Box::pin(async move { self.api_policy().models.clone() })
+    }
     fn acquire_inference(&self) -> InferenceGuardFuture<'_>;
     fn try_acquire_websocket(&self) -> Option<OwnedSemaphorePermit>;
     fn try_acquire_pending_websocket(&self) -> Option<OwnedSemaphorePermit>;

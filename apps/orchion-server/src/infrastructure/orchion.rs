@@ -21,12 +21,15 @@ use crate::application::transcription::{
 use crate::application::{
     ActivityPolicy, ApiModel, ApiPolicy, AsrApiPolicy, RuntimeError, ServerApplication,
 };
-use crate::settings::ServerConfig;
+use crate::settings::{ServerConfig, TableStructureConfig};
 use anyhow::Context;
 use orchion::{
-    ArtifactRequest, Asr, AsrModel, DeploymentSourcePlan, DevicePreference, DownloadSource,
-    ModelCapabilities, ModelCategory, ModelDownloader, ModelId, ModelSpec, ModelUrlSource, Ocr,
-    OcrAssets, OcrModel, OcrModelKind, RuntimeProvider, Tts, TtsModel, model_descriptor,
+    ArtifactRequest, ArtifactRole, Asr, AsrModel, DeploymentArtifactPlan,
+    DeploymentArtifactRequest, DeploymentArtifactSource, DeploymentPublication,
+    DeploymentSourcePlan, DevicePreference, DownloadSource, ModelCapabilities, ModelCategory,
+    ModelDownloader, ModelId, ModelSpec, ModelUrlSource, Ocr, OcrAssets, OcrModel,
+    OcrModelAssetKind, OcrModelAssetRole, OcrModelKind, RuntimeProvider, TableStructureAssets, Tts,
+    TtsModel, model_descriptor,
 };
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -43,16 +46,44 @@ type OcrRuntimeCache = ModelCache<OcrRuntimeKey, Ocr>;
 pub type AsrRuntimeFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<Asr>> + Send + 'a>>;
 pub type TtsRuntimeFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<Tts>> + Send + 'a>>;
 pub type OcrRuntimeFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<Ocr>> + Send + 'a>>;
+pub type OcrDeploymentFuture<'a> =
+    Pin<Box<dyn Future<Output = anyhow::Result<DeploymentPublication>> + Send + 'a>>;
+
+pub trait OcrDeploymentProvisioner: Send + Sync {
+    fn provision_deployment(
+        &self,
+        primary: OcrModel,
+        plan: DeploymentArtifactPlan,
+        models_dir: PathBuf,
+    ) -> OcrDeploymentFuture<'_>;
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct OcrRuntimeKey {
     primary: OcrModel,
     layout: Option<DeploymentLayoutModel>,
+    table_structure: Option<TableStructureConfig>,
+    table_source_intent: Option<String>,
 }
 
 impl OcrRuntimeKey {
     const fn new(primary: OcrModel, layout: Option<DeploymentLayoutModel>) -> Self {
-        Self { primary, layout }
+        Self {
+            primary,
+            layout,
+            table_structure: None,
+            table_source_intent: None,
+        }
+    }
+
+    fn with_table_structure(mut self, table_structure: Option<TableStructureConfig>) -> Self {
+        self.table_structure = table_structure;
+        self
+    }
+
+    fn with_table_source_intent(mut self, source_intent: Option<String>) -> Self {
+        self.table_source_intent = source_intent;
+        self
     }
 }
 
@@ -146,6 +177,7 @@ pub trait ModelRuntimeFactory: Send + Sync + 'static {
         model_dir: PathBuf,
         cache_root: PathBuf,
         layout_model: Option<(OcrModel, PathBuf)>,
+        table_structure: Option<TableStructureAssets>,
         device: DevicePreference,
     ) -> OcrRuntimeFuture<'_>;
 }
@@ -204,6 +236,7 @@ impl ModelRuntimeFactory for BuiltinModelRuntimeFactory {
         model_dir: PathBuf,
         cache_root: PathBuf,
         layout_model: Option<(OcrModel, PathBuf)>,
+        table_structure: Option<TableStructureAssets>,
         device: DevicePreference,
     ) -> OcrRuntimeFuture<'_> {
         Box::pin(async move {
@@ -230,8 +263,9 @@ impl ModelRuntimeFactory for BuiltinModelRuntimeFactory {
                     }
                 })
                 .transpose()?;
-            let assets =
-                OcrAssets::from_cache_layout(known, model_dir, cache_root).with_layout(layout);
+            let assets = OcrAssets::from_cache_layout(known, model_dir, cache_root)
+                .with_layout(layout)
+                .with_table_structure(table_structure);
             Ocr::load_with_assets_and_device(known.id(), assets, device)
                 .await
                 .map_err(Into::into)
@@ -266,9 +300,25 @@ impl<M: ModelSpec> ModelProvisioner<M> for ModelDownloader {
     }
 }
 
+impl OcrDeploymentProvisioner for ModelDownloader {
+    fn provision_deployment(
+        &self,
+        primary: OcrModel,
+        plan: DeploymentArtifactPlan,
+        models_dir: PathBuf,
+    ) -> OcrDeploymentFuture<'_> {
+        Box::pin(async move {
+            ModelDownloader::provision_deployment(self, primary, &plan, models_dir)
+                .await
+                .map_err(anyhow::Error::from)
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     config: ServerConfig,
+    source_candidates: Vec<DownloadSource>,
     api_policy: ApiPolicy,
     asr_models: AsrModelCache,
     tts_models: TtsModelCache,
@@ -276,6 +326,8 @@ pub struct AppState {
     ocr_vl_models: OcrRuntimeCache,
     ocr_assets: OcrAssetCache,
     layout_models: LayoutModelCache,
+    ocr_deployment_plans: HashMap<OcrRuntimeKey, DeploymentArtifactPlan>,
+    ocr_deployment_provisioner: Option<Arc<dyn OcrDeploymentProvisioner>>,
     global_models: GlobalModelCacheLimiter,
     model_residency: ResidencyDomain,
     resources: ResourcePolicy,
@@ -473,6 +525,19 @@ mod tests {
         }
     }
 
+    impl OcrDeploymentProvisioner for RecordingModelProvisioner {
+        fn provision_deployment(
+            &self,
+            _primary: OcrModel,
+            _plan: DeploymentArtifactPlan,
+            _models_dir: PathBuf,
+        ) -> OcrDeploymentFuture<'_> {
+            Box::pin(async {
+                anyhow::bail!("OCR deployment provisioning is not used by this test")
+            })
+        }
+    }
+
     impl ModelRuntimeFactory for RecordingOcrRuntimeFactory {
         fn load_asr(
             &self,
@@ -498,6 +563,7 @@ mod tests {
             _model_dir: PathBuf,
             _cache_root: PathBuf,
             layout_model: Option<(OcrModel, PathBuf)>,
+            _table_structure: Option<TableStructureAssets>,
             _device: DevicePreference,
         ) -> OcrRuntimeFuture<'_> {
             self.layouts
@@ -629,6 +695,7 @@ mod tests {
             _model_dir: PathBuf,
             _cache_root: PathBuf,
             _layout_model: Option<(OcrModel, PathBuf)>,
+            _table_structure: Option<TableStructureAssets>,
             _device: DevicePreference,
         ) -> OcrRuntimeFuture<'_> {
             Box::pin(async { anyhow::bail!("OCR is not used by this test factory") })
@@ -660,6 +727,7 @@ mod tests {
             _model_dir: PathBuf,
             _cache_root: PathBuf,
             _layout_model: Option<(OcrModel, PathBuf)>,
+            _table_structure: Option<TableStructureAssets>,
             _device: DevicePreference,
         ) -> OcrRuntimeFuture<'_> {
             Box::pin(async { anyhow::bail!("OCR is not used by this test factory") })
@@ -691,6 +759,7 @@ mod tests {
             _model_dir: PathBuf,
             _cache_root: PathBuf,
             _layout_model: Option<(OcrModel, PathBuf)>,
+            _table_structure: Option<TableStructureAssets>,
             _device: DevicePreference,
         ) -> OcrRuntimeFuture<'_> {
             Box::pin(async { anyhow::bail!("injected OCR runtime factory") })
@@ -1034,6 +1103,7 @@ impl AppState {
         P: ModelProvisioner<AsrModel>
             + ModelProvisioner<TtsModel>
             + ModelProvisioner<OcrModel>
+            + OcrDeploymentProvisioner
             + 'static,
     {
         config.validate()?;
@@ -1054,6 +1124,7 @@ impl AppState {
         P: ModelProvisioner<AsrModel>
             + ModelProvisioner<TtsModel>
             + ModelProvisioner<OcrModel>
+            + OcrDeploymentProvisioner
             + 'static,
     {
         config.validate()?;
@@ -1138,8 +1209,11 @@ impl AppState {
             ocr_vl: resolved_ocr_vl,
             layout: resolved_layout,
             layout_locators: resolved_layout_locators,
+            deployment_plans: ocr_deployment_plans,
         } = resolved_ocr_models;
         let api_policy = api_policy(&config);
+        let ocr_deployment_provisioner =
+            provisioners.map(|provisioners| Arc::clone(&provisioners.ocr_deployments));
         let model_residency = ResidencyDomain::new();
         let asr_models = build_model_cache(
             "asr",
@@ -1229,6 +1303,7 @@ impl AppState {
         );
         Self {
             config,
+            source_candidates: source_candidates.to_vec(),
             api_policy,
             asr_models,
             tts_models,
@@ -1236,6 +1311,8 @@ impl AppState {
             ocr_vl_models,
             ocr_assets,
             layout_models,
+            ocr_deployment_plans,
+            ocr_deployment_provisioner,
             global_models,
             model_residency,
             resources,
@@ -1245,6 +1322,10 @@ impl AppState {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "provisions each service default and its deployment-owned OCR auxiliaries"
+    )]
     async fn ensure_startup_models(self: &Arc<Self>) -> anyhow::Result<ProvisionedModelCounts> {
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_MODEL_PROVISIONS));
         let mut tasks = JoinSet::new();
@@ -1271,6 +1352,10 @@ impl AppState {
         }
         if self.config.services.ocr.active()
             && let Some(model) = &self.config.services.ocr.default_model
+            && !self
+                .ocr_deployment_plans
+                .keys()
+                .any(|key| key.primary.id() == model)
         {
             spawn_model_provision(
                 &mut tasks,
@@ -1297,6 +1382,10 @@ impl AppState {
         let mut required_layouts = HashSet::new();
         if self.config.services.ocr.active()
             && let Some(deployment_id) = &self.config.services.ocr.default_model
+            && !self
+                .ocr_deployment_plans
+                .keys()
+                .any(|key| key.primary.id() == deployment_id)
             && let Some(model) = self.config.services.ocr.default_layout_runtime()
         {
             required_layouts.insert(DeploymentLayoutModel::new(
@@ -1330,6 +1419,24 @@ impl AppState {
                 .record(result.map_err(|error| {
                     anyhow::anyhow!("model provision task failed: {error:#}")
                 })??);
+        }
+        if let (Some(default), Some(provisioner)) = (
+            self.config.services.ocr.default_model.as_ref(),
+            self.ocr_deployment_provisioner.as_ref(),
+        ) && let Some((key, plan)) = self
+            .ocr_deployment_plans
+            .iter()
+            .find(|(key, _)| key.primary.id() == default)
+        {
+            provisioner
+                .provision_deployment(
+                    key.primary.clone(),
+                    plan.clone(),
+                    self.config.models.dir.clone(),
+                )
+                .await
+                .context("provision default OCR deployment")?;
+            counts.ocr += 1;
         }
         Ok(counts)
     }
@@ -1402,13 +1509,31 @@ impl AppState {
         if !self.config.services.ocr.active() {
             return Ok(None);
         }
+        let deployment = self
+            .config
+            .services
+            .ocr
+            .models
+            .iter()
+            .find(|deployment| deployment.id == *model.id());
         let layout = layout.map(|layout| DeploymentLayoutModel::new(model.id().clone(), layout));
-        let key = OcrRuntimeKey::new(model, layout);
+        let table_structure = deployment.and_then(|deployment| deployment.table_structure.clone());
+        let table_source_intent = if table_structure.is_some() {
+            deployment
+                .map(|deployment| ocr_deployment_source_intent(deployment, &self.source_candidates))
+        } else {
+            None
+        };
+        let key = OcrRuntimeKey::new(model, layout)
+            .with_table_structure(table_structure)
+            .with_table_source_intent(table_source_intent);
         let device = self.config.services.ocr.device;
         let models_dir = self.config.models.dir.clone();
         let runtime_factory = Arc::clone(&self.runtime_factory);
         let ocr_assets = self.ocr_assets.clone();
         let layout_models = self.layout_models.clone();
+        let deployment_plan = self.ocr_deployment_plans.get(&key).cloned();
+        let deployment_provisioner = self.ocr_deployment_provisioner.clone();
         let all_caches = self.active_model_caches();
         self.global_models
             .get_or_load(
@@ -1421,6 +1546,8 @@ impl AppState {
                         models_dir,
                         ocr_assets,
                         layout_models,
+                        deployment_plan,
+                        deployment_provisioner,
                         runtime_factory,
                         device,
                     )
@@ -1461,6 +1588,8 @@ impl AppState {
                         models_dir,
                         ocr_assets,
                         layout_models,
+                        None,
+                        None,
                         runtime_factory,
                         device,
                     )
@@ -1591,6 +1720,7 @@ impl AppState {
     }
 
     async fn unload_all_models(&self) {
+        let source_candidates = &self.source_candidates;
         for deployment in &self.config.services.asr.models {
             let model = &deployment.runtime;
             if let Err(error) = self.asr_models.unload(model.clone()).await {
@@ -1605,10 +1735,7 @@ impl AppState {
         }
         for deployment in &self.config.services.ocr.models {
             let id = &deployment.id;
-            let model = deployment.runtime.clone();
-            for key in
-                ocr_runtime_keys_for_model(&model, &self.config.services.ocr.layout_ids_for(id))
-            {
+            for key in ocr_runtime_keys_for_deployment(deployment, source_candidates) {
                 if let Err(error) = self.ocr_models.unload(key).await {
                     tracing::error!(model = %id, %error, "failed to unload OCR model during shutdown");
                 }
@@ -1616,10 +1743,7 @@ impl AppState {
         }
         for deployment in &self.config.services.ocr_vl.models {
             let id = &deployment.id;
-            let model = deployment.runtime.clone();
-            for key in
-                ocr_runtime_keys_for_model(&model, &self.config.services.ocr_vl.layout_ids_for(id))
-            {
+            for key in ocr_runtime_keys_for_deployment(deployment, source_candidates) {
                 if let Err(error) = self.ocr_vl_models.unload(key).await {
                     tracing::error!(model = %id, %error, "failed to unload OCR-VL model during shutdown");
                 }
@@ -1628,15 +1752,44 @@ impl AppState {
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "keeps legacy caches and atomic deployment publication dependencies explicit"
+)]
 async fn load_ocr_runtime(
     key: OcrRuntimeKey,
     models_dir: PathBuf,
     ocr_assets: OcrAssetCache,
     layout_models: LayoutModelCache,
+    deployment_plan: Option<DeploymentArtifactPlan>,
+    deployment_provisioner: Option<Arc<dyn OcrDeploymentProvisioner>>,
     runtime_factory: Arc<dyn ModelRuntimeFactory>,
     device: DevicePreference,
 ) -> anyhow::Result<Ocr> {
     let primary = key.primary;
+    if let Some(plan) = deployment_plan {
+        let publication = if let Some(provisioner) = deployment_provisioner {
+            provisioner
+                .provision_deployment(primary.clone(), plan, models_dir.clone())
+                .await?
+        } else {
+            let prepared_primary = primary.clone();
+            tokio::task::spawn_blocking(move || {
+                ModelDownloader::resolve_prepared_deployment(&prepared_primary, &plan, &models_dir)
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("prepared deployment resolver failed: {error}"))??
+        };
+        return load_published_ocr_runtime(
+            primary,
+            key.layout,
+            key.table_structure,
+            publication,
+            runtime_factory,
+            device,
+        )
+        .await;
+    }
     let primary_path = ocr_assets
         .ensure_provisioned(primary.clone())
         .await?
@@ -1659,9 +1812,73 @@ async fn load_ocr_runtime(
         } else {
             models_dir.clone()
         };
+    anyhow::ensure!(
+        key.table_structure.is_none(),
+        "OCR table structure deployment has no atomic artifact plan"
+    );
     tracing::info!(model = ?primary, layout = ?layout.as_ref().map(|(model, _)| model), device = %device, "loading OCR model");
     runtime_factory
-        .load_ocr(primary, primary_path, primary_cache_root, layout, device)
+        .load_ocr(
+            primary,
+            primary_path,
+            primary_cache_root,
+            layout,
+            None,
+            device,
+        )
+        .await
+}
+
+async fn load_published_ocr_runtime(
+    primary: OcrModel,
+    layout: Option<DeploymentLayoutModel>,
+    table: Option<TableStructureConfig>,
+    publication: DeploymentPublication,
+    runtime_factory: Arc<dyn ModelRuntimeFactory>,
+    device: DevicePreference,
+) -> anyhow::Result<Ocr> {
+    let primary_cache_root = publication.role_root(ArtifactRole::Model);
+    let primary_path = primary
+        .id()
+        .as_str()
+        .split('/')
+        .fold(primary_cache_root.clone(), |path, segment| {
+            path.join(segment)
+        });
+    let layout = layout
+        .map(|layout| {
+            publication
+                .artifact_file(ArtifactRole::OcrLayout)
+                .map(|path| (layout.model, path.to_path_buf()))
+                .with_context(|| "published OCR deployment is missing its layout artifact")
+        })
+        .transpose()?;
+    let table_structure = table
+        .map(|table| {
+            Ok::<_, anyhow::Error>(TableStructureAssets {
+                model: publication
+                    .artifact_file(ArtifactRole::OcrTableStructureModel)
+                    .context("published OCR deployment is missing its table model")?
+                    .to_path_buf(),
+                dictionary: publication
+                    .artifact_file(ArtifactRole::OcrTableStructureDictionary)
+                    .context("published OCR deployment is missing its table dictionary")?
+                    .to_path_buf(),
+                table_type: table.table_type.as_str().to_string(),
+                score_threshold: table.score_threshold,
+                max_structure_length: table.max_structure_length,
+            })
+        })
+        .transpose()?;
+    runtime_factory
+        .load_ocr(
+            primary,
+            primary_path,
+            primary_cache_root,
+            layout,
+            table_structure,
+            device,
+        )
         .await
 }
 
@@ -1678,11 +1895,11 @@ fn earlier_deadline(
 
 async fn ocr_runtime_status(
     cache: &OcrRuntimeCache,
-    model: &OcrModel,
-    layout_models: &[ModelId],
+    deployment: &crate::settings::OcrModelDeployment,
+    source_candidates: &[DownloadSource],
 ) -> Option<ModelResidencyStatus> {
     let mut selected = None;
-    for key in ocr_runtime_keys_for_model(model, layout_models) {
+    for key in ocr_runtime_keys_for_deployment(deployment, source_candidates) {
         let Some(status) = cache.status(&key).await else {
             continue;
         };
@@ -1706,17 +1923,54 @@ const fn residency_status_rank(status: ModelResidencyStatus) -> u8 {
 
 async fn unload_ocr_runtimes(
     cache: &OcrRuntimeCache,
-    model: &OcrModel,
-    layout_models: &[ModelId],
+    deployment: &crate::settings::OcrModelDeployment,
+    source_candidates: &[DownloadSource],
 ) -> anyhow::Result<Option<bool>> {
     cache
-        .unload_many(ocr_runtime_keys_for_model(model, layout_models))
+        .unload_many(ocr_runtime_keys_for_deployment(
+            deployment,
+            source_candidates,
+        ))
         .await
 }
 
 impl ServerApplication for AppState {
     fn api_policy(&self) -> &ApiPolicy {
         &self.api_policy
+    }
+
+    fn model_catalog(&self) -> crate::application::ModelCatalogFuture<'_> {
+        Box::pin(async move {
+            let mut models = self.api_policy.models.clone();
+            for deployment in self
+                .config
+                .services
+                .ocr
+                .models
+                .iter()
+                .filter(|deployment| deployment.table_structure.is_some())
+            {
+                let loaded = ocr_runtime_keys_for_deployment(deployment, &self.source_candidates)
+                    .into_iter();
+                let mut table_loaded = false;
+                for key in loaded {
+                    if self.ocr_models.status(&key).await == Some(ModelResidencyStatus::Loaded) {
+                        table_loaded = true;
+                        break;
+                    }
+                }
+                if table_loaded
+                    && let Some(model) = models.iter_mut().find(|model| {
+                        model.service == ModelService::Ocr && model.id == deployment.id
+                    })
+                {
+                    model.capabilities = model
+                        .capabilities
+                        .union(ModelCapabilities::OCR_TABLE_STRUCTURE);
+                }
+            }
+            models
+        })
     }
 
     fn acquire_inference(&self) -> crate::application::InferenceGuardFuture<'_> {
@@ -1736,6 +1990,7 @@ impl ModelLifecycleRuntime for AppState {
     fn model_statuses(&self) -> ModelStatusesFuture<'_> {
         Box::pin(async move {
             let mut statuses = Vec::new();
+            let source_candidates = &self.source_candidates;
             if self.config.services.asr.enabled {
                 for deployment in &self.config.services.asr.models {
                     let model = &deployment.runtime;
@@ -1755,13 +2010,8 @@ impl ModelLifecycleRuntime for AppState {
             if self.config.services.ocr.active() {
                 for deployment in &self.config.services.ocr.models {
                     let id = &deployment.id;
-                    let model = deployment.runtime.clone();
-                    if let Some(status) = ocr_runtime_status(
-                        &self.ocr_models,
-                        &model,
-                        &self.config.services.ocr.layout_ids_for(id),
-                    )
-                    .await
+                    if let Some(status) =
+                        ocr_runtime_status(&self.ocr_models, deployment, source_candidates).await
                     {
                         statuses.push(model_status(id.as_str(), ModelService::Ocr, status));
                     }
@@ -1770,13 +2020,8 @@ impl ModelLifecycleRuntime for AppState {
             if self.config.services.ocr_vl.active() {
                 for deployment in &self.config.services.ocr_vl.models {
                     let id = &deployment.id;
-                    let model = deployment.runtime.clone();
-                    if let Some(status) = ocr_runtime_status(
-                        &self.ocr_vl_models,
-                        &model,
-                        &self.config.services.ocr_vl.layout_ids_for(id),
-                    )
-                    .await
+                    if let Some(status) =
+                        ocr_runtime_status(&self.ocr_vl_models, deployment, source_candidates).await
                     {
                         statuses.push(model_status(id.as_str(), ModelService::OcrVl, status));
                     }
@@ -1825,17 +2070,31 @@ impl ModelLifecycleRuntime for AppState {
                     ) else {
                         return Ok(None);
                     };
+                    let layout = self
+                        .config
+                        .services
+                        .ocr
+                        .models
+                        .iter()
+                        .find(|deployment| deployment.id == *model.id())
+                        .and_then(|deployment| deployment.layout_runtime.clone());
                     let Some(lease) = self
-                        .ocr(model.clone(), None)
+                        .ocr(model.clone(), layout)
                         .await
                         .map_err(|error| model_lifecycle_error(&error))?
                     else {
                         return Ok(None);
                     };
                     drop(lease);
-                    self.ocr_models
-                        .status(&OcrRuntimeKey::new(model, None))
-                        .await
+                    let deployment = self
+                        .config
+                        .services
+                        .ocr
+                        .models
+                        .iter()
+                        .find(|deployment| deployment.id == *model.id())
+                        .expect("selected OCR model has a deployment");
+                    ocr_runtime_status(&self.ocr_models, deployment, &self.source_candidates).await
                 }
                 ModelService::OcrVl => {
                     let Some(model) = selected_ocr_model(
@@ -1853,8 +2112,15 @@ impl ModelLifecycleRuntime for AppState {
                         return Ok(None);
                     };
                     drop(lease);
-                    self.ocr_vl_models
-                        .status(&OcrRuntimeKey::new(model, None))
+                    let deployment = self
+                        .config
+                        .services
+                        .ocr_vl
+                        .models
+                        .iter()
+                        .find(|deployment| deployment.id == *model.id())
+                        .expect("selected OCR-VL model has a deployment");
+                    ocr_runtime_status(&self.ocr_vl_models, deployment, &self.source_candidates)
                         .await
                 }
             };
@@ -1903,13 +2169,17 @@ impl ModelLifecycleRuntime for AppState {
                     ) else {
                         return Ok(None);
                     };
-                    unload_ocr_runtimes(
-                        &self.ocr_models,
-                        &model,
-                        &self.config.services.ocr.layout_ids_for(model.id()),
-                    )
-                    .await
-                    .map_err(|error| model_lifecycle_error(&error))?;
+                    let deployment = self
+                        .config
+                        .services
+                        .ocr
+                        .models
+                        .iter()
+                        .find(|deployment| deployment.id == *model.id())
+                        .expect("selected OCR model has a deployment");
+                    unload_ocr_runtimes(&self.ocr_models, deployment, &self.source_candidates)
+                        .await
+                        .map_err(|error| model_lifecycle_error(&error))?;
                     Some(ModelResidencyStatus::Unloaded)
                 }
                 ModelService::OcrVl if self.config.services.ocr_vl.active() => {
@@ -1920,13 +2190,17 @@ impl ModelLifecycleRuntime for AppState {
                     ) else {
                         return Ok(None);
                     };
-                    unload_ocr_runtimes(
-                        &self.ocr_vl_models,
-                        &model,
-                        &self.config.services.ocr_vl.layout_ids_for(model.id()),
-                    )
-                    .await
-                    .map_err(|error| model_lifecycle_error(&error))?;
+                    let deployment = self
+                        .config
+                        .services
+                        .ocr_vl
+                        .models
+                        .iter()
+                        .find(|deployment| deployment.id == *model.id())
+                        .expect("selected OCR-VL model has a deployment");
+                    unload_ocr_runtimes(&self.ocr_vl_models, deployment, &self.source_candidates)
+                        .await
+                        .map_err(|error| model_lifecycle_error(&error))?;
                     Some(ModelResidencyStatus::Unloaded)
                 }
                 _ => return Ok(None),
@@ -2133,6 +2407,7 @@ struct ModelProvisioners {
     tts: Arc<dyn ModelProvisioner<TtsModel>>,
     ocr: Arc<dyn ModelProvisioner<OcrModel>>,
     layout: Arc<dyn ModelProvisioner<DeploymentLayoutModel>>,
+    ocr_deployments: Arc<dyn OcrDeploymentProvisioner>,
 }
 
 struct LayoutModelProvisioner {
@@ -2156,20 +2431,23 @@ impl ModelProvisioners {
         P: ModelProvisioner<AsrModel>
             + ModelProvisioner<TtsModel>
             + ModelProvisioner<OcrModel>
+            + OcrDeploymentProvisioner
             + 'static,
     {
         let asr: Arc<dyn ModelProvisioner<AsrModel>> = provisioner.clone();
         let tts: Arc<dyn ModelProvisioner<TtsModel>> = provisioner.clone();
-        let ocr: Arc<dyn ModelProvisioner<OcrModel>> = provisioner;
+        let ocr: Arc<dyn ModelProvisioner<OcrModel>> = provisioner.clone();
         let layout: Arc<dyn ModelProvisioner<DeploymentLayoutModel>> =
             Arc::new(LayoutModelProvisioner {
                 inner: Arc::clone(&ocr),
             });
+        let ocr_deployments: Arc<dyn OcrDeploymentProvisioner> = provisioner;
         Self {
             asr,
             tts,
             ocr,
             layout,
+            ocr_deployments,
         }
     }
 }
@@ -2277,6 +2555,7 @@ struct ResolvedOcrModels {
     ocr_vl: Vec<OcrRuntimeKey>,
     layout: Vec<DeploymentLayoutModel>,
     layout_locators: HashMap<DeploymentLayoutModel, ModelProvisioning>,
+    deployment_plans: HashMap<OcrRuntimeKey, DeploymentArtifactPlan>,
 }
 
 #[allow(
@@ -2293,6 +2572,7 @@ fn resolve_configured_ocr_models(
             .ocr
             .models
             .iter()
+            .filter(|deployment| deployment.table_structure.is_none())
             .map(|model| model.runtime.clone())
             .collect()
     } else {
@@ -2316,6 +2596,7 @@ fn resolve_configured_ocr_models(
         .models
         .iter()
         .filter(|_| config.services.ocr.active())
+        .filter(|deployment| deployment.table_structure.is_none())
         .chain(
             config
                 .services
@@ -2339,6 +2620,7 @@ fn resolve_configured_ocr_models(
         .models
         .iter()
         .chain(&config.services.ocr_vl.models)
+        .filter(|deployment| deployment.table_structure.is_none())
         .filter(|deployment| match deployment.runtime.kind() {
             OcrModelKind::TraditionalOcr => config.services.ocr.active(),
             OcrModelKind::OcrVl => config.services.ocr_vl.active(),
@@ -2359,6 +2641,7 @@ fn resolve_configured_ocr_models(
         .models
         .iter()
         .filter(|_| config.services.ocr.active())
+        .filter(|deployment| deployment.table_structure.is_none())
         .chain(
             config
                 .services
@@ -2388,15 +2671,29 @@ fn resolve_configured_ocr_models(
         })
         .collect();
     let ocr = if config.services.ocr.active() {
-        resolve_deployment_runtime_keys(&config.services.ocr.models)
+        resolve_deployment_runtime_keys(&config.services.ocr.models, source_candidates)
     } else {
         Vec::new()
     };
     let ocr_vl = if config.services.ocr_vl.active() {
-        resolve_deployment_runtime_keys(&config.services.ocr_vl.models)
+        resolve_deployment_runtime_keys(&config.services.ocr_vl.models, source_candidates)
     } else {
         Vec::new()
     };
+    let deployment_plans = config
+        .services
+        .ocr
+        .models
+        .iter()
+        .filter(|_| config.services.ocr.active())
+        .filter(|deployment| deployment.table_structure.is_some())
+        .flat_map(|deployment| {
+            let plan = ocr_deployment_artifact_plan(deployment, source_candidates);
+            ocr_runtime_keys_for_deployment(deployment, source_candidates)
+                .into_iter()
+                .map(move |key| (key, plan.clone()))
+        })
+        .collect();
     ResolvedOcrModels {
         assets,
         asset_locators,
@@ -2404,6 +2701,132 @@ fn resolve_configured_ocr_models(
         ocr_vl,
         layout,
         layout_locators,
+        deployment_plans,
+    }
+}
+
+fn ocr_deployment_artifact_plan(
+    deployment: &crate::settings::OcrModelDeployment,
+    source_candidates: &[DownloadSource],
+) -> DeploymentArtifactPlan {
+    let primary = deployment
+        .runtime
+        .known()
+        .expect("validated OCR deployment has a known runtime recipe");
+    let mut artifacts = primary
+        .download_assets()
+        .iter()
+        .map(|artifact| DeploymentArtifactRequest {
+            role: match artifact.role {
+                OcrModelAssetRole::Detector => ArtifactRole::OcrDetector,
+                OcrModelAssetRole::Recognizer => ArtifactRole::OcrRecognizer,
+                OcrModelAssetRole::Dictionary => ArtifactRole::OcrDictionary,
+                OcrModelAssetRole::Layout => ArtifactRole::OcrLayout,
+            },
+            source: deployment_artifact_source(&deployment.model),
+            repository: Some(artifact.repo.to_string()),
+            files: vec![artifact.file.to_string()],
+            required_source: matches!(artifact.kind, OcrModelAssetKind::ModelScopeFile { .. })
+                .then_some(DownloadSource::ModelScope),
+        })
+        .collect::<Vec<_>>();
+    if let (Some(layout), Some(layout_runtime)) = (
+        deployment.layout_model.as_ref(),
+        deployment.layout_runtime.as_ref(),
+    ) {
+        artifacts.extend(deployment_artifact_requests(
+            ArtifactRole::OcrLayout,
+            layout_runtime,
+            layout,
+        ));
+    }
+    if let Some(table) = &deployment.table_structure {
+        artifacts.push(exact_deployment_artifact(
+            ArtifactRole::OcrTableStructureModel,
+            &table.model,
+        ));
+        artifacts.push(exact_deployment_artifact(
+            ArtifactRole::OcrTableStructureDictionary,
+            &table.dictionary,
+        ));
+    }
+    DeploymentArtifactPlan {
+        deployment_id: deployment.id.clone(),
+        category: deployment.runtime.category(),
+        source_intent: ocr_deployment_source_intent(deployment, source_candidates),
+        artifacts,
+        neutral_candidates: source_candidates.to_vec(),
+    }
+}
+
+fn deployment_artifact_requests(
+    role: ArtifactRole,
+    runtime: &OcrModel,
+    url: &orchion::ModelUrl,
+) -> Vec<DeploymentArtifactRequest> {
+    if url.source() == ModelUrlSource::File {
+        return vec![exact_deployment_artifact(role, url)];
+    }
+    ModelDownloader::model_artifact_plan(runtime, url)
+        .expect("validated OCR auxiliary has an artifact recipe")
+        .into_iter()
+        .map(|artifact| DeploymentArtifactRequest {
+            role,
+            source: deployment_artifact_source(url),
+            repository: Some(artifact.repository),
+            files: artifact
+                .files
+                .expect("validated OCR auxiliary recipe has exact files"),
+            required_source: artifact.required_source,
+        })
+        .collect()
+}
+
+fn exact_deployment_artifact(
+    role: ArtifactRole,
+    url: &orchion::ModelUrl,
+) -> DeploymentArtifactRequest {
+    if url.source() == ModelUrlSource::File {
+        let path = PathBuf::from(url.path().expect("validated file URL has a path"));
+        return DeploymentArtifactRequest {
+            role,
+            source: DeploymentArtifactSource::File(path.clone()),
+            repository: None,
+            files: vec![
+                path.file_name()
+                    .expect("validated file URL has a file name")
+                    .to_string_lossy()
+                    .to_string(),
+            ],
+            required_source: None,
+        };
+    }
+    DeploymentArtifactRequest {
+        role,
+        source: deployment_artifact_source(url),
+        repository: Some(format!(
+            "{}/{}",
+            url.owner().expect("validated hub URL has an owner"),
+            url.repository()
+                .expect("validated hub URL has a repository")
+        )),
+        files: vec![
+            url.path()
+                .expect("validated auxiliary URL has an exact path")
+                .to_string(),
+        ],
+        required_source: None,
+    }
+}
+
+fn deployment_artifact_source(url: &orchion::ModelUrl) -> DeploymentArtifactSource {
+    match url.source() {
+        ModelUrlSource::Neutral => DeploymentArtifactSource::Neutral,
+        ModelUrlSource::HuggingFace => DeploymentArtifactSource::HuggingFace,
+        ModelUrlSource::ModelScope => DeploymentArtifactSource::ModelScope,
+        ModelUrlSource::File => DeploymentArtifactSource::File(PathBuf::from(
+            url.path().expect("validated file URL has a path"),
+        )),
     }
 }
 
@@ -2510,9 +2933,26 @@ fn ocr_deployment_source_intent(
         || deployment
             .layout_model
             .as_ref()
-            .is_some_and(|url| url.source() == ModelUrlSource::Neutral);
+            .is_some_and(|url| url.source() == ModelUrlSource::Neutral)
+        || deployment.table_structure.as_ref().is_some_and(|table| {
+            table.model.source() == ModelUrlSource::Neutral
+                || table.dictionary.source() == ModelUrlSource::Neutral
+        });
+    let table = deployment.table_structure.as_ref().map_or_else(
+        || "none".to_string(),
+        |table| {
+            format!(
+                "model={},dictionary={},type={},score={:08x},max_length={}",
+                table.model,
+                table.dictionary,
+                table.table_type.as_str(),
+                table.score_threshold.to_bits(),
+                table.max_structure_length
+            )
+        },
+    );
     format!(
-        "id={}|model={}|layout={}{}",
+        "id={}|model={}|layout={}|table={table}{}",
         deployment.id,
         deployment.model,
         deployment
@@ -2642,6 +3082,10 @@ fn active_neutral_locators(config: &ServerConfig) -> bool {
                         .layout_model
                         .as_ref()
                         .is_some_and(|url| url.source() == ModelUrlSource::Neutral)
+                    || deployment.table_structure.as_ref().is_some_and(|table| {
+                        table.model.source() == ModelUrlSource::Neutral
+                            || table.dictionary.source() == ModelUrlSource::Neutral
+                    })
             })
         || config.services.ocr_vl.active()
             && config.services.ocr_vl.models.iter().any(|deployment| {
@@ -2805,32 +3249,33 @@ fn ocr_api_model(
 
 fn resolve_deployment_runtime_keys(
     deployments: &[crate::settings::OcrModelDeployment],
+    source_candidates: &[DownloadSource],
 ) -> Vec<OcrRuntimeKey> {
     deployments
         .iter()
-        .flat_map(|deployment| {
-            std::iter::once(OcrRuntimeKey::new(deployment.runtime.clone(), None)).chain(
-                deployment.layout_runtime.clone().map(|layout| {
-                    OcrRuntimeKey::new(
-                        deployment.runtime.clone(),
-                        Some(DeploymentLayoutModel::new(deployment.id.clone(), layout)),
-                    )
-                }),
-            )
-        })
+        .flat_map(|deployment| ocr_runtime_keys_for_deployment(deployment, source_candidates))
         .collect()
 }
 
-fn ocr_runtime_keys_for_model(primary: &OcrModel, layout_models: &[ModelId]) -> Vec<OcrRuntimeKey> {
-    std::iter::once(OcrRuntimeKey::new(primary.clone(), None))
-        .chain(layout_models.iter().cloned().map(|layout| {
-            OcrRuntimeKey::new(
-                primary.clone(),
-                Some(DeploymentLayoutModel::new(
-                    primary.id().clone(),
-                    OcrModel::new(layout, OcrModelKind::Layout),
-                )),
-            )
-        }))
+fn ocr_runtime_keys_for_deployment(
+    deployment: &crate::settings::OcrModelDeployment,
+    source_candidates: &[DownloadSource],
+) -> Vec<OcrRuntimeKey> {
+    let layout = deployment
+        .layout_runtime
+        .clone()
+        .map(|layout| DeploymentLayoutModel::new(deployment.id.clone(), layout));
+    if let Some(table) = deployment.table_structure.clone() {
+        return vec![
+            OcrRuntimeKey::new(deployment.runtime.clone(), layout)
+                .with_table_structure(Some(table))
+                .with_table_source_intent(Some(ocr_deployment_source_intent(
+                    deployment,
+                    source_candidates,
+                ))),
+        ];
+    }
+    std::iter::once(OcrRuntimeKey::new(deployment.runtime.clone(), None))
+        .chain(layout.map(|layout| OcrRuntimeKey::new(deployment.runtime.clone(), Some(layout))))
         .collect()
 }

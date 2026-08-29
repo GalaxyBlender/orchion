@@ -3,6 +3,28 @@ use orchion_core::{
 };
 use std::path::{Path, PathBuf};
 
+/// Local assets and runtime configuration for table structure recognition.
+#[derive(Debug, Clone)]
+pub struct TableStructureAssets {
+    pub model: PathBuf,
+    pub dictionary: PathBuf,
+    pub table_type: String,
+    pub score_threshold: f32,
+    pub max_structure_length: usize,
+}
+
+impl PartialEq for TableStructureAssets {
+    fn eq(&self, other: &Self) -> bool {
+        self.model == other.model
+            && self.dictionary == other.dictionary
+            && self.table_type == other.table_type
+            && self.score_threshold.to_bits() == other.score_threshold.to_bits()
+            && self.max_structure_length == other.max_structure_length
+    }
+}
+
+impl Eq for TableStructureAssets {}
+
 /// Complete local paths needed to load an OCR runtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OcrAssets {
@@ -12,6 +34,7 @@ pub enum OcrAssets {
         recognizer: PathBuf,
         dictionary: PathBuf,
         layout: Option<PathBuf>,
+        table_structure: Option<TableStructureAssets>,
     },
     /// Standalone document layout model.
     Layout { model: PathBuf },
@@ -30,15 +53,37 @@ impl OcrAssets {
                 detector,
                 recognizer,
                 dictionary,
+                table_structure,
                 ..
             } => Self::Traditional {
                 detector,
                 recognizer,
                 dictionary,
                 layout,
+                table_structure,
             },
             Self::VisionLanguage { model_dir, .. } => Self::VisionLanguage { model_dir, layout },
             Self::Layout { model } => Self::Layout { model },
+        }
+    }
+
+    #[must_use]
+    pub fn with_table_structure(self, table_structure: Option<TableStructureAssets>) -> Self {
+        match self {
+            Self::Traditional {
+                detector,
+                recognizer,
+                dictionary,
+                layout,
+                ..
+            } => Self::Traditional {
+                detector,
+                recognizer,
+                dictionary,
+                layout,
+                table_structure,
+            },
+            other => other,
         }
     }
 
@@ -84,6 +129,7 @@ impl OcrAssets {
                     cache_root,
                 ),
                 layout: layout.is_file().then_some(layout),
+                table_structure: None,
             },
             KnownOcrModel::PpDocLayoutV3 => Self::Layout { model: layout },
             KnownOcrModel::PaddleOcrVl15 | KnownOcrModel::PaddleOcrVl16 => Self::VisionLanguage {
@@ -150,6 +196,7 @@ mod tests {
             recognizer,
             dictionary,
             layout,
+            table_structure,
         } = assets
         else {
             panic!("expected traditional OCR assets");
@@ -167,5 +214,6 @@ mod tests {
             Path::new("models/PaddlePaddle/PP-OCRv6_tiny/ppocrv6_tiny_dict.txt")
         );
         assert_eq!(layout, None);
+        assert_eq!(table_structure, None);
     }
 }

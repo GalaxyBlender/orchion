@@ -166,6 +166,7 @@ pub enum ModelCapability {
     TtsVoiceDesign,
     OcrText,
     OcrLayout,
+    OcrTableStructure,
     OcrVisionLanguage,
     OcrMarkdown,
     OcrHtml,
@@ -216,6 +217,10 @@ impl ModelCapability {
             (ModelCapabilities::TTS_VOICE_DESIGN, Self::TtsVoiceDesign),
             (ModelCapabilities::OCR_TEXT, Self::OcrText),
             (ModelCapabilities::OCR_LAYOUT, Self::OcrLayout),
+            (
+                ModelCapabilities::OCR_TABLE_STRUCTURE,
+                Self::OcrTableStructure,
+            ),
             (
                 ModelCapabilities::OCR_VISION_LANGUAGE,
                 Self::OcrVisionLanguage,

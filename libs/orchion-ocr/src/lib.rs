@@ -6,7 +6,7 @@ mod runtime;
 #[cfg(all(feature = "ocr-vl", feature = "cuda"))]
 mod vl_worker;
 
-pub use assets::OcrAssets;
+pub use assets::{OcrAssets, TableStructureAssets};
 pub use result::validate_image_file;
 pub use runtime::OcrEngine;
 

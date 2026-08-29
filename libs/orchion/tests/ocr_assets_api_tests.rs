@@ -2,7 +2,7 @@
 
 use orchion::{
     ModelId, Ocr, OcrAssets, OcrEngine, OcrEngineFuture, OcrLimits, OcrOptions, OcrResponseFormat,
-    OcrResult, OcrUsage,
+    OcrResult, OcrUsage, TableStructureAssets,
 };
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -14,6 +14,7 @@ fn explicit_ocr_assets_do_not_require_a_shared_directory_hierarchy() {
         recognizer: PathBuf::from("runtime/recognizer.onnx"),
         dictionary: PathBuf::from("/opt/dictionaries/ppocr.txt"),
         layout: Some(PathBuf::from("models/layout/inference.onnx")),
+        table_structure: None,
     };
 
     let OcrAssets::Traditional {
@@ -21,6 +22,7 @@ fn explicit_ocr_assets_do_not_require_a_shared_directory_hierarchy() {
         recognizer,
         dictionary,
         layout,
+        table_structure,
     } = assets
     else {
         panic!("expected traditional OCR assets");
@@ -33,6 +35,7 @@ fn explicit_ocr_assets_do_not_require_a_shared_directory_hierarchy() {
         layout.as_deref(),
         Some(Path::new("models/layout/inference.onnx"))
     );
+    assert_eq!(table_structure, None);
 }
 
 #[test]
@@ -67,6 +70,32 @@ fn explicit_layout_assets_accept_a_top_level_model_path() {
 }
 
 #[test]
+fn traditional_assets_carry_table_structure_paths_and_config() {
+    let table = TableStructureAssets {
+        model: PathBuf::from("table.onnx"),
+        dictionary: PathBuf::from("table_dict.txt"),
+        table_type: "wireless".to_string(),
+        score_threshold: 0.7,
+        max_structure_length: 640,
+    };
+    let assets = OcrAssets::Traditional {
+        detector: PathBuf::from("detector.onnx"),
+        recognizer: PathBuf::from("recognizer.onnx"),
+        dictionary: PathBuf::from("ocr_dict.txt"),
+        layout: Some(PathBuf::from("layout.onnx")),
+        table_structure: None,
+    }
+    .with_table_structure(Some(table.clone()));
+    let OcrAssets::Traditional {
+        table_structure, ..
+    } = assets
+    else {
+        panic!("expected traditional OCR assets");
+    };
+    assert_eq!(table_structure, Some(table));
+}
+
+#[test]
 fn cache_layout_assets_use_the_explicit_cache_root() {
     let assets = OcrAssets::from_cache_layout(
         orchion::KnownOcrModel::PpOcrV6Tiny,
@@ -78,6 +107,7 @@ fn cache_layout_assets_use_the_explicit_cache_root() {
         recognizer,
         dictionary,
         layout,
+        table_structure,
     } = assets
     else {
         panic!("expected traditional OCR assets");
@@ -92,6 +122,7 @@ fn cache_layout_assets_use_the_explicit_cache_root() {
     );
     assert_eq!(dictionary, Path::new("main-model/ppocrv6_tiny_dict.txt"));
     assert_eq!(layout, None);
+    assert_eq!(table_structure, None);
 }
 
 struct TestOcrEngine {

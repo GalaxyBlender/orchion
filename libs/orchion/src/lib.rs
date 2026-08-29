@@ -39,7 +39,9 @@ pub use audio_vad::{
 
 #[cfg(feature = "download-all")]
 pub use orchion_download::{
-    ArtifactRequest, DeploymentSourcePlan, DownloadSource, ModelDownloader,
+    ArtifactRequest, ArtifactRole, DeploymentArtifactPlan, DeploymentArtifactRequest,
+    DeploymentArtifactSource, DeploymentPublication, DeploymentSourcePlan, DownloadSource,
+    ModelDownloader, PublishedDeploymentArtifact,
 };
 
 #[cfg(feature = "docs")]
@@ -50,6 +52,8 @@ pub use asr::{Asr, AsrEngine, AsrEngineFuture, AsrStream, AsrStreamSession};
 
 #[cfg(any(feature = "ocr", feature = "ocr-vl"))]
 pub use ocr::{Ocr, OcrAssets, OcrEngine, OcrEngineFuture};
+#[cfg(any(feature = "ocr", feature = "ocr-vl"))]
+pub use orchion_ocr::TableStructureAssets;
 
 #[cfg(any(feature = "ocr", feature = "ocr-vl"))]
 pub use orchion_ocr::validate_image_file as validate_ocr_image_file;

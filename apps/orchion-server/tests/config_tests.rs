@@ -1,5 +1,11 @@
-use orchion::{DevicePreference, ModelId, ModelUrlSource, OcrResponseFormat};
-use orchion_server::config::{ConfigError, ModelSource, ServerConfig};
+use orchion::{
+    DevicePreference, KnownOcrModel, ModelId, ModelUrl, ModelUrlSource, OcrResponseFormat,
+};
+use orchion_server::config::{
+    ConfigError, ModelSource, OcrModelDeployment, ServerConfig, TableStructureConfig,
+    TableStructureType,
+};
+use orchion_server::state::AppState;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::time::Duration;
@@ -393,6 +399,185 @@ layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
     .unwrap_err();
     assert!(matches!(error, ConfigError::ParseToml(_)));
     assert!(error.to_string().contains("unknown field"));
+}
+
+fn table_config(extra: &str) -> String {
+    format!(
+        r#"
+[[services.ocr.models]]
+id = "PaddlePaddle/PP-OCRv6_tiny"
+model = "//PaddlePaddle/PP-OCRv6_tiny"
+layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
+table_structure = {{ model = "//Acme/Table/table.onnx", dictionary = "//Acme/Table/table_dict.txt", table_type = "wired"{extra} }}
+"#
+    )
+}
+
+fn programmatic_table_config(score_threshold: f32, max_structure_length: usize) -> ServerConfig {
+    let mut config = ServerConfig::default_for_exe(exe());
+    let mut deployment = OcrModelDeployment::from_runtime(KnownOcrModel::PpOcrV6Tiny.into_model())
+        .with_supported_layout();
+    deployment.table_structure = Some(TableStructureConfig {
+        model: ModelUrl::parse("//Acme/Table/table.onnx").unwrap(),
+        dictionary: ModelUrl::parse("//Acme/Table/table_dict.txt").unwrap(),
+        table_type: TableStructureType::Wired,
+        score_threshold,
+        max_structure_length,
+    });
+    config.services.ocr.enabled = true;
+    config.services.ocr.default_model = Some(deployment.id.clone());
+    config.services.ocr.models = vec![deployment];
+    config
+}
+
+#[test]
+fn table_structure_defaults_and_overrides_parse() {
+    let config = ServerConfig::from_toml_str(&table_config(""), exe()).unwrap();
+    let table = config.services.ocr.models[0]
+        .table_structure
+        .as_ref()
+        .unwrap();
+    assert_eq!(table.table_type.as_str(), "wired");
+    assert!((table.score_threshold - 0.5).abs() <= f32::EPSILON);
+    assert_eq!(table.max_structure_length, 500);
+
+    let config = ServerConfig::from_toml_str(
+        &table_config(", score_threshold = 0.75, max_structure_length = 768"),
+        exe(),
+    )
+    .unwrap();
+    let table = config.services.ocr.models[0]
+        .table_structure
+        .as_ref()
+        .unwrap();
+    assert!((table.score_threshold - 0.75).abs() <= f32::EPSILON);
+    assert_eq!(table.max_structure_length, 768);
+}
+
+#[test]
+fn table_structure_accepts_wired_and_wireless_only() {
+    for table_type in ["wired", "wireless"] {
+        let document = table_config("").replace(
+            "table_type = \"wired\"",
+            &format!("table_type = \"{table_type}\""),
+        );
+        let config = ServerConfig::from_toml_str(&document, exe()).unwrap();
+        assert_eq!(
+            config.services.ocr.models[0]
+                .table_structure
+                .as_ref()
+                .unwrap()
+                .table_type
+                .as_str(),
+            table_type
+        );
+    }
+    let error = ServerConfig::from_toml_str(
+        &table_config("").replace("table_type = \"wired\"", "table_type = \"auto\""),
+        exe(),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        ConfigError::InvalidTableStructureType { .. }
+    ));
+}
+
+#[test]
+fn table_structure_rejects_unknown_fields_and_missing_layout() {
+    let error = ServerConfig::from_toml_str(&table_config(", input_shape = [488, 488]"), exe())
+        .unwrap_err();
+    assert!(error.to_string().contains("unknown field"));
+
+    let document = table_config("").replace(
+        "layout_model = \"//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx\"\n",
+        "",
+    );
+    let error = ServerConfig::from_toml_str(&document, exe()).unwrap_err();
+    assert!(matches!(
+        error,
+        ConfigError::TableStructureRequiresLayout { .. }
+    ));
+}
+
+#[test]
+fn ocr_vl_rejects_table_structure() {
+    let document = table_config("")
+        .replace("services.ocr.models", "services.ocr-vl.models")
+        .replace(
+            "PaddlePaddle/PP-OCRv6_tiny",
+            "PaddlePaddle/PaddleOCR-VL-1.6",
+        );
+    let error = ServerConfig::from_toml_str(&document, exe()).unwrap_err();
+    assert!(matches!(
+        error,
+        ConfigError::UnsupportedTableStructurePipeline { .. }
+    ));
+}
+
+#[test]
+fn table_structure_rejects_invalid_thresholds_and_zero_length() {
+    for value in ["nan", "inf", "-inf", "-0.01", "1.01"] {
+        let error = ServerConfig::from_toml_str(
+            &table_config(&format!(", score_threshold = {value}")),
+            exe(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigError::InvalidTableStructureThreshold { .. }
+        ));
+    }
+    let error = ServerConfig::from_toml_str(&table_config(", max_structure_length = 0"), exe())
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ConfigError::InvalidTableStructureLength { .. }
+    ));
+}
+
+#[test]
+fn programmatic_table_structure_rejects_invalid_thresholds_in_validate_and_app_state() {
+    for score_threshold in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.01, 1.01] {
+        let config = programmatic_table_config(score_threshold, 500);
+        assert!(matches!(
+            config.validate().unwrap_err(),
+            ConfigError::InvalidTableStructureThreshold {
+                section: "services.ocr",
+                ..
+            }
+        ));
+        let Err(error) = AppState::from_prepared_config(config) else {
+            panic!("invalid programmatic table threshold should reject AppState");
+        };
+        assert!(matches!(
+            error.downcast_ref::<ConfigError>(),
+            Some(ConfigError::InvalidTableStructureThreshold {
+                section: "services.ocr",
+                ..
+            })
+        ));
+    }
+}
+
+#[test]
+fn programmatic_table_structure_rejects_zero_length_in_validate_and_app_state() {
+    let config = programmatic_table_config(0.5, 0);
+    assert!(matches!(
+        config.validate().unwrap_err(),
+        ConfigError::InvalidTableStructureLength {
+            section: "services.ocr"
+        }
+    ));
+    let Err(error) = AppState::from_prepared_config(config) else {
+        panic!("zero programmatic table length should reject AppState");
+    };
+    assert!(matches!(
+        error.downcast_ref::<ConfigError>(),
+        Some(ConfigError::InvalidTableStructureLength {
+            section: "services.ocr"
+        })
+    ));
 }
 
 #[test]

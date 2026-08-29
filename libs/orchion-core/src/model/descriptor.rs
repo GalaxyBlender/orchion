@@ -27,6 +27,7 @@ impl ModelCapabilities {
     pub const OCR_VISION_LANGUAGE: Self = Self(1 << 7);
     pub const OCR_MARKDOWN: Self = Self(1 << 8);
     pub const OCR_HTML: Self = Self(1 << 9);
+    pub const OCR_TABLE_STRUCTURE: Self = Self(1 << 10);
 
     #[must_use]
     pub const fn union(self, other: Self) -> Self {

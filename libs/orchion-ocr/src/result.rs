@@ -300,6 +300,20 @@ fn build_structure_runtime(
         } else {
             builder
         };
+        let builder = if let Some(table) =
+            ocr_assets.and_then(|assets| assets.table_structure.as_ref())
+        {
+            let config = oar_ocr::domain::tasks::TableStructureRecognitionConfig {
+                score_threshold: table.score_threshold,
+                max_structure_length: table.max_structure_length,
+            };
+            builder
+                .with_table_structure_recognition(table.model.clone(), table.table_type.as_str())
+                .table_structure_dict_path(table.dictionary.clone())
+                .table_structure_recognition_config(config)
+        } else {
+            builder
+        };
         builder.build().map_err(model_load_error)
     })
 }
@@ -771,6 +785,7 @@ struct TraditionalAssets {
     detector: PathBuf,
     recognizer: PathBuf,
     dictionary: PathBuf,
+    table_structure: Option<crate::TableStructureAssets>,
 }
 
 #[cfg(feature = "ocr")]
@@ -783,6 +798,7 @@ fn traditional_assets(
         recognizer,
         dictionary,
         layout,
+        table_structure,
     } = assets
     else {
         return Err(asset_kind_error(model, "traditional"));
@@ -792,6 +808,7 @@ fn traditional_assets(
             detector: detector.clone(),
             recognizer: recognizer.clone(),
             dictionary: dictionary.clone(),
+            table_structure: table_structure.clone(),
         },
         layout.as_deref(),
     ))

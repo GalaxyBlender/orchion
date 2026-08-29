@@ -134,6 +134,7 @@ mod tests {
                 "tts_voice_design",
                 "ocr_text",
                 "ocr_layout",
+                "ocr_table_structure",
                 "ocr_vision_language",
                 "ocr_markdown",
                 "ocr_html"
