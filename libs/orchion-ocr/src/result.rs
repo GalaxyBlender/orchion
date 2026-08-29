@@ -49,6 +49,45 @@ pub(crate) struct OcrVlRuntime {
     layout_predictor: Option<oar_ocr::predictors::LayoutDetectionPredictor>,
 }
 
+#[cfg(feature = "ocr-vl")]
+struct OcrLayoutSource<'a> {
+    predictor: &'a oar_ocr::predictors::LayoutDetectionPredictor,
+}
+
+#[cfg(feature = "ocr-vl")]
+impl oar_ocr_vl::LayoutSource for OcrLayoutSource<'_> {
+    fn detect(
+        &self,
+        image: &image::RgbImage,
+    ) -> std::result::Result<oar_ocr_vl::LayoutDetections, oar_ocr_vl::Error> {
+        let result = self
+            .predictor
+            .predict(vec![image.clone()])
+            .map_err(|error| oar_ocr_vl::Error::invalid_input(error.to_string()))?;
+        let elements = result
+            .elements
+            .into_iter()
+            .next()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|element| oar_ocr_vl::LayoutDetectionElement {
+                bbox: oar_ocr_vl::BoundingBox::new(
+                    element
+                        .bbox
+                        .points
+                        .into_iter()
+                        .map(|point| oar_ocr_vl::Point::new(point.x, point.y))
+                        .collect(),
+                ),
+                element_type: element.element_type,
+                score: element.score,
+            })
+            .collect();
+
+        Ok(oar_ocr_vl::LayoutDetections::new(elements))
+    }
+}
+
 pub async fn load_runtime(
     model: KnownOcrModel,
     assets: OcrAssets,
@@ -479,6 +518,7 @@ fn run_vl_ocr_with_image(
     let text = runtime
         .model
         .generate(&[image], &[task], max_tokens)
+        .map_err(inference_error)?
         .into_iter()
         .next()
         .ok_or_else(|| OrchionError::Inference {
@@ -513,8 +553,11 @@ fn run_vl_layout_ocr(
             ..DocParserConfig::default()
         },
     );
+    let layout_source = OcrLayoutSource {
+        predictor: layout_predictor,
+    };
     let structure = parser
-        .parse(layout_predictor, image)
+        .parse(&layout_source, image)
         .map_err(inference_error)?;
     let text = structure
         .layout_elements
@@ -911,7 +954,7 @@ fn polygon_points(bbox: &oar_ocr::processors::BoundingBox) -> Vec<OcrPoint> {
 }
 
 #[cfg(feature = "ocr-vl")]
-fn bbox_points(bbox: &oar_ocr::processors::BoundingBox) -> Vec<orchion_core::OcrPoint> {
+fn bbox_points(bbox: &oar_ocr_vl::BoundingBox) -> Vec<orchion_core::OcrPoint> {
     bbox.points
         .iter()
         .map(|point| orchion_core::OcrPoint {
