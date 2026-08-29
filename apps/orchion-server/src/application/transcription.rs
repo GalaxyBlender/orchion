@@ -12,7 +12,7 @@ pub type TranscriptionFuture<'a> =
 
 #[derive(Debug, Clone)]
 pub struct TranscriptionPolicy {
-    pub available_models: Vec<AsrModel>,
+    pub models: Vec<AsrModel>,
     pub max_audio_duration: Duration,
 }
 
@@ -53,7 +53,7 @@ pub async fn transcribe(
     let policy = runtime.transcription_policy();
     let model = AsrModel::parse(&command.model)
         .map_err(|_| UseCaseError::ModelNotAvailable(command.model.clone()))?;
-    if !policy.available_models.contains(&model) {
+    if !policy.models.contains(&model) {
         return Err(UseCaseError::ModelNotAvailable(command.model));
     }
 

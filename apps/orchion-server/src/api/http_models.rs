@@ -22,7 +22,7 @@ where
     let mut data = Vec::new();
     if let Some(asr) = &policy.asr {
         data.extend(
-            asr.available_models
+            asr.models
                 .iter()
                 .cloned()
                 .map(|model| ModelObject::new(model, ModelType::Asr, None)),

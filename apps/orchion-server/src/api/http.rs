@@ -166,6 +166,7 @@ mod tests {
     use crate::api::openai::ApiError;
     use crate::infrastructure::orchion::AppState;
     use crate::settings::ServerConfig;
+    use crate::settings::{ModelDeployment, OcrModelDeployment};
     use axum::body::Body;
     use axum::extract::connect_info::ConnectInfo;
     use axum::http::header::{
@@ -177,7 +178,7 @@ mod tests {
     use axum::response::Response;
     use futures_util::{SinkExt, StreamExt};
     use http_body_util::BodyExt;
-    use orchion::{AsrModel, ModelId, TtsModel};
+    use orchion::{AsrModel, ModelId, OcrModel, OcrModelKind, TtsModel};
     use serde_json::Value;
     use std::net::SocketAddr;
     use std::time::Duration;
@@ -1167,19 +1168,28 @@ mod tests {
         config.services.ocr.enabled = ocr_active;
         config.services.ocr.default_model =
             Some(ModelId::parse("PaddlePaddle/PP-OCRv6_tiny").unwrap());
-        config.services.ocr.available_models = vec![
-            ModelId::parse("PaddlePaddle/PP-OCRv6_tiny").unwrap(),
-            ModelId::parse("PaddlePaddle/PP-OCRv6_small").unwrap(),
-        ];
+        config.services.ocr.models = ["PaddlePaddle/PP-OCRv6_tiny", "PaddlePaddle/PP-OCRv6_small"]
+            .into_iter()
+            .map(|id| {
+                OcrModelDeployment::from_runtime(OcrModel::new(
+                    ModelId::parse(id).unwrap(),
+                    OcrModelKind::TraditionalOcr,
+                ))
+            })
+            .collect();
         config.services.ocr_vl.enabled = ocr_vl_active;
         config.services.ocr_vl.default_model =
             Some(ModelId::parse("PaddlePaddle/PaddleOCR-VL-1.6").unwrap());
-        config.services.ocr_vl.available_models =
-            vec![ModelId::parse("PaddlePaddle/PaddleOCR-VL-1.6").unwrap()];
-        config.services.asr.available_models =
-            vec![AsrModel::parse("Qwen/Qwen3-ASR-0.6B").unwrap()];
-        config.services.tts.available_models =
-            vec![TtsModel::parse("Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice").unwrap()];
+        config.services.ocr_vl.models = vec![OcrModelDeployment::from_runtime(OcrModel::new(
+            ModelId::parse("PaddlePaddle/PaddleOCR-VL-1.6").unwrap(),
+            OcrModelKind::OcrVl,
+        ))];
+        config.services.asr.models = vec![ModelDeployment::from_asr_runtime(
+            AsrModel::parse("Qwen/Qwen3-ASR-0.6B").unwrap(),
+        )];
+        config.services.tts.models = vec![ModelDeployment::from_tts_runtime(
+            TtsModel::parse("Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice").unwrap(),
+        )];
         config.services.asr.idle_timeout = Duration::from_mins(10);
         config.services.tts.idle_timeout = Duration::from_mins(10);
         configure(&mut config);

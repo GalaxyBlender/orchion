@@ -199,7 +199,7 @@ async fn handle_transcription_ws<S>(
         .await;
         return;
     };
-    if asr_policy.available_models.contains(&requested)
+    if asr_policy.models.contains(&requested)
         && let Some(activity) = &activity
     {
         activity.set_model(requested.to_string());

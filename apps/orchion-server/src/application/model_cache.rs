@@ -1,6 +1,9 @@
 use super::mark_owned_operation_dispatched;
 use super::resource_policy::InferenceLimiter;
-use orchion::{Asr, AsrModel, ModelDownloader, ModelSpec, Ocr, OcrModel, Tts, TtsModel};
+use orchion::{
+    Asr, AsrModel, DeploymentSourcePlan, ModelDownloader, ModelSpec, ModelUrl, Ocr, OcrModel, Tts,
+    TtsModel,
+};
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -17,8 +20,20 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub type ModelProvisionFuture<'a> =
     Pin<Box<dyn Future<Output = anyhow::Result<PathBuf>> + Send + 'a>>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelProvisioning {
+    pub model_url: ModelUrl,
+    pub source_intent: String,
+    pub source_plan: Option<DeploymentSourcePlan>,
+}
+
 pub trait ModelProvisioner<M>: Send + Sync {
-    fn provision(&self, model: M, models_dir: PathBuf) -> ModelProvisionFuture<'_>;
+    fn provision(
+        &self,
+        model: M,
+        provisioning: Option<ModelProvisioning>,
+        models_dir: PathBuf,
+    ) -> ModelProvisionFuture<'_>;
 }
 
 pub(crate) trait CacheTracker: Send + Sync {
@@ -90,6 +105,7 @@ pub struct ModelCache<M, E> {
 
 struct ModelCacheState<M, E> {
     available: Vec<M>,
+    provisioning: HashMap<M, ModelProvisioning>,
     loaded: HashMap<M, LoadedModel<E>>,
     loading: HashMap<M, Arc<Mutex<()>>>,
     draining: HashSet<M>,
@@ -581,6 +597,7 @@ where
         Self::build(
             cache_id,
             available_models,
+            HashMap::new(),
             idle_timeout,
             max_loaded,
             dir,
@@ -623,6 +640,7 @@ where
         Self::build(
             cache_id,
             available_models,
+            HashMap::new(),
             idle_timeout,
             max_loaded,
             dir,
@@ -643,6 +661,29 @@ where
         Self::build(
             cache_id,
             available_models,
+            HashMap::new(),
+            idle_timeout,
+            max_loaded,
+            dir,
+            provisioner,
+            residency,
+        )
+    }
+
+    pub(crate) fn new_in_domain_with_provisioning(
+        cache_id: &'static str,
+        available_models: Vec<M>,
+        provisioning: HashMap<M, ModelProvisioning>,
+        idle_timeout: Duration,
+        max_loaded: usize,
+        dir: PathBuf,
+        provisioner: Option<Arc<dyn ModelProvisioner<M>>>,
+        residency: ResidencyDomain,
+    ) -> Self {
+        Self::build(
+            cache_id,
+            available_models,
+            provisioning,
             idle_timeout,
             max_loaded,
             dir,
@@ -654,6 +695,7 @@ where
     fn build(
         cache_id: &'static str,
         available_models: Vec<M>,
+        provisioning: HashMap<M, ModelProvisioning>,
         idle_timeout: Duration,
         max_loaded: usize,
         dir: PathBuf,
@@ -663,6 +705,7 @@ where
         Self {
             inner: Arc::new(Mutex::new(ModelCacheState {
                 available: available_models,
+                provisioning,
                 loaded: HashMap::new(),
                 loading: HashMap::new(),
                 draining: HashSet::new(),
@@ -852,12 +895,34 @@ where
             return Ok(path);
         }
         let Some(provisioner) = self.provisioner.as_ref() else {
-            return Ok(model.cache_path(&self.dir));
+            let provisioning = self.inner.lock().await.provisioning.get(&model).cloned();
+            return match provisioning {
+                Some(provisioning) => match provisioning.source_plan.as_ref() {
+                    Some(plan) => ModelDownloader::resolve_prepared_model_url_path_with_plan(
+                        &model,
+                        &provisioning.model_url,
+                        &provisioning.source_intent,
+                        plan,
+                        &self.dir,
+                    )
+                    .map_err(anyhow::Error::from),
+                    None => ModelDownloader::resolve_model_url_path(
+                        &model,
+                        &provisioning.model_url,
+                        &provisioning.source_intent,
+                        &self.dir,
+                    )
+                    .await
+                    .map_err(anyhow::Error::from),
+                },
+                None => Ok(model.cache_path(&self.dir)),
+            };
         };
 
         tracing::debug!(cache = self.cache_id, model = ?model, models_dir = %self.dir.display(), "ensuring model is available");
+        let provisioning = self.inner.lock().await.provisioning.get(&model).cloned();
         let path = provisioner
-            .provision(model.clone(), self.dir.clone())
+            .provision(model.clone(), provisioning, self.dir.clone())
             .await?;
         self.inner
             .lock()
@@ -1310,7 +1375,9 @@ where
 {
     for model in models {
         tracing::debug!(model = ?model, models_dir = %dir.display(), "ensuring {label} model is available");
-        let path = provisioner.provision(model.clone(), dir.clone()).await?;
+        let path = provisioner
+            .provision(model.clone(), None, dir.clone())
+            .await?;
         tracing::debug!(model = ?model, path = %path.display(), "{label} model cache ready");
     }
     Ok(models.len())
@@ -2140,6 +2207,7 @@ mod tests {
         let model = qwen_asr_06b();
         let mut state = ModelCacheState {
             available: vec![model.clone()],
+            provisioning: HashMap::new(),
             loaded: HashMap::from([(
                 model.clone(),
                 LoadedModel {

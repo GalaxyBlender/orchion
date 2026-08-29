@@ -1,19 +1,16 @@
-use orchion::{AsrModel, DevicePreference, ModelId, OcrResponseFormat, TtsModel};
+use orchion::{DevicePreference, ModelId, ModelUrlSource, OcrResponseFormat};
 use orchion_server::config::{ConfigError, ModelSource, ServerConfig};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::Path;
 use std::time::Duration;
 
-fn asr_model(value: &str) -> AsrModel {
-    AsrModel::parse(value).unwrap()
-}
-
-fn tts_model(value: &str) -> TtsModel {
-    TtsModel::parse(value).unwrap()
+fn exe() -> &'static Path {
+    Path::new("/tmp/orchion-server")
 }
 
 #[test]
-fn defaults_are_executable_relative() {
-    let exe_path = std::path::Path::new("/tmp/orchion/bin/orchion-server");
+fn defaults_are_executable_relative_and_use_neutral_deployments() {
+    let exe_path = Path::new("/tmp/orchion/bin/orchion-server");
     let config = ServerConfig::default_for_exe(exe_path);
 
     assert_eq!(
@@ -26,1034 +23,463 @@ fn defaults_are_executable_relative() {
     );
     assert_eq!(config.models.dir, exe_path.parent().unwrap().join("models"));
     assert_eq!(config.models.source, ModelSource::Auto);
-    assert_eq!(config.models.max_loaded, 2);
-    assert!(!config.models.verify_file_integrity);
-    assert!(!config.services.asr.enabled);
+    assert_eq!(config.services.asr.models.len(), 1);
     assert_eq!(
-        config.services.asr.default_model,
-        asr_model("Qwen/Qwen3-ASR-0.6B")
+        config.services.asr.models[0].id.as_str(),
+        "Qwen/Qwen3-ASR-0.6B"
     );
     assert_eq!(
-        config.services.asr.available_models,
-        vec![asr_model("Qwen/Qwen3-ASR-0.6B")]
-    );
-    assert_eq!(config.services.asr.idle_timeout, Duration::from_mins(10));
-    assert_eq!(config.services.asr.max_loaded, 1);
-    assert_eq!(config.services.asr.device, DevicePreference::Auto);
-    assert!(!config.services.tts.enabled);
-    assert_eq!(
-        config.services.tts.default_model,
-        tts_model("Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")
+        config.services.asr.models[0].model.source(),
+        ModelUrlSource::Neutral
     );
     assert_eq!(
-        config.services.tts.available_models,
-        vec![tts_model("Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")]
+        config.services.tts.models[0].id.as_str(),
+        "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
     );
-    assert_eq!(config.services.tts.idle_timeout, Duration::from_mins(10));
-    assert_eq!(config.services.tts.max_loaded, 1);
-    assert_eq!(config.services.tts.device, DevicePreference::Auto);
-    assert!(!config.services.ocr.enabled);
-    assert_eq!(config.services.ocr.default_model, None);
-    assert!(config.services.ocr.available_models.is_empty());
-    assert_eq!(config.services.ocr.layout_default_model, None);
-    assert!(config.services.ocr.layout_available_models.is_empty());
-    assert_eq!(config.services.ocr.idle_timeout, Duration::from_mins(10));
-    assert_eq!(config.services.ocr.max_loaded, 1);
-    assert_eq!(config.services.ocr.device, DevicePreference::Auto);
+    assert!(config.services.ocr.models.is_empty());
+    assert!(config.services.ocr_vl.models.is_empty());
     assert_eq!(config.services.ocr.format, OcrResponseFormat::Json);
-    assert_eq!(config.services.ocr.max_pixels, 100_000_000);
-    assert!(!config.services.ocr.active());
-    assert!(!config.services.ocr_vl.enabled);
-    assert_eq!(config.services.ocr_vl.default_model, None);
-    assert!(config.services.ocr_vl.available_models.is_empty());
-    assert_eq!(config.services.ocr_vl.layout_default_model, None);
-    assert!(config.services.ocr_vl.layout_available_models.is_empty());
-    assert_eq!(config.services.ocr_vl.idle_timeout, Duration::from_mins(10));
-    assert_eq!(config.services.ocr_vl.max_loaded, 1);
-    assert_eq!(config.services.ocr_vl.device, DevicePreference::Auto);
     assert_eq!(config.services.ocr_vl.format, OcrResponseFormat::Markdown);
-    assert_eq!(config.services.ocr_vl.max_pixels, 100_000_000);
-    assert!(!config.services.ocr_vl.active());
-    assert_eq!(config.auth.api_key, None);
-    assert_eq!(config.server.cors_allowed_origins, ["*"]);
-    assert_eq!(config.server.max_upload_size, 30 * 1024 * 1024);
-    assert_eq!(config.server.max_concurrent_inference, 2);
-    assert_eq!(config.server.max_websocket_connections, 64);
-    assert_eq!(config.server.max_pending_websocket_connections, 16);
-    assert_eq!(config.server.max_websocket_message_size, 2 * 1024 * 1024);
-    assert!(config.activity.enabled);
-    assert_eq!(config.activity.history_capacity, 500);
 }
 
 #[test]
-fn activity_settings_can_be_overridden() {
+fn deployment_arrays_parse_and_replace_defaults() {
     let config = ServerConfig::from_toml_str(
-        "[activity]\nenabled = false\nhistory_capacity = 25",
-        std::path::Path::new("/tmp/orchion-server"),
+        r#"
+[services.asr]
+default_model = "Qwen/Qwen3-ASR-1.7B"
+
+[[services.asr.models]]
+id = "Qwen/Qwen3-ASR-1.7B"
+name = "  Qwen3 ASR 1.7B  "
+model = "ms://Qwen/Qwen3-ASR-1.7B"
+"#,
+        exe(),
     )
     .unwrap();
 
-    assert!(!config.activity.enabled);
-    assert_eq!(config.activity.history_capacity, 25);
+    assert_eq!(config.services.asr.models.len(), 1);
+    let deployment = &config.services.asr.models[0];
+    assert_eq!(deployment.id.as_str(), "Qwen/Qwen3-ASR-1.7B");
+    assert_eq!(deployment.runtime.as_str(), deployment.id.as_str());
+    assert_eq!(deployment.name.as_deref(), Some("Qwen3 ASR 1.7B"));
+    assert_eq!(deployment.display_name(), "Qwen3 ASR 1.7B");
+    assert_eq!(deployment.model.as_str(), "ms://Qwen/Qwen3-ASR-1.7B");
+    assert_eq!(deployment.model.source(), ModelUrlSource::ModelScope);
 }
 
 #[test]
-fn activity_history_capacity_has_a_bounded_maximum() {
-    let error = ServerConfig::from_toml_str(
-        "[activity]\nhistory_capacity = 10001",
-        std::path::Path::new("/tmp/orchion-server"),
-    )
-    .unwrap_err();
-
-    assert!(error.to_string().contains("must not exceed 10000"));
-}
-
-#[test]
-fn cors_allowed_origins_are_parsed_from_toml() {
+fn omitted_name_falls_back_to_model_id_name_segment() {
     let config = ServerConfig::from_toml_str(
         r#"
-[server]
-cors_allowed_origins = ["https://app.example.com", "https://admin.example.com"]
+[[services.tts.models]]
+id = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+model = "//Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
 "#,
-        std::path::Path::new("/tmp/orchion-server"),
+        exe(),
     )
     .unwrap();
 
     assert_eq!(
-        config.server.cors_allowed_origins,
-        ["https://app.example.com", "https://admin.example.com"]
+        config.services.tts.models[0].display_name(),
+        "Qwen3-TTS-12Hz-0.6B-CustomVoice"
     );
 }
 
 #[test]
-fn cors_wildcard_cannot_be_combined_with_specific_origins() {
+fn blank_names_are_rejected() {
     let error = ServerConfig::from_toml_str(
         r#"
-[server]
-cors_allowed_origins = ["*", "https://app.example.com"]
+[[services.asr.models]]
+id = "Qwen/Qwen3-ASR-0.6B"
+name = "   "
+model = "//Qwen/Qwen3-ASR-0.6B"
 "#,
-        std::path::Path::new("/tmp/orchion-server"),
+        exe(),
     )
     .unwrap_err();
 
-    assert!(matches!(
-        error,
-        ConfigError::CorsWildcardWithSpecificOrigins
-    ));
+    assert!(matches!(error, ConfigError::InvalidModelName { .. }));
 }
 
 #[test]
-fn cors_origins_reject_paths() {
-    let error = ServerConfig::from_toml_str(
-        r#"
-[server]
-cors_allowed_origins = ["https://app.example.com/path"]
-"#,
-        std::path::Path::new("/tmp/orchion-server"),
-    )
-    .unwrap_err();
-
-    assert!(matches!(error, ConfigError::InvalidCorsOrigin { .. }));
-}
-
-#[test]
-fn cors_origins_are_normalized_for_browser_matching() {
-    let config = ServerConfig::from_toml_str(
-        r#"
-[server]
-cors_allowed_origins = ["HTTPS://APP.EXAMPLE.COM:443", "http://LOCALHOST:3000"]
-"#,
-        std::path::Path::new("/tmp/orchion-server"),
-    )
-    .unwrap();
-
-    assert_eq!(
-        config.server.cors_allowed_origins,
-        ["https://app.example.com", "http://localhost:3000"]
-    );
-}
-
-#[test]
-fn cors_origins_use_whatwg_host_normalization() {
-    let config = ServerConfig::from_toml_str(
-        r#"
-[server]
-cors_allowed_origins = ["http://127.1", "https://%65xample.com"]
-"#,
-        std::path::Path::new("/tmp/orchion-server"),
-    )
-    .unwrap();
-
-    assert_eq!(
-        config.server.cors_allowed_origins,
-        ["http://127.0.0.1", "https://example.com"]
-    );
-}
-
-#[test]
-fn server_resource_limits_must_be_greater_than_zero() {
-    let error = ServerConfig::from_toml_str(
-        "[server]\nmax_concurrent_inference = 0",
-        std::path::Path::new("/tmp/orchion-server"),
-    )
-    .unwrap_err();
-
-    assert!(
-        error
-            .to_string()
-            .contains("server.max_concurrent_inference")
-    );
-}
-
-#[test]
-fn pending_websocket_limit_must_be_greater_than_zero() {
-    let error = ServerConfig::from_toml_str(
-        "[server]\nmax_pending_websocket_connections = 0",
-        std::path::Path::new("/tmp/orchion-server"),
-    )
-    .unwrap_err();
-
-    assert!(
-        error
-            .to_string()
-            .contains("server.max_pending_websocket_connections")
-    );
-}
-
-#[test]
-fn pending_websocket_limit_can_be_overridden() {
-    let config = ServerConfig::from_toml_str(
-        "[server]\nmax_pending_websocket_connections = 7",
-        std::path::Path::new("/tmp/orchion-server"),
-    )
-    .unwrap();
-
-    assert_eq!(config.server.max_pending_websocket_connections, 7);
-}
-
-#[test]
-fn websocket_message_size_must_be_greater_than_zero() {
-    let error = ServerConfig::from_toml_str(
-        "[server]\nmax_websocket_message_size = 0",
-        std::path::Path::new("/tmp/orchion-server"),
-    )
-    .unwrap_err();
-
-    assert!(
-        error
-            .to_string()
-            .contains("server.max_websocket_message_size")
-    );
-}
-
-#[test]
-fn websocket_message_size_can_be_overridden() {
-    let config = ServerConfig::from_toml_str(
-        "[server]\nmax_websocket_message_size = 1048576",
-        std::path::Path::new("/tmp/orchion-server"),
-    )
-    .unwrap();
-
-    assert_eq!(config.server.max_websocket_message_size, 1024 * 1024);
-}
-
-#[test]
-fn enabled_ocr_requires_available_models() {
-    let exe_path = std::path::Path::new("/tmp/orchion-server");
-    let error = ServerConfig::from_toml_str(
-        r"
-[services.ocr]
-enabled = true
-",
-        exe_path,
-    )
-    .unwrap_err();
-
-    match error {
-        ConfigError::ServiceEnabledWithoutModels { section } => {
-            assert_eq!(section, "services.ocr");
-        }
-        other => panic!("unexpected error: {other}"),
+fn enabled_services_require_nonempty_models() {
+    for section in ["asr", "tts", "ocr", "ocr-vl"] {
+        let document = format!("[services.{section}]\nenabled = true\nmodels = []");
+        let error = ServerConfig::from_toml_str(&document, exe()).unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigError::ServiceEnabledWithoutModels { .. }
+        ));
     }
 }
 
 #[test]
-fn active_ocr_default_must_be_available_models_member() {
-    let exe_path = std::path::Path::new("/tmp/orchion-server");
+fn defaults_must_match_exactly_one_local_deployment_even_when_disabled() {
     let error = ServerConfig::from_toml_str(
         r#"
-[services.ocr]
-enabled = true
-default_model = "PaddlePaddle/PP-OCRv6_small"
-available_models = ["PaddlePaddle/PP-OCRv6_tiny"]
+[services.asr]
+enabled = false
+default_model = "Qwen/Qwen3-ASR-1.7B"
+
+[[services.asr.models]]
+id = "Qwen/Qwen3-ASR-0.6B"
+model = "//Qwen/Qwen3-ASR-0.6B"
 "#,
-        exe_path,
+        exe(),
     )
     .unwrap_err();
 
-    assert!(error.to_string().contains("services.ocr.available_models"));
     assert!(matches!(error, ConfigError::DefaultModelUnavailable { .. }));
+    assert!(error.to_string().contains("services.asr.models"));
 }
 
 #[test]
-fn active_ocr_accepts_multiple_layout_models() {
-    let config = ServerConfig::from_toml_str(
-        r#"
-[services.ocr]
-enabled = true
-available_models = ["PaddlePaddle/PP-OCRv6_tiny"]
-layout_available_models = ["PaddlePaddle/PP-DocLayoutV3", "Acme/Other-Layout"]
-"#,
-        std::path::Path::new("/tmp/orchion-server"),
-    )
-    .unwrap();
-
-    assert_eq!(config.services.ocr.layout_available_models.len(), 2);
-}
-
-#[test]
-fn active_ocr_without_an_explicit_default_has_no_startup_model() {
-    let config = ServerConfig::from_toml_str(
-        r#"
-[services.ocr]
-enabled = true
-available_models = ["PaddlePaddle/PP-OCRv6_tiny", "PaddlePaddle/PP-OCRv6_small"]
-"#,
-        std::path::Path::new("/tmp/orchion-server"),
-    )
-    .unwrap();
-
-    assert_eq!(config.services.ocr.default_model, None);
-}
-
-#[test]
-fn invalid_ocr_model_id_is_rejected() {
-    let exe_path = std::path::Path::new("/tmp/orchion-server");
+fn model_ids_are_globally_unique_including_disabled_services() {
     let error = ServerConfig::from_toml_str(
         r#"
-[services.ocr-vl]
-enabled = true
-default_model = "bad id with spaces"
-available_models = ["PaddlePaddle/PaddleOCR-VL-1.6"]
+[[services.asr.models]]
+id = "Qwen/Qwen3-ASR-0.6B"
+model = "//Qwen/Qwen3-ASR-0.6B"
+
+[[services.tts.models]]
+id = "Qwen/Qwen3-ASR-0.6B"
+model = "//Qwen/Qwen3-ASR-0.6B"
 "#,
-        exe_path,
+        exe(),
     )
     .unwrap_err();
 
-    match error {
-        ConfigError::InvalidModelId { section, value } => {
-            assert_eq!(section, "services.ocr-vl.default_model");
-            assert_eq!(value, "bad id with spaces");
-        }
-        other => panic!("unexpected error: {other}"),
-    }
-}
+    assert!(matches!(error, ConfigError::DuplicateModelId { .. }));
 
-#[test]
-fn ocr_html_response_format_is_parsed() {
-    let exe_path = std::path::Path::new("/tmp/orchion-server");
-    let config = ServerConfig::from_toml_str(
+    let error = ServerConfig::from_toml_str(
         r#"
-[services.ocr]
-format = "html"
-"#,
-        exe_path,
-    )
-    .unwrap();
+[[services.ocr.models]]
+id = "PaddlePaddle/PP-OCRv6_tiny"
+model = "//PaddlePaddle/PP-OCRv6_tiny"
 
-    assert_eq!(config.services.ocr.format, OcrResponseFormat::Html);
+[[services.ocr-vl.models]]
+id = "PaddlePaddle/PP-OCRv6_tiny"
+model = "//PaddlePaddle/PP-OCRv6_tiny"
+"#,
+        exe(),
+    )
+    .unwrap_err();
+    assert!(matches!(error, ConfigError::DuplicateModelId { .. }));
 }
 
 #[test]
-fn enabled_traditional_ocr_rejects_html_as_default_format() {
+fn duplicate_ids_within_one_disabled_service_are_rejected() {
     let error = ServerConfig::from_toml_str(
         r#"
 [services.ocr]
-enabled = true
-available_models = ["PaddlePaddle/PP-OCRv6_tiny"]
-layout_default_model = "PaddlePaddle/PP-DocLayoutV3"
-layout_available_models = ["PaddlePaddle/PP-DocLayoutV3"]
-format = "html"
+enabled = false
+
+[[services.ocr.models]]
+id = "PaddlePaddle/PP-OCRv6_tiny"
+model = "//PaddlePaddle/PP-OCRv6_tiny"
+[[services.ocr.models]]
+id = "PaddlePaddle/PP-OCRv6_tiny"
+model = "hf://PaddlePaddle/PP-OCRv6_tiny"
 "#,
-        std::path::Path::new("/tmp/orchion-server"),
+        exe(),
     )
     .unwrap_err();
 
-    assert!(matches!(
-        error,
-        ConfigError::UnsupportedOcrDefaultFormat {
-            section: "services.ocr",
-            format: "html"
-        }
-    ));
+    assert!(matches!(error, ConfigError::DuplicateModelId { .. }));
 }
 
 #[test]
-fn enabled_traditional_ocr_markdown_does_not_require_a_startup_layout() {
-    let config = ServerConfig::from_toml_str(
+fn configured_ids_must_match_the_service_runtime_category() {
+    let error = ServerConfig::from_toml_str(
         r#"
-[services.ocr]
-enabled = true
-available_models = ["PaddlePaddle/PP-OCRv6_tiny"]
-format = "markdown"
-"#,
-        std::path::Path::new("/tmp/orchion-server"),
-    )
-    .unwrap();
-
-    assert_eq!(config.services.ocr.layout_default_model, None);
-}
-
-#[test]
-fn ocr_vl_toml_overrides_are_parsed() {
-    let exe_path = std::path::Path::new("/tmp/orchion-server");
-    let config = ServerConfig::from_toml_str(
-        r#"
-[services.ocr-vl]
-enabled = true
+[services.asr]
 default_model = "PaddlePaddle/PaddleOCR-VL-1.6"
-available_models = ["PaddlePaddle/PaddleOCR-VL-1.5", "PaddlePaddle/PaddleOCR-VL-1.6"]
-layout_default_model = "PaddlePaddle/PP-DocLayoutV3"
-layout_available_models = ["PaddlePaddle/PP-DocLayoutV3"]
-idle_timeout = "2m"
-max_loaded = 1
-device = "cpu"
-format = "text"
-max_pixels = 25000000
+[[services.asr.models]]
+id = "PaddlePaddle/PaddleOCR-VL-1.6"
+model = "//PaddlePaddle/PaddleOCR-VL-1.6"
 "#,
-        exe_path,
+        exe(),
     )
-    .unwrap();
+    .unwrap_err();
+    assert!(matches!(error, ConfigError::UnsupportedRuntimeModel { .. }));
 
-    assert!(config.services.ocr_vl.active());
-    assert_eq!(
-        config.services.ocr_vl.default_model,
-        Some(ModelId::parse("PaddlePaddle/PaddleOCR-VL-1.6").unwrap())
-    );
-    assert_eq!(
-        config.services.ocr_vl.available_models,
-        vec![
-            ModelId::parse("PaddlePaddle/PaddleOCR-VL-1.5").unwrap(),
-            ModelId::parse("PaddlePaddle/PaddleOCR-VL-1.6").unwrap(),
-        ]
-    );
-    assert_eq!(
-        config.services.ocr_vl.layout_default_model,
-        Some(ModelId::parse("PaddlePaddle/PP-DocLayoutV3").unwrap())
-    );
-    assert_eq!(
-        config.services.ocr_vl.layout_available_models,
-        vec![ModelId::parse("PaddlePaddle/PP-DocLayoutV3").unwrap()]
-    );
-    assert_eq!(config.services.ocr_vl.idle_timeout, Duration::from_mins(2));
-    assert_eq!(config.services.ocr_vl.device, DevicePreference::Cpu);
-    assert_eq!(config.services.ocr_vl.format, OcrResponseFormat::Text);
-    assert_eq!(config.services.ocr_vl.max_pixels, 25_000_000);
+    let error = ServerConfig::from_toml_str(
+        r#"
+[[services.ocr.models]]
+id = "PaddlePaddle/PaddleOCR-VL-1.6"
+model = "//PaddlePaddle/PaddleOCR-VL-1.6"
+"#,
+        exe(),
+    )
+    .unwrap_err();
+    assert!(matches!(error, ConfigError::UnsupportedRuntimeModel { .. }));
 }
 
 #[test]
-fn ocr_max_pixels_must_be_greater_than_zero() {
+fn unregistered_speech_ids_remain_valid_runtime_models() {
+    let config = ServerConfig::from_toml_str(
+        r#"
+[services.asr]
+default_model = "Acme/Private-ASR"
+[[services.asr.models]]
+id = "Acme/Private-ASR"
+model = "hf://Acme/Private-ASR-Package"
+
+[services.tts]
+default_model = "Acme/Private-TTS"
+[[services.tts.models]]
+id = "Acme/Private-TTS"
+model = "ms://Acme/Private-TTS-Package"
+"#,
+        exe(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        config.services.asr.models[0].runtime.as_str(),
+        "Acme/Private-ASR"
+    );
+    assert_eq!(
+        config.services.tts.models[0].runtime.as_str(),
+        "Acme/Private-TTS"
+    );
+}
+
+#[test]
+fn repository_runtime_rejects_exact_file_model_locator() {
     let error = ServerConfig::from_toml_str(
-        r"
-[services.ocr]
-max_pixels = 0
-",
-        std::path::Path::new("/tmp/orchion-server"),
+        r#"
+[[services.asr.models]]
+id = "Qwen/Qwen3-ASR-0.6B"
+model = "//Qwen/Qwen3-ASR-0.6B/model.safetensors"
+"#,
+        exe(),
     )
     .unwrap_err();
 
-    assert!(error.to_string().contains("services.ocr.max_pixels"));
+    assert!(matches!(error, ConfigError::UnsupportedModelLocator { .. }));
 }
 
 #[test]
-fn active_ocr_vl_structured_format_does_not_require_a_startup_layout() {
-    let config = ServerConfig::from_toml_str(
-        r#"
-[services.ocr-vl]
-enabled = true
-default_model = "PaddlePaddle/PaddleOCR-VL-1.6"
-available_models = ["PaddlePaddle/PaddleOCR-VL-1.6"]
-format = "markdown"
-"#,
-        std::path::Path::new("/tmp/orchion-server"),
-    )
-    .unwrap();
-
-    assert_eq!(config.services.ocr_vl.layout_default_model, None);
-}
-
-#[test]
-fn active_ocr_rejects_ocr_vl_models() {
-    let exe_path = std::path::Path::new("/tmp/orchion-server");
-    let error = ServerConfig::from_toml_str(
-        r#"
-[services.ocr]
-enabled = true
-available_models = ["PaddlePaddle/PaddleOCR-VL-1.6"]
-"#,
-        exe_path,
-    )
-    .unwrap_err();
-
-    assert!(matches!(error, ConfigError::InvalidOcrModelKind { .. }));
-    assert!(error.to_string().contains("traditional OCR model"));
-}
-
-#[test]
-fn active_ocr_accepts_custom_provider_model_ids() {
-    let config = ServerConfig::from_toml_str(
-        r#"
-[services.ocr]
-enabled = true
-available_models = ["Acme/Experimental-OCR"]
-"#,
-        std::path::Path::new("/tmp/orchion-server"),
-    )
-    .unwrap();
-
-    assert_eq!(
-        config.services.ocr.available_models,
-        vec![ModelId::parse("Acme/Experimental-OCR").unwrap()]
-    );
-}
-
-#[test]
-fn flat_layout_fields_are_parsed_for_ocr_and_ocr_vl() {
-    let exe_path = std::path::Path::new("/tmp/orchion-server");
+fn ocr_deployment_accepts_supported_layout_recipe_and_projects_runtime_id() {
     let config = ServerConfig::from_toml_str(
         r#"
 [services.ocr]
 enabled = true
 default_model = "PaddlePaddle/PP-OCRv6_tiny"
-available_models = ["PaddlePaddle/PP-OCRv6_tiny"]
-layout_default_model = "PaddlePaddle/PP-DocLayoutV3"
-layout_available_models = ["PaddlePaddle/PP-DocLayoutV3"]
 
-[services.ocr-vl]
-enabled = true
-default_model = "PaddlePaddle/PaddleOCR-VL-1.6"
-available_models = ["PaddlePaddle/PaddleOCR-VL-1.6"]
-layout_default_model = "PaddlePaddle/PP-DocLayoutV3"
-layout_available_models = ["PaddlePaddle/PP-DocLayoutV3"]
+[[services.ocr.models]]
+id = "PaddlePaddle/PP-OCRv6_tiny"
+model = "hf://PaddlePaddle/PP-OCRv6_tiny"
+layout_model = "ms://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
 "#,
-        exe_path,
+        exe(),
     )
     .unwrap();
 
-    let layout_model = ModelId::parse("PaddlePaddle/PP-DocLayoutV3").unwrap();
+    let deployment = &config.services.ocr.models[0];
+    assert_eq!(deployment.model.source(), ModelUrlSource::HuggingFace);
     assert_eq!(
-        config.services.ocr.layout_default_model.as_ref(),
-        Some(&layout_model)
+        deployment.layout_model.as_ref().unwrap().as_str(),
+        "ms://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
     );
     assert_eq!(
-        config.services.ocr.layout_available_models,
-        vec![layout_model.clone()]
+        config.services.ocr.layout_ids(),
+        [ModelId::parse("PaddlePaddle/PP-DocLayoutV3").unwrap()]
     );
     assert_eq!(
-        config.services.ocr_vl.layout_default_model.as_ref(),
-        Some(&layout_model)
-    );
-    assert_eq!(
-        config.services.ocr_vl.layout_available_models,
-        vec![layout_model]
+        config
+            .services
+            .ocr
+            .default_layout_runtime()
+            .unwrap()
+            .id()
+            .as_str(),
+        "PaddlePaddle/PP-DocLayoutV3"
     );
 }
 
 #[test]
-fn active_ocr_rejects_layout_model_in_main_available_models() {
-    let exe_path = std::path::Path::new("/tmp/orchion-server");
+fn unsupported_layout_recipe_is_rejected() {
     let error = ServerConfig::from_toml_str(
         r#"
-[services.ocr]
-enabled = true
-available_models = ["PaddlePaddle/PP-OCRv6_tiny", "PaddlePaddle/PP-DocLayoutV3"]
+[[services.ocr-vl.models]]
+id = "PaddlePaddle/PaddleOCR-VL-1.6"
+model = "//PaddlePaddle/PaddleOCR-VL-1.6"
+layout_model = "//Acme/Layout/model.onnx"
 "#,
-        exe_path,
+        exe(),
     )
     .unwrap_err();
-
-    assert!(matches!(error, ConfigError::InvalidOcrModelKind { .. }));
-    assert!(error.to_string().contains("traditional OCR model"));
+    assert!(matches!(error, ConfigError::UnsupportedLayoutModel { .. }));
 }
 
 #[test]
-fn active_ocr_accepts_layout_available_models_and_default() {
-    let exe_path = std::path::Path::new("/tmp/orchion-server");
+fn local_layout_artifact_uses_the_supported_layout_runtime_recipe() {
+    let config = ServerConfig::from_toml_str(
+        r#"
+[[services.ocr-vl.models]]
+id = "PaddlePaddle/PaddleOCR-VL-1.6"
+model = "//PaddlePaddle/PaddleOCR-VL-1.6"
+layout_model = "file:///tmp/layout.onnx"
+"#,
+        exe(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        config.services.ocr_vl.models[0]
+            .layout_runtime
+            .as_ref()
+            .unwrap()
+            .id()
+            .as_str(),
+        "PaddlePaddle/PP-DocLayoutV3"
+    );
+}
+
+#[test]
+fn separate_ocr_deployments_accept_distinct_layout_locators() {
     let config = ServerConfig::from_toml_str(
         r#"
 [services.ocr]
 enabled = true
 default_model = "PaddlePaddle/PP-OCRv6_tiny"
-available_models = ["PaddlePaddle/PP-OCRv6_tiny"]
-layout_default_model = "PaddlePaddle/PP-DocLayoutV3"
-layout_available_models = ["PaddlePaddle/PP-DocLayoutV3"]
+
+[[services.ocr.models]]
+id = "PaddlePaddle/PP-OCRv6_tiny"
+model = "//PaddlePaddle/PP-OCRv6_tiny"
+layout_model = "hf://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
+
+[[services.ocr.models]]
+id = "PaddlePaddle/PP-OCRv6_small"
+model = "//PaddlePaddle/PP-OCRv6_small"
+layout_model = "ms://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
 "#,
-        exe_path,
+        exe(),
     )
     .unwrap();
 
-    let layout_model = ModelId::parse("PaddlePaddle/PP-DocLayoutV3").unwrap();
     assert_eq!(
-        config.services.ocr.layout_default_model.as_ref(),
-        Some(&layout_model)
+        config.services.ocr.models[0]
+            .layout_model
+            .as_ref()
+            .unwrap()
+            .source(),
+        ModelUrlSource::HuggingFace
     );
     assert_eq!(
-        config.services.ocr.layout_available_models,
-        vec![layout_model]
+        config.services.ocr.models[1]
+            .layout_model
+            .as_ref()
+            .unwrap()
+            .source(),
+        ModelUrlSource::ModelScope
     );
 }
 
 #[test]
-fn active_ocr_vl_rejects_traditional_models() {
-    let exe_path = std::path::Path::new("/tmp/orchion-server");
+fn layout_model_is_rejected_for_speech_deployments() {
     let error = ServerConfig::from_toml_str(
         r#"
-[services.ocr-vl]
-enabled = true
-available_models = ["PaddlePaddle/PP-OCRv6_tiny"]
+[[services.asr.models]]
+id = "Qwen/Qwen3-ASR-0.6B"
+model = "//Qwen/Qwen3-ASR-0.6B"
+layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
 "#,
-        exe_path,
+        exe(),
     )
     .unwrap_err();
-
-    assert!(matches!(error, ConfigError::InvalidOcrModelKind { .. }));
-    assert!(error.to_string().contains("OCR-VL model"));
+    assert!(matches!(error, ConfigError::ParseToml(_)));
+    assert!(error.to_string().contains("unknown field"));
 }
 
 #[test]
-fn active_ocr_vl_rejects_wrong_layout_model() {
-    let exe_path = std::path::Path::new("/tmp/orchion-server");
-    let error = ServerConfig::from_toml_str(
-        r#"
-[services.ocr-vl]
-enabled = true
-available_models = ["PaddlePaddle/PaddleOCR-VL-1.6"]
-layout_default_model = "PaddlePaddle/PP-OCRv6_tiny"
-layout_available_models = ["PaddlePaddle/PP-OCRv6_tiny"]
-"#,
-        exe_path,
-    )
-    .unwrap_err();
-
-    assert!(matches!(error, ConfigError::InvalidOcrModelKind { .. }));
-    assert!(error.to_string().contains("PaddlePaddle/PP-DocLayoutV3"));
+fn all_removed_config_fields_are_rejected_without_aliases() {
+    for field in [
+        "available_models = []",
+        "layout_available_models = []",
+        "layout_default_model = \"PaddlePaddle/PP-DocLayoutV3\"",
+    ] {
+        let section = if field.starts_with("available") {
+            "asr"
+        } else {
+            "ocr"
+        };
+        let document = format!("[services.{section}]\n{field}");
+        let error = ServerConfig::from_toml_str(&document, exe()).unwrap_err();
+        assert!(error.to_string().contains("unknown field"), "{field}");
+    }
 }
 
 #[test]
-fn active_ocr_vl_layout_default_must_be_available_models_member() {
-    let exe_path = std::path::Path::new("/tmp/orchion-server");
+fn model_url_validation_runs_during_toml_deserialization() {
     let error = ServerConfig::from_toml_str(
         r#"
-[services.ocr-vl]
-enabled = true
-available_models = ["PaddlePaddle/PaddleOCR-VL-1.6"]
-layout_default_model = "PaddlePaddle/PP-DocLayoutV3"
-layout_available_models = []
+[[services.asr.models]]
+id = "Qwen/Qwen3-ASR-0.6B"
+model = "https://huggingface.co/Qwen/Qwen3-ASR-0.6B"
 "#,
-        exe_path,
+        exe(),
     )
     .unwrap_err();
-
-    assert!(matches!(error, ConfigError::DefaultModelUnavailable { .. }));
-    assert!(
-        error
-            .to_string()
-            .contains("services.ocr-vl.layout_available_models")
-    );
+    assert!(error.to_string().contains("invalid model URL"));
 }
 
 #[test]
-fn toml_overrides_model_registry_and_services() {
-    let exe_path = std::path::Path::new("/opt/orchion/orchion-server");
-    let document = r#"
+fn general_server_and_service_overrides_still_parse() {
+    let config = ServerConfig::from_toml_str(
+        r#"
 [server]
 bind = "0.0.0.0:9000"
 max_upload_size = "64M"
-max_pdf_pages = 12
-max_pdf_pixels = 345000
-max_pdf_output_size = "16M"
+max_concurrent_inference = 4
 
 [models]
 dir = "cache/models"
 source = "modelscope"
 max_loaded = 3
-verify_file_integrity = true
 
 [services.asr]
-enabled = true
-default_model = "Qwen/Qwen3-ASR-1.7B"
-available_models = ["Qwen/Qwen3-ASR-0.6B", "Qwen/Qwen3-ASR-1.7B"]
-idle_timeout = "5m"
-max_loaded = 2
 device = "cuda0"
-max_audio_duration = "20m"
-stream_idle_timeout = "45s"
-stream_max_duration = "3h"
+idle_timeout = "5m"
+stream_chunk_size = 1.5
 
 [services.tts]
-enabled = true
-default_model = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
-available_models = ["Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice", "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"]
-idle_timeout = "30s"
-max_loaded = 1
-device = "cuda:1"
 format = "mp3"
 max_length = 1024
-max_reference_audio_duration = "2m"
-
-[services.ocr-vl]
-max_tokens = 2048
-
-[auth]
-api_key = "test-secret"
-"#;
-
-    let config = ServerConfig::from_toml_str(document, exe_path).unwrap();
+"#,
+        Path::new("/opt/orchion/orchion-server"),
+    )
+    .unwrap();
 
     assert_eq!(config.server.bind.port(), 9000);
     assert_eq!(config.server.max_upload_size, 64 * 1024 * 1024);
-    assert_eq!(config.server.max_pdf_pages, 12);
-    assert_eq!(config.server.max_pdf_pixels, 345_000);
-    assert_eq!(config.server.max_pdf_output_size, 16 * 1024 * 1024);
-    assert_eq!(
-        config.models.dir,
-        exe_path.parent().unwrap().join("cache/models")
-    );
     assert_eq!(config.models.source, ModelSource::ModelScope);
-    assert_eq!(config.models.max_loaded, 3);
-    assert!(config.models.verify_file_integrity);
-    assert!(config.services.asr.enabled);
-    assert_eq!(
-        config.services.asr.default_model,
-        asr_model("Qwen/Qwen3-ASR-1.7B")
-    );
-    assert_eq!(
-        config.services.asr.available_models,
-        vec![
-            asr_model("Qwen/Qwen3-ASR-0.6B"),
-            asr_model("Qwen/Qwen3-ASR-1.7B"),
-        ]
-    );
-    assert_eq!(config.services.asr.idle_timeout, Duration::from_mins(5));
-    assert_eq!(config.services.asr.max_loaded, 2);
     assert_eq!(config.services.asr.device, DevicePreference::Cuda(Some(0)));
-    assert_eq!(
-        config.services.asr.max_audio_duration,
-        Duration::from_mins(20)
-    );
-    assert_eq!(
-        config.services.asr.stream_idle_timeout,
-        Duration::from_secs(45)
-    );
-    assert_eq!(
-        config.services.asr.stream_max_duration,
-        Duration::from_hours(3)
-    );
-    assert!(config.services.tts.enabled);
-    assert_eq!(
-        config.services.tts.default_model,
-        tts_model("Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign")
-    );
-    assert_eq!(
-        config.services.tts.available_models,
-        vec![
-            tts_model("Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"),
-            tts_model("Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"),
-        ]
-    );
-    assert_eq!(config.services.tts.idle_timeout, Duration::from_secs(30));
-    assert_eq!(config.services.tts.max_loaded, 1);
-    assert_eq!(config.services.tts.device, DevicePreference::Cuda(Some(1)));
+    assert_eq!(config.services.asr.idle_timeout, Duration::from_mins(5));
     assert_eq!(config.services.tts.format, "mp3");
     assert_eq!(config.services.tts.max_length, 1024);
-    assert_eq!(
-        config.services.tts.max_reference_audio_duration,
-        Duration::from_mins(2)
-    );
-    assert_eq!(config.services.ocr_vl.max_tokens, 2048);
-    assert_eq!(config.auth.api_key.as_deref(), Some("test-secret"));
 }
 
 #[test]
-fn device_aliases_are_parsed_in_services() {
-    let exe_path = std::path::Path::new("/tmp/orchion-server");
-    let config = ServerConfig::from_toml_str(
-        r#"
-[services.asr]
-device = "metal0"
+fn shipped_config_uses_the_new_contract() {
+    let document = include_str!("../config.toml");
+    let config = ServerConfig::from_toml_str(document, exe()).unwrap();
 
-[services.tts]
-device = "cuda"
-"#,
-        exe_path,
-    )
-    .unwrap();
-
-    assert_eq!(config.services.asr.device, DevicePreference::Metal);
-    assert_eq!(config.services.tts.device, DevicePreference::Cuda(None));
+    assert!(config.services.asr.enabled);
+    assert_eq!(config.services.asr.models.len(), 2);
+    assert_eq!(config.services.tts.models.len(), 5);
+    assert_eq!(config.services.ocr.models.len(), 5);
+    assert_eq!(config.services.ocr_vl.models.len(), 2);
+    assert_eq!(config.services.ocr.layout_ids().len(), 1);
 }
 
 #[test]
-fn malformed_device_config_is_rejected() {
-    let exe_path = std::path::Path::new("/tmp/orchion-server");
-    let error = ServerConfig::from_toml_str(
-        r#"
-[services.asr]
-device = "cuda:"
-"#,
-        exe_path,
-    )
-    .unwrap_err();
-
-    assert!(error.to_string().contains("invalid services.asr.device"));
-}
-
-#[test]
-fn empty_api_key_disables_authentication() {
-    let exe_path = std::path::Path::new("/tmp/orchion-server");
-    let config = ServerConfig::from_toml_str(
-        r#"
-[auth]
-api_key = ""
-"#,
-        exe_path,
-    )
-    .unwrap();
-
-    assert_eq!(config.auth.api_key, None);
-}
-
-#[test]
-fn enabled_service_default_must_be_available_models_member() {
-    let exe_path = std::path::Path::new("/tmp/orchion-server");
-    let error = ServerConfig::from_toml_str(
-        r#"
-[services.asr]
-enabled = true
-default_model = "Qwen/Qwen3-ASR-1.7B"
-available_models = ["Qwen/Qwen3-ASR-0.6B"]
-"#,
-        exe_path,
-    )
-    .unwrap_err();
-
-    assert!(error.to_string().contains("services.asr.available_models"));
-}
-
-#[test]
-fn disabled_service_can_keep_default_outside_available_models() {
-    let exe_path = std::path::Path::new("/tmp/orchion-server");
-    let config = ServerConfig::from_toml_str(
-        r#"
-[services.asr]
-enabled = false
-default_model = "Qwen/Qwen3-ASR-1.7B"
-available_models = ["Qwen/Qwen3-ASR-0.6B"]
-"#,
-        exe_path,
-    )
-    .unwrap();
-
-    assert!(!config.services.asr.enabled);
-    assert_eq!(
-        config.services.asr.default_model,
-        asr_model("Qwen/Qwen3-ASR-1.7B")
-    );
-    assert_eq!(
-        config.services.asr.available_models,
-        vec![asr_model("Qwen/Qwen3-ASR-0.6B")]
-    );
-}
-
-#[test]
-fn invalid_model_cache_limits_are_rejected() {
-    let exe_path = std::path::Path::new("/tmp/orchion-server");
-    let error = ServerConfig::from_toml_str(
-        r"
-[services.tts]
-max_loaded = 0
-",
-        exe_path,
-    )
-    .unwrap_err();
-
-    assert!(error.to_string().contains("max_loaded"));
-}
-
-#[test]
-fn invalid_global_model_cache_limit_is_rejected() {
-    let exe_path = std::path::Path::new("/tmp/orchion-server");
-    let error = ServerConfig::from_toml_str(
-        r"
-[models]
-max_loaded = 0
-",
-        exe_path,
-    )
-    .unwrap_err();
-
-    assert!(error.to_string().contains("invalid models.max_loaded"));
-}
-
-#[test]
-fn upload_size_units_are_parsed() {
-    let exe_path = std::path::Path::new("/tmp/orchion-server");
-    let config = ServerConfig::from_toml_str(
-        r#"
-[server]
-max_upload_size = "512K"
-"#,
-        exe_path,
-    )
-    .unwrap();
-
-    assert_eq!(config.server.max_upload_size, 512 * 1024);
-}
-
-#[test]
-fn invalid_upload_size_is_rejected() {
-    let exe_path = std::path::Path::new("/tmp/orchion-server");
-    let error = ServerConfig::from_toml_str(
-        r#"
-[server]
-max_upload_size = "huge"
-"#,
-        exe_path,
-    )
-    .unwrap_err();
-
-    assert!(error.to_string().contains("invalid upload size"));
-}
-
-#[test]
-fn invalid_asr_model_id_is_rejected() {
-    let exe_path = std::path::Path::new("/tmp/orchion-server");
-    let error = ServerConfig::from_toml_str(
-        r#"
-[services.asr]
-available_models = ["not-a-model"]
-"#,
-        exe_path,
-    )
-    .unwrap_err();
-
-    assert!(error.to_string().contains("invalid ASR model id"));
-}
-
-#[test]
-fn invalid_short_asr_and_tts_model_ids_are_rejected() {
-    let exe_path = std::path::Path::new("/tmp/orchion-server");
-    let error = ServerConfig::from_toml_str(
-        r#"
-[services.asr]
-available_models = ["qwen3-asr-0.6b"]
-"#,
-        exe_path,
-    )
-    .unwrap_err();
-    assert!(error.to_string().contains("invalid ASR model id"));
-
-    let error = ServerConfig::from_toml_str(
-        r#"
-[services.tts]
-available_models = ["qwen3-tts-0.6b-custom-voice"]
-"#,
-        exe_path,
-    )
-    .unwrap_err();
-    assert!(error.to_string().contains("invalid TTS model id"));
-}
-
-#[test]
-fn custom_asr_and_tts_model_ids_are_accepted() {
-    let exe_path = std::path::Path::new("/tmp/orchion-server");
-    let config = ServerConfig::from_toml_str(
-        r#"
-[services.asr]
-default_model = "Acme/New-ASR"
-available_models = ["Acme/New-ASR"]
-
-[services.tts]
-default_model = "Acme/New-TTS"
-available_models = ["Acme/New-TTS"]
-"#,
-        exe_path,
-    )
-    .unwrap();
-
-    assert_eq!(config.services.asr.default_model.as_str(), "Acme/New-ASR");
-    assert_eq!(config.services.tts.default_model.as_str(), "Acme/New-TTS");
-}
-
-#[test]
-fn enabled_services_preserve_qwen_fallback_for_unregistered_models() {
-    let config = ServerConfig::from_toml_str(
-        r#"
-[services.asr]
-enabled = true
-default_model = "Acme/New-ASR"
-available_models = ["Acme/New-ASR"]
-
-[services.tts]
-enabled = true
-default_model = "Acme/New-TTS"
-available_models = ["Acme/New-TTS"]
-"#,
-        std::path::Path::new("/tmp/orchion-server"),
-    )
-    .unwrap();
-
-    assert_eq!(config.services.asr.default_model.as_str(), "Acme/New-ASR");
-    assert_eq!(config.services.tts.default_model.as_str(), "Acme/New-TTS");
-}
-
-#[test]
-fn speech_config_defers_provider_support_to_the_runtime_factory() {
-    let config = ServerConfig::from_toml_str(
-        r#"
-[services.asr]
-enabled = true
-default_model = "PaddlePaddle/PaddleOCR-VL-1.6"
-available_models = ["PaddlePaddle/PaddleOCR-VL-1.6"]
-"#,
-        std::path::Path::new("/tmp/orchion-server"),
-    )
-    .unwrap();
-
-    assert_eq!(
-        config.services.asr.default_model.as_str(),
-        "PaddlePaddle/PaddleOCR-VL-1.6"
-    );
-}
-
-#[test]
-fn tts_voice_and_language_are_request_only() {
-    let exe_path = std::path::Path::new("/tmp/orchion-server");
-    let error = ServerConfig::from_toml_str(
-        r#"
-[services.tts]
-voice = "ryan"
-language = "english"
-format = "wav"
-"#,
-        exe_path,
-    )
-    .unwrap_err();
-
-    assert!(error.to_string().contains("unknown field"));
-}
-
-#[test]
-fn old_model_service_sections_are_rejected() {
-    let exe_path = std::path::Path::new("/tmp/orchion-server");
-    let error = ServerConfig::from_toml_str(
-        r#"
-[models.asr]
-default = "Qwen/Qwen3-ASR-0.6B"
-"#,
-        exe_path,
-    )
-    .unwrap_err();
-
+fn malformed_limits_and_unknown_fields_remain_rejected() {
+    assert!(ServerConfig::from_toml_str("[models]\nmax_loaded = 0", exe()).is_err());
+    assert!(ServerConfig::from_toml_str("[services.tts]\nmax_length = 0", exe()).is_err());
+    let error = ServerConfig::from_toml_str("[services.tts]\nvoice = \"ryan\"", exe()).unwrap_err();
     assert!(error.to_string().contains("unknown field"));
 }

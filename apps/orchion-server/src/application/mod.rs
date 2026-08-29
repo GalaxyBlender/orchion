@@ -95,7 +95,7 @@ pub type InferenceGuardFuture<'a> = Pin<Box<dyn Future<Output = InferenceGuard> 
 
 #[derive(Debug, Clone)]
 pub struct AsrApiPolicy {
-    pub available_models: Vec<AsrModel>,
+    pub models: Vec<AsrModel>,
     pub stream_target_segment: Duration,
     pub stream_max_segment: Duration,
     pub stream_idle_timeout: Duration,

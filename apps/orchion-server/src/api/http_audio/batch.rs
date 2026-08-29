@@ -97,7 +97,7 @@ where
                 .api_policy()
                 .asr
                 .as_ref()
-                .is_some_and(|policy| policy.available_models.contains(&model_id))
+                .is_some_and(|policy| policy.models.contains(&model_id))
         {
             activity.set_model(model_id.to_string());
         }

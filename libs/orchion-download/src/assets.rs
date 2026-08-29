@@ -15,13 +15,3 @@ pub(crate) fn uses_modelscope_file_assets(assets: &[ModelHubAsset]) -> bool {
         .iter()
         .any(|asset| matches!(asset.kind, ModelHubAssetKind::ModelScopeFile { .. }))
 }
-
-pub(crate) fn files_for_repo(assets: &[ModelHubAsset], repo: &str) -> Vec<&'static str> {
-    let mut files = Vec::new();
-    for asset in assets.iter().filter(|asset| asset.repo == repo) {
-        if !files.contains(&asset.file) {
-            files.push(asset.file);
-        }
-    }
-    files
-}

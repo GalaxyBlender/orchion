@@ -8,6 +8,22 @@ pub struct DownloadFailure {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadRetryability {
+    RetryableNotFound,
+    RetryableNetwork,
+    RetryableRateLimit,
+    RetryableServer,
+    Terminal,
+}
+
+impl DownloadRetryability {
+    #[must_use]
+    pub const fn is_retryable(self) -> bool {
+        !matches!(self, Self::Terminal)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum OrchionError {
@@ -19,6 +35,14 @@ pub enum OrchionError {
         source_name: &'static str,
         repo: String,
         message: String,
+    },
+
+    #[error("provider request failed for {repo} from {source_name}: {message}")]
+    ProviderDownload {
+        source_name: &'static str,
+        repo: String,
+        message: String,
+        retryability: DownloadRetryability,
     },
 
     #[error("all download sources failed for {repo}: {failures:?}")]

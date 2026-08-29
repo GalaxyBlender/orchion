@@ -4,7 +4,7 @@
 
 Orchion 通过 `POST /v1/ocr` 和 `multipart/form-data` 提供传统 OCR 与 OCR-VL 能力。
 
-服务端的 `default_model` 和 `layout_default_model` 配置仅控制启动预置。请求仍须显式传入 `model`，结构化响应还须显式传入 `layout_model`。
+服务端的 `default_model` 从 `[[services.ocr.models]]` 或 `[[services.ocr-vl.models]]` deployment 中选择启动预置项；每个 deployment 可配置自己的 `layout_model` artifact。本阶段请求仍须显式传入 `model`，结构化响应仍须传入现有的 `layout_model` runtime ID。
 
 ## 传统 OCR
 

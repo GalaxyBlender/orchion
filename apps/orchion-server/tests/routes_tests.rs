@@ -2,10 +2,10 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header, header::AUTHORIZATION};
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
-use orchion::{AsrModel, ModelId, TtsModel};
+use orchion::{AsrModel, ModelId, OcrModel, OcrModelKind, TtsModel};
 use orchion_protocol::{AsrStreamEvent, AsrStreamInputAudioFormat, AsrStreamStartMessage};
 use orchion_server::api::ui;
-use orchion_server::config::ServerConfig;
+use orchion_server::config::{ModelDeployment, OcrModelDeployment, ServerConfig};
 use orchion_server::routes::{router, router_with_ui_routes};
 use orchion_server::state::AppState;
 use serde_json::Value;
@@ -266,10 +266,13 @@ async fn models_endpoint_includes_active_ocr_model_ids() {
 
 #[tokio::test]
 async fn models_endpoint_includes_configured_ocr_layout_model_ids() {
-    let layout_model = ModelId::parse("PaddlePaddle/PP-DocLayoutV3").unwrap();
     let state = test_state_with_ocr_services_config(None, |config| {
-        config.services.ocr.layout_available_models = vec![layout_model.clone()];
-        config.services.ocr_vl.layout_available_models = vec![layout_model];
+        config.services.ocr.models[0] = config.services.ocr.models[0]
+            .clone()
+            .with_supported_layout();
+        config.services.ocr_vl.models[0] = config.services.ocr_vl.models[0]
+            .clone()
+            .with_supported_layout();
     });
 
     let response = router(state)
@@ -956,10 +959,10 @@ async fn ocr_requires_an_explicit_model() {
 
 #[tokio::test]
 async fn traditional_ocr_markdown_does_not_use_startup_default_layout_model() {
-    let layout_model = ModelId::parse("PaddlePaddle/PP-DocLayoutV3").unwrap();
     let state = test_state_with_ocr_services_config(None, |config| {
-        config.services.ocr.layout_default_model = Some(layout_model.clone());
-        config.services.ocr.layout_available_models = vec![layout_model];
+        config.services.ocr.models[0] = config.services.ocr.models[0]
+            .clone()
+            .with_supported_layout();
     });
     let boundary = "orchion-ocr-default-layout";
     let body = multipart_body(
@@ -995,9 +998,10 @@ async fn traditional_ocr_markdown_does_not_use_startup_default_layout_model() {
 
 #[tokio::test]
 async fn traditional_ocr_markdown_accepts_an_explicit_layout_model() {
-    let layout_model = ModelId::parse("PaddlePaddle/PP-DocLayoutV3").unwrap();
     let state = test_state_with_ocr_services_config(None, |config| {
-        config.services.ocr.layout_available_models = vec![layout_model];
+        config.services.ocr.models[0] = config.services.ocr.models[0]
+            .clone()
+            .with_supported_layout();
     });
     let boundary = "orchion-ocr-explicit-layout";
     let body = multipart_body(
@@ -1035,8 +1039,8 @@ async fn traditional_ocr_markdown_accepts_an_explicit_layout_model() {
 #[tokio::test]
 async fn ocr_vl_rejects_structured_format_without_layout_before_model_load() {
     let state = test_state_with_ocr_services_config(None, |config| {
-        config.services.ocr_vl.layout_default_model = None;
-        config.services.ocr_vl.layout_available_models.clear();
+        config.services.ocr_vl.models[0].layout_model = None;
+        config.services.ocr_vl.models[0].layout_runtime = None;
     });
     let boundary = "orchion-ocr-vl-layout-required";
     let body = multipart_body(
@@ -1436,13 +1440,17 @@ fn test_state_with_ocr_services_config(
         config.services.ocr.enabled = true;
         config.services.ocr.default_model =
             Some(ModelId::parse("PaddlePaddle/PP-OCRv6_tiny").unwrap());
-        config.services.ocr.available_models =
-            vec![ModelId::parse("PaddlePaddle/PP-OCRv6_tiny").unwrap()];
+        config.services.ocr.models = vec![OcrModelDeployment::from_runtime(OcrModel::new(
+            ModelId::parse("PaddlePaddle/PP-OCRv6_tiny").unwrap(),
+            OcrModelKind::TraditionalOcr,
+        ))];
         config.services.ocr_vl.enabled = true;
         config.services.ocr_vl.default_model =
             Some(ModelId::parse("PaddlePaddle/PaddleOCR-VL-1.6").unwrap());
-        config.services.ocr_vl.available_models =
-            vec![ModelId::parse("PaddlePaddle/PaddleOCR-VL-1.6").unwrap()];
+        config.services.ocr_vl.models = vec![OcrModelDeployment::from_runtime(OcrModel::new(
+            ModelId::parse("PaddlePaddle/PaddleOCR-VL-1.6").unwrap(),
+            OcrModelKind::OcrVl,
+        ))];
         configure(config);
     })
 }
@@ -1465,17 +1473,23 @@ fn test_state_with_services_config(
     config.auth.api_key = api_key.map(str::to_string);
     config.services.asr.enabled = asr_enabled;
     config.services.tts.enabled = tts_enabled;
-    config.services.asr.available_models = vec![
+    config.services.asr.models = [
         asr_model("Qwen/Qwen3-ASR-0.6B"),
         asr_model("Qwen/Qwen3-ASR-1.7B"),
-    ];
+    ]
+    .into_iter()
+    .map(ModelDeployment::from_asr_runtime)
+    .collect();
     config.services.asr.idle_timeout = Duration::from_mins(10);
     config.services.asr.max_loaded = 2;
-    config.services.tts.available_models = vec![
+    config.services.tts.models = vec![
         tts_model("Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"),
         tts_model("Qwen/Qwen3-TTS-12Hz-0.6B-Base"),
         tts_model("Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"),
-    ];
+    ]
+    .into_iter()
+    .map(ModelDeployment::from_tts_runtime)
+    .collect();
     config.services.tts.idle_timeout = Duration::from_mins(10);
     config.services.tts.max_loaded = 2;
     configure(&mut config);

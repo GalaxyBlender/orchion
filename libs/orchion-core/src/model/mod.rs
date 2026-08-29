@@ -6,6 +6,7 @@ mod descriptor;
 mod id;
 mod ocr;
 mod tts;
+mod url;
 
 pub use asr::AsrModel;
 pub use descriptor::{
@@ -17,6 +18,7 @@ pub use ocr::{
     KnownOcrModel, OcrModel, OcrModelAsset, OcrModelAssetKind, OcrModelAssetRole, OcrModelKind,
 };
 pub use tts::TtsModel;
+pub use url::{ModelUrl, ModelUrlSource, ParseModelUrlError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ModelCategory {

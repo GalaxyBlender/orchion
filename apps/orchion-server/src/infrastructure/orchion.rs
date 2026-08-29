@@ -1,6 +1,7 @@
 use crate::application::model_cache::{
     AsrModelCache, CacheTracker, GlobalModelCacheLimiter, ModelCache, ModelLease,
-    ModelProvisionFuture, ModelProvisioner, ModelResidencyStatus, ResidencyDomain, TtsModelCache,
+    ModelProvisionFuture, ModelProvisioner, ModelProvisioning, ModelResidencyStatus,
+    ResidencyDomain, TtsModelCache,
 };
 use crate::application::model_lifecycle::{
     ModelControlFuture, ModelLifecycleRuntime, ModelResidency, ModelSelector, ModelService,
@@ -23,10 +24,11 @@ use crate::application::{
 use crate::settings::ServerConfig;
 use anyhow::Context;
 use orchion::{
-    Asr, AsrModel, DevicePreference, ModelCategory, ModelDownloader, ModelId, ModelSpec, Ocr,
-    OcrAssets, OcrModel, OcrModelKind, RuntimeProvider, Tts, TtsModel, model_descriptor,
+    ArtifactRequest, Asr, AsrModel, DeploymentSourcePlan, DevicePreference, DownloadSource,
+    ModelCategory, ModelDownloader, ModelId, ModelSpec, ModelUrlSource, Ocr, OcrAssets, OcrModel,
+    OcrModelKind, RuntimeProvider, Tts, TtsModel, model_descriptor,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -35,7 +37,7 @@ use tokio::sync::{Semaphore, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 const MAX_CONCURRENT_MODEL_PROVISIONS: usize = 2;
-type LayoutModelCache = ModelCache<OcrModel, ()>;
+type LayoutModelCache = ModelCache<DeploymentLayoutModel, ()>;
 type OcrAssetCache = ModelCache<OcrModel, ()>;
 type OcrRuntimeCache = ModelCache<OcrRuntimeKey, Ocr>;
 pub type AsrRuntimeFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<Asr>> + Send + 'a>>;
@@ -45,12 +47,51 @@ pub type OcrRuntimeFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<Ocr>>
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct OcrRuntimeKey {
     primary: OcrModel,
-    layout: Option<OcrModel>,
+    layout: Option<DeploymentLayoutModel>,
 }
 
 impl OcrRuntimeKey {
-    const fn new(primary: OcrModel, layout: Option<OcrModel>) -> Self {
+    const fn new(primary: OcrModel, layout: Option<DeploymentLayoutModel>) -> Self {
         Self { primary, layout }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DeploymentLayoutModel {
+    deployment_id: ModelId,
+    model: OcrModel,
+}
+
+impl DeploymentLayoutModel {
+    const fn new(deployment_id: ModelId, model: OcrModel) -> Self {
+        Self {
+            deployment_id,
+            model,
+        }
+    }
+}
+
+impl std::fmt::Display for DeploymentLayoutModel {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.model.fmt(formatter)
+    }
+}
+
+impl ModelSpec for DeploymentLayoutModel {
+    fn category(&self) -> ModelCategory {
+        self.model.category()
+    }
+
+    fn huggingface_repo(&self) -> &str {
+        self.model.huggingface_repo()
+    }
+
+    fn modelscope_repo(&self) -> &str {
+        self.model.modelscope_repo()
+    }
+
+    fn required_files(&self) -> &'static [&'static str] {
+        self.model.required_files()
     }
 }
 
@@ -171,10 +212,17 @@ impl ModelRuntimeFactory for BuiltinModelRuntimeFactory {
                 .with_context(|| format!("unsupported built-in OCR model `{model}`"))?;
             let layout = layout_model
                 .map(|(layout_model, path)| {
+                    if path.is_file() {
+                        return Ok(path);
+                    }
+                    let layout_cache_root = path
+                        .parent()
+                        .and_then(std::path::Path::parent)
+                        .unwrap_or(&cache_root);
                     let known_layout = layout_model.known().with_context(|| {
                         format!("unsupported built-in OCR layout model `{layout_model}`")
                     })?;
-                    match OcrAssets::from_cache_layout(known_layout, path, &cache_root) {
+                    match OcrAssets::from_cache_layout(known_layout, &path, layout_cache_root) {
                         OcrAssets::Layout { model } => Ok(model),
                         OcrAssets::Traditional { .. } | OcrAssets::VisionLanguage { .. } => {
                             anyhow::bail!("model `{layout_model}` did not resolve to layout assets")
@@ -192,11 +240,28 @@ impl ModelRuntimeFactory for BuiltinModelRuntimeFactory {
 }
 
 impl<M: ModelSpec> ModelProvisioner<M> for ModelDownloader {
-    fn provision(&self, model: M, models_dir: PathBuf) -> ModelProvisionFuture<'_> {
+    fn provision(
+        &self,
+        model: M,
+        provisioning: Option<ModelProvisioning>,
+        models_dir: PathBuf,
+    ) -> ModelProvisionFuture<'_> {
         Box::pin(async move {
-            self.download(model, models_dir)
-                .await
-                .map_err(anyhow::Error::from)
+            match provisioning {
+                Some(provisioning) => {
+                    self.download_model_url_with_plan(
+                        model,
+                        &provisioning.model_url,
+                        &provisioning.source_intent,
+                        None,
+                        provisioning.source_plan.as_ref(),
+                        models_dir,
+                    )
+                    .await
+                }
+                None => self.download(model, models_dir).await,
+            }
+            .map_err(anyhow::Error::from)
         })
     }
 }
@@ -222,6 +287,7 @@ pub struct AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::{ModelDeployment, OcrModelDeployment};
     use orchion::{
         AsrEngine, AsrEngineFuture, AsrOptions, AsrStreamSession, AsrStreamingOptions,
         AsrTranscript, KnownOcrModel, OcrEngine, OcrEngineFuture, OcrLimits, OcrOptions, OcrResult,
@@ -257,38 +323,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inactive_ocr_services_ignore_unknown_available_models() {
+    async fn inactive_ocr_services_still_validate_unknown_deployments() {
         let mut config = test_config();
         let unknown_model = ModelId::parse("Acme/Experimental-OCR").unwrap();
         config.services.ocr.enabled = false;
-        config.services.ocr.available_models = vec![unknown_model.clone()];
+        config.services.ocr.models = vec![OcrModelDeployment::from_runtime(OcrModel::new(
+            unknown_model.clone(),
+            OcrModelKind::TraditionalOcr,
+        ))];
         config.services.ocr_vl.enabled = false;
-        config.services.ocr_vl.available_models = vec![unknown_model];
 
-        let state = AppState::load(config).await.unwrap();
+        let Err(error) = AppState::load(config).await else {
+            panic!("unknown disabled OCR deployment should fail validation");
+        };
 
         assert!(
-            state
-                .ocr(KnownOcrModel::PpOcrV6Tiny.into_model(), None)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            state
-                .ocr_vl(KnownOcrModel::PaddleOcrVl16.into_model(), None)
-                .await
-                .unwrap()
-                .is_none()
+            error
+                .to_string()
+                .contains("not a supported traditional OCR")
         );
     }
 
     #[tokio::test]
-    async fn custom_ocr_model_reaches_injected_runtime_factory() {
+    async fn known_ocr_model_reaches_injected_runtime_factory() {
         let mut config = test_config();
         config.services.ocr.enabled = true;
-        let model_id = ModelId::parse("Acme/Experimental-OCR").unwrap();
-        config.services.ocr.available_models = vec![model_id.clone()];
+        let model_id = ModelId::parse("PaddlePaddle/PP-OCRv6_tiny").unwrap();
+        config.services.ocr.models = vec![OcrModelDeployment::from_runtime(OcrModel::new(
+            model_id.clone(),
+            OcrModelKind::TraditionalOcr,
+        ))];
 
         let state = AppState::from_prepared_config_with_runtime_factory(
             config,
@@ -306,11 +370,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn custom_ocr_vl_model_reaches_injected_runtime_factory() {
+    async fn known_ocr_vl_model_reaches_injected_runtime_factory() {
         let mut config = test_config();
         config.services.ocr_vl.enabled = true;
-        let model_id = ModelId::parse("Acme/Experimental-OCR-VL").unwrap();
-        config.services.ocr_vl.available_models = vec![model_id.clone()];
+        let model_id = ModelId::parse("PaddlePaddle/PaddleOCR-VL-1.6").unwrap();
+        config.services.ocr_vl.models = vec![OcrModelDeployment::from_runtime(OcrModel::new(
+            model_id.clone(),
+            OcrModelKind::OcrVl,
+        ))];
 
         let state = AppState::from_prepared_config_with_runtime_factory(
             config,
@@ -374,19 +441,34 @@ mod tests {
     }
 
     impl ModelProvisioner<AsrModel> for RecordingModelProvisioner {
-        fn provision(&self, model: AsrModel, models_dir: PathBuf) -> ModelProvisionFuture<'_> {
+        fn provision(
+            &self,
+            model: AsrModel,
+            _provisioning: Option<ModelProvisioning>,
+            models_dir: PathBuf,
+        ) -> ModelProvisionFuture<'_> {
             self.provision(&model, models_dir)
         }
     }
 
     impl ModelProvisioner<TtsModel> for RecordingModelProvisioner {
-        fn provision(&self, model: TtsModel, models_dir: PathBuf) -> ModelProvisionFuture<'_> {
+        fn provision(
+            &self,
+            model: TtsModel,
+            _provisioning: Option<ModelProvisioning>,
+            models_dir: PathBuf,
+        ) -> ModelProvisionFuture<'_> {
             self.provision(&model, models_dir)
         }
     }
 
     impl ModelProvisioner<OcrModel> for RecordingModelProvisioner {
-        fn provision(&self, model: OcrModel, models_dir: PathBuf) -> ModelProvisionFuture<'_> {
+        fn provision(
+            &self,
+            model: OcrModel,
+            _provisioning: Option<ModelProvisioning>,
+            models_dir: PathBuf,
+        ) -> ModelProvisionFuture<'_> {
             self.provision(&model, models_dir)
         }
     }
@@ -433,45 +515,36 @@ mod tests {
         config.models.max_loaded = 3;
         config.services.ocr.enabled = true;
         config.services.ocr.max_loaded = 3;
-        let primary_id = ModelId::parse("Acme/Experimental-OCR").unwrap();
-        let first_layout_id = ModelId::parse("Acme/Layout-A").unwrap();
-        let second_layout_id = ModelId::parse("Acme/Layout-B").unwrap();
-        config.services.ocr.available_models = vec![primary_id.clone()];
-        config.services.ocr.layout_available_models =
-            vec![first_layout_id.clone(), second_layout_id.clone()];
+        let primary_id = ModelId::parse("PaddlePaddle/PP-OCRv6_tiny").unwrap();
+        let layout_id = ModelId::parse("PaddlePaddle/PP-DocLayoutV3").unwrap();
+        let primary = OcrModel::new(primary_id.clone(), OcrModelKind::TraditionalOcr);
+        config.services.ocr.models =
+            vec![OcrModelDeployment::from_runtime(primary.clone()).with_supported_layout()];
         let factory = Arc::new(RecordingOcrRuntimeFactory::default());
         let provisioner = Arc::new(RecordingModelProvisioner::default());
         let state = AppState::load_with_components(config, provisioner.clone(), factory.clone())
             .await
             .unwrap();
         let primary = OcrModel::new(primary_id, OcrModelKind::TraditionalOcr);
-        let layout_a = OcrModel::new(first_layout_id.clone(), OcrModelKind::Layout);
-        let layout_b = OcrModel::new(second_layout_id.clone(), OcrModelKind::Layout);
+        let layout = OcrModel::new(layout_id.clone(), OcrModelKind::Layout);
 
         drop(state.ocr(primary.clone(), None).await.unwrap().unwrap());
         drop(
             state
-                .ocr(primary.clone(), Some(layout_a.clone()))
+                .ocr(primary.clone(), Some(layout.clone()))
                 .await
                 .unwrap()
                 .unwrap(),
         );
-        drop(
-            state
-                .ocr(primary.clone(), Some(layout_b))
-                .await
-                .unwrap()
-                .unwrap(),
-        );
-        drop(state.ocr(primary, Some(layout_a)).await.unwrap().unwrap());
+        drop(state.ocr(primary, Some(layout)).await.unwrap().unwrap());
 
         assert_eq!(
             *factory.layouts.lock().unwrap(),
-            vec![None, Some(first_layout_id), Some(second_layout_id)]
+            vec![None, Some(layout_id)]
         );
         assert_eq!(
             *provisioner.models.lock().unwrap(),
-            vec!["Acme/Experimental-OCR", "Acme/Layout-A", "Acme/Layout-B"]
+            vec!["PaddlePaddle/PP-OCRv6_tiny", "PaddlePaddle/PP-DocLayoutV3"]
         );
         state.shutdown().await;
     }
@@ -524,6 +597,43 @@ mod tests {
     }
 
     struct SuccessfulAsrRuntimeFactory;
+
+    #[derive(Default)]
+    struct RecordingAsrPathRuntimeFactory {
+        paths: StdMutex<Vec<PathBuf>>,
+    }
+
+    impl ModelRuntimeFactory for RecordingAsrPathRuntimeFactory {
+        fn load_asr(
+            &self,
+            model: AsrModel,
+            path: PathBuf,
+            _device: DevicePreference,
+        ) -> AsrRuntimeFuture<'_> {
+            self.paths.lock().unwrap().push(path);
+            Box::pin(async move { Ok(Asr::from_engine(Arc::new(TestAsrEngine { model }))) })
+        }
+
+        fn load_tts(
+            &self,
+            _model: TtsModel,
+            _path: PathBuf,
+            _device: DevicePreference,
+        ) -> TtsRuntimeFuture<'_> {
+            Box::pin(async { anyhow::bail!("TTS is not used by this test factory") })
+        }
+
+        fn load_ocr(
+            &self,
+            _model: OcrModel,
+            _model_dir: PathBuf,
+            _cache_root: PathBuf,
+            _layout_model: Option<(OcrModel, PathBuf)>,
+            _device: DevicePreference,
+        ) -> OcrRuntimeFuture<'_> {
+            Box::pin(async { anyhow::bail!("OCR is not used by this test factory") })
+        }
+    }
 
     impl ModelRuntimeFactory for SuccessfulAsrRuntimeFactory {
         fn load_asr(
@@ -585,6 +695,168 @@ mod tests {
         ) -> OcrRuntimeFuture<'_> {
             Box::pin(async { anyhow::bail!("injected OCR runtime factory") })
         }
+    }
+
+    #[tokio::test]
+    async fn prepared_remote_model_uses_deterministic_deployment_path() {
+        let mut config = test_config();
+        config.services.asr.enabled = true;
+        config.models.source = crate::settings::ModelSource::HuggingFace;
+        config.services.asr.models[0].model =
+            orchion::ModelUrl::parse("//Mirror/Shared-ASR-Package").unwrap();
+        let model = config.services.asr.default_model.clone();
+        let provisioning =
+            deployment_provisioning(&config.services.asr.models, &[DownloadSource::HuggingFace])
+                .remove(&model)
+                .unwrap();
+        let expected =
+            resolve_prepared_provisioning_path(&model, &provisioning, &config.models.dir).unwrap();
+        let factory = Arc::new(RecordingAsrPathRuntimeFactory::default());
+        let state =
+            AppState::from_prepared_config_with_runtime_factory(config, factory.clone()).unwrap();
+
+        drop(state.asr(model).await.unwrap().unwrap());
+
+        assert_eq!(*factory.paths.lock().unwrap(), [expected]);
+    }
+
+    #[tokio::test]
+    async fn prepared_local_model_uses_validated_local_package_path() {
+        let mut config = test_config();
+        config.services.asr.enabled = true;
+        let package = config.models.dir.parent().unwrap().join("local-asr");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("config.json"), "{}").unwrap();
+        std::fs::write(package.join("tokenizer.json"), "{}").unwrap();
+        config.services.asr.models[0].model =
+            orchion::ModelUrl::parse(&format!("file://{}", package.display())).unwrap();
+        let model = config.services.asr.default_model.clone();
+        let factory = Arc::new(RecordingAsrPathRuntimeFactory::default());
+        let state =
+            AppState::from_prepared_config_with_runtime_factory(config, factory.clone()).unwrap();
+
+        drop(state.asr(model).await.unwrap().unwrap());
+
+        assert_eq!(*factory.paths.lock().unwrap(), [package]);
+    }
+
+    #[test]
+    fn prepared_constructor_rejects_missing_local_package() {
+        let mut config = test_config();
+        config.services.asr.enabled = true;
+        let missing = config
+            .models
+            .dir
+            .parent()
+            .unwrap()
+            .join("missing-local-asr");
+        config.services.asr.models[0].model =
+            orchion::ModelUrl::parse(&format!("file://{}", missing.display())).unwrap();
+
+        let Err(error) = AppState::from_prepared_config_with_runtime_factory(
+            config,
+            Arc::new(RecordingAsrPathRuntimeFactory::default()),
+        ) else {
+            panic!("missing prepared local package should fail construction");
+        };
+
+        assert!(error.to_string().contains("invalid local model path"));
+    }
+
+    #[test]
+    fn explicit_active_locators_ignore_invalid_source_environment_and_disabled_defaults() {
+        let mut config = test_config();
+        config.services.asr.enabled = true;
+        config.services.asr.models[0].model =
+            orchion::ModelUrl::parse("hf://Qwen/Qwen3-ASR-0.6B").unwrap();
+        assert!(
+            config
+                .services
+                .tts
+                .models
+                .iter()
+                .any(|deployment| deployment.model.source() == ModelUrlSource::Neutral)
+        );
+
+        let candidates =
+            resolve_config_source_candidates_with_env(&config, Some("invalid-provider")).unwrap();
+
+        assert!(candidates.is_empty());
+        let hugging_face =
+            deployment_provisioning(&config.services.asr.models, &[DownloadSource::HuggingFace]);
+        let model_scope =
+            deployment_provisioning(&config.services.asr.models, &[DownloadSource::ModelScope]);
+        let model = &config.services.asr.default_model;
+        assert_eq!(
+            hugging_face[model].source_intent,
+            model_scope[model].source_intent
+        );
+        assert!(hugging_face[model].source_plan.is_none());
+        assert!(model_scope[model].source_plan.is_none());
+    }
+
+    #[test]
+    fn active_neutral_auto_uses_documented_candidate_order() {
+        let mut config = test_config();
+        config.services.asr.enabled = true;
+
+        assert_eq!(
+            resolve_config_source_candidates_with_env(&config, None).unwrap(),
+            [DownloadSource::HuggingFace, DownloadSource::ModelScope]
+        );
+        assert!(
+            resolve_config_source_candidates_with_env(&config, Some("invalid-provider")).is_err()
+        );
+    }
+
+    #[test]
+    fn distinct_layout_locators_have_deployment_scoped_runtime_keys() {
+        let config = ServerConfig::from_toml_str(
+            r#"
+[services.ocr]
+enabled = true
+default_model = "PaddlePaddle/PP-OCRv6_tiny"
+
+[[services.ocr.models]]
+id = "PaddlePaddle/PP-OCRv6_tiny"
+model = "//PaddlePaddle/PP-OCRv6_tiny"
+layout_model = "hf://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
+
+[[services.ocr.models]]
+id = "PaddlePaddle/PP-OCRv6_small"
+model = "//PaddlePaddle/PP-OCRv6_small"
+layout_model = "ms://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
+"#,
+            std::path::Path::new("/tmp/orchion-server"),
+        )
+        .unwrap();
+
+        let resolved = resolve_configured_ocr_models(
+            &config,
+            &[DownloadSource::HuggingFace, DownloadSource::ModelScope],
+        );
+
+        assert_eq!(resolved.layout.len(), 2);
+        assert_ne!(
+            resolved.layout[0].deployment_id,
+            resolved.layout[1].deployment_id
+        );
+        let urls = resolved
+            .layout
+            .iter()
+            .map(|key| {
+                resolved
+                    .layout_locators
+                    .get(key)
+                    .unwrap()
+                    .model_url
+                    .source()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            urls,
+            [ModelUrlSource::HuggingFace, ModelUrlSource::ModelScope]
+        );
     }
 
     #[tokio::test]
@@ -693,7 +965,7 @@ mod tests {
         let model = AsrModel::parse("PaddlePaddle/PaddleOCR-VL-1.6").unwrap();
         config.services.asr.enabled = true;
         config.services.asr.default_model = model.clone();
-        config.services.asr.available_models = vec![model];
+        config.services.asr.models = vec![ModelDeployment::from_asr_runtime(model)];
 
         let Err(error) = AppState::from_prepared_config(config) else {
             panic!("builtin runtime factory should reject a foreign ASR descriptor");
@@ -702,7 +974,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("does not support configured ASR model")
+                .contains("not a supported ASR runtime model")
         );
     }
 
@@ -711,7 +983,10 @@ mod tests {
         let mut config = test_config();
         let model = ModelId::parse("Acme/Experimental-OCR").unwrap();
         config.services.ocr.enabled = true;
-        config.services.ocr.available_models = vec![model];
+        config.services.ocr.models = vec![OcrModelDeployment::from_runtime(OcrModel::new(
+            model,
+            OcrModelKind::TraditionalOcr,
+        ))];
 
         let Err(error) = AppState::from_prepared_config(config) else {
             panic!("builtin runtime factory should reject a custom OCR model");
@@ -720,7 +995,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("does not support configured OCR model")
+                .contains("not a supported traditional OCR")
         );
     }
 
@@ -740,6 +1015,7 @@ impl AppState {
     ///
     /// Returns an error when configuration, provisioning, or startup model loading fails.
     pub async fn load(config: ServerConfig) -> anyhow::Result<Arc<Self>> {
+        config.validate()?;
         let provisioner = Arc::new(
             ModelDownloader::new(config.models.source.into())
                 .with_file_integrity_verification(config.models.verify_file_integrity),
@@ -760,6 +1036,7 @@ impl AppState {
             + ModelProvisioner<OcrModel>
             + 'static,
     {
+        config.validate()?;
         Self::load_with_components(config, provisioner, Arc::new(BuiltinModelRuntimeFactory)).await
     }
 
@@ -779,14 +1056,17 @@ impl AppState {
             + ModelProvisioner<OcrModel>
             + 'static,
     {
+        config.validate()?;
         validate_runtime_factory(&config, runtime_factory.as_ref())?;
-        let resolved_ocr_models = resolve_configured_ocr_models(&config);
+        let source_candidates = resolve_config_source_candidates(&config)?;
+        let resolved_ocr_models = resolve_configured_ocr_models(&config, &source_candidates);
         let provisioners = ModelProvisioners::new(provisioner);
         let state = Arc::new(Self::build(
             config,
             resolved_ocr_models,
             Some(&provisioners),
             runtime_factory,
+            &source_candidates,
         ));
         let counts = state.ensure_startup_models().await?;
         state.spawn_idle_cleanup();
@@ -805,6 +1085,7 @@ impl AppState {
     ///
     /// Returns an error when configured OCR model identifiers cannot be resolved.
     pub fn from_prepared_config(config: ServerConfig) -> anyhow::Result<Self> {
+        config.validate()?;
         Self::from_prepared_config_with_runtime_factory(
             config,
             Arc::new(BuiltinModelRuntimeFactory),
@@ -820,13 +1101,17 @@ impl AppState {
         config: ServerConfig,
         runtime_factory: Arc<dyn ModelRuntimeFactory>,
     ) -> anyhow::Result<Self> {
+        config.validate()?;
         validate_runtime_factory(&config, runtime_factory.as_ref())?;
-        let resolved_ocr_models = resolve_configured_ocr_models(&config);
+        let source_candidates = resolve_config_source_candidates(&config)?;
+        let resolved_ocr_models = resolve_configured_ocr_models(&config, &source_candidates);
+        validate_prepared_model_paths(&config, &source_candidates, &resolved_ocr_models)?;
         Ok(Self::build(
             config,
             resolved_ocr_models,
             None,
             runtime_factory,
+            &source_candidates,
         ))
     }
 
@@ -844,18 +1129,22 @@ impl AppState {
         resolved_ocr_models: ResolvedOcrModels,
         provisioners: Option<&ModelProvisioners>,
         runtime_factory: Arc<dyn ModelRuntimeFactory>,
+        source_candidates: &[DownloadSource],
     ) -> Self {
         let ResolvedOcrModels {
             assets: resolved_ocr_assets,
+            asset_locators: resolved_ocr_asset_locators,
             ocr: resolved_ocr,
             ocr_vl: resolved_ocr_vl,
             layout: resolved_layout,
+            layout_locators: resolved_layout_locators,
         } = resolved_ocr_models;
         let api_policy = api_policy(&config);
         let model_residency = ResidencyDomain::new();
         let asr_models = build_model_cache(
             "asr",
-            config.services.asr.available_models.clone(),
+            config.services.asr.runtime_models(),
+            deployment_provisioning(&config.services.asr.models, source_candidates),
             config.services.asr.idle_timeout,
             config.services.asr.max_loaded,
             config.models.dir.clone(),
@@ -866,7 +1155,8 @@ impl AppState {
         );
         let tts_models = build_model_cache(
             "tts",
-            config.services.tts.available_models.clone(),
+            config.services.tts.runtime_models(),
+            deployment_provisioning(&config.services.tts.models, source_candidates),
             config.services.tts.idle_timeout,
             config.services.tts.max_loaded,
             config.models.dir.clone(),
@@ -878,6 +1168,7 @@ impl AppState {
         let ocr_assets = build_model_cache(
             "ocr-assets",
             resolved_ocr_assets,
+            resolved_ocr_asset_locators,
             config
                 .services
                 .ocr
@@ -893,6 +1184,7 @@ impl AppState {
         let ocr_models = build_model_cache(
             "ocr",
             resolved_ocr,
+            HashMap::new(),
             config.services.ocr.idle_timeout,
             config.services.ocr.max_loaded,
             config.models.dir.clone(),
@@ -902,6 +1194,7 @@ impl AppState {
         let ocr_vl_models = build_model_cache(
             "ocr-vl",
             resolved_ocr_vl,
+            HashMap::new(),
             config.services.ocr_vl.idle_timeout,
             config.services.ocr_vl.max_loaded,
             config.models.dir.clone(),
@@ -911,6 +1204,7 @@ impl AppState {
         let layout_models = build_model_cache(
             "ocr-layout",
             resolved_layout,
+            resolved_layout_locators,
             config
                 .services
                 .ocr
@@ -920,7 +1214,7 @@ impl AppState {
             config.models.dir.clone(),
             provisioners
                 .as_ref()
-                .map(|provisioners| Arc::clone(&provisioners.ocr)),
+                .map(|provisioners| Arc::clone(&provisioners.layout)),
             model_residency.clone(),
         );
         let global_models = GlobalModelCacheLimiter::new_in_domain(
@@ -1002,14 +1296,22 @@ impl AppState {
 
         let mut required_layouts = HashSet::new();
         if self.config.services.ocr.active()
-            && let Some(model) = &self.config.services.ocr.layout_default_model
+            && let Some(deployment_id) = &self.config.services.ocr.default_model
+            && let Some(model) = self.config.services.ocr.default_layout_runtime()
         {
-            required_layouts.insert(OcrModel::new(model.clone(), OcrModelKind::Layout));
+            required_layouts.insert(DeploymentLayoutModel::new(
+                deployment_id.clone(),
+                model.clone(),
+            ));
         }
         if self.config.services.ocr_vl.active()
-            && let Some(model) = &self.config.services.ocr_vl.layout_default_model
+            && let Some(deployment_id) = &self.config.services.ocr_vl.default_model
+            && let Some(model) = self.config.services.ocr_vl.default_layout_runtime()
         {
-            required_layouts.insert(OcrModel::new(model.clone(), OcrModelKind::Layout));
+            required_layouts.insert(DeploymentLayoutModel::new(
+                deployment_id.clone(),
+                model.clone(),
+            ));
         }
         for layout in required_layouts {
             spawn_model_provision(
@@ -1100,6 +1402,7 @@ impl AppState {
         if !self.config.services.ocr.active() {
             return Ok(None);
         }
+        let layout = layout.map(|layout| DeploymentLayoutModel::new(model.id().clone(), layout));
         let key = OcrRuntimeKey::new(model, layout);
         let device = self.config.services.ocr.device;
         let models_dir = self.config.models.dir.clone();
@@ -1139,6 +1442,7 @@ impl AppState {
         if !self.config.services.ocr_vl.active() {
             return Ok(None);
         }
+        let layout = layout.map(|layout| DeploymentLayoutModel::new(model.id().clone(), layout));
         let key = OcrRuntimeKey::new(model, layout);
         let device = self.config.services.ocr_vl.device;
         let models_dir = self.config.models.dir.clone();
@@ -1287,33 +1591,35 @@ impl AppState {
     }
 
     async fn unload_all_models(&self) {
-        for model in &self.config.services.asr.available_models {
+        for deployment in &self.config.services.asr.models {
+            let model = &deployment.runtime;
             if let Err(error) = self.asr_models.unload(model.clone()).await {
                 tracing::error!(model = %model, %error, "failed to unload ASR model during shutdown");
             }
         }
-        for model in &self.config.services.tts.available_models {
+        for deployment in &self.config.services.tts.models {
+            let model = &deployment.runtime;
             if let Err(error) = self.tts_models.unload(model.clone()).await {
                 tracing::error!(model = %model, %error, "failed to unload TTS model during shutdown");
             }
         }
-        for id in &self.config.services.ocr.available_models {
-            let model = OcrModel::new(id.clone(), OcrModelKind::TraditionalOcr);
-            for key in ocr_runtime_keys_for_model(
-                &model,
-                &self.config.services.ocr.layout_available_models,
-            ) {
+        for deployment in &self.config.services.ocr.models {
+            let id = &deployment.id;
+            let model = deployment.runtime.clone();
+            for key in
+                ocr_runtime_keys_for_model(&model, &self.config.services.ocr.layout_ids_for(id))
+            {
                 if let Err(error) = self.ocr_models.unload(key).await {
                     tracing::error!(model = %id, %error, "failed to unload OCR model during shutdown");
                 }
             }
         }
-        for id in &self.config.services.ocr_vl.available_models {
-            let model = OcrModel::new(id.clone(), OcrModelKind::OcrVl);
-            for key in ocr_runtime_keys_for_model(
-                &model,
-                &self.config.services.ocr_vl.layout_available_models,
-            ) {
+        for deployment in &self.config.services.ocr_vl.models {
+            let id = &deployment.id;
+            let model = deployment.runtime.clone();
+            for key in
+                ocr_runtime_keys_for_model(&model, &self.config.services.ocr_vl.layout_ids_for(id))
+            {
                 if let Err(error) = self.ocr_vl_models.unload(key).await {
                     tracing::error!(model = %id, %error, "failed to unload OCR-VL model during shutdown");
                 }
@@ -1340,13 +1646,22 @@ async fn load_ocr_runtime(
             .ensure_provisioned(layout.clone())
             .await?
             .with_context(|| format!("configured OCR layout model `{layout}` is unavailable"))?;
-        Some((layout, path))
+        Some((layout.model, path))
     } else {
         None
     };
+    let primary_cache_root =
+        if primary_path.starts_with(models_dir.join(".orchion").join("deployments")) {
+            primary_path
+                .parent()
+                .and_then(std::path::Path::parent)
+                .map_or_else(|| models_dir.clone(), std::path::Path::to_path_buf)
+        } else {
+            models_dir.clone()
+        };
     tracing::info!(model = ?primary, layout = ?layout.as_ref().map(|(model, _)| model), device = %device, "loading OCR model");
     runtime_factory
-        .load_ocr(primary, primary_path, models_dir, layout, device)
+        .load_ocr(primary, primary_path, primary_cache_root, layout, device)
         .await
 }
 
@@ -1422,26 +1737,29 @@ impl ModelLifecycleRuntime for AppState {
         Box::pin(async move {
             let mut statuses = Vec::new();
             if self.config.services.asr.enabled {
-                for model in &self.config.services.asr.available_models {
+                for deployment in &self.config.services.asr.models {
+                    let model = &deployment.runtime;
                     if let Some(status) = self.asr_models.status(model).await {
                         statuses.push(model_status(model.as_str(), ModelService::Asr, status));
                     }
                 }
             }
             if self.config.services.tts.enabled {
-                for model in &self.config.services.tts.available_models {
+                for deployment in &self.config.services.tts.models {
+                    let model = &deployment.runtime;
                     if let Some(status) = self.tts_models.status(model).await {
                         statuses.push(model_status(model.as_str(), ModelService::Tts, status));
                     }
                 }
             }
             if self.config.services.ocr.active() {
-                for id in &self.config.services.ocr.available_models {
-                    let model = OcrModel::new(id.clone(), OcrModelKind::TraditionalOcr);
+                for deployment in &self.config.services.ocr.models {
+                    let id = &deployment.id;
+                    let model = deployment.runtime.clone();
                     if let Some(status) = ocr_runtime_status(
                         &self.ocr_models,
                         &model,
-                        &self.config.services.ocr.layout_available_models,
+                        &self.config.services.ocr.layout_ids_for(id),
                     )
                     .await
                     {
@@ -1450,12 +1768,13 @@ impl ModelLifecycleRuntime for AppState {
                 }
             }
             if self.config.services.ocr_vl.active() {
-                for id in &self.config.services.ocr_vl.available_models {
-                    let model = OcrModel::new(id.clone(), OcrModelKind::OcrVl);
+                for deployment in &self.config.services.ocr_vl.models {
+                    let id = &deployment.id;
+                    let model = deployment.runtime.clone();
                     if let Some(status) = ocr_runtime_status(
                         &self.ocr_vl_models,
                         &model,
-                        &self.config.services.ocr_vl.layout_available_models,
+                        &self.config.services.ocr_vl.layout_ids_for(id),
                     )
                     .await
                     {
@@ -1501,7 +1820,7 @@ impl ModelLifecycleRuntime for AppState {
                 ModelService::Ocr => {
                     let Some(model) = selected_ocr_model(
                         &selector.model,
-                        &self.config.services.ocr.available_models,
+                        &self.config.services.ocr.model_ids(),
                         OcrModelKind::TraditionalOcr,
                     ) else {
                         return Ok(None);
@@ -1521,7 +1840,7 @@ impl ModelLifecycleRuntime for AppState {
                 ModelService::OcrVl => {
                     let Some(model) = selected_ocr_model(
                         &selector.model,
-                        &self.config.services.ocr_vl.available_models,
+                        &self.config.services.ocr_vl.model_ids(),
                         OcrModelKind::OcrVl,
                     ) else {
                         return Ok(None);
@@ -1579,7 +1898,7 @@ impl ModelLifecycleRuntime for AppState {
                 ModelService::Ocr if self.config.services.ocr.active() => {
                     let Some(model) = selected_ocr_model(
                         &selector.model,
-                        &self.config.services.ocr.available_models,
+                        &self.config.services.ocr.model_ids(),
                         OcrModelKind::TraditionalOcr,
                     ) else {
                         return Ok(None);
@@ -1587,7 +1906,7 @@ impl ModelLifecycleRuntime for AppState {
                     unload_ocr_runtimes(
                         &self.ocr_models,
                         &model,
-                        &self.config.services.ocr.layout_available_models,
+                        &self.config.services.ocr.layout_ids_for(model.id()),
                     )
                     .await
                     .map_err(|error| model_lifecycle_error(&error))?;
@@ -1596,7 +1915,7 @@ impl ModelLifecycleRuntime for AppState {
                 ModelService::OcrVl if self.config.services.ocr_vl.active() => {
                     let Some(model) = selected_ocr_model(
                         &selector.model,
-                        &self.config.services.ocr_vl.available_models,
+                        &self.config.services.ocr_vl.model_ids(),
                         OcrModelKind::OcrVl,
                     ) else {
                         return Ok(None);
@@ -1604,7 +1923,7 @@ impl ModelLifecycleRuntime for AppState {
                     unload_ocr_runtimes(
                         &self.ocr_vl_models,
                         &model,
-                        &self.config.services.ocr_vl.layout_available_models,
+                        &self.config.services.ocr_vl.layout_ids_for(model.id()),
                     )
                     .await
                     .map_err(|error| model_lifecycle_error(&error))?;
@@ -1639,7 +1958,7 @@ fn model_lifecycle_error(error: &anyhow::Error) -> RuntimeError {
 impl TranscriptionRuntime for AppState {
     fn transcription_policy(&self) -> TranscriptionPolicy {
         TranscriptionPolicy {
-            available_models: self.config.services.asr.available_models.clone(),
+            models: self.config.services.asr.runtime_models(),
             max_audio_duration: self.config.services.asr.max_audio_duration,
         }
     }
@@ -1748,15 +2067,17 @@ impl OcrRuntime for AppState {
         OcrPolicy {
             ocr: OcrServicePolicy {
                 active: ocr.active(),
-                available_models: ocr.available_models.clone(),
-                layout_available_models: ocr.layout_available_models.clone(),
+                models: ocr.model_ids(),
+                layout_models: ocr.layout_ids(),
+                model_layouts: ocr.model_layouts(),
                 format: ocr.format,
                 max_pixels: ocr.max_pixels,
             },
             ocr_vl: OcrVlServicePolicy {
                 active: ocr_vl.active(),
-                available_models: ocr_vl.available_models.clone(),
-                layout_available_models: ocr_vl.layout_available_models.clone(),
+                models: ocr_vl.model_ids(),
+                layout_models: ocr_vl.layout_ids(),
+                model_layouts: ocr_vl.model_layouts(),
                 format: ocr_vl.format,
                 max_tokens: ocr_vl.max_tokens,
                 max_pixels: ocr_vl.max_pixels,
@@ -1813,6 +2134,22 @@ struct ModelProvisioners {
     asr: Arc<dyn ModelProvisioner<AsrModel>>,
     tts: Arc<dyn ModelProvisioner<TtsModel>>,
     ocr: Arc<dyn ModelProvisioner<OcrModel>>,
+    layout: Arc<dyn ModelProvisioner<DeploymentLayoutModel>>,
+}
+
+struct LayoutModelProvisioner {
+    inner: Arc<dyn ModelProvisioner<OcrModel>>,
+}
+
+impl ModelProvisioner<DeploymentLayoutModel> for LayoutModelProvisioner {
+    fn provision(
+        &self,
+        model: DeploymentLayoutModel,
+        provisioning: Option<ModelProvisioning>,
+        models_dir: PathBuf,
+    ) -> ModelProvisionFuture<'_> {
+        self.inner.provision(model.model, provisioning, models_dir)
+    }
 }
 
 impl ModelProvisioners {
@@ -1826,13 +2163,23 @@ impl ModelProvisioners {
         let asr: Arc<dyn ModelProvisioner<AsrModel>> = provisioner.clone();
         let tts: Arc<dyn ModelProvisioner<TtsModel>> = provisioner.clone();
         let ocr: Arc<dyn ModelProvisioner<OcrModel>> = provisioner;
-        Self { asr, tts, ocr }
+        let layout: Arc<dyn ModelProvisioner<DeploymentLayoutModel>> =
+            Arc::new(LayoutModelProvisioner {
+                inner: Arc::clone(&ocr),
+            });
+        Self {
+            asr,
+            tts,
+            ocr,
+            layout,
+        }
     }
 }
 
 fn build_model_cache<M, E>(
     cache_id: &'static str,
-    available_models: Vec<M>,
+    models: Vec<M>,
+    provisioning: HashMap<M, ModelProvisioning>,
     idle_timeout: std::time::Duration,
     max_loaded: usize,
     dir: PathBuf,
@@ -1843,15 +2190,28 @@ where
     M: ModelSpec + std::hash::Hash,
     E: Clone,
 {
-    ModelCache::new_in_domain(
-        cache_id,
-        available_models,
-        idle_timeout,
-        max_loaded,
-        dir,
-        provisioner,
-        residency,
-    )
+    if provisioning.is_empty() {
+        ModelCache::new_in_domain(
+            cache_id,
+            models,
+            idle_timeout,
+            max_loaded,
+            dir,
+            provisioner,
+            residency,
+        )
+    } else {
+        ModelCache::new_in_domain_with_provisioning(
+            cache_id,
+            models,
+            provisioning,
+            idle_timeout,
+            max_loaded,
+            dir,
+            provisioner,
+            residency,
+        )
+    }
 }
 
 fn spawn_model_provision<M, E>(
@@ -1914,53 +2274,385 @@ impl ProvisionedModelCounts {
 
 struct ResolvedOcrModels {
     assets: Vec<OcrModel>,
+    asset_locators: HashMap<OcrModel, ModelProvisioning>,
     ocr: Vec<OcrRuntimeKey>,
     ocr_vl: Vec<OcrRuntimeKey>,
-    layout: Vec<OcrModel>,
+    layout: Vec<DeploymentLayoutModel>,
+    layout_locators: HashMap<DeploymentLayoutModel, ModelProvisioning>,
 }
 
-fn resolve_configured_ocr_models(config: &ServerConfig) -> ResolvedOcrModels {
+#[allow(
+    clippy::too_many_lines,
+    reason = "projects one validated OCR deployment set into asset, runtime, and layout caches"
+)]
+fn resolve_configured_ocr_models(
+    config: &ServerConfig,
+    source_candidates: &[DownloadSource],
+) -> ResolvedOcrModels {
     let ocr_models = if config.services.ocr.active() {
-        resolve_ocr_models(
-            &config.services.ocr.available_models,
-            OcrModelKind::TraditionalOcr,
-        )
+        config
+            .services
+            .ocr
+            .models
+            .iter()
+            .map(|model| model.runtime.clone())
+            .collect()
     } else {
         Vec::new()
     };
     let ocr_vl_models = if config.services.ocr_vl.active() {
-        resolve_ocr_models(
-            &config.services.ocr_vl.available_models,
-            OcrModelKind::OcrVl,
-        )
+        config
+            .services
+            .ocr_vl
+            .models
+            .iter()
+            .map(|model| model.runtime.clone())
+            .collect()
     } else {
         Vec::new()
     };
     let mut layout = Vec::new();
-    if config.services.ocr.active() {
-        layout.extend(resolve_layout_models(
-            &config.services.ocr.layout_available_models,
-        ));
-    }
-    if config.services.ocr_vl.active() {
-        for model in resolve_layout_models(&config.services.ocr_vl.layout_available_models) {
+    for deployment in config
+        .services
+        .ocr
+        .models
+        .iter()
+        .filter(|_| config.services.ocr.active())
+        .chain(
+            config
+                .services
+                .ocr_vl
+                .models
+                .iter()
+                .filter(|_| config.services.ocr_vl.active()),
+        )
+    {
+        if let Some(model) = &deployment.layout_runtime {
+            let model = DeploymentLayoutModel::new(deployment.id.clone(), model.clone());
             if !layout.contains(&model) {
                 layout.push(model);
             }
         }
     }
     let assets = ocr_models.iter().chain(&ocr_vl_models).cloned().collect();
-    let ocr = resolve_ocr_runtime_keys(&ocr_models, &config.services.ocr.layout_available_models);
-    let ocr_vl = resolve_ocr_runtime_keys(
-        &ocr_vl_models,
-        &config.services.ocr_vl.layout_available_models,
-    );
+    let asset_locators = config
+        .services
+        .ocr
+        .models
+        .iter()
+        .chain(&config.services.ocr_vl.models)
+        .filter(|deployment| match deployment.runtime.kind() {
+            OcrModelKind::TraditionalOcr => config.services.ocr.active(),
+            OcrModelKind::OcrVl => config.services.ocr_vl.active(),
+            OcrModelKind::Layout => false,
+        })
+        .map(|deployment| {
+            let source_intent = ocr_deployment_source_intent(deployment, source_candidates);
+            let source_plan = ocr_deployment_source_plan(deployment, source_candidates);
+            (
+                deployment.runtime.clone(),
+                provisioning_for_url(&deployment.model, source_intent, source_plan),
+            )
+        })
+        .collect();
+    let layout_locators = config
+        .services
+        .ocr
+        .models
+        .iter()
+        .filter(|_| config.services.ocr.active())
+        .chain(
+            config
+                .services
+                .ocr_vl
+                .models
+                .iter()
+                .filter(|_| config.services.ocr_vl.active()),
+        )
+        .filter_map(|deployment| {
+            let runtime = DeploymentLayoutModel::new(
+                deployment.id.clone(),
+                deployment.layout_runtime.clone()?,
+            );
+            let url = deployment.layout_model.as_ref()?;
+            let source_intent = format!(
+                "deployment={}|layout={url}{}",
+                deployment.id,
+                neutral_policy_suffix(
+                    (url.source() == ModelUrlSource::Neutral).then_some(source_candidates)
+                )
+            );
+            let source_plan = ocr_deployment_source_plan(deployment, source_candidates);
+            Some((
+                runtime,
+                provisioning_for_url(url, source_intent, source_plan),
+            ))
+        })
+        .collect();
+    let ocr = if config.services.ocr.active() {
+        resolve_deployment_runtime_keys(&config.services.ocr.models)
+    } else {
+        Vec::new()
+    };
+    let ocr_vl = if config.services.ocr_vl.active() {
+        resolve_deployment_runtime_keys(&config.services.ocr_vl.models)
+    } else {
+        Vec::new()
+    };
     ResolvedOcrModels {
         assets,
+        asset_locators,
         ocr,
         ocr_vl,
         layout,
+        layout_locators,
     }
+}
+
+fn deployment_provisioning<M>(
+    deployments: &[crate::settings::ModelDeployment<M>],
+    source_candidates: &[DownloadSource],
+) -> HashMap<M, ModelProvisioning>
+where
+    M: ModelSpec + std::hash::Hash,
+{
+    deployments
+        .iter()
+        .map(|deployment| {
+            let source_intent = format!(
+                "id={}|model={}{}",
+                deployment.id,
+                deployment.model,
+                neutral_policy_suffix(
+                    (deployment.model.source() == ModelUrlSource::Neutral)
+                        .then_some(source_candidates)
+                )
+            );
+            let artifacts = if deployment.model.source() == ModelUrlSource::Neutral {
+                ModelDownloader::model_artifact_plan(&deployment.runtime, &deployment.model)
+                    .expect("validated speech deployment has a compatible artifact plan")
+            } else {
+                Vec::new()
+            };
+            let source_plan =
+                deployment_source_plan(source_intent.clone(), artifacts, source_candidates);
+            (
+                deployment.runtime.clone(),
+                provisioning_for_url(&deployment.model, source_intent, source_plan),
+            )
+        })
+        .collect()
+}
+
+fn validate_prepared_model_paths(
+    config: &ServerConfig,
+    source_candidates: &[DownloadSource],
+    ocr: &ResolvedOcrModels,
+) -> anyhow::Result<()> {
+    for (model, provisioning) in
+        deployment_provisioning(&config.services.asr.models, source_candidates)
+    {
+        resolve_prepared_provisioning_path(&model, &provisioning, &config.models.dir)?;
+    }
+    for (model, provisioning) in
+        deployment_provisioning(&config.services.tts.models, source_candidates)
+    {
+        resolve_prepared_provisioning_path(&model, &provisioning, &config.models.dir)?;
+    }
+    for (model, provisioning) in &ocr.asset_locators {
+        resolve_prepared_provisioning_path(model, provisioning, &config.models.dir)?;
+    }
+    for (model, provisioning) in &ocr.layout_locators {
+        resolve_prepared_provisioning_path(&model.model, provisioning, &config.models.dir)?;
+    }
+    Ok(())
+}
+
+fn resolve_prepared_provisioning_path<M: ModelSpec>(
+    model: &M,
+    provisioning: &ModelProvisioning,
+    models_dir: &std::path::Path,
+) -> anyhow::Result<PathBuf> {
+    match &provisioning.source_plan {
+        Some(plan) => Ok(ModelDownloader::resolve_prepared_model_url_path_with_plan(
+            model,
+            &provisioning.model_url,
+            &provisioning.source_intent,
+            plan,
+            models_dir,
+        )?),
+        None => Ok(ModelDownloader::resolve_prepared_model_url_path(
+            model,
+            &provisioning.model_url,
+            &provisioning.source_intent,
+            models_dir,
+        )?),
+    }
+}
+
+fn provisioning_for_url(
+    url: &orchion::ModelUrl,
+    source_intent: String,
+    source_plan: Option<DeploymentSourcePlan>,
+) -> ModelProvisioning {
+    ModelProvisioning {
+        model_url: url.clone(),
+        source_intent,
+        source_plan: (url.source() == ModelUrlSource::Neutral)
+            .then_some(source_plan)
+            .flatten(),
+    }
+}
+
+fn ocr_deployment_source_intent(
+    deployment: &crate::settings::OcrModelDeployment,
+    source_candidates: &[DownloadSource],
+) -> String {
+    let has_neutral = deployment.model.source() == ModelUrlSource::Neutral
+        || deployment
+            .layout_model
+            .as_ref()
+            .is_some_and(|url| url.source() == ModelUrlSource::Neutral);
+    format!(
+        "id={}|model={}|layout={}{}",
+        deployment.id,
+        deployment.model,
+        deployment
+            .layout_model
+            .as_ref()
+            .map_or("none", orchion::ModelUrl::as_str),
+        neutral_policy_suffix(has_neutral.then_some(source_candidates))
+    )
+}
+
+fn neutral_policy_suffix(candidates: Option<&[DownloadSource]>) -> String {
+    candidates.map_or_else(String::new, |candidates| {
+        let policy = candidates
+            .iter()
+            .map(|source| match source {
+                DownloadSource::HuggingFace => "huggingface",
+                DownloadSource::ModelScope => "modelscope",
+                DownloadSource::Auto => "auto",
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("|neutral-policy={policy}")
+    })
+}
+
+fn deployment_source_plan(
+    key: String,
+    artifacts: Vec<ArtifactRequest>,
+    source_candidates: &[DownloadSource],
+) -> Option<DeploymentSourcePlan> {
+    (!artifacts.is_empty() && !source_candidates.is_empty()).then(|| DeploymentSourcePlan {
+        key,
+        artifacts,
+        candidates: source_candidates.to_vec(),
+    })
+}
+
+fn ocr_deployment_source_plan(
+    deployment: &crate::settings::OcrModelDeployment,
+    source_candidates: &[DownloadSource],
+) -> Option<DeploymentSourcePlan> {
+    let mut artifacts = Vec::new();
+    if deployment.model.source() == ModelUrlSource::Neutral {
+        artifacts.extend(
+            ModelDownloader::model_artifact_plan(&deployment.runtime, &deployment.model)
+                .expect("validated OCR deployment has a compatible primary artifact plan"),
+        );
+    }
+    if let (Some(runtime), Some(url)) = (
+        deployment.layout_runtime.as_ref(),
+        deployment.layout_model.as_ref(),
+    ) && url.source() == ModelUrlSource::Neutral
+    {
+        artifacts.extend(
+            ModelDownloader::model_artifact_plan(runtime, url)
+                .expect("validated OCR deployment has a compatible layout artifact plan"),
+        );
+    }
+    deployment_source_plan(
+        format!("ocr-deployment={}", deployment.id),
+        artifacts,
+        source_candidates,
+    )
+}
+
+fn resolve_config_source_candidates(config: &ServerConfig) -> anyhow::Result<Vec<DownloadSource>> {
+    if !active_neutral_locators(config) {
+        return Ok(Vec::new());
+    }
+    let environment = match std::env::var("ORCHION_MODEL_SOURCE") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("ORCHION_MODEL_SOURCE contains non-Unicode data")
+        }
+    };
+    resolve_config_source_candidates_with_env(config, environment.as_deref())
+}
+
+fn resolve_config_source_candidates_with_env(
+    config: &ServerConfig,
+    environment: Option<&str>,
+) -> anyhow::Result<Vec<DownloadSource>> {
+    if !active_neutral_locators(config) {
+        return Ok(Vec::new());
+    }
+    match config.models.source {
+        crate::settings::ModelSource::HuggingFace => Ok(vec![DownloadSource::HuggingFace]),
+        crate::settings::ModelSource::ModelScope => Ok(vec![DownloadSource::ModelScope]),
+        crate::settings::ModelSource::Auto => match environment {
+            Some(value) => match value.trim().to_ascii_lowercase().as_str() {
+                "hf" | "huggingface" => Ok(vec![DownloadSource::HuggingFace]),
+                "ms" | "modelscope" => Ok(vec![DownloadSource::ModelScope]),
+                "auto" => Ok(vec![
+                    DownloadSource::HuggingFace,
+                    DownloadSource::ModelScope,
+                ]),
+                _ => anyhow::bail!("invalid ORCHION_MODEL_SOURCE `{value}`"),
+            },
+            None => Ok(vec![
+                DownloadSource::HuggingFace,
+                DownloadSource::ModelScope,
+            ]),
+        },
+    }
+}
+
+fn active_neutral_locators(config: &ServerConfig) -> bool {
+    config.services.asr.enabled
+        && config
+            .services
+            .asr
+            .models
+            .iter()
+            .any(|deployment| deployment.model.source() == ModelUrlSource::Neutral)
+        || config.services.tts.enabled
+            && config
+                .services
+                .tts
+                .models
+                .iter()
+                .any(|deployment| deployment.model.source() == ModelUrlSource::Neutral)
+        || config.services.ocr.active()
+            && config.services.ocr.models.iter().any(|deployment| {
+                deployment.model.source() == ModelUrlSource::Neutral
+                    || deployment
+                        .layout_model
+                        .as_ref()
+                        .is_some_and(|url| url.source() == ModelUrlSource::Neutral)
+            })
+        || config.services.ocr_vl.active()
+            && config.services.ocr_vl.models.iter().any(|deployment| {
+                deployment.model.source() == ModelUrlSource::Neutral
+                    || deployment
+                        .layout_model
+                        .as_ref()
+                        .is_some_and(|url| url.source() == ModelUrlSource::Neutral)
+            })
 }
 
 fn validate_runtime_factory(
@@ -1968,7 +2660,8 @@ fn validate_runtime_factory(
     runtime_factory: &dyn ModelRuntimeFactory,
 ) -> anyhow::Result<()> {
     if config.services.asr.enabled {
-        for model in &config.services.asr.available_models {
+        for deployment in &config.services.asr.models {
+            let model = &deployment.runtime;
             anyhow::ensure!(
                 runtime_factory.supports_asr(model),
                 "runtime factory does not support configured ASR model `{model}`"
@@ -1976,7 +2669,8 @@ fn validate_runtime_factory(
         }
     }
     if config.services.tts.enabled {
-        for model in &config.services.tts.available_models {
+        for deployment in &config.services.tts.models {
+            let model = &deployment.runtime;
             anyhow::ensure!(
                 runtime_factory.supports_tts(model),
                 "runtime factory does not support configured TTS model `{model}`"
@@ -1984,8 +2678,8 @@ fn validate_runtime_factory(
         }
     }
 
-    let resolved = resolve_configured_ocr_models(config);
-    for model in resolved.assets.into_iter().chain(resolved.layout) {
+    let resolved = resolve_configured_ocr_models(config, &[DownloadSource::HuggingFace]);
+    for model in resolved.assets {
         anyhow::ensure!(
             runtime_factory.supports_ocr(&model),
             "runtime factory does not support configured {} model `{model}`",
@@ -1994,6 +2688,13 @@ fn validate_runtime_factory(
                 OcrModelKind::OcrVl => "OCR-VL",
                 OcrModelKind::Layout => "OCR layout",
             }
+        );
+    }
+    for layout in resolved.layout {
+        let model = layout.model;
+        anyhow::ensure!(
+            runtime_factory.supports_ocr(&model),
+            "runtime factory does not support configured OCR layout model `{model}`"
         );
     }
     Ok(())
@@ -2013,7 +2714,7 @@ fn api_policy(config: &ServerConfig) -> ApiPolicy {
             history_capacity: config.activity.history_capacity,
         },
         asr: config.services.asr.enabled.then(|| AsrApiPolicy {
-            available_models: config.services.asr.available_models.clone(),
+            models: config.services.asr.runtime_models(),
             stream_target_segment: config.services.asr.stream_target_segment,
             stream_max_segment: config.services.asr.stream_max_segment,
             stream_idle_timeout: config.services.asr.stream_idle_timeout,
@@ -2024,37 +2725,33 @@ fn api_policy(config: &ServerConfig) -> ApiPolicy {
             .services
             .tts
             .enabled
-            .then(|| config.services.tts.available_models.clone()),
+            .then(|| config.services.tts.runtime_models()),
         ocr: config.services.ocr.active().then(|| OcrApiModels {
-            models: config.services.ocr.available_models.clone(),
-            layout_models: config.services.ocr.layout_available_models.clone(),
+            models: config.services.ocr.model_ids(),
+            layout_models: config.services.ocr.layout_ids(),
         }),
         ocr_vl: config.services.ocr_vl.active().then(|| OcrApiModels {
-            models: config.services.ocr_vl.available_models.clone(),
-            layout_models: config.services.ocr_vl.layout_available_models.clone(),
+            models: config.services.ocr_vl.model_ids(),
+            layout_models: config.services.ocr_vl.layout_ids(),
         }),
     }
 }
 
-fn resolve_ocr_models(models: &[ModelId], kind: OcrModelKind) -> Vec<OcrModel> {
-    models
-        .iter()
-        .cloned()
-        .map(|model| OcrModel::new(model, kind))
-        .collect()
-}
-
-fn resolve_layout_models(models: &[ModelId]) -> Vec<OcrModel> {
-    resolve_ocr_models(models, OcrModelKind::Layout)
-}
-
-fn resolve_ocr_runtime_keys(
-    primary_models: &[OcrModel],
-    layout_models: &[ModelId],
+fn resolve_deployment_runtime_keys(
+    deployments: &[crate::settings::OcrModelDeployment],
 ) -> Vec<OcrRuntimeKey> {
-    primary_models
+    deployments
         .iter()
-        .flat_map(|primary| ocr_runtime_keys_for_model(primary, layout_models))
+        .flat_map(|deployment| {
+            std::iter::once(OcrRuntimeKey::new(deployment.runtime.clone(), None)).chain(
+                deployment.layout_runtime.clone().map(|layout| {
+                    OcrRuntimeKey::new(
+                        deployment.runtime.clone(),
+                        Some(DeploymentLayoutModel::new(deployment.id.clone(), layout)),
+                    )
+                }),
+            )
+        })
         .collect()
 }
 
@@ -2063,7 +2760,10 @@ fn ocr_runtime_keys_for_model(primary: &OcrModel, layout_models: &[ModelId]) -> 
         .chain(layout_models.iter().cloned().map(|layout| {
             OcrRuntimeKey::new(
                 primary.clone(),
-                Some(OcrModel::new(layout, OcrModelKind::Layout)),
+                Some(DeploymentLayoutModel::new(
+                    primary.id().clone(),
+                    OcrModel::new(layout, OcrModelKind::Layout),
+                )),
             )
         }))
         .collect()

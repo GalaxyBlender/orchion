@@ -12,12 +12,12 @@ pub use asr::{
     AsrTranscript, prepare_asr_samples,
 };
 pub use device::{DevicePreference, ParseDevicePreferenceError};
-pub use error::{DownloadFailure, OrchionError, Result};
+pub use error::{DownloadFailure, DownloadRetryability, OrchionError, Result};
 pub use model::{
     AsrModel, KnownOcrModel, ModelCapabilities, ModelCapabilityRequirement, ModelCategory,
-    ModelDescriptor, ModelId, ModelSourceLocators, ModelSpec, OcrModel, OcrModelAsset,
-    OcrModelAssetKind, OcrModelAssetRole, OcrModelKind, ParseModelIdError, RuntimeProvider,
-    TtsModel, model_descriptor, registered_model_descriptors,
+    ModelDescriptor, ModelId, ModelSourceLocators, ModelSpec, ModelUrl, ModelUrlSource, OcrModel,
+    OcrModelAsset, OcrModelAssetKind, OcrModelAssetRole, OcrModelKind, ParseModelIdError,
+    ParseModelUrlError, RuntimeProvider, TtsModel, model_descriptor, registered_model_descriptors,
 };
 pub use ocr::{
     OcrLayoutBlock, OcrLimits, OcrOptions, OcrPoint, OcrRegion, OcrResponseFormat, OcrResult,

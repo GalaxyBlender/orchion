@@ -4,7 +4,7 @@
 
 Orchion exposes traditional OCR and OCR-VL through `POST /v1/ocr` with `multipart/form-data`.
 
-Server `default_model` and `layout_default_model` settings control startup provisioning only. Requests must still provide `model`, and structured responses must provide `layout_model`.
+Server `default_model` selects one `[[services.ocr.models]]` or `[[services.ocr-vl.models]]` deployment for startup provisioning. Each deployment configures its optional `layout_model` artifact. In this phase, requests must still provide `model`, and structured responses must still provide the existing `layout_model` runtime ID.
 
 ## Traditional OCR
 

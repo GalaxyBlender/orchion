@@ -12,8 +12,9 @@ pub type OcrFuture<'a> =
 #[derive(Debug, Clone)]
 pub struct OcrServicePolicy {
     pub active: bool,
-    pub available_models: Vec<ModelId>,
-    pub layout_available_models: Vec<ModelId>,
+    pub models: Vec<ModelId>,
+    pub layout_models: Vec<ModelId>,
+    pub model_layouts: Vec<(ModelId, ModelId)>,
     pub format: OcrResponseFormat,
     pub max_pixels: u64,
 }
@@ -21,8 +22,9 @@ pub struct OcrServicePolicy {
 #[derive(Debug, Clone)]
 pub struct OcrVlServicePolicy {
     pub active: bool,
-    pub available_models: Vec<ModelId>,
-    pub layout_available_models: Vec<ModelId>,
+    pub models: Vec<ModelId>,
+    pub layout_models: Vec<ModelId>,
+    pub model_layouts: Vec<(ModelId, ModelId)>,
     pub format: OcrResponseFormat,
     pub max_tokens: usize,
     pub max_pixels: u64,
@@ -169,8 +171,8 @@ fn resolve_explicit_model(
 ) -> Result<OcrServiceChoice, UseCaseError> {
     let model_id =
         ModelId::parse(model).map_err(|_| UseCaseError::ModelNotAvailable(model.to_string()))?;
-    let ocr_match = policy.ocr.active && policy.ocr.available_models.contains(&model_id);
-    let ocr_vl_match = policy.ocr_vl.active && policy.ocr_vl.available_models.contains(&model_id);
+    let ocr_match = policy.ocr.active && policy.ocr.models.contains(&model_id);
+    let ocr_vl_match = policy.ocr_vl.active && policy.ocr_vl.models.contains(&model_id);
     match (ocr_match, ocr_vl_match) {
         (true, _) => Ok(OcrServiceChoice::ocr(model_id)),
         (false, true) => Ok(OcrServiceChoice::ocr_vl(model_id)),
@@ -232,7 +234,8 @@ pub fn validate_parameters(
     if choice.is_ocr_vl() {
         if let Some(layout_model) = layout_model {
             validate_configured_layout_model(
-                &policy.ocr_vl.layout_available_models,
+                &policy.ocr_vl.model_layouts,
+                choice.model(),
                 layout_model,
                 "OCR-VL",
             )?;
@@ -240,7 +243,12 @@ pub fn validate_parameters(
         return Ok(());
     }
     if let Some(layout_model) = layout_model {
-        validate_configured_layout_model(&policy.ocr.layout_available_models, layout_model, "OCR")?;
+        validate_configured_layout_model(
+            &policy.ocr.model_layouts,
+            choice.model(),
+            layout_model,
+            "OCR",
+        )?;
     }
     if task != OcrTask::Ocr || max_tokens.is_some() {
         return Err(UseCaseError::invalid(
@@ -270,11 +278,17 @@ pub fn resolve_max_tokens(
 }
 
 fn validate_configured_layout_model(
-    available_models: &[ModelId],
+    model_layouts: &[(ModelId, ModelId)],
+    model: &ModelId,
     layout_model: &ModelId,
     service_name: &str,
 ) -> Result<(), UseCaseError> {
-    if available_models.contains(layout_model) {
+    if model_layouts
+        .iter()
+        .any(|(configured_model, configured_layout)| {
+            configured_model == model && configured_layout == layout_model
+        })
+    {
         return Ok(());
     }
     Err(UseCaseError::invalid(
@@ -300,15 +314,17 @@ mod tests {
         OcrPolicy {
             ocr: OcrServicePolicy {
                 active: true,
-                available_models: vec![ModelId::parse("PaddlePaddle/PP-OCRv6_tiny").unwrap()],
-                layout_available_models: Vec::new(),
+                models: vec![ModelId::parse("PaddlePaddle/PP-OCRv6_tiny").unwrap()],
+                layout_models: Vec::new(),
+                model_layouts: Vec::new(),
                 format: OcrResponseFormat::Json,
                 max_pixels: 1_000,
             },
             ocr_vl: OcrVlServicePolicy {
                 active: true,
-                available_models: vec![ModelId::parse("PaddlePaddle/PaddleOCR-VL-1.6").unwrap()],
-                layout_available_models: Vec::new(),
+                models: vec![ModelId::parse("PaddlePaddle/PaddleOCR-VL-1.6").unwrap()],
+                layout_models: Vec::new(),
+                model_layouts: Vec::new(),
                 format: OcrResponseFormat::Markdown,
                 max_tokens: 64,
                 max_pixels: 2_000,
@@ -367,7 +383,8 @@ mod tests {
             model: traditional_model(),
         };
         let mut policy = policy();
-        policy.ocr.layout_available_models = vec![layout.clone()];
+        policy.ocr.layout_models = vec![layout.clone()];
+        policy.ocr.model_layouts = vec![(traditional_model(), layout.clone())];
         validate_parameters(
             &choice,
             OcrResponseFormat::Markdown,
@@ -378,7 +395,8 @@ mod tests {
         )
         .unwrap();
 
-        policy.ocr.layout_available_models.clear();
+        policy.ocr.layout_models.clear();
+        policy.ocr.model_layouts.clear();
         let error = validate_parameters(
             &choice,
             OcrResponseFormat::Json,
@@ -388,6 +406,35 @@ mod tests {
             &policy,
         )
         .unwrap_err();
+        assert!(matches!(
+            error,
+            UseCaseError::InvalidRequest {
+                param: Some("layout_model"),
+                code: "model_not_available",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn layout_configuration_is_scoped_to_the_selected_deployment() {
+        let layout = ModelId::parse("PaddlePaddle/PP-DocLayoutV3").unwrap();
+        let other = ModelId::parse("PaddlePaddle/PP-OCRv6_small").unwrap();
+        let mut policy = policy();
+        policy.ocr.models.push(other.clone());
+        policy.ocr.layout_models = vec![layout.clone()];
+        policy.ocr.model_layouts = vec![(traditional_model(), layout.clone())];
+
+        let error = validate_parameters(
+            &OcrServiceChoice::Ocr { model: other },
+            OcrResponseFormat::Markdown,
+            OcrTask::Ocr,
+            Some(&layout),
+            None,
+            &policy,
+        )
+        .unwrap_err();
+
         assert!(matches!(
             error,
             UseCaseError::InvalidRequest {

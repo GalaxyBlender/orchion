@@ -5,11 +5,14 @@ mod transaction;
 pub use provider::{
     DownloadFuture, DownloadProvider, DownloadProviderRegistry, DownloadSource, HubProviderOptions,
     HuggingFaceProvider, ModelScopeProvider, ProviderDownloadRequest, ProviderDownloadResult,
-    ProviderModel, ResolvedDownloadFuture,
+    ProviderModel, ProviderPreflightRequest, ProviderPreflightResult, ResolvedDownloadFuture,
 };
 
 use assets::{ModelHubAsset, ModelHubAssetKind, uses_modelscope_file_assets};
-use orchion_core::{DownloadFailure, ModelCategory, ModelId, ModelSpec, OrchionError, Result};
+use orchion_core::{
+    DownloadFailure, DownloadRetryability, KnownOcrModel, ModelCategory, ModelId, ModelSpec,
+    ModelUrl, ModelUrlSource, OrchionError, Result,
+};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::future::Future;
@@ -166,6 +169,28 @@ enum ProviderSelection {
     Registry,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentSourcePlan {
+    pub key: String,
+    pub artifacts: Vec<ArtifactRequest>,
+    pub candidates: Vec<DownloadSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactRequest {
+    pub repository: String,
+    pub files: Option<Vec<String>>,
+    pub required_source: Option<DownloadSource>,
+}
+
+#[derive(Debug, Clone)]
+struct DeploymentSelectionState {
+    source: DownloadSource,
+    artifacts: Vec<ArtifactRequest>,
+    committed: bool,
+    rejected: Vec<DownloadSource>,
+}
+
 #[derive(Clone)]
 pub struct ModelDownloader {
     selection: ProviderSelection,
@@ -174,6 +199,7 @@ pub struct ModelDownloader {
     repository_revisions: HashMap<String, String>,
     verify_file_integrity: bool,
     huggingface_available: Arc<tokio::sync::OnceCell<bool>>,
+    deployment_sources: Arc<tokio::sync::Mutex<HashMap<String, DeploymentSelectionState>>>,
 }
 
 impl std::fmt::Debug for ModelDownloader {
@@ -186,6 +212,7 @@ impl std::fmt::Debug for ModelDownloader {
             .field("repository_revisions", &self.repository_revisions)
             .field("verify_file_integrity", &self.verify_file_integrity)
             .field("huggingface_available", &self.huggingface_available)
+            .field("deployment_sources", &"<deployment selections>")
             .finish()
     }
 }
@@ -197,6 +224,36 @@ impl Default for ModelDownloader {
 }
 
 impl ModelDownloader {
+    /// Expands a configured locator into the repositories and exact files used by provisioning.
+    ///
+    /// Registered OCR recipes expand through their runtime asset registry. Repository packages
+    /// without a registered file recipe remain repository requests with `files = None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the locator is incompatible with the runtime recipe.
+    pub fn model_artifact_plan<M: ModelSpec>(
+        model: &M,
+        model_url: &ModelUrl,
+    ) -> Result<Vec<ArtifactRequest>> {
+        let assets = model_hub_assets(model);
+        if !assets.is_empty() {
+            return Ok(artifact_requests_for_assets(assets));
+        }
+        let (Some(owner), Some(repository)) = (model_url.owner(), model_url.repository()) else {
+            return Err(incompatible_model_url(
+                model,
+                model_url,
+                "artifact preflight plan requires a hub locator",
+            ));
+        };
+        let repository = format!("{owner}/{repository}");
+        Ok(vec![ArtifactRequest {
+            repository,
+            files: model_url.path().map(|path| vec![path.to_string()]),
+            required_source: None,
+        }])
+    }
     #[must_use]
     pub fn new(source: DownloadSource) -> Self {
         Self {
@@ -208,6 +265,7 @@ impl ModelDownloader {
             repository_revisions: HashMap::new(),
             verify_file_integrity: true,
             huggingface_available: Arc::new(tokio::sync::OnceCell::const_new()),
+            deployment_sources: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -228,6 +286,7 @@ impl ModelDownloader {
             repository_revisions: HashMap::new(),
             verify_file_integrity: true,
             huggingface_available: Arc::new(tokio::sync::OnceCell::const_new()),
+            deployment_sources: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -277,6 +336,618 @@ impl ModelDownloader {
         .await
     }
 
+    /// Provisions a model from an explicit validated locator.
+    ///
+    /// Repository locators preserve the runtime model's cache recipe while overriding its source
+    /// repository. Exact file locators are accepted only when they identify the recipe's sole
+    /// required hub asset. Local locators bypass remote providers entirely.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the locator is incompatible with the runtime recipe or provisioning
+    /// fails.
+    pub async fn download_model_url<M: ModelSpec>(
+        &self,
+        model: M,
+        model_url: &ModelUrl,
+        cache_dir: impl AsRef<Path>,
+    ) -> Result<PathBuf> {
+        self.download_model_url_with_intent(model, model_url, model_url.as_str(), None, cache_dir)
+            .await
+    }
+
+    /// Provisions a model using a deployment source-intent identity and optional provider choice.
+    ///
+    /// `source_intent` affects only local cache identity. `source_override` is applied only to a
+    /// neutral locator; explicit locator schemes always remain authoritative.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the locator, provider, local artifact, or download is invalid.
+    pub async fn download_model_url_with_intent<M: ModelSpec>(
+        &self,
+        model: M,
+        model_url: &ModelUrl,
+        source_intent: &str,
+        source_override: Option<DownloadSource>,
+        cache_dir: impl AsRef<Path>,
+    ) -> Result<PathBuf> {
+        self.download_model_url_with_plan(
+            model,
+            model_url,
+            source_intent,
+            source_override,
+            None,
+            cache_dir,
+        )
+        .await
+    }
+
+    /// Provisions one artifact under a deployment-scoped neutral-provider plan.
+    ///
+    /// Selection and download are serialized per downloader so a deployment cannot mix neutral
+    /// providers. Retryable failure before the first committed artifact advances to the next
+    /// candidate; after any artifact commits, changing provider is terminal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when preflight, source selection, or provisioning fails.
+    pub async fn download_model_url_with_plan<M: ModelSpec>(
+        &self,
+        model: M,
+        model_url: &ModelUrl,
+        source_intent: &str,
+        source_override: Option<DownloadSource>,
+        plan: Option<&DeploymentSourcePlan>,
+        cache_dir: impl AsRef<Path>,
+    ) -> Result<PathBuf> {
+        let env = DownloadEnv::current();
+        if model_url.source() == ModelUrlSource::File {
+            return self
+                .download_model_url_with_intent_and_client_and_probe(
+                    model,
+                    model_url,
+                    source_intent,
+                    source_override,
+                    cache_dir,
+                    &LibraryDownloadClient,
+                    &HttpSourceProbe,
+                    &env,
+                )
+                .await;
+        }
+        let implicit_plan;
+        let plan = if let Some(plan) = plan {
+            plan
+        } else {
+            let candidates = self.model_url_candidates(model_url, source_override, &env)?;
+            implicit_plan = DeploymentSourcePlan {
+                key: format!("implicit={source_intent}"),
+                artifacts: Self::model_artifact_plan(&model, model_url)?,
+                candidates,
+            };
+            &implicit_plan
+        };
+        self.download_neutral_deployment_artifact(
+            model,
+            model_url,
+            source_intent,
+            plan,
+            cache_dir.as_ref(),
+            &LibraryDownloadClient,
+            &HttpSourceProbe,
+            &env,
+        )
+        .await
+    }
+
+    fn model_url_candidates(
+        &self,
+        model_url: &ModelUrl,
+        source_override: Option<DownloadSource>,
+        env: &DownloadEnv,
+    ) -> Result<Vec<DownloadSource>> {
+        match model_url.source() {
+            ModelUrlSource::HuggingFace => Ok(vec![DownloadSource::HuggingFace]),
+            ModelUrlSource::ModelScope => Ok(vec![DownloadSource::ModelScope]),
+            ModelUrlSource::File => Ok(Vec::new()),
+            ModelUrlSource::Neutral => {
+                if let Some(source) = source_override
+                    && source != DownloadSource::Auto
+                {
+                    return Ok(vec![source]);
+                }
+                match self.selection {
+                    ProviderSelection::BuiltIn(source) => Ok(resolve_source(source, env)?
+                        .into_iter()
+                        .map(|source| match source {
+                            ResolvedSource::HuggingFace => DownloadSource::HuggingFace,
+                            ResolvedSource::ModelScope => DownloadSource::ModelScope,
+                        })
+                        .collect()),
+                    ProviderSelection::Registry => Ok(self
+                        .providers
+                        .providers()
+                        .iter()
+                        .filter_map(|provider| match provider.label() {
+                            "huggingface" => Some(DownloadSource::HuggingFace),
+                            "modelscope" => Some(DownloadSource::ModelScope),
+                            _ => None,
+                        })
+                        .collect()),
+                }
+            }
+        }
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "keeps deployment selection and injectable provider adapters explicit"
+    )]
+    async fn download_neutral_deployment_artifact<
+        M: ModelSpec,
+        C: DownloadClient,
+        P: SourceProbe,
+    >(
+        &self,
+        model: M,
+        model_url: &ModelUrl,
+        source_intent: &str,
+        plan: &DeploymentSourcePlan,
+        cache_dir: &Path,
+        client: &C,
+        probe: &P,
+        env: &DownloadEnv,
+    ) -> Result<PathBuf> {
+        let mut selections = self.deployment_sources.lock().await;
+        loop {
+            if !selections.contains_key(&plan.key) {
+                let (source, artifacts) = self
+                    .preflight_deployment_candidates(plan, &[], client, env)
+                    .await?;
+                selections.insert(
+                    plan.key.clone(),
+                    DeploymentSelectionState {
+                        source,
+                        artifacts,
+                        committed: false,
+                        rejected: Vec::new(),
+                    },
+                );
+            }
+            let state = selections
+                .get(&plan.key)
+                .expect("deployment selection inserted");
+            let source = state.source;
+            let artifacts = state.artifacts.clone();
+            let committed = state.committed;
+            let effective_intent = if model_url.source() == ModelUrlSource::Neutral {
+                format!(
+                    "{source_intent}|neutral-provider={}",
+                    download_source_label(source)
+                )
+            } else {
+                source_intent.to_string()
+            };
+            let result = self
+                .download_model_url_with_resolved_plan_and_client_and_probe(
+                    model.clone(),
+                    model_url,
+                    &effective_intent,
+                    Some(source),
+                    Some(&artifacts),
+                    cache_dir,
+                    client,
+                    probe,
+                    env,
+                )
+                .await;
+            match result {
+                Ok(path) => {
+                    selections
+                        .get_mut(&plan.key)
+                        .expect("deployment selection retained")
+                        .committed = true;
+                    return Ok(path);
+                }
+                Err(error) if !committed && is_retryable_candidate_error(&error) => {
+                    let rejected = {
+                        let state = selections
+                            .get_mut(&plan.key)
+                            .expect("deployment selection retained");
+                        if !state.rejected.contains(&source) {
+                            state.rejected.push(source);
+                        }
+                        state.rejected.clone()
+                    };
+                    let (next, artifacts) = self
+                        .preflight_deployment_candidates(plan, &rejected, client, env)
+                        .await?;
+                    let state = selections
+                        .get_mut(&plan.key)
+                        .expect("deployment selection retained");
+                    state.source = next;
+                    state.artifacts = artifacts;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn preflight_deployment_candidates<C: DownloadClient>(
+        &self,
+        plan: &DeploymentSourcePlan,
+        rejected: &[DownloadSource],
+        client: &C,
+        _env: &DownloadEnv,
+    ) -> Result<(DownloadSource, Vec<ArtifactRequest>)> {
+        let mut failures = Vec::new();
+        for source in plan
+            .candidates
+            .iter()
+            .copied()
+            .filter(|source| !rejected.contains(source))
+        {
+            let Some(provider) = self.providers.provider(download_source_label(source)) else {
+                continue;
+            };
+            let mut candidate_error = None;
+            let mut resolved_artifacts = Vec::with_capacity(plan.artifacts.len());
+            for artifact in &plan.artifacts {
+                if artifact
+                    .required_source
+                    .is_some_and(|required| required != source)
+                {
+                    candidate_error = Some(OrchionError::ProviderDownload {
+                        source_name: provider.label(),
+                        repo: artifact.repository.clone(),
+                        message: format!(
+                            "artifact recipe requires {}",
+                            download_source_label(
+                                artifact.required_source.expect("checked source")
+                            )
+                        ),
+                        retryability: DownloadRetryability::RetryableNotFound,
+                    });
+                    break;
+                }
+                let file_refs = artifact
+                    .files
+                    .as_ref()
+                    .map(|files| files.iter().map(String::as_str).collect::<Vec<_>>());
+                let result = client
+                    .preflight(
+                        provider.as_ref(),
+                        ProviderPreflightRequest::new(
+                            &artifact.repository,
+                            provider.default_revision(),
+                            file_refs.as_deref(),
+                        ),
+                    )
+                    .await;
+                match result {
+                    Ok(result) if result.files().is_empty() => {
+                        candidate_error = Some(OrchionError::ProviderDownload {
+                            source_name: provider.label(),
+                            repo: artifact.repository.clone(),
+                            message: "provider metadata returned an empty artifact plan"
+                                .to_string(),
+                            retryability: DownloadRetryability::Terminal,
+                        });
+                        break;
+                    }
+                    Ok(result) => resolved_artifacts.push(ArtifactRequest {
+                        repository: artifact.repository.clone(),
+                        files: Some(result.files().to_vec()),
+                        required_source: artifact.required_source,
+                    }),
+                    Err(error) => {
+                        candidate_error = Some(error);
+                        break;
+                    }
+                }
+            }
+            match candidate_error {
+                None => return Ok((source, resolved_artifacts)),
+                Some(error) if is_retryable_candidate_error(&error) => {
+                    failures.push(DownloadFailure {
+                        source_name: provider.label(),
+                        message: error.to_string(),
+                    });
+                }
+                Some(error) => return Err(error),
+            }
+        }
+        Err(OrchionError::DownloadFallbackExhausted {
+            repo: plan.key.clone(),
+            failures,
+        })
+    }
+
+    /// Resolves the package path used by prepared and networked provisioning.
+    ///
+    /// Local locators are validated and returned directly. Remote paths are deterministic and do
+    /// not require the package to exist yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a local path is invalid or the locator is incompatible with the
+    /// runtime recipe.
+    pub async fn resolve_model_url_path<M: ModelSpec>(
+        model: &M,
+        model_url: &ModelUrl,
+        source_intent: &str,
+        cache_dir: impl AsRef<Path>,
+    ) -> Result<PathBuf> {
+        if model_url.source() == ModelUrlSource::File {
+            validate_local_model_path(model, model_url).await
+        } else {
+            expected_remote_model_path(model, model_url, source_intent, cache_dir.as_ref())
+        }
+    }
+
+    /// Resolves a prepared model path without performing network I/O.
+    ///
+    /// Local paths are validated synchronously so non-async state constructors can reject invalid
+    /// prepared configuration before building caches. Remote locators return the same deterministic
+    /// path used by [`Self::download_model_url_with_intent`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a local path is invalid or a remote locator is incompatible with the
+    /// runtime recipe.
+    pub fn resolve_prepared_model_url_path<M: ModelSpec>(
+        model: &M,
+        model_url: &ModelUrl,
+        source_intent: &str,
+        cache_dir: impl AsRef<Path>,
+    ) -> Result<PathBuf> {
+        if model_url.source() == ModelUrlSource::File {
+            validate_local_model_path_sync(model, model_url)
+        } else {
+            expected_remote_model_path(model, model_url, source_intent, cache_dir.as_ref())
+        }
+    }
+
+    /// Resolves a prepared path under a deployment provider policy.
+    ///
+    /// Existing candidate-specific cache paths are checked in policy order. If none exists, the
+    /// first candidate path is returned, matching normal mode's first preflight candidate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the policy is empty or the locator is incompatible.
+    pub fn resolve_prepared_model_url_path_with_plan<M: ModelSpec>(
+        model: &M,
+        model_url: &ModelUrl,
+        source_intent: &str,
+        plan: &DeploymentSourcePlan,
+        cache_dir: impl AsRef<Path>,
+    ) -> Result<PathBuf> {
+        if model_url.source() != ModelUrlSource::Neutral {
+            return Self::resolve_prepared_model_url_path(
+                model,
+                model_url,
+                source_intent,
+                cache_dir,
+            );
+        }
+        let mut paths = plan
+            .candidates
+            .iter()
+            .copied()
+            .map(|source| {
+                let intent = format!(
+                    "{source_intent}|neutral-provider={}",
+                    download_source_label(source)
+                );
+                expected_remote_model_path(model, model_url, &intent, cache_dir.as_ref())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if paths.is_empty() {
+            return Err(OrchionError::Download {
+                source_name: "provider-policy",
+                repo: model.huggingface_repo().to_string(),
+                message: "neutral deployment has no provider candidates".to_string(),
+            });
+        }
+        Ok(paths
+            .iter()
+            .find(|path| path.exists())
+            .cloned()
+            .unwrap_or_else(|| paths.remove(0)))
+    }
+
+    #[cfg(test)]
+    async fn download_model_url_with_client_and_probe<
+        M: ModelSpec,
+        C: DownloadClient,
+        P: SourceProbe,
+    >(
+        &self,
+        model: M,
+        model_url: &ModelUrl,
+        cache_dir: impl AsRef<Path>,
+        client: &C,
+        probe: &P,
+        env: &DownloadEnv,
+    ) -> Result<PathBuf> {
+        self.download_model_url_with_intent_and_client_and_probe(
+            model,
+            model_url,
+            model_url.as_str(),
+            None,
+            cache_dir,
+            client,
+            probe,
+            env,
+        )
+        .await
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "keeps request-scoped source intent and injectable download adapters explicit"
+    )]
+    async fn download_model_url_with_intent_and_client_and_probe<
+        M: ModelSpec,
+        C: DownloadClient,
+        P: SourceProbe,
+    >(
+        &self,
+        model: M,
+        model_url: &ModelUrl,
+        source_intent: &str,
+        source_override: Option<DownloadSource>,
+        cache_dir: impl AsRef<Path>,
+        client: &C,
+        probe: &P,
+        env: &DownloadEnv,
+    ) -> Result<PathBuf> {
+        if model_url.source() == ModelUrlSource::File {
+            return self
+                .download_model_url_with_resolved_plan_and_client_and_probe(
+                    model,
+                    model_url,
+                    source_intent,
+                    source_override,
+                    None,
+                    cache_dir,
+                    client,
+                    probe,
+                    env,
+                )
+                .await;
+        }
+        let plan = DeploymentSourcePlan {
+            key: format!("injected={source_intent}"),
+            artifacts: Self::model_artifact_plan(&model, model_url)?,
+            candidates: self.model_url_candidates(model_url, source_override, env)?,
+        };
+        self.download_neutral_deployment_artifact(
+            model,
+            model_url,
+            source_intent,
+            &plan,
+            cache_dir.as_ref(),
+            client,
+            probe,
+            env,
+        )
+        .await
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "keeps resolved artifact plans and injectable download adapters explicit"
+    )]
+    async fn download_model_url_with_resolved_plan_and_client_and_probe<
+        M: ModelSpec,
+        C: DownloadClient,
+        P: SourceProbe,
+    >(
+        &self,
+        model: M,
+        model_url: &ModelUrl,
+        source_intent: &str,
+        source_override: Option<DownloadSource>,
+        resolved_artifacts: Option<&[ArtifactRequest]>,
+        cache_dir: impl AsRef<Path>,
+        client: &C,
+        probe: &P,
+        env: &DownloadEnv,
+    ) -> Result<PathBuf> {
+        if model_url.source() == ModelUrlSource::File {
+            return validate_local_model_path(&model, model_url).await;
+        }
+
+        let repository = format!(
+            "{}/{}",
+            model_url.owner().expect("validated hub URL has owner"),
+            model_url
+                .repository()
+                .expect("validated hub URL has repository")
+        );
+        let downloader = self.for_model_url_source(model_url.source(), source_override);
+        let assets = model_hub_assets(&model);
+        let deployment_root = deployment_cache_root(&model, source_intent, cache_dir.as_ref());
+        let expected =
+            expected_remote_model_path(&model, model_url, source_intent, cache_dir.as_ref())?;
+        if let Some(path) = model_url.path() {
+            if assets.len() != 1 || assets[0].repo != repository || assets[0].file != path {
+                return Err(incompatible_model_url(
+                    &model,
+                    model_url,
+                    "exact file locator does not match the runtime recipe's sole required asset",
+                ));
+            }
+            let actual = downloader
+                .download_with_client_and_probe_with_artifacts(
+                    model,
+                    &deployment_root,
+                    resolved_artifacts,
+                    client,
+                    probe,
+                    env,
+                )
+                .await?;
+            debug_assert_eq!(actual, expected);
+            return Ok(actual);
+        }
+
+        if !assets.is_empty() {
+            if repository != model.huggingface_repo() {
+                return Err(incompatible_model_url(
+                    &model,
+                    model_url,
+                    "repository locator cannot replace a multi-repository runtime recipe",
+                ));
+            }
+            let actual = downloader
+                .download_with_client_and_probe_with_artifacts(
+                    model,
+                    &deployment_root,
+                    resolved_artifacts,
+                    client,
+                    probe,
+                    env,
+                )
+                .await?;
+            debug_assert_eq!(actual, expected);
+            return Ok(actual);
+        }
+
+        let actual = downloader
+            .download_with_client_and_probe_with_artifacts(
+                LocatedRepositoryModel { model, repository },
+                &deployment_root,
+                resolved_artifacts,
+                client,
+                probe,
+                env,
+            )
+            .await?;
+        debug_assert_eq!(actual, expected);
+        Ok(actual)
+    }
+
+    fn for_model_url_source(
+        &self,
+        source: ModelUrlSource,
+        source_override: Option<DownloadSource>,
+    ) -> Self {
+        let mut downloader = self.clone();
+        downloader.selection = match source {
+            ModelUrlSource::HuggingFace => ProviderSelection::BuiltIn(DownloadSource::HuggingFace),
+            ModelUrlSource::ModelScope => ProviderSelection::BuiltIn(DownloadSource::ModelScope),
+            ModelUrlSource::Neutral => {
+                source_override.map_or(self.selection, ProviderSelection::BuiltIn)
+            }
+            ModelUrlSource::File => unreachable!("local locators do not select a provider"),
+        };
+        downloader
+    }
+
     #[cfg(test)]
     async fn download_with_client<M: ModelSpec, C: DownloadClient>(
         &self,
@@ -294,6 +965,26 @@ impl ModelDownloader {
         &self,
         model: M,
         cache_dir: impl AsRef<Path>,
+        client: &C,
+        probe: &P,
+        env: &DownloadEnv,
+    ) -> Result<PathBuf> {
+        self.download_with_client_and_probe_with_artifacts(
+            model, cache_dir, None, client, probe, env,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn download_with_client_and_probe_with_artifacts<
+        M: ModelSpec,
+        C: DownloadClient,
+        P: SourceProbe,
+    >(
+        &self,
+        model: M,
+        cache_dir: impl AsRef<Path>,
+        resolved_artifacts: Option<&[ArtifactRequest]>,
         client: &C,
         probe: &P,
         env: &DownloadEnv,
@@ -358,6 +1049,20 @@ impl ModelDownloader {
         }
 
         let assets = model_hub_assets(&model);
+        let static_artifact_requests = artifact_requests_for_assets(assets);
+        let artifact_requests = resolved_artifacts.unwrap_or(&static_artifact_requests);
+        if resolved_artifacts.is_some()
+            && (artifact_requests.is_empty()
+                || artifact_requests
+                    .iter()
+                    .any(|request| request.files.as_ref().is_none_or(Vec::is_empty)))
+        {
+            return Err(OrchionError::Download {
+                source_name: "metadata",
+                repo: model.huggingface_repo().to_string(),
+                message: "provisioning requires a resolved nonempty exact file plan".to_string(),
+            });
+        }
         let cache_sources = self.configured_providers(
             env,
             uses_modelscope_file_assets(assets),
@@ -387,6 +1092,7 @@ impl ModelDownloader {
         } else {
             self.resolve_candidates(env, probe).await?
         };
+        let single_candidate = candidates.len() == 1;
         tracing::info!(
             model = ?model,
             path = %target.display(),
@@ -419,6 +1125,16 @@ impl ModelDownloader {
             let preparation_result = async {
                 let downloads = if assets.is_empty() {
                     let request = &repository_requests[0];
+                    let files = artifact_requests
+                        .iter()
+                        .find(|artifact| artifact.repository == request.identity)
+                        .or_else(|| {
+                            artifact_requests
+                                .iter()
+                                .find(|artifact| artifact.repository == request.repository)
+                        })
+                        .and_then(|artifact| artifact.files.as_ref())
+                        .map(|files| files.iter().map(String::as_str).collect::<Vec<_>>());
                     tracing::info!(
                         source = source_name,
                         repo = request.repository,
@@ -431,7 +1147,7 @@ impl ModelDownloader {
                             &request.repository,
                             staging_root,
                             &staging_target,
-                            None,
+                            files.as_deref(),
                             &request.requested_revision,
                             env,
                         )
@@ -445,6 +1161,7 @@ impl ModelDownloader {
                         &model,
                         candidate.as_ref(),
                         assets,
+                        artifact_requests,
                         &repository_requests,
                         staging_root,
                         &staging_target,
@@ -506,6 +1223,9 @@ impl ModelDownloader {
                         error = %error,
                         "model candidate transaction failed"
                     );
+                    if single_candidate {
+                        return Err(error);
+                    }
                     failures.push(DownloadFailure {
                         source_name,
                         message: error.to_string(),
@@ -629,6 +1349,275 @@ impl ModelDownloader {
                 .filter(|provider| provider.label() != "huggingface")
                 .collect())
         }
+    }
+}
+
+fn is_retryable_candidate_error(error: &OrchionError) -> bool {
+    matches!(
+        error,
+        OrchionError::ProviderDownload { retryability, .. } if retryability.is_retryable()
+    )
+}
+
+const fn download_source_label(source: DownloadSource) -> &'static str {
+    match source {
+        DownloadSource::HuggingFace => "huggingface",
+        DownloadSource::ModelScope => "modelscope",
+        DownloadSource::Auto => "auto",
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocatedRepositoryModel<M> {
+    model: M,
+    repository: String,
+}
+
+fn expected_remote_model_path<M: ModelSpec>(
+    model: &M,
+    model_url: &ModelUrl,
+    source_intent: &str,
+    cache_dir: &Path,
+) -> Result<PathBuf> {
+    let repository = format!(
+        "{}/{}",
+        model_url.owner().expect("validated hub URL has owner"),
+        model_url
+            .repository()
+            .expect("validated hub URL has repository")
+    );
+    let assets = model_hub_assets(model);
+    let package_repository = if let Some(path) = model_url.path() {
+        if assets.len() != 1 || assets[0].repo != repository || assets[0].file != path {
+            return Err(incompatible_model_url(
+                model,
+                model_url,
+                "exact file locator does not match the runtime recipe's sole required asset",
+            ));
+        }
+        model.huggingface_repo()
+    } else if assets.is_empty() {
+        repository.as_str()
+    } else {
+        if repository != model.huggingface_repo() {
+            return Err(incompatible_model_url(
+                model,
+                model_url,
+                "repository locator cannot replace a multi-repository runtime recipe",
+            ));
+        }
+        model.huggingface_repo()
+    };
+    Ok(repo_cache_path(
+        &deployment_cache_root(model, source_intent, cache_dir),
+        package_repository,
+    ))
+}
+
+fn deployment_cache_root<M: ModelSpec>(
+    model: &M,
+    source_intent: &str,
+    cache_dir: &Path,
+) -> PathBuf {
+    let digest = Sha256::digest(source_intent.as_bytes());
+    let fingerprint = encode_hex(&digest);
+    model
+        .huggingface_repo()
+        .split('/')
+        .fold(
+            cache_dir
+                .join(CACHE_STATE_DIR)
+                .join("deployments")
+                .join(model.category().cache_segment()),
+            |path, segment| path.join(segment),
+        )
+        .join(fingerprint)
+}
+
+impl<M: ModelSpec> ModelSpec for LocatedRepositoryModel<M> {
+    fn category(&self) -> ModelCategory {
+        self.model.category()
+    }
+
+    fn huggingface_repo(&self) -> &str {
+        &self.repository
+    }
+
+    fn modelscope_repo(&self) -> &str {
+        &self.repository
+    }
+
+    fn required_files(&self) -> &'static [&'static str] {
+        self.model.required_files()
+    }
+}
+
+async fn validate_local_model_path<M: ModelSpec>(model: &M, url: &ModelUrl) -> Result<PathBuf> {
+    let path = PathBuf::from(url.path().expect("validated file URL has a path"));
+    let metadata = tokio::fs::symlink_metadata(&path)
+        .await
+        .map_err(|error| local_model_error(model, &path, error.to_string()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(local_model_error(
+            model,
+            &path,
+            "local model path must not be a symbolic link",
+        ));
+    }
+    if metadata.is_file() {
+        if metadata.len() == 0 {
+            return Err(local_model_error(
+                model,
+                &path,
+                "local model artifact must be non-empty",
+            ));
+        }
+        if !model.required_files().is_empty() {
+            return Err(local_model_error(
+                model,
+                &path,
+                "this runtime recipe requires a local package directory",
+            ));
+        }
+        return Ok(path);
+    }
+    if !metadata.is_dir() {
+        return Err(local_model_error(
+            model,
+            &path,
+            "local model path must be a regular file or directory",
+        ));
+    }
+    if model.huggingface_repo() == KnownOcrModel::PpDocLayoutV3.id() {
+        return Err(local_model_error(
+            model,
+            &path,
+            "the layout runtime recipe requires a regular model artifact file",
+        ));
+    }
+
+    let mut entries = tokio::fs::read_dir(&path)
+        .await
+        .map_err(|error| local_model_error(model, &path, error.to_string()))?;
+    if entries
+        .next_entry()
+        .await
+        .map_err(|error| local_model_error(model, &path, error.to_string()))?
+        .is_none()
+    {
+        return Err(local_model_error(
+            model,
+            &path,
+            "local model package directory must be non-empty",
+        ));
+    }
+    for required in model.required_files() {
+        let required_path = path.join(required);
+        cache_file_size(&required_path)
+            .await
+            .map_err(|error| local_model_error(model, &required_path, error.to_string()))?;
+    }
+    Ok(path)
+}
+
+fn validate_local_model_path_sync<M: ModelSpec>(model: &M, url: &ModelUrl) -> Result<PathBuf> {
+    let path = PathBuf::from(url.path().expect("validated file URL has a path"));
+    let metadata = std::fs::symlink_metadata(&path)
+        .map_err(|error| local_model_error(model, &path, error.to_string()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(local_model_error(
+            model,
+            &path,
+            "local model path must not be a symbolic link",
+        ));
+    }
+    if metadata.is_file() {
+        if metadata.len() == 0 {
+            return Err(local_model_error(
+                model,
+                &path,
+                "local model artifact must be non-empty",
+            ));
+        }
+        if !model.required_files().is_empty() {
+            return Err(local_model_error(
+                model,
+                &path,
+                "this runtime recipe requires a local package directory",
+            ));
+        }
+        return Ok(path);
+    }
+    if !metadata.is_dir() {
+        return Err(local_model_error(
+            model,
+            &path,
+            "local model path must be a regular file or directory",
+        ));
+    }
+    if model.huggingface_repo() == KnownOcrModel::PpDocLayoutV3.id() {
+        return Err(local_model_error(
+            model,
+            &path,
+            "the layout runtime recipe requires a regular model artifact file",
+        ));
+    }
+    if std::fs::read_dir(&path)
+        .map_err(|error| local_model_error(model, &path, error.to_string()))?
+        .next()
+        .transpose()
+        .map_err(|error| local_model_error(model, &path, error.to_string()))?
+        .is_none()
+    {
+        return Err(local_model_error(
+            model,
+            &path,
+            "local model package directory must be non-empty",
+        ));
+    }
+    for required in model.required_files() {
+        let required_path = path.join(required);
+        let required_metadata = std::fs::symlink_metadata(&required_path)
+            .map_err(|error| local_model_error(model, &required_path, error.to_string()))?;
+        if required_metadata.file_type().is_symlink()
+            || !required_metadata.is_file()
+            || required_metadata.len() == 0
+        {
+            return Err(local_model_error(
+                model,
+                &required_path,
+                "expected a non-empty regular file",
+            ));
+        }
+    }
+    Ok(path)
+}
+
+fn incompatible_model_url<M: ModelSpec>(
+    model: &M,
+    url: &ModelUrl,
+    message: impl Into<String>,
+) -> OrchionError {
+    OrchionError::Download {
+        source_name: "model-url",
+        repo: model.huggingface_repo().to_string(),
+        message: format!("incompatible model URL `{url}`: {}", message.into()),
+    }
+}
+
+fn local_model_error(
+    model: &impl ModelSpec,
+    path: &Path,
+    message: impl Into<String>,
+) -> OrchionError {
+    OrchionError::Download {
+        source_name: "file",
+        repo: model.huggingface_repo().to_string(),
+        message: format!(
+            "invalid local model path `{}`: {}",
+            path.display(),
+            message.into()
+        ),
     }
 }
 
@@ -1381,6 +2370,41 @@ fn model_hub_assets<M: ModelSpec>(model: &M) -> &'static [ModelHubAsset] {
     assets::for_model(model.huggingface_repo())
 }
 
+fn artifact_requests_for_assets(assets: &[ModelHubAsset]) -> Vec<ArtifactRequest> {
+    let mut requests = Vec::<ArtifactRequest>::new();
+    for asset in assets {
+        let index = requests
+            .iter_mut()
+            .position(|request| request.repository == asset.repo)
+            .unwrap_or_else(|| {
+                requests.push(ArtifactRequest {
+                    repository: asset.repo.to_string(),
+                    files: Some(Vec::new()),
+                    required_source: None,
+                });
+                requests.len() - 1
+            });
+        let request = &mut requests[index];
+        let files = request
+            .files
+            .as_mut()
+            .expect("registered OCR artifact requests always use exact files");
+        if !files.iter().any(|file| file == asset.file) {
+            files.push(asset.file.to_string());
+        }
+        if matches!(asset.kind, ModelHubAssetKind::ModelScopeFile { .. }) {
+            request.required_source = Some(DownloadSource::ModelScope);
+        }
+    }
+    debug_assert!(requests.iter().all(|request| {
+        request
+            .files
+            .as_ref()
+            .is_some_and(|files| !files.is_empty())
+    }));
+    requests
+}
+
 fn repo_cache_path(cache_dir: &Path, repo: &str) -> PathBuf {
     repo.split('/')
         .fold(cache_dir.to_path_buf(), |path, segment| path.join(segment))
@@ -1395,6 +2419,7 @@ async fn download_hub_assets<M: ModelSpec, C: DownloadClient>(
     model: &M,
     provider: &dyn DownloadProvider,
     assets: &[ModelHubAsset],
+    artifact_requests: &[ArtifactRequest],
     repository_requests: &[RepositoryRequest],
     cache_dir: &Path,
     target: &Path,
@@ -1412,7 +2437,14 @@ async fn download_hub_assets<M: ModelSpec, C: DownloadClient>(
     let mut downloads = Vec::with_capacity(repository_requests.len());
     for request in repository_requests {
         let repo_target = repo_cache_path(cache_dir, &request.identity);
-        let repo_files = assets::files_for_repo(assets, &request.identity);
+        let repo_files = artifact_requests
+            .iter()
+            .find(|artifact| artifact.repository == request.identity)
+            .and_then(|artifact| artifact.files.as_ref())
+            .expect("repository requests and expanded artifact plan must agree")
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
         tracing::info!(
             source = provider.label(),
             repo = request.repository,
@@ -1817,6 +2849,12 @@ impl SourceProbe for AlwaysAvailableProbe {
 
 #[allow(clippy::too_many_arguments)]
 trait DownloadClient {
+    fn preflight<'a>(
+        &'a self,
+        provider: &'a dyn DownloadProvider,
+        request: ProviderPreflightRequest<'a>,
+    ) -> BoxFuture<'a, Result<ProviderPreflightResult>>;
+
     fn download<'a>(
         &'a self,
         provider: &'a dyn DownloadProvider,
@@ -1832,6 +2870,14 @@ trait DownloadClient {
 struct LibraryDownloadClient;
 
 impl DownloadClient for LibraryDownloadClient {
+    fn preflight<'a>(
+        &'a self,
+        provider: &'a dyn DownloadProvider,
+        request: ProviderPreflightRequest<'a>,
+    ) -> BoxFuture<'a, Result<ProviderPreflightResult>> {
+        provider.preflight(request)
+    }
+
     fn download<'a>(
         &'a self,
         provider: &'a dyn DownloadProvider,
@@ -2066,7 +3112,7 @@ mod downloader_tests {
     #![allow(clippy::struct_excessive_bools, clippy::unnecessary_literal_bound)]
 
     use super::*;
-    use orchion_core::{AsrModel, KnownOcrModel, TtsModel};
+    use orchion_core::{AsrModel, DownloadRetryability, KnownOcrModel, TtsModel};
     use std::sync::{Arc, Mutex};
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2144,6 +3190,7 @@ mod downloader_tests {
     #[derive(Default)]
     struct FakeDownloadClient {
         fail_huggingface: bool,
+        huggingface_failure_message: Option<&'static str>,
         omit_asr_tokenizer_sources: bool,
         omit_huggingface_asr_tokenizer_sources: bool,
         write_empty_config: bool,
@@ -2154,11 +3201,74 @@ mod downloader_tests {
         file_filters: Arc<Mutex<Vec<Option<Vec<String>>>>>,
         revisions: Arc<Mutex<Vec<String>>>,
         omit_resolved_revision: bool,
+        delegate_preflight: bool,
+        empty_preflight_plan: bool,
     }
 
     struct FakeProbe {
         huggingface_available: bool,
         calls: Arc<Mutex<usize>>,
+    }
+
+    #[derive(Clone)]
+    struct FakePlanningProvider {
+        label: &'static str,
+        calls: Arc<Mutex<Vec<String>>>,
+        failure_repo: Option<&'static str>,
+        failure: DownloadRetryability,
+    }
+
+    impl DownloadProvider for FakePlanningProvider {
+        fn label(&self) -> &'static str {
+            self.label
+        }
+
+        fn default_revision(&self) -> &'static str {
+            match self.label {
+                "huggingface" => "main",
+                _ => "master",
+            }
+        }
+
+        fn repository(&self, model: ProviderModel<'_>) -> String {
+            model
+                .repository_identity()
+                .unwrap_or_else(|| model.huggingface_repo())
+                .to_string()
+        }
+
+        fn download<'a>(&'a self, _request: ProviderDownloadRequest<'a>) -> DownloadFuture<'a> {
+            Box::pin(async { unreachable!("fake client handles downloads") })
+        }
+
+        fn preflight<'a>(
+            &'a self,
+            request: ProviderPreflightRequest<'a>,
+        ) -> provider::PreflightFuture<'a> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(format!("{}:{}", self.label, request.repository()));
+                if self
+                    .failure_repo
+                    .is_some_and(|repo| request.repository() == repo)
+                {
+                    return Err(OrchionError::ProviderDownload {
+                        source_name: self.label,
+                        repo: request.repository().to_string(),
+                        message: "planned preflight failure".to_string(),
+                        retryability: self.failure,
+                    });
+                }
+                Ok(provider::ProviderPreflightResult::new(
+                    request.files().map_or_else(
+                        || vec!["config.json".to_string()],
+                        |files| files.iter().map(|file| (*file).to_string()).collect(),
+                    ),
+                ))
+            })
+        }
     }
 
     impl SourceProbe for FakeProbe {
@@ -2195,6 +3305,27 @@ mod downloader_tests {
     }
 
     impl DownloadClient for FakeDownloadClient {
+        fn preflight<'a>(
+            &'a self,
+            provider: &'a dyn DownloadProvider,
+            request: ProviderPreflightRequest<'a>,
+        ) -> BoxFuture<'a, Result<ProviderPreflightResult>> {
+            if self.delegate_preflight {
+                return provider.preflight(request);
+            }
+            Box::pin(async move {
+                let files = if self.empty_preflight_plan {
+                    Vec::new()
+                } else {
+                    request.files().map_or_else(
+                        || vec!["config.json".to_string(), "tokenizer.json".to_string()],
+                        |files| files.iter().map(|file| (*file).to_string()).collect(),
+                    )
+                };
+                Ok(ProviderPreflightResult::new(files))
+            })
+        }
+
         fn download<'a>(
             &'a self,
             provider: &'a dyn DownloadProvider,
@@ -2232,7 +3363,10 @@ mod downloader_tests {
                     return Err(OrchionError::Download {
                         source_name,
                         repo: repo.to_string(),
-                        message: "simulated failure".to_string(),
+                        message: self
+                            .huggingface_failure_message
+                            .unwrap_or("simulated failure")
+                            .to_string(),
                     });
                 }
                 tokio::fs::create_dir_all(target).await.map_err(|error| {
@@ -2307,6 +3441,634 @@ mod downloader_tests {
         assert!(!path.join("partial.bin").exists());
         assert!(!path.join(".orchion-complete").exists());
         assert_eq!(&*calls.lock().unwrap(), &["huggingface", "modelscope"]);
+    }
+
+    #[tokio::test]
+    async fn explicit_hub_model_urls_override_environment_source() {
+        for (url, environment, expected_source) in [
+            ("hf://Mirror/Speech-Package", "modelscope", "huggingface"),
+            ("ms://Mirror/Speech-Package", "huggingface", "modelscope"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let client = FakeDownloadClient::default();
+            let env = DownloadEnv {
+                orchion_model_source: Some(environment.to_string()),
+                hf_endpoint: None,
+            };
+            let downloader = ModelDownloader::new(DownloadSource::Auto);
+
+            let path = downloader
+                .download_model_url_with_client_and_probe(
+                    qwen_asr_06b(),
+                    &ModelUrl::parse(url).unwrap(),
+                    dir.path(),
+                    &client,
+                    &AlwaysAvailableProbe,
+                    &env,
+                )
+                .await
+                .unwrap();
+
+            let expected_path = ModelDownloader::resolve_model_url_path(
+                &qwen_asr_06b(),
+                &ModelUrl::parse(url).unwrap(),
+                url,
+                dir.path(),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(*client.calls.lock().unwrap(), [expected_source]);
+            assert_eq!(*client.repos.lock().unwrap(), ["Mirror/Speech-Package"]);
+            assert_eq!(path, expected_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn deployment_cache_identity_separates_logical_ids_and_locator_profiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared_url = ModelUrl::parse("//Mirror/Shared-Package").unwrap();
+        let first = qwen_asr_06b();
+        let second = AsrModel::parse("Qwen/Qwen3-ASR-1.7B").unwrap();
+        let first_path = ModelDownloader::resolve_model_url_path(
+            &first,
+            &shared_url,
+            "id=first|model=//Mirror/Shared-Package|neutral-source=huggingface",
+            dir.path(),
+        )
+        .await
+        .unwrap();
+        let second_path = ModelDownloader::resolve_model_url_path(
+            &second,
+            &shared_url,
+            "id=second|model=//Mirror/Shared-Package|neutral-source=huggingface",
+            dir.path(),
+        )
+        .await
+        .unwrap();
+        assert_ne!(first_path, second_path);
+
+        let hf_url = ModelUrl::parse("hf://Mirror/Shared-Package").unwrap();
+        let ms_url = ModelUrl::parse("ms://Mirror/Shared-Package").unwrap();
+        let hf_path =
+            ModelDownloader::resolve_model_url_path(&first, &hf_url, hf_url.as_str(), dir.path())
+                .await
+                .unwrap();
+        let ms_path =
+            ModelDownloader::resolve_model_url_path(&first, &ms_url, ms_url.as_str(), dir.path())
+                .await
+                .unwrap();
+        assert_ne!(hf_path, ms_path);
+    }
+
+    #[test]
+    fn neutral_provider_policy_and_selection_separate_cache_identity() {
+        let cache = tempfile::tempdir().unwrap();
+        let model = qwen_asr_06b();
+        let url = ModelUrl::parse("//Mirror/Shared-Package").unwrap();
+        let artifacts = ModelDownloader::model_artifact_plan(&model, &url).unwrap();
+        let cases = [
+            (
+                "id=model|neutral-policy=huggingface",
+                vec![DownloadSource::HuggingFace],
+            ),
+            (
+                "id=model|neutral-policy=modelscope",
+                vec![DownloadSource::ModelScope],
+            ),
+            (
+                "id=model|neutral-policy=huggingface,modelscope",
+                vec![DownloadSource::HuggingFace, DownloadSource::ModelScope],
+            ),
+        ];
+        let paths = cases
+            .into_iter()
+            .map(|(intent, candidates)| {
+                ModelDownloader::resolve_prepared_model_url_path_with_plan(
+                    &model,
+                    &url,
+                    intent,
+                    &DeploymentSourcePlan {
+                        key: intent.to_string(),
+                        artifacts: artifacts.clone(),
+                        candidates,
+                    },
+                    cache.path(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        assert_ne!(paths[0], paths[1]);
+        assert_ne!(paths[0], paths[2]);
+        assert_ne!(paths[1], paths[2]);
+
+        let explicit = ModelUrl::parse("hf://Mirror/Shared-Package").unwrap();
+        let explicit_path = ModelDownloader::resolve_prepared_model_url_path(
+            &model,
+            &explicit,
+            explicit.as_str(),
+            cache.path(),
+        )
+        .unwrap();
+        assert!(!explicit_path.to_string_lossy().contains("neutral-policy"));
+    }
+
+    #[tokio::test]
+    async fn normal_and_prepared_modes_share_selected_provider_cache_path() {
+        let cache = tempfile::tempdir().unwrap();
+        let model = qwen_asr_06b();
+        let url = ModelUrl::parse("//Mirror/Shared-Package").unwrap();
+        let source_intent = "id=model|neutral-policy=modelscope";
+        let plan = DeploymentSourcePlan {
+            key: source_intent.to_string(),
+            artifacts: ModelDownloader::model_artifact_plan(&model, &url).unwrap(),
+            candidates: vec![DownloadSource::ModelScope],
+        };
+        let client = FakeDownloadClient::default();
+
+        let normal = ModelDownloader::new(DownloadSource::Auto)
+            .download_neutral_deployment_artifact(
+                model.clone(),
+                &url,
+                source_intent,
+                &plan,
+                cache.path(),
+                &client,
+                &AlwaysAvailableProbe,
+                &DownloadEnv {
+                    orchion_model_source: None,
+                    hf_endpoint: None,
+                },
+            )
+            .await
+            .unwrap();
+        let prepared = ModelDownloader::resolve_prepared_model_url_path_with_plan(
+            &model,
+            &url,
+            source_intent,
+            &plan,
+            cache.path(),
+        )
+        .unwrap();
+
+        assert_eq!(normal, prepared);
+        assert!(
+            client
+                .file_filters
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|files| { files.as_ref().is_some_and(|files| !files.is_empty()) })
+        );
+    }
+
+    #[tokio::test]
+    async fn auxiliary_locator_change_invalidates_primary_package_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = qwen_asr_06b();
+        let url = ModelUrl::parse("//Mirror/Shared-Package").unwrap();
+        let without_layout = ModelDownloader::resolve_model_url_path(
+            &model,
+            &url,
+            "id=deployment|model=//Mirror/Shared-Package|layout=none",
+            dir.path(),
+        )
+        .await
+        .unwrap();
+        let with_layout = ModelDownloader::resolve_model_url_path(
+            &model,
+            &url,
+            "id=deployment|model=//Mirror/Shared-Package|layout=//Mirror/Layout/file.onnx",
+            dir.path(),
+        )
+        .await
+        .unwrap();
+
+        assert_ne!(without_layout, with_layout);
+    }
+
+    #[tokio::test]
+    async fn neutral_model_url_uses_environment_source_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = FakeDownloadClient::default();
+        let env = DownloadEnv {
+            orchion_model_source: Some("modelscope".to_string()),
+            hf_endpoint: None,
+        };
+
+        ModelDownloader::new(DownloadSource::Auto)
+            .download_model_url_with_client_and_probe(
+                qwen_asr_06b(),
+                &ModelUrl::parse("//Mirror/Speech-Package").unwrap(),
+                dir.path(),
+                &client,
+                &AlwaysAvailableProbe,
+                &env,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(*client.calls.lock().unwrap(), ["modelscope"]);
+        assert!(
+            client
+                .file_filters
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|files| { files.as_ref().is_some_and(|files| !files.is_empty()) })
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_metadata_plan_rejects_package_without_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = FakeDownloadClient {
+            empty_preflight_plan: true,
+            ..Default::default()
+        };
+
+        let error = ModelDownloader::new(DownloadSource::HuggingFace)
+            .download_model_url_with_client_and_probe(
+                qwen_asr_06b(),
+                &ModelUrl::parse("//Mirror/Speech-Package").unwrap(),
+                dir.path(),
+                &client,
+                &AlwaysAvailableProbe,
+                &DownloadEnv {
+                    orchion_model_source: None,
+                    hf_endpoint: None,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            OrchionError::ProviderDownload {
+                retryability: DownloadRetryability::Terminal,
+                ..
+            }
+        ));
+        assert!(error.to_string().contains("empty artifact plan"));
+        assert!(client.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_model_url_bypasses_remote_download() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("config.json"), b"{}")
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("tokenizer.json"), b"{}")
+            .await
+            .unwrap();
+        let client = FakeDownloadClient::default();
+        let url = ModelUrl::parse(&format!("file://{}", dir.path().display())).unwrap();
+
+        let path = ModelDownloader::new(DownloadSource::Auto)
+            .download_model_url_with_client_and_probe(
+                qwen_asr_06b(),
+                &url,
+                dir.path().join("unused-cache"),
+                &client,
+                &AlwaysAvailableProbe,
+                &DownloadEnv {
+                    orchion_model_source: Some("huggingface".to_string()),
+                    hf_endpoint: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(path, dir.path());
+        assert!(client.calls.lock().unwrap().is_empty());
+        assert!(!dir.path().join("unused-cache").exists());
+    }
+
+    #[tokio::test]
+    async fn local_model_url_rejects_empty_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = dir.path().join("empty.bin");
+        tokio::fs::write(&artifact, b"").await.unwrap();
+        let client = FakeDownloadClient::default();
+        let url = ModelUrl::parse(&format!("file://{}", artifact.display())).unwrap();
+
+        let error = ModelDownloader::new(DownloadSource::Auto)
+            .download_model_url_with_client_and_probe(
+                qwen_asr_06b(),
+                &url,
+                dir.path().join("unused-cache"),
+                &client,
+                &AlwaysAvailableProbe,
+                &DownloadEnv {
+                    orchion_model_source: None,
+                    hf_endpoint: None,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("must be non-empty"));
+        assert!(client.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn exact_file_locator_is_not_ignored_for_repository_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = FakeDownloadClient::default();
+
+        let error = ModelDownloader::new(DownloadSource::Auto)
+            .download_model_url_with_client_and_probe(
+                qwen_asr_06b(),
+                &ModelUrl::parse("//Mirror/Speech-Package/model.safetensors").unwrap(),
+                dir.path(),
+                &client,
+                &AlwaysAvailableProbe,
+                &DownloadEnv {
+                    orchion_model_source: None,
+                    hf_endpoint: None,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("exact file locator"));
+        assert!(client.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn layout_exact_file_locator_controls_provider_and_file_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = FakeDownloadClient::default();
+        let env = DownloadEnv {
+            orchion_model_source: Some("huggingface".to_string()),
+            hf_endpoint: None,
+        };
+
+        ModelDownloader::new(DownloadSource::Auto)
+            .download_model_url_with_client_and_probe(
+                KnownOcrModel::PpDocLayoutV3.into_model(),
+                &ModelUrl::parse("ms://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx").unwrap(),
+                dir.path(),
+                &client,
+                &AlwaysAvailableProbe,
+                &env,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(*client.calls.lock().unwrap(), ["modelscope"]);
+        assert_eq!(
+            *client.file_filters.lock().unwrap(),
+            [Some(vec!["inference.onnx".to_string()])]
+        );
+    }
+
+    #[tokio::test]
+    async fn forced_neutral_provider_error_is_terminal_without_fallback() {
+        for message in [
+            "401 unauthorized",
+            "integrity mismatch",
+            "runtime compatibility failure",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let client = FakeDownloadClient {
+                fail_huggingface: true,
+                huggingface_failure_message: Some(message),
+                ..Default::default()
+            };
+            let url = ModelUrl::parse("//Mirror/Speech-Package").unwrap();
+
+            let error = ModelDownloader::new(DownloadSource::Auto)
+                .download_model_url_with_intent_and_client_and_probe(
+                    qwen_asr_06b(),
+                    &url,
+                    "deployment|neutral-source=huggingface",
+                    Some(DownloadSource::HuggingFace),
+                    dir.path(),
+                    &client,
+                    &AlwaysAvailableProbe,
+                    &DownloadEnv {
+                        orchion_model_source: None,
+                        hf_endpoint: None,
+                    },
+                )
+                .await
+                .unwrap_err();
+
+            assert!(matches!(error, OrchionError::Download { .. }));
+            assert!(error.to_string().contains(message));
+            assert_eq!(*client.calls.lock().unwrap(), ["huggingface"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn deployment_preflight_falls_back_as_a_unit_for_retryable_missing_artifact() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let registry = DownloadProviderRegistry::new()
+            .with_provider(FakePlanningProvider {
+                label: "huggingface",
+                calls: Arc::clone(&calls),
+                failure_repo: Some("PaddlePaddle/PP-DocLayoutV3_onnx"),
+                failure: DownloadRetryability::RetryableNotFound,
+            })
+            .with_provider(FakePlanningProvider {
+                label: "modelscope",
+                calls: Arc::clone(&calls),
+                failure_repo: None,
+                failure: DownloadRetryability::Terminal,
+            });
+        let downloader = ModelDownloader::from_registry(registry);
+        let client = FakeDownloadClient {
+            delegate_preflight: true,
+            ..Default::default()
+        };
+        let cache = tempfile::tempdir().unwrap();
+        let primary_url = ModelUrl::parse("//Qwen/Qwen3-ASR-0.6B").unwrap();
+        let layout_url =
+            ModelUrl::parse("//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx").unwrap();
+        let plan = DeploymentSourcePlan {
+            key: "deployment-with-layout".to_string(),
+            artifacts: ModelDownloader::model_artifact_plan(&qwen_asr_06b(), &primary_url)
+                .unwrap()
+                .into_iter()
+                .chain(
+                    ModelDownloader::model_artifact_plan(
+                        &KnownOcrModel::PpDocLayoutV3.into_model(),
+                        &layout_url,
+                    )
+                    .unwrap(),
+                )
+                .collect(),
+            candidates: vec![DownloadSource::HuggingFace, DownloadSource::ModelScope],
+        };
+        let env = DownloadEnv {
+            orchion_model_source: None,
+            hf_endpoint: None,
+        };
+
+        downloader
+            .download_neutral_deployment_artifact(
+                qwen_asr_06b(),
+                &primary_url,
+                primary_url.as_str(),
+                &plan,
+                cache.path(),
+                &client,
+                &AlwaysAvailableProbe,
+                &env,
+            )
+            .await
+            .unwrap();
+        downloader
+            .download_neutral_deployment_artifact(
+                KnownOcrModel::PpDocLayoutV3.into_model(),
+                &layout_url,
+                layout_url.as_str(),
+                &plan,
+                cache.path(),
+                &client,
+                &AlwaysAvailableProbe,
+                &env,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(*client.calls.lock().unwrap(), ["modelscope", "modelscope"]);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [
+                "huggingface:Qwen/Qwen3-ASR-0.6B",
+                "huggingface:PaddlePaddle/PP-DocLayoutV3_onnx",
+                "modelscope:Qwen/Qwen3-ASR-0.6B",
+                "modelscope:PaddlePaddle/PP-DocLayoutV3_onnx",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn deployment_preflight_terminal_error_does_not_fallback() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let registry = DownloadProviderRegistry::new()
+            .with_provider(FakePlanningProvider {
+                label: "huggingface",
+                calls: Arc::clone(&calls),
+                failure_repo: Some("Qwen/Qwen3-ASR-0.6B"),
+                failure: DownloadRetryability::Terminal,
+            })
+            .with_provider(FakePlanningProvider {
+                label: "modelscope",
+                calls: Arc::clone(&calls),
+                failure_repo: None,
+                failure: DownloadRetryability::Terminal,
+            });
+        let downloader = ModelDownloader::from_registry(registry);
+        let client = FakeDownloadClient {
+            delegate_preflight: true,
+            ..Default::default()
+        };
+        let cache = tempfile::tempdir().unwrap();
+        let url = ModelUrl::parse("//Qwen/Qwen3-ASR-0.6B").unwrap();
+        let plan = DeploymentSourcePlan {
+            key: "terminal-deployment".to_string(),
+            artifacts: ModelDownloader::model_artifact_plan(&qwen_asr_06b(), &url).unwrap(),
+            candidates: vec![DownloadSource::HuggingFace, DownloadSource::ModelScope],
+        };
+
+        let error = downloader
+            .download_neutral_deployment_artifact(
+                qwen_asr_06b(),
+                &url,
+                url.as_str(),
+                &plan,
+                cache.path(),
+                &client,
+                &AlwaysAvailableProbe,
+                &DownloadEnv {
+                    orchion_model_source: None,
+                    hf_endpoint: None,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            OrchionError::ProviderDownload {
+                retryability: DownloadRetryability::Terminal,
+                ..
+            }
+        ));
+        assert_eq!(*calls.lock().unwrap(), ["huggingface:Qwen/Qwen3-ASR-0.6B"]);
+        assert!(client.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pp_ocr_v5_mobile_preflight_uses_expanded_modelscope_asset_plan() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let registry = DownloadProviderRegistry::new()
+            .with_provider(FakePlanningProvider {
+                label: "huggingface",
+                calls: Arc::clone(&calls),
+                failure_repo: None,
+                failure: DownloadRetryability::Terminal,
+            })
+            .with_provider(FakePlanningProvider {
+                label: "modelscope",
+                calls: Arc::clone(&calls),
+                failure_repo: None,
+                failure: DownloadRetryability::Terminal,
+            });
+        let downloader = ModelDownloader::from_registry(registry);
+        let model = KnownOcrModel::PpOcrV5Mobile.into_model();
+        let url = ModelUrl::parse("//PaddlePaddle/PP-OCRv5_mobile").unwrap();
+        let artifacts = ModelDownloader::model_artifact_plan(&model, &url).unwrap();
+        let plan = DeploymentSourcePlan {
+            key: "pp-ocr-v5-mobile".to_string(),
+            artifacts: artifacts.clone(),
+            candidates: vec![DownloadSource::HuggingFace, DownloadSource::ModelScope],
+        };
+        let client = FakeDownloadClient {
+            delegate_preflight: true,
+            ..Default::default()
+        };
+
+        let (selected, resolved) = downloader
+            .preflight_deployment_candidates(
+                &plan,
+                &[],
+                &client,
+                &DownloadEnv {
+                    orchion_model_source: None,
+                    hf_endpoint: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(selected, DownloadSource::ModelScope);
+        assert!(resolved.iter().all(|artifact| {
+            artifact
+                .files
+                .as_ref()
+                .is_some_and(|files| !files.is_empty())
+        }));
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].repository, "greatv/oar-ocr");
+        assert_eq!(
+            artifacts[0].files.as_ref().unwrap(),
+            &vec![
+                "pp-ocrv5_mobile_det.onnx".to_string(),
+                "pp-ocrv5_mobile_rec.onnx".to_string(),
+                "ppocrv5_dict.txt".to_string(),
+            ]
+        );
+        assert_eq!(
+            artifacts[0].required_source,
+            Some(DownloadSource::ModelScope)
+        );
+        assert_eq!(*calls.lock().unwrap(), ["modelscope:greatv/oar-ocr"]);
     }
 
     #[tokio::test]
@@ -2560,9 +4322,8 @@ mod downloader_tests {
 
         assert!(matches!(
             error,
-            OrchionError::DownloadFallbackExhausted { failures, .. }
-                if failures.len() == 1
-                    && failures[0].message.contains("required cache files")
+            OrchionError::Download { message, .. }
+                if message.contains("required cache files")
         ));
         assert!(!qwen_asr_06b().cache_path(dir.path()).exists());
     }

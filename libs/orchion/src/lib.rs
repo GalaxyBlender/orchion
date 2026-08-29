@@ -14,13 +14,13 @@ pub mod ocr;
 
 pub use orchion_core::{
     ASR_SAMPLE_RATE, AsrModel, AsrOptions, AsrSegment, AsrStreamingOptions,
-    AsrTimestampGranularity, AsrTranscript, DevicePreference, KnownOcrModel, ModelCapabilities,
-    ModelCapabilityRequirement, ModelCategory, ModelDescriptor, ModelId, ModelSourceLocators,
-    ModelSpec, OcrLayoutBlock, OcrLimits, OcrModel, OcrModelAsset, OcrModelAssetKind,
-    OcrModelAssetRole, OcrModelKind, OcrOptions, OcrPoint, OcrRegion, OcrResponseFormat, OcrResult,
-    OcrTask, OcrUsage, OrchionError, Result, RuntimeProvider, TtsAudio, TtsLanguage, TtsModel,
-    TtsOptions, TtsSpeaker, TtsVoice, ensure_voice_supported, model_descriptor,
-    prepare_asr_samples, registered_model_descriptors,
+    AsrTimestampGranularity, AsrTranscript, DevicePreference, DownloadRetryability, KnownOcrModel,
+    ModelCapabilities, ModelCapabilityRequirement, ModelCategory, ModelDescriptor, ModelId,
+    ModelSourceLocators, ModelSpec, ModelUrl, ModelUrlSource, OcrLayoutBlock, OcrLimits, OcrModel,
+    OcrModelAsset, OcrModelAssetKind, OcrModelAssetRole, OcrModelKind, OcrOptions, OcrPoint,
+    OcrRegion, OcrResponseFormat, OcrResult, OcrTask, OcrUsage, OrchionError, ParseModelUrlError,
+    Result, RuntimeProvider, TtsAudio, TtsLanguage, TtsModel, TtsOptions, TtsSpeaker, TtsVoice,
+    ensure_voice_supported, model_descriptor, prepare_asr_samples, registered_model_descriptors,
 };
 
 #[cfg(feature = "audio-ffmpeg")]
@@ -38,7 +38,9 @@ pub use audio_vad::{
 };
 
 #[cfg(feature = "download-all")]
-pub use orchion_download::{DownloadSource, ModelDownloader};
+pub use orchion_download::{
+    ArtifactRequest, DeploymentSourcePlan, DownloadSource, ModelDownloader,
+};
 
 #[cfg(feature = "docs")]
 pub use orchion_docs as docs;

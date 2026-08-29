@@ -25,7 +25,6 @@ verify_file_integrity = false
 enabled = true
 default_model = "Qwen/Qwen3-ASR-0.6B"
 device = "auto"
-available_models = ["Qwen/Qwen3-ASR-0.6B", "Qwen/Qwen3-ASR-1.7B"]
 idle_timeout = "10m"
 stream_chunk_size = 2.0
 stream_target_segment = "12s"
@@ -35,56 +34,101 @@ stream_max_duration = "2h"
 max_audio_duration = "30m"
 max_loaded = 1
 
+[[services.asr.models]]
+id = "Qwen/Qwen3-ASR-0.6B"
+name = "Qwen3 ASR 0.6B"
+model = "//Qwen/Qwen3-ASR-0.6B"
+
+[[services.asr.models]]
+id = "Qwen/Qwen3-ASR-1.7B"
+name = "Qwen3 ASR 1.7B"
+model = "//Qwen/Qwen3-ASR-1.7B"
+
 [services.tts]
 enabled = true
 default_model = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
 device = "auto"
-available_models = [
-  "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
-  "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
-  "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
-  "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
-  "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
-]
 idle_timeout = "10m"
 max_loaded = 1
 format = "wav"
 max_length = 2048
 max_reference_audio_duration = "5m"
 
+[[services.tts.models]]
+id = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+model = "//Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+
+[[services.tts.models]]
+id = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+model = "//Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+
+[[services.tts.models]]
+id = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+model = "//Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+
+[[services.tts.models]]
+id = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+model = "//Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+
+[[services.tts.models]]
+id = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+model = "//Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+
 [services.ocr]
 enabled = true
 default_model = "PaddlePaddle/PP-OCRv6_tiny"
-available_models = [
-  "PaddlePaddle/PP-OCRv5_mobile",
-  "PaddlePaddle/PP-OCRv5_server",
-  "PaddlePaddle/PP-OCRv6_tiny",
-  "PaddlePaddle/PP-OCRv6_small",
-  "PaddlePaddle/PP-OCRv6_medium"
-]
-layout_default_model = "PaddlePaddle/PP-DocLayoutV3"
-layout_available_models = ["PaddlePaddle/PP-DocLayoutV3"]
 device = "auto"
 idle_timeout = "10m"
 max_loaded = 1
 format = "json"
 max_pixels = 100000000
 
+[[services.ocr.models]]
+id = "PaddlePaddle/PP-OCRv5_mobile"
+model = "//PaddlePaddle/PP-OCRv5_mobile"
+layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
+
+[[services.ocr.models]]
+id = "PaddlePaddle/PP-OCRv5_server"
+model = "//PaddlePaddle/PP-OCRv5_server"
+layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
+
+[[services.ocr.models]]
+id = "PaddlePaddle/PP-OCRv6_tiny"
+name = "PP-OCRv6 Tiny"
+model = "//PaddlePaddle/PP-OCRv6_tiny"
+layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
+
+[[services.ocr.models]]
+id = "PaddlePaddle/PP-OCRv6_small"
+model = "//PaddlePaddle/PP-OCRv6_small"
+layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
+
+[[services.ocr.models]]
+id = "PaddlePaddle/PP-OCRv6_medium"
+model = "//PaddlePaddle/PP-OCRv6_medium"
+layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
+
 [services.ocr-vl]
 enabled = true
 default_model = "PaddlePaddle/PaddleOCR-VL-1.6"
-available_models = [
-  "PaddlePaddle/PaddleOCR-VL-1.5",
-  "PaddlePaddle/PaddleOCR-VL-1.6",
-]
-layout_default_model = "PaddlePaddle/PP-DocLayoutV3"
-layout_available_models = ["PaddlePaddle/PP-DocLayoutV3"]
 device = "auto"
 idle_timeout = "10m"
 max_loaded = 1
 format = "markdown"
 max_tokens = 4096
 max_pixels = 100000000
+
+[[services.ocr-vl.models]]
+id = "PaddlePaddle/PaddleOCR-VL-1.5"
+model = "//PaddlePaddle/PaddleOCR-VL-1.5"
+layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
+
+[[services.ocr-vl.models]]
+id = "PaddlePaddle/PaddleOCR-VL-1.6"
+name = "PaddleOCR-VL 1.6"
+model = "//PaddlePaddle/PaddleOCR-VL-1.6"
+layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
 
 [auth]
 # api_key = "change-me"
