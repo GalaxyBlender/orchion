@@ -44,7 +44,7 @@ fn main() {
         print_source_rerun_if_changed(&manifest_dir, &web_src);
     }
 
-    provision_pdfium().unwrap_or_else(|error| {
+    provision_pdfium(&manifest_dir).unwrap_or_else(|error| {
         panic!("failed to provision PDFium for build: {error}");
     });
 
@@ -159,30 +159,29 @@ fn pdfium_asset() -> io::Result<PdfiumAsset> {
     }
 }
 
-fn target_profile_dir() -> io::Result<PathBuf> {
-    let out_dir = PathBuf::from(
-        env::var_os("OUT_DIR")
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "OUT_DIR is unavailable"))?,
-    );
+fn target_profile_dir(manifest_dir: &Path) -> io::Result<PathBuf> {
+    // OUT_DIR may be in Cargo's shared build-dir; PDFium must be next to the final executable.
+    let configured_target_dir = env::var_os("CARGO_TARGET_DIR")
+        .or_else(|| env::var_os("CARGO_BUILD_TARGET_DIR"))
+        .map(PathBuf::from);
+    let profile = env::var("PROFILE").map_err(io_other)?;
+    let target = env::var("TARGET").map_err(io_other)?;
+    let host = env::var("HOST").map_err(io_other)?;
+    let explicit_target = env::var_os("CARGO_BUILD_TARGET").is_some();
 
-    out_dir
-        .ancestors()
-        .nth(3)
-        .map(Path::to_path_buf)
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "failed to derive Cargo target profile directory from {}",
-                    out_dir.display()
-                ),
-            )
-        })
+    Ok(pdfium_provisioning::target_profile_dir(
+        manifest_dir,
+        configured_target_dir.as_deref(),
+        &profile,
+        &target,
+        &host,
+        explicit_target,
+    ))
 }
 
-fn provision_pdfium() -> io::Result<()> {
+fn provision_pdfium(manifest_dir: &Path) -> io::Result<()> {
     let asset = pdfium_asset()?;
-    let target_library_path = target_profile_dir()?.join(asset.library_name);
+    let target_library_path = target_profile_dir(manifest_dir)?.join(asset.library_name);
     let source_checksum_path =
         target_library_path.with_file_name(format!("{}.source.sha256", asset.library_name));
     let library_checksum_path =
