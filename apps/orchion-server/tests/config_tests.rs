@@ -80,6 +80,31 @@ fn defaults_are_executable_relative() {
     assert_eq!(config.server.max_websocket_connections, 64);
     assert_eq!(config.server.max_pending_websocket_connections, 16);
     assert_eq!(config.server.max_websocket_message_size, 2 * 1024 * 1024);
+    assert!(config.activity.enabled);
+    assert_eq!(config.activity.history_capacity, 500);
+}
+
+#[test]
+fn activity_settings_can_be_overridden() {
+    let config = ServerConfig::from_toml_str(
+        "[activity]\nenabled = false\nhistory_capacity = 25",
+        std::path::Path::new("/tmp/orchion-server"),
+    )
+    .unwrap();
+
+    assert!(!config.activity.enabled);
+    assert_eq!(config.activity.history_capacity, 25);
+}
+
+#[test]
+fn activity_history_capacity_has_a_bounded_maximum() {
+    let error = ServerConfig::from_toml_str(
+        "[activity]\nhistory_capacity = 10001",
+        std::path::Path::new("/tmp/orchion-server"),
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("must not exceed 10000"));
 }
 
 #[test]

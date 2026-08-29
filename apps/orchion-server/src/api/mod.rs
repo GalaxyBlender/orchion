@@ -1,5 +1,7 @@
+pub mod activity;
 pub mod docs;
 pub mod http;
+mod http_activity;
 mod http_audio;
 mod http_models;
 mod http_ocr;

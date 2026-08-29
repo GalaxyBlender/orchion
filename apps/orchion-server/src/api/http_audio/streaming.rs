@@ -1,3 +1,4 @@
+use crate::api::activity::{ActivityContext, WebSocketActivity};
 use crate::api::http_shared::{authorize, origin_is_allowed};
 use crate::api::openai::ApiError;
 use crate::application::streaming_transcription::{
@@ -6,8 +7,8 @@ use crate::application::streaming_transcription::{
 };
 use crate::application::{ServerApplication, UseCaseError};
 use crate::settings::parse_asr_model;
-use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Extension, State};
 use axum::http::HeaderMap;
 use axum::http::header::{AUTHORIZATION, ORIGIN};
 use axum::response::Response;
@@ -74,6 +75,7 @@ async fn await_stream_finish<T>(
 pub(in crate::api) async fn create_transcription_ws<S>(
     State(state): State<Arc<S>>,
     headers: HeaderMap,
+    activity: Option<Extension<ActivityContext>>,
     ws: WebSocketUpgrade,
 ) -> Result<Response, ApiError>
 where
@@ -90,11 +92,18 @@ where
         .try_acquire_pending_websocket()
         .ok_or_else(|| ApiError::resource_exhausted("pending websocket connection"))?;
     let max_message_size = state.api_policy().max_websocket_message_size;
+    let activity = activity.map(|value| value.0.handoff_to_websocket());
     Ok(ws
         .max_message_size(max_message_size)
         .max_frame_size(max_message_size)
         .on_upgrade(move |socket| {
-            handle_transcription_ws(socket, state, header_authorized, pending_connection_permit)
+            handle_transcription_ws(
+                socket,
+                state,
+                header_authorized,
+                pending_connection_permit,
+                activity,
+            )
         }))
 }
 
@@ -121,6 +130,7 @@ async fn handle_transcription_ws<S>(
     state: Arc<S>,
     header_authorized: bool,
     pending_connection_permit: tokio::sync::OwnedSemaphorePermit,
+    activity: Option<WebSocketActivity>,
 ) where
     S: ServerApplication,
 {
@@ -135,26 +145,32 @@ async fn handle_transcription_ws<S>(
         duration_to_millis_u32(asr_policy.stream_target_segment, "stream_target_segment");
     let stream_max_segment_millis =
         duration_to_millis_u32(asr_policy.stream_max_segment, "stream_max_segment");
-    let start =
-        match receive_transcription_stream_start(&mut socket, stream_max_segment_millis).await {
-            Ok(start) => start,
-            Err(error) => {
-                let _ = send_stream_error(&mut socket, error).await;
-                return;
-            }
-        };
+    let start = match receive_transcription_stream_start(
+        &mut socket,
+        stream_max_segment_millis,
+        activity.as_ref(),
+    )
+    .await
+    {
+        Ok(start) => start,
+        Err(error) => {
+            let _ = send_stream_error(&mut socket, error, activity.as_ref()).await;
+            return;
+        }
+    };
     if let Err(error) = validate_transcription_stream_api_key(
         api_key.as_deref(),
         start.api_key.as_deref(),
         header_authorized,
     ) {
-        let _ = send_stream_error(&mut socket, error).await;
+        let _ = send_stream_error(&mut socket, error, activity.as_ref()).await;
         return;
     }
     let Some(_connection_permit) = state.try_acquire_websocket() else {
         let _ = send_stream_error(
             &mut socket,
             ApiError::resource_exhausted("websocket connection"),
+            activity.as_ref(),
         )
         .await;
         return;
@@ -170,39 +186,72 @@ async fn handle_transcription_ws<S>(
     if let Err(error) = validate_transcription_streaming_options(
         &start.to_streaming_options(default_chunk_size_sec),
     ) {
-        let _ = send_stream_error(&mut socket, error).await;
+        let _ = send_stream_error(&mut socket, error, activity.as_ref()).await;
         return;
     }
     let model = start.model.clone();
     let Ok(requested) = parse_asr_model(&model) else {
-        let _ = send_stream_error(&mut socket, ApiError::model_not_available(&model)).await;
+        let _ = send_stream_error(
+            &mut socket,
+            ApiError::model_not_available(&model),
+            activity.as_ref(),
+        )
+        .await;
         return;
     };
+    if asr_policy.available_models.contains(&requested)
+        && let Some(activity) = &activity
+    {
+        activity.set_model(requested.to_string());
+    }
     let asr = match await_stream_operation(
         &budget,
         limits,
-        await_stream_model_while_connected(&mut socket, state.lease_streaming_model(requested)),
+        await_stream_model_while_connected(
+            &mut socket,
+            state.lease_streaming_model(requested),
+            activity.as_ref(),
+        ),
     )
     .await
     {
         Ok(PendingStreamModel::Loaded(Ok(Some(asr)))) => asr,
         Ok(PendingStreamModel::Loaded(Ok(None))) => {
-            let _ = send_stream_error(&mut socket, ApiError::model_not_available(&model)).await;
+            let _ = send_stream_error(
+                &mut socket,
+                ApiError::model_not_available(&model),
+                activity.as_ref(),
+            )
+            .await;
             return;
         }
         Ok(PendingStreamModel::Loaded(Err(error))) => {
-            let _ = send_stream_error(&mut socket, ApiError::from(UseCaseError::from(error))).await;
+            let _ = send_stream_error(
+                &mut socket,
+                ApiError::from(UseCaseError::from(error)),
+                activity.as_ref(),
+            )
+            .await;
             return;
         }
         Ok(PendingStreamModel::Disconnected) => return,
         Ok(PendingStreamModel::InvalidMessage(error)) | Err(error) => {
-            let _ = send_stream_error(&mut socket, error).await;
+            let _ = send_stream_error(&mut socket, error, activity.as_ref()).await;
             return;
         }
     };
     match start.mode {
         TranscriptionStreamMode::Legacy => {
-            legacy::run(socket, start, asr, default_chunk_size_sec, limits, budget).await;
+            legacy::run(
+                socket,
+                start,
+                asr,
+                default_chunk_size_sec,
+                limits,
+                budget,
+                activity,
+            )
+            .await;
         }
         TranscriptionStreamMode::Caption => {
             caption::run(
@@ -213,6 +262,7 @@ async fn handle_transcription_ws<S>(
                 stream_target_segment_millis,
                 limits,
                 budget,
+                activity,
             )
             .await;
         }
@@ -228,17 +278,31 @@ enum PendingStreamModel<T> {
 async fn await_stream_model_while_connected<T>(
     socket: &mut WebSocket,
     operation: impl std::future::Future<Output = T>,
+    activity: Option<&WebSocketActivity>,
 ) -> PendingStreamModel<T> {
     tokio::pin!(operation);
     loop {
         tokio::select! {
             biased;
             message = socket.recv() => match message {
-                None | Some(Ok(Message::Close(_)) | Err(_)) => {
+                None | Some(Ok(Message::Close(_))) => {
                     return PendingStreamModel::Disconnected;
                 }
+                Some(Err(error)) => {
+                    return PendingStreamModel::InvalidMessage(websocket_receive_error(error));
+                }
                 Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
-                Some(Ok(Message::Binary(_) | Message::Text(_))) => {
+                Some(Ok(Message::Binary(bytes))) => {
+                    if let Some(activity) = activity {
+                        activity.add_input_bytes(bytes.len());
+                    }
+                    return PendingStreamModel::InvalidMessage(ApiError::invalid_request(
+                        "wait for `ready` before sending stream data",
+                        None,
+                        Some("invalid_stream_state"),
+                    ));
+                }
+                Some(Ok(Message::Text(_))) => {
                     return PendingStreamModel::InvalidMessage(ApiError::invalid_request(
                         "wait for `ready` before sending stream data",
                         None,
@@ -255,6 +319,7 @@ async fn receive_transcription_stream_message(
     socket: &mut WebSocket,
     budget: &mut TranscriptionStreamBudget,
     limits: TranscriptionStreamLimits,
+    activity: Option<&WebSocketActivity>,
 ) -> Result<Option<Message>, ApiError> {
     let wait = budget.next_wait(limits)?;
     let message = timeout(wait, socket.recv())
@@ -263,10 +328,11 @@ async fn receive_transcription_stream_message(
     let Some(message) = message else {
         return Ok(None);
     };
-    let message = message.map_err(|error| {
-        ApiError::invalid_request(error.to_string(), None, Some("invalid_websocket_message"))
-    })?;
+    let message = message.map_err(websocket_receive_error)?;
     if let Message::Binary(bytes) = &message {
+        if let Some(activity) = activity {
+            activity.add_input_bytes(bytes.len());
+        }
         budget.record_binary_input(bytes.len(), limits)?;
     }
     Ok(Some(message))
@@ -297,6 +363,7 @@ fn validate_transcription_stream_api_key(
 async fn receive_transcription_stream_start(
     socket: &mut WebSocket,
     stream_max_segment_millis: u32,
+    activity: Option<&WebSocketActivity>,
 ) -> Result<TranscriptionStreamStart, ApiError> {
     let message = timeout(TRANSCRIPTION_STREAM_START_TIMEOUT, socket.recv())
         .await
@@ -306,21 +373,23 @@ async fn receive_transcription_stream_start(
             text.as_str(),
             stream_max_segment_millis,
         ),
+        Some(Ok(Message::Binary(bytes))) => {
+            if let Some(activity) = activity {
+                activity.add_input_bytes(bytes.len());
+            }
+            Err(ApiError::invalid_request(
+                "first websocket message must be a JSON start message",
+                Some("type"),
+                Some("missing_start_message"),
+            ))
+        }
+        Some(Ok(Message::Close(_))) | None => Err(websocket_disconnected()),
         Some(Ok(_)) => Err(ApiError::invalid_request(
             "first websocket message must be a JSON start message",
             Some("type"),
             Some("missing_start_message"),
         )),
-        Some(Err(error)) => Err(ApiError::invalid_request(
-            error.to_string(),
-            None,
-            Some("invalid_websocket_message"),
-        )),
-        None => Err(ApiError::invalid_request(
-            "websocket closed before start message",
-            Some("type"),
-            Some("missing_start_message"),
-        )),
+        Some(Err(error)) => Err(websocket_receive_error(error)),
     }
 }
 

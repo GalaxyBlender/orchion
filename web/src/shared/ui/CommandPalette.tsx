@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useMemo } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
 import { useTranslation } from "react-i18next";
-import { Search, Navigation, Settings, ShieldAlert, Sparkles, ScanText, FileText } from "lucide-react";
+import { Activity, Search, Navigation, Settings, ShieldAlert, Sparkles, ScanText, FileText } from "lucide-react";
 import { resetPersistentState } from "@/shared/storage/persistentState";
 import { useToast } from "./Toast";
 
@@ -41,6 +41,13 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ isOpen, onClose 
 
   const commands = useMemo<CommandItem[]>(() => {
     return [
+      {
+        id: "nav-activity",
+        title: t("shell.commandPalette.navActivity", "Go to Activity"),
+        icon: <Activity size={16} />,
+        category: "nav",
+        action: () => { navigate("/activity"); onClose(); },
+      },
       {
         id: "nav-asr",
         title: t("shell.commandPalette.navAsr", "Go to ASR (Speech to Text)"),

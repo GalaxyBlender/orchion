@@ -18,6 +18,7 @@ pub(super) async fn run(
     stream_target_segment_millis: u32,
     limits: TranscriptionStreamLimits,
     mut budget: TranscriptionStreamBudget,
+    activity: Option<WebSocketActivity>,
 ) {
     let streaming_options = start.to_streaming_options(default_chunk_size_sec);
     let mut decoder =
@@ -26,14 +27,14 @@ pub(super) async fn run(
         {
             Ok(Ok(decoder)) => decoder,
             Ok(Err(error)) | Err(error) => {
-                let _ = send_stream_error(&mut socket, error).await;
+                let _ = send_stream_error(&mut socket, error, activity.as_ref()).await;
                 return;
             }
         };
     let mut endpoint = match AudioVadStreamingEndpoint::new(start.endpointing.to_vad_config()) {
         Ok(endpoint) => endpoint,
         Err(error) => {
-            let _ = send_stream_error(&mut socket, ApiError::from(error)).await;
+            let _ = send_stream_error(&mut socket, ApiError::from(error), activity.as_ref()).await;
             return;
         }
     };
@@ -42,21 +43,27 @@ pub(super) async fn run(
         Ok(Ok(())) => {}
         Ok(Err(_)) => return,
         Err(error) => {
-            let _ = send_stream_error(&mut socket, error).await;
+            let _ = send_stream_error(&mut socket, error, activity.as_ref()).await;
             return;
         }
     }
 
     loop {
-        let message =
-            match receive_transcription_stream_message(&mut socket, &mut budget, limits).await {
-                Ok(Some(message)) => message,
-                Ok(None) => return,
-                Err(error) => {
-                    let _ = send_stream_error(&mut socket, error).await;
-                    return;
-                }
-            };
+        let message = match receive_transcription_stream_message(
+            &mut socket,
+            &mut budget,
+            limits,
+            activity.as_ref(),
+        )
+        .await
+        {
+            Ok(Some(message)) => message,
+            Ok(None) => return,
+            Err(error) => {
+                let _ = send_stream_error(&mut socket, error, activity.as_ref()).await;
+                return;
+            }
+        };
         match message {
             Message::Binary(bytes) => {
                 let audio_chunk =
@@ -66,12 +73,13 @@ pub(super) async fn run(
                             let _ = send_stream_error(
                                 &mut socket,
                                 transcription_stream_decoder_error(error, limits),
+                                activity.as_ref(),
                             )
                             .await;
                             return;
                         }
                         Err(error) => {
-                            let _ = send_stream_error(&mut socket, error).await;
+                            let _ = send_stream_error(&mut socket, error, activity.as_ref()).await;
                             return;
                         }
                     };
@@ -80,13 +88,20 @@ pub(super) async fn run(
                     audio_chunk.sample_rate,
                     limits,
                 ) {
-                    let _ = send_stream_error(&mut socket, ApiError::from(error)).await;
+                    let _ =
+                        send_stream_error(&mut socket, ApiError::from(error), activity.as_ref())
+                            .await;
                     return;
                 }
                 let events = match endpoint.push(&audio_chunk.samples, audio_chunk.sample_rate) {
                     Ok(events) => events,
                     Err(error) => {
-                        let _ = send_stream_error(&mut socket, ApiError::from(error)).await;
+                        let _ = send_stream_error(
+                            &mut socket,
+                            ApiError::from(error),
+                            activity.as_ref(),
+                        )
+                        .await;
                         return;
                     }
                 };
@@ -104,7 +119,7 @@ pub(super) async fn run(
                 {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) | Err(error) => {
-                        let _ = send_stream_error(&mut socket, error).await;
+                        let _ = send_stream_error(&mut socket, error, activity.as_ref()).await;
                         return;
                     }
                 }
@@ -127,7 +142,9 @@ pub(super) async fn run(
                     )
                     .await;
                     if let Err(error) = result {
-                        let _ = send_stream_error(&mut socket, error).await;
+                        let _ = send_stream_error(&mut socket, error, activity.as_ref()).await;
+                    } else if let Some(activity) = &activity {
+                        activity.complete_success();
                     }
                     return;
                 }
@@ -139,12 +156,13 @@ pub(super) async fn run(
                             Some("type"),
                             Some("invalid_stream_state"),
                         ),
+                        activity.as_ref(),
                     )
                     .await;
                     return;
                 }
                 Err(error) => {
-                    let _ = send_stream_error(&mut socket, error).await;
+                    let _ = send_stream_error(&mut socket, error, activity.as_ref()).await;
                     return;
                 }
             },

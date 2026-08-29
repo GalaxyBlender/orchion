@@ -1,3 +1,4 @@
+use crate::api::activity::ActivityContext;
 use crate::api::http_shared::{
     authorize, is_multipart, parse_multipart_value, read_text_field, required_multipart_field,
     run_owned, write_multipart_file_to_temp_file,
@@ -7,11 +8,11 @@ use crate::application::ServerApplication;
 use crate::application::speech::{SpeechCommand, synthesize};
 use axum::Json;
 use axum::body::Body;
-use axum::extract::{FromRequest, Multipart, Request, State};
+use axum::extract::{Extension, FromRequest, Multipart, Request, State};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
-use orchion::AudioOutputFormat;
+use orchion::{AudioOutputFormat, TtsModel};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::{Builder as TempFileBuilder, NamedTempFile};
@@ -19,6 +20,7 @@ use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 pub(in crate::api) async fn create_speech<S>(
     State(state): State<Arc<S>>,
     headers: HeaderMap,
+    activity: Option<Extension<ActivityContext>>,
     request: Request,
 ) -> Result<Response, ApiError>
 where
@@ -31,7 +33,7 @@ where
             .map_err(|error| {
                 ApiError::invalid_request(error.to_string(), None, Some("invalid_multipart"))
             })?;
-        return create_speech_multipart(state, multipart).await;
+        return create_speech_multipart(state, multipart, activity.map(|value| value.0)).await;
     }
 
     let Json(request) = Json::<SpeechRequest>::from_request(request, &state)
@@ -46,7 +48,13 @@ where
             Some("unsupported_voice_input"),
         ));
     }
-    create_speech_from_command(state, speech_command(request), Vec::new()).await
+    create_speech_from_command(
+        state,
+        speech_command(request),
+        Vec::new(),
+        activity.map(|value| value.0),
+    )
+    .await
 }
 
 #[allow(
@@ -56,6 +64,7 @@ where
 async fn create_speech_multipart<S>(
     state: Arc<S>,
     mut multipart: Multipart,
+    activity: Option<ActivityContext>,
 ) -> Result<Response, ApiError>
 where
     S: ServerApplication,
@@ -134,6 +143,9 @@ where
             Some("invalid_file"),
         ));
     }
+    if let Some(activity) = &activity {
+        activity.set_input_bytes(reference_audio_size);
+    }
     let reference_wav_file = TempFileBuilder::new()
         .suffix(".wav")
         .tempfile()
@@ -160,6 +172,7 @@ where
         state,
         command,
         vec![reference_audio_file, reference_wav_file],
+        activity,
     )
     .await
 }
@@ -168,10 +181,21 @@ async fn create_speech_from_command<S>(
     state: Arc<S>,
     command: SpeechCommand,
     temporary_files: Vec<NamedTempFile>,
+    activity: Option<ActivityContext>,
 ) -> Result<Response, ApiError>
 where
     S: ServerApplication,
 {
+    if let Some(activity) = &activity
+        && let Ok(model_id) = TtsModel::parse(&command.model)
+        && state
+            .api_policy()
+            .tts_models
+            .as_ref()
+            .is_some_and(|models| models.contains(&model_id))
+    {
+        activity.set_model(model_id.to_string());
+    }
     tracing::debug!(
         model = %command.model,
         voice = %command.voice,

@@ -1,3 +1,4 @@
+use crate::api::activity::ActivityContext;
 use crate::api::http_shared::{
     authorize, read_text_field, run_owned, write_multipart_file_to_temp_file,
 };
@@ -8,11 +9,11 @@ use crate::api::srt::format_srt;
 use crate::application::ServerApplication;
 use crate::application::transcription::{TranscriptionCommand, transcribe};
 use axum::Json;
-use axum::extract::{Multipart, State};
+use axum::extract::{Extension, Multipart, State};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, HeaderValue};
 use axum::response::{IntoResponse, Response};
-use orchion::AsrTimestampGranularity;
+use orchion::{AsrModel, AsrTimestampGranularity};
 use std::sync::Arc;
 
 #[allow(
@@ -22,6 +23,7 @@ use std::sync::Arc;
 pub(in crate::api) async fn create_transcription<S>(
     State(state): State<Arc<S>>,
     headers: HeaderMap,
+    activity: Option<Extension<ActivityContext>>,
     mut multipart: Multipart,
 ) -> Result<Response, ApiError>
 where
@@ -88,6 +90,18 @@ where
             Some("file"),
             Some("invalid_file"),
         ));
+    }
+    if let Some(Extension(activity)) = &activity {
+        if let Ok(model_id) = AsrModel::parse(&model)
+            && state
+                .api_policy()
+                .asr
+                .as_ref()
+                .is_some_and(|policy| policy.available_models.contains(&model_id))
+        {
+            activity.set_model(model_id.to_string());
+        }
+        activity.set_input_bytes(audio_bytes);
     }
     let audio_path = audio_file.path().to_path_buf();
     tracing::debug!(

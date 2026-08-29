@@ -4,6 +4,7 @@ import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import { currentLanguageSelection, detectBrowserLanguage, syncLanguageFromSelection } from "@/shared/i18n";
 import { AppLayout, ToastProvider } from "@/shared/ui";
 import { AsrPage } from "./pages/AsrPage";
+import { ActivityPage } from "./pages/ActivityPage";
 import { ModelsPage } from "./pages/ModelsPage";
 import { OcrPage } from "./pages/OcrPage";
 import { PdfPage } from "./pages/PdfPage";
@@ -34,6 +35,7 @@ export function App() {
           <Route element={<AppLayout />}>
             <Route path="/" element={<Navigate to="/asr" replace />} />
             <Route path="/asr" element={<AsrPage />} />
+            <Route path="/activity" element={<ActivityPage />} />
             <Route path="/tts" element={<TtsPage />} />
             <Route path="/ocr" element={<OcrPage />} />
             <Route path="/pdf" element={<PdfPage />} />

@@ -1,7 +1,7 @@
 import React from "react";
 import { NavLink, useLocation } from "react-router-dom";
 import { useTranslation } from "react-i18next";
-import { Mic, Volume2, Database, Settings, Globe, ChevronLeft, ChevronRight, ScanText, FileText } from "lucide-react";
+import { Activity, Mic, Volume2, Database, Settings, Globe, ChevronLeft, ChevronRight, ScanText, FileText } from "lucide-react";
 import { Button } from "./Button";
 import { setLanguageSelection, currentLanguageSelection } from "@/shared/i18n";
 
@@ -20,6 +20,12 @@ export const Sidebar: React.FC<SidebarProps> = ({
   const location = useLocation();
 
   const navItems = [
+    {
+      to: "/activity",
+      label: t("shell.nav.activity.label", "Activity"),
+      meta: t("shell.nav.activity.meta", "request history"),
+      icon: <Activity size={18} />
+    },
     {
       to: "/asr",
       label: t("shell.nav.asr.label", "ASR"),

@@ -10,6 +10,11 @@ max_websocket_connections = 64
 max_pending_websocket_connections = 16
 max_websocket_message_size = 2097152
 
+[activity]
+enabled = true
+# Retained in memory for this process only; maximum 10000.
+history_capacity = 500
+
 [models]
 dir = "models"
 source = "auto"

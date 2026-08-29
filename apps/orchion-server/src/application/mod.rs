@@ -109,6 +109,12 @@ pub struct OcrApiModels {
     pub layout_models: Vec<ModelId>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ActivityPolicy {
+    pub enabled: bool,
+    pub history_capacity: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct ApiPolicy {
     pub api_key: Option<String>,
@@ -118,6 +124,7 @@ pub struct ApiPolicy {
     pub max_pdf_pixels: u64,
     pub max_pdf_output_size: usize,
     pub max_websocket_message_size: usize,
+    pub activity: ActivityPolicy,
     pub asr: Option<AsrApiPolicy>,
     pub tts_models: Option<Vec<TtsModel>>,
     pub ocr: Option<OcrApiModels>,

@@ -43,6 +43,14 @@ export async function requestBlob(
   return { blob: await response.blob(), headers: response.headers };
 }
 
+export function requestStream(
+  settings: ApiSettings,
+  path: string,
+  init: RequestInit = {},
+): Promise<Response> {
+  return request(settings, path, init);
+}
+
 export function fetchModels(settings: ApiSettings): Promise<ModelList> {
   return requestJson<ModelList>(settings, "/v1/models", { method: "GET" });
 }

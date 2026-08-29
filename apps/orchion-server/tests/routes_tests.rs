@@ -82,7 +82,7 @@ async fn model_status_endpoint_reports_runtime_residency_by_service() {
     let response = router(test_state(None))
         .oneshot(
             Request::builder()
-                .uri("/v1/models/status")
+                .uri("/api/models/status")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -110,7 +110,7 @@ async fn model_unload_is_idempotent_for_configured_unloaded_model() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/v1/models/unload")
+                .uri("/api/models/unload")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{"model":"Qwen/Qwen3-ASR-0.6B","service":"asr"}"#,
@@ -135,7 +135,7 @@ async fn model_control_rejects_wrong_service_and_invalid_json() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/v1/models/prewarm")
+                .uri("/api/models/load")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{"model":"Qwen/Qwen3-ASR-0.6B","service":"ocr"}"#,
@@ -154,7 +154,7 @@ async fn model_control_rejects_wrong_service_and_invalid_json() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/v1/models/unload")
+                .uri("/api/models/unload")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from("{}"))
                 .unwrap(),
@@ -166,6 +166,32 @@ async fn model_control_rejects_wrong_service_and_invalid_json() {
         json_body(invalid_json).await["error"]["code"],
         "invalid_json"
     );
+}
+
+#[tokio::test]
+async fn legacy_model_control_routes_are_removed() {
+    let app = router(test_state(None));
+    for (method, route) in [
+        ("GET", "/v1/models/status"),
+        ("POST", "/v1/models/prewarm"),
+        ("POST", "/v1/models/unload"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(route)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"Qwen/Qwen3-ASR-0.6B","service":"asr"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{route}");
+    }
 }
 
 #[tokio::test]
@@ -343,6 +369,45 @@ async fn v1_routes_accept_matching_bearer_auth() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn model_management_routes_enforce_configured_bearer_auth() {
+    let app = router(test_state(Some("secret")));
+    for (method, route, authorized_status) in [
+        ("GET", "/api/models/status", StatusCode::OK),
+        ("POST", "/api/models/load", StatusCode::BAD_REQUEST),
+        ("POST", "/api/models/unload", StatusCode::BAD_REQUEST),
+    ] {
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(route)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED, "{route}");
+
+        let authorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(route)
+                    .header(AUTHORIZATION, "Bearer secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authorized.status(), authorized_status, "{route}");
+    }
 }
 
 #[tokio::test]

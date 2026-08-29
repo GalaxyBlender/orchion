@@ -45,11 +45,16 @@ API keys and form preferences are stored in browser `localStorage`; do not save 
 
 - `GET /healthz`: health check.
 - `GET /v1/models`: configured model list.
+- `GET /api/models/status`: configured model runtime residency.
+- `POST /api/models/load`: load a configured model runtime.
+- `POST /api/models/unload`: unload a configured model runtime.
 - `POST /v1/audio/transcriptions`: ASR file transcription.
 - `GET /v1/audio/transcriptions/stream`: ASR WebSocket streaming.
 - `POST /v1/audio/speech`: TTS.
 - `POST /v1/ocr`: OCR and OCR-VL.
 - `POST /v1/pdf/images`: PDF page rendering.
+- `GET /api/activity`: in-flight requests, retained history, and summary statistics.
+- `GET /api/activity/events`: authenticated server-sent Activity events.
 - `GET /docs`: Swagger UI.
 - `GET /openapi/v1.json`: OpenAPI document.
 
@@ -61,7 +66,9 @@ Detailed API docs:
 - [OCR and OCR-VL](docs/ocr.md)
 - [PDF rendering](docs/pdf.md)
 
-If `[auth] api_key` is configured, pass `Authorization: Bearer <api_key>` for every `/v1/*` request.
+If `[auth] api_key` is configured, pass `Authorization: Bearer <api_key>` for every `/v1/*`, `/api/models/*`, and `/api/activity*` request.
+
+The Activity view records only allowlisted metadata such as route templates, model IDs, status, timing, and input size. While a request is in flight, Activity clients can also see its peer address and User-Agent; these live-only fields are removed before history is retained. Activity endpoints follow the global API key configuration, so deployments without an API key expose live metadata to clients that can reach the server. Activity never stores request bodies, response bodies, credentials, filenames, or generated output. HTTP timing covers the matched request through response-body completion, including parsing, queueing, and inference; WebSocket timing covers the upgraded session. History is bounded and exists only for the lifetime of the server process.
 
 ## Rust Library
 
@@ -93,6 +100,7 @@ cargo run -p orchion-example-tts-preset --features cpu -- "Hello from Orchion" o
 `apps/orchion-server/config.toml` is the full local example. Key sections:
 
 - `[server]`: bind address, CORS allowed origins, upload limit, and PDF page/pixel/output limits. CORS defaults to all origins (`["*"]`).
+- `[activity]`: enable request activity and set the in-memory completed-history capacity (default `500`).
 - `[models]`: model directory, source, and global residency limit.
 - `[services.asr]`, `[services.tts]`, `[services.ocr]`, `[services.ocr-vl]`: service enablement, defaults, allowlists, device, and per-service residency. ASR batch audio uses `max_audio_duration`; streaming captions use `stream_target_segment` and `stream_max_segment`; sessions use `stream_idle_timeout` and `stream_max_duration`. TTS uses `max_length` and `max_reference_audio_duration`; OCR-VL uses `max_tokens`.
 - `[auth]`: optional API key.

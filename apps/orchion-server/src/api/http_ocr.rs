@@ -1,11 +1,12 @@
+use crate::api::activity::ActivityContext;
 use crate::api::http_shared::{
     authorize, parse_multipart_value, read_text_field, run_owned, write_multipart_file_to_temp_file,
 };
 use crate::api::openai::{ApiError, OcrApiFormat, OcrJsonResponse};
 use crate::application::ServerApplication;
-use crate::application::ocr::{OcrCommand, recognize};
+use crate::application::ocr::{OcrCommand, recognize, resolve_service_choice};
 use axum::Json;
-use axum::extract::{Multipart, State};
+use axum::extract::{Extension, Multipart, State};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, HeaderValue};
 use axum::response::{IntoResponse, Response};
@@ -19,6 +20,7 @@ use std::sync::Arc;
 pub(super) async fn create_ocr<S>(
     State(state): State<Arc<S>>,
     headers: HeaderMap,
+    activity: Option<Extension<ActivityContext>>,
     mut multipart: Multipart,
 ) -> Result<Response, ApiError>
 where
@@ -84,6 +86,16 @@ where
             Some("invalid_file"),
         ));
     }
+    if let Some(Extension(activity)) = &activity {
+        activity.set_input_bytes(image_bytes);
+        if let Ok(choice) = resolve_service_choice(
+            &state.ocr_policy(),
+            model.as_deref(),
+            response_format.map(OcrResponseFormat::from),
+        ) {
+            activity.set_model(choice.model().to_string());
+        }
+    }
 
     let image_path = image_file.path().to_path_buf();
     let operation_state = Arc::clone(&state);
@@ -107,6 +119,9 @@ where
 
     let response_format = OcrApiFormat::from(output.format);
     let result = output.result;
+    if let Some(Extension(activity)) = &activity {
+        activity.set_model(result.model.to_string());
+    }
     Ok(match response_format {
         OcrApiFormat::Json => Json(OcrJsonResponse {
             model: result.model.to_string(),

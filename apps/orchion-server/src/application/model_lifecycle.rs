@@ -54,6 +54,6 @@ impl ModelStatus {
 
 pub trait ModelLifecycleRuntime: Send + Sync {
     fn model_statuses(&self) -> ModelStatusesFuture<'_>;
-    fn prewarm_model(&self, selector: ModelSelector) -> ModelControlFuture<'_>;
+    fn load_model(&self, selector: ModelSelector) -> ModelControlFuture<'_>;
     fn unload_model(&self, selector: ModelSelector) -> ModelControlFuture<'_>;
 }

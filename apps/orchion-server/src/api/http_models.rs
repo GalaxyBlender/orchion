@@ -85,7 +85,7 @@ where
     }))
 }
 
-pub(super) async fn prewarm_model<S>(
+pub(super) async fn load_model<S>(
     State(state): State<Arc<S>>,
     headers: HeaderMap,
     request: Result<Json<ModelControlRequest>, JsonRejection>,
@@ -97,7 +97,7 @@ where
     let request = parse_control_request(request)?;
     let model = request.model.clone();
     let status = state
-        .prewarm_model(ModelSelector {
+        .load_model(ModelSelector {
             model: request.model,
             service: request.service,
         })

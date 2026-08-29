@@ -1,3 +1,7 @@
+use crate::api::activity::{
+    ActivityEntry, ActivityOperation, ActivityOutcome, ActivityPage, ActivityState,
+    ActivitySummary, ActivityTransport,
+};
 use crate::api::http_models::{ModelControlRequest, ModelStatusList};
 use crate::api::openai::{
     ErrorBody, ModelList, OcrApiFormat, OcrJsonResponse, SpeechRequest, TranscriptionJson,
@@ -5,21 +9,42 @@ use crate::api::openai::{
 };
 use crate::application::model_lifecycle::ModelStatus;
 use orchion::docs::PdfImageFormat;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
+use utoipa::{Modify, OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(healthz_doc, list_models_doc, list_model_statuses_doc, prewarm_model_doc, unload_model_doc, create_speech_doc, create_transcription_doc, create_ocr_doc, create_pdf_images_doc),
-    components(schemas(SpeechRequest, ErrorBody, ModelList, ModelStatusList, ModelStatus, ModelControlRequest, TranscriptionJson, TranscriptionVerboseJson, OcrJsonResponse, OcrApiFormat, PdfImageFormat, PdfImagesMultipartRequest)),
+    paths(healthz_doc, list_models_doc, list_model_statuses_doc, load_model_doc, unload_model_doc, create_speech_doc, create_transcription_doc, create_ocr_doc, create_pdf_images_doc, list_activity_doc, activity_events_doc),
+    components(schemas(SpeechRequest, ErrorBody, ModelList, ModelStatusList, ModelStatus, ModelControlRequest, TranscriptionJson, TranscriptionVerboseJson, OcrJsonResponse, OcrApiFormat, PdfImageFormat, PdfImagesMultipartRequest, ActivityPage, ActivityEntry, ActivitySummary, ActivityState, ActivityTransport, ActivityOperation, ActivityOutcome)),
+    modifiers(&BearerAuth),
     tags(
         (name = "audio", description = "OpenAI-compatible audio APIs"),
         (name = "ocr", description = "OCR and OCR-VL APIs"),
         (name = "pdf", description = "PDF rendering APIs"),
-        (name = "models", description = "OpenAI-compatible model APIs")
+        (name = "models", description = "Model discovery and runtime lifecycle APIs"),
+        (name = "activity", description = "Live and retained request metadata")
     )
 )]
 struct ApiDoc;
+
+struct BearerAuth;
+
+impl Modify for BearerAuth {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        if let Some(components) = openapi.components.as_mut() {
+            components.add_security_scheme(
+                "bearer_auth",
+                SecurityScheme::Http(
+                    HttpBuilder::new()
+                        .scheme(HttpAuthScheme::Bearer)
+                        .bearer_format("API key")
+                        .build(),
+                ),
+            );
+        }
+    }
+}
 
 #[derive(ToSchema)]
 #[allow(dead_code)]
@@ -92,9 +117,23 @@ mod tests {
     fn openapi_includes_model_lifecycle_paths_and_schemas() {
         let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
 
-        assert!(spec["paths"]["/v1/models/status"]["get"].is_object());
-        assert!(spec["paths"]["/v1/models/prewarm"]["post"].is_object());
-        assert!(spec["paths"]["/v1/models/unload"]["post"].is_object());
+        assert!(spec["paths"]["/api/models/status"]["get"].is_object());
+        assert!(spec["paths"]["/api/models/load"]["post"].is_object());
+        assert!(spec["paths"]["/api/models/unload"]["post"].is_object());
+        assert!(spec["paths"].get("/v1/models/status").is_none());
+        assert!(spec["paths"].get("/v1/models/prewarm").is_none());
+        assert!(spec["paths"].get("/v1/models/unload").is_none());
+        for (path, method) in [
+            ("/api/models/status", "get"),
+            ("/api/models/load", "post"),
+            ("/api/models/unload", "post"),
+        ] {
+            assert_eq!(
+                spec["paths"][path][method]["security"][0]["bearer_auth"],
+                serde_json::json!([]),
+                "{method} {path}"
+            );
+        }
         assert!(spec["components"]["schemas"]["ModelStatus"].is_object());
         assert!(spec["components"]["schemas"]["ModelControlRequest"].is_object());
     }
@@ -150,6 +189,39 @@ mod tests {
         assert!(pdf_images_post["responses"]["200"]["content"]["application/zip"].is_object());
     }
 
+    #[test]
+    fn openapi_includes_activity_endpoints_and_contract() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+
+        assert!(spec["paths"]["/api/activity"]["get"].is_object());
+        assert!(spec["paths"]["/api/activity/events"]["get"].is_object());
+        assert!(spec["components"]["schemas"]["ActivityPage"].is_object());
+        assert_eq!(
+            spec["components"]["securitySchemes"]["bearer_auth"]["scheme"],
+            "bearer"
+        );
+        assert_eq!(
+            spec["paths"]["/api/activity"]["get"]["security"][0]["bearer_auth"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            spec["components"]["schemas"]["ActivityOutcome"]["enum"],
+            serde_json::json!([
+                "success",
+                "client_error",
+                "server_error",
+                "cancelled",
+                "disconnected",
+                "timeout",
+                "resource_exhausted"
+            ])
+        );
+        assert_eq!(
+            spec["components"]["schemas"]["ActivityOperation"]["enum"],
+            serde_json::json!(["asr", "asr_stream", "tts", "ocr", "pdf"])
+        );
+    }
+
     fn schema_references(schema: &Value, schema_name: &str) -> bool {
         if schema
             .get("$ref")
@@ -196,6 +268,7 @@ fn healthz_doc() {}
         (status = 200, description = "Configured model list", body = ModelList),
         (status = 401, description = "OpenAI-compatible error", body = ErrorBody)
     ),
+    security(("bearer_auth" = [])),
     tag = "models"
 )]
 #[allow(dead_code)]
@@ -203,11 +276,12 @@ fn list_models_doc() {}
 
 #[utoipa::path(
     get,
-    path = "/v1/models/status",
+    path = "/api/models/status",
     responses(
         (status = 200, description = "Configured model runtime residency", body = ModelStatusList),
         (status = 401, description = "OpenAI-compatible error", body = ErrorBody)
     ),
+    security(("bearer_auth" = [])),
     tag = "models"
 )]
 #[allow(dead_code)]
@@ -215,27 +289,29 @@ fn list_model_statuses_doc() {}
 
 #[utoipa::path(
     post,
-    path = "/v1/models/prewarm",
+    path = "/api/models/load",
     request_body = ModelControlRequest,
     responses(
         (status = 200, description = "Loaded model runtime", body = ModelStatus),
         (status = 400, description = "OpenAI-compatible error", body = ErrorBody),
         (status = 401, description = "OpenAI-compatible error", body = ErrorBody)
     ),
+    security(("bearer_auth" = [])),
     tag = "models"
 )]
 #[allow(dead_code)]
-fn prewarm_model_doc() {}
+fn load_model_doc() {}
 
 #[utoipa::path(
     post,
-    path = "/v1/models/unload",
+    path = "/api/models/unload",
     request_body = ModelControlRequest,
     responses(
         (status = 200, description = "Unloaded model runtime", body = ModelStatus),
         (status = 400, description = "OpenAI-compatible error", body = ErrorBody),
         (status = 401, description = "OpenAI-compatible error", body = ErrorBody)
     ),
+    security(("bearer_auth" = [])),
     tag = "models"
 )]
 #[allow(dead_code)]
@@ -310,3 +386,37 @@ fn create_ocr_doc() {}
 )]
 #[allow(dead_code)]
 fn create_pdf_images_doc() {}
+
+#[utoipa::path(
+    get,
+    path = "/api/activity",
+    security(("bearer_auth" = [])),
+    params(
+        ("limit" = Option<usize>, Query, description = "History rows to return, from 1 to 200"),
+        ("before" = Option<String>, Query, description = "Return completed requests with IDs older than this cursor"),
+        ("operation" = Option<ActivityOperation>, Query, description = "Filter by operation"),
+        ("outcome" = Option<ActivityOutcome>, Query, description = "Filter by completion outcome"),
+        ("model" = Option<String>, Query, description = "Filter by exact model ID")
+    ),
+    responses(
+        (status = 200, description = "Current in-flight requests and retained history", body = ActivityPage),
+        (status = 400, description = "Invalid query", body = ErrorBody),
+        (status = 401, description = "OpenAI-compatible error", body = ErrorBody)
+    ),
+    tag = "activity"
+)]
+#[allow(dead_code)]
+fn list_activity_doc() {}
+
+#[utoipa::path(
+    get,
+    path = "/api/activity/events",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Server-sent events named snapshot, started, updated, completed, or reset", content_type = "text/event-stream", body = String),
+        (status = 401, description = "OpenAI-compatible error", body = ErrorBody)
+    ),
+    tag = "activity"
+)]
+#[allow(dead_code)]
+fn activity_events_doc() {}

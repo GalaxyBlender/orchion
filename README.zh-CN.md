@@ -45,11 +45,16 @@ API key 和表单偏好会存储在浏览器 `localStorage`；不要在共享或
 
 - `GET /healthz`：健康检查。
 - `GET /v1/models`：已配置模型列表。
+- `GET /api/models/status`：已配置模型的运行时驻留状态。
+- `POST /api/models/load`：加载已配置模型的运行时。
+- `POST /api/models/unload`：卸载已配置模型的运行时。
 - `POST /v1/audio/transcriptions`：ASR 文件转录。
 - `GET /v1/audio/transcriptions/stream`：ASR WebSocket 流式转录。
 - `POST /v1/audio/speech`：TTS。
 - `POST /v1/ocr`：OCR 和 OCR-VL。
 - `POST /v1/pdf/images`：PDF 页面渲染。
+- `GET /api/activity`：进行中的请求、保留历史和摘要统计。
+- `GET /api/activity/events`：需要认证的 Activity 服务端事件流。
 - `GET /docs`：Swagger UI。
 - `GET /openapi/v1.json`：OpenAPI 文档。
 
@@ -61,7 +66,9 @@ API key 和表单偏好会存储在浏览器 `localStorage`；不要在共享或
 - [OCR 和 OCR-VL](docs/ocr.zh-CN.md)
 - [PDF 页面渲染](docs/pdf.zh-CN.md)
 
-如果配置了 `[auth] api_key`，所有 `/v1/*` 请求都需要传入 `Authorization: Bearer <api_key>`。
+如果配置了 `[auth] api_key`，所有 `/v1/*`、`/api/models/*` 和 `/api/activity*` 请求都需要传入 `Authorization: Bearer <api_key>`。
+
+Activity 页面只记录路由模板、模型 ID、状态、耗时和输入大小等白名单元数据。请求进行期间，Activity 客户端还可以看到 peer 地址和 User-Agent；这些仅限实时展示的字段会在写入历史前清除。Activity 接口遵循全局 API key 配置，因此未配置 API key 的部署会向所有能访问服务的客户端开放实时元数据。Activity 不存储请求正文、响应正文、凭据、文件名或生成结果。HTTP 耗时从请求进入匹配路由起，覆盖解析、排队、推理，直到响应 body 完成；WebSocket 耗时覆盖升级后的完整会话。历史数量有上限，并且仅在当前服务进程生命周期内存在。
 
 ## Rust 库
 
@@ -93,6 +100,7 @@ cargo run -p orchion-example-tts-preset --features cpu -- "Hello from Orchion" o
 完整本地配置示例在 `apps/orchion-server/config.toml`。主要配置段：
 
 - `[server]`：监听地址、CORS 允许来源、上传大小限制，以及 PDF 页数、像素和输出大小限制。CORS 默认允许所有来源（`["*"]`）。
+- `[activity]`：启用请求活动并设置内存中的已完成历史容量（默认 `500`）。
 - `[models]`：模型目录、下载来源和全局驻留上限。
 - `[services.asr]`、`[services.tts]`、`[services.ocr]`、`[services.ocr-vl]`：服务开关、默认模型、allowlist、运行设备和每类驻留上限。ASR 批量音频使用 `max_audio_duration`；流式字幕使用 `stream_target_segment` 和 `stream_max_segment`；会话使用 `stream_idle_timeout` 和 `stream_max_duration`。TTS 使用 `max_length` 和 `max_reference_audio_duration`；OCR-VL 使用 `max_tokens`。
 - `[auth]`：可选 API key。

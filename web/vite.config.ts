@@ -7,6 +7,10 @@ export default defineConfig({
   plugins: [react()],
   server: {
     proxy: {
+      "/api": {
+        target: "http://127.0.0.1:9090",
+        changeOrigin: true,
+      },
       "/v1": {
         target: "http://127.0.0.1:9090",
         changeOrigin: true,

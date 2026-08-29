@@ -20,6 +20,7 @@ pub const DEFAULT_MAX_CONCURRENT_INFERENCE: usize = 2;
 pub const DEFAULT_MAX_WEBSOCKET_CONNECTIONS: usize = 64;
 pub const DEFAULT_MAX_PENDING_WEBSOCKET_CONNECTIONS: usize = 16;
 pub const DEFAULT_MAX_WEBSOCKET_MESSAGE_SIZE: usize = 2 * 1024 * 1024;
+pub const MAX_ACTIVITY_HISTORY_CAPACITY: usize = 10_000;
 pub const CORS_ALLOWED_ORIGINS_ENV: &str = "CORS_ALLOWED_ORIGINS";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,9 +44,16 @@ impl From<ModelSource> for DownloadSource {
 pub struct ServerConfig {
     pub config_path: PathBuf,
     pub server: ServerSection,
+    pub activity: ActivitySection,
     pub models: ModelsSection,
     pub services: ServicesSection,
     pub auth: AuthSection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivitySection {
+    pub enabled: bool,
+    pub history_capacity: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -224,6 +232,10 @@ pub enum ConfigError {
         value: String,
     },
     #[error(
+        "invalid activity.history_capacity `{value}`: value must not exceed {MAX_ACTIVITY_HISTORY_CAPACITY}"
+    )]
+    InvalidActivityHistoryCapacity { value: usize },
+    #[error(
         "invalid {section}.stream_chunk_size `{value}`: value must be finite and greater than zero"
     )]
     InvalidChunkSize { section: &'static str, value: f32 },
@@ -296,6 +308,10 @@ impl ServerConfig {
                 max_websocket_connections: DEFAULT_MAX_WEBSOCKET_CONNECTIONS,
                 max_pending_websocket_connections: DEFAULT_MAX_PENDING_WEBSOCKET_CONNECTIONS,
                 max_websocket_message_size: DEFAULT_MAX_WEBSOCKET_MESSAGE_SIZE,
+            },
+            activity: ActivitySection {
+                enabled: true,
+                history_capacity: 500,
             },
             models: ModelsSection {
                 dir: exe_dir.join("models"),
@@ -462,6 +478,20 @@ impl ServerConfig {
                     "max_websocket_message_size",
                     max_websocket_message_size,
                 )?;
+            }
+        }
+
+        if let Some(activity) = raw.activity {
+            if let Some(enabled) = activity.enabled {
+                config.activity.enabled = enabled;
+            }
+            if let Some(history_capacity) = activity.history_capacity {
+                if history_capacity > MAX_ACTIVITY_HISTORY_CAPACITY {
+                    return Err(ConfigError::InvalidActivityHistoryCapacity {
+                        value: history_capacity,
+                    });
+                }
+                config.activity.history_capacity = history_capacity;
             }
         }
 
@@ -1297,9 +1327,17 @@ fn normalize_identifier(value: &str) -> String {
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     server: Option<RawServer>,
+    activity: Option<RawActivity>,
     models: Option<RawModels>,
     services: Option<RawServices>,
     auth: Option<RawAuth>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawActivity {
+    enabled: Option<bool>,
+    history_capacity: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -1,3 +1,4 @@
+use crate::api::activity::WebSocketActivity;
 use crate::api::openai::{ApiError, TranscriptionFormat};
 use crate::application::streaming_transcription::{self, StreamingTranscriptionEvent};
 use crate::settings::DEFAULT_ASR_STREAM_MAX_SEGMENT;
@@ -79,7 +80,21 @@ pub(super) fn caption_completed_event() -> AsrStreamEvent {
 pub(super) async fn send_stream_error(
     socket: &mut WebSocket,
     error: ApiError,
+    activity: Option<&WebSocketActivity>,
 ) -> Result<(), axum::Error> {
+    if let Some(activity) = activity {
+        let code = error.error.code.clone();
+        if code.as_deref() == Some("websocket_disconnected") {
+            activity.complete_disconnected();
+        } else if code
+            .as_deref()
+            .is_some_and(|code| code.contains("timeout") || code.contains("duration_exceeded"))
+        {
+            activity.complete_timeout(code);
+        } else {
+            activity.complete_error(error.status().as_u16(), code);
+        }
+    }
     let event = stream_error_event(&error);
     let error_type = error.error.error_type;
     let code = error.error.code.as_deref();
@@ -166,9 +181,88 @@ pub(super) async fn send_application_stream_events(
         };
         send_stream_event(socket, &wire)
             .await
-            .map_err(|error| ApiError::internal(error.to_string()))?;
+            .map_err(websocket_disconnected_error)?;
     }
     Ok(())
+}
+
+pub(super) fn websocket_disconnected_error(_error: axum::Error) -> ApiError {
+    websocket_disconnected()
+}
+
+pub(super) fn websocket_receive_error(error: axum::Error) -> ApiError {
+    let Ok(error) = error.into_inner().downcast::<tungstenite::Error>() else {
+        return ApiError::internal("unexpected websocket receive error");
+    };
+    match *error {
+        tungstenite::Error::ConnectionClosed
+        | tungstenite::Error::AlreadyClosed
+        | tungstenite::Error::Io(_)
+        | tungstenite::Error::Tls(_)
+        | tungstenite::Error::Protocol(
+            tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
+        ) => websocket_disconnected(),
+        tungstenite::Error::Capacity(_) => ApiError::invalid_request(
+            "websocket message exceeds the configured limit",
+            None,
+            Some("websocket_message_too_large"),
+        ),
+        tungstenite::Error::Protocol(_)
+        | tungstenite::Error::Utf8(_)
+        | tungstenite::Error::AttackAttempt => ApiError::invalid_request(
+            "invalid websocket message",
+            None,
+            Some("invalid_websocket_message"),
+        ),
+        tungstenite::Error::WriteBufferFull(_)
+        | tungstenite::Error::Url(_)
+        | tungstenite::Error::Http(_)
+        | tungstenite::Error::HttpFormat(_) => {
+            ApiError::internal("unexpected websocket receive error")
+        }
+    }
+}
+
+pub(super) fn websocket_disconnected() -> ApiError {
+    ApiError::invalid_request(
+        "websocket client disconnected",
+        None,
+        Some("websocket_disconnected"),
+    )
+}
+
+#[cfg(test)]
+mod websocket_error_tests {
+    use super::*;
+    use std::io;
+    use tungstenite::error::CapacityError;
+
+    #[test]
+    fn receive_errors_distinguish_disconnects_from_client_protocol_errors() {
+        let disconnected = websocket_receive_error(axum::Error::new(tungstenite::Error::Io(
+            io::Error::new(io::ErrorKind::ConnectionReset, "reset"),
+        )));
+        let oversized = websocket_receive_error(axum::Error::new(tungstenite::Error::Capacity(
+            CapacityError::MessageTooLong {
+                size: 10,
+                max_size: 5,
+            },
+        )));
+        let reset = websocket_receive_error(axum::Error::new(tungstenite::Error::Protocol(
+            tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
+        )));
+
+        assert_eq!(
+            disconnected.error.code.as_deref(),
+            Some("websocket_disconnected")
+        );
+        assert_eq!(
+            oversized.error.code.as_deref(),
+            Some("websocket_message_too_large")
+        );
+        assert_eq!(oversized.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(reset.error.code.as_deref(), Some("websocket_disconnected"));
+    }
 }
 
 fn stream_event_type(event: &AsrStreamEvent) -> &'static str {

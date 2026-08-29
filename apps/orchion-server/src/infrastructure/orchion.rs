@@ -18,7 +18,9 @@ use crate::application::streaming_transcription::{
 use crate::application::transcription::{
     TranscriptionFuture, TranscriptionPolicy, TranscriptionRuntime,
 };
-use crate::application::{ApiPolicy, AsrApiPolicy, OcrApiModels, RuntimeError, ServerApplication};
+use crate::application::{
+    ActivityPolicy, ApiPolicy, AsrApiPolicy, OcrApiModels, RuntimeError, ServerApplication,
+};
 use crate::settings::ServerConfig;
 use anyhow::Context;
 use orchion::{
@@ -419,7 +421,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_lifecycle_prewarms_reports_and_unloads_runtime() {
+    async fn model_lifecycle_loads_reports_and_unloads_runtime() {
         let mut config = test_config();
         config.services.asr.enabled = true;
         let model = config.services.asr.default_model.clone();
@@ -433,12 +435,8 @@ mod tests {
             service: ModelService::Asr,
         };
 
-        let prewarmed = state
-            .prewarm_model(selector.clone())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(prewarmed.status, ModelResidency::Loaded);
+        let loaded = state.load_model(selector.clone()).await.unwrap().unwrap();
+        assert_eq!(loaded.status, ModelResidency::Loaded);
         assert!(state.model_statuses().await.iter().any(|status| {
             status.id == model.as_str() && status.status == ModelResidency::Loaded
         }));
@@ -450,7 +448,7 @@ mod tests {
         }));
 
         state
-            .prewarm_model(ModelSelector {
+            .load_model(ModelSelector {
                 model: model.as_str().to_string(),
                 service: ModelService::Asr,
             })
@@ -1174,7 +1172,7 @@ impl ModelLifecycleRuntime for AppState {
         })
     }
 
-    fn prewarm_model(&self, selector: ModelSelector) -> ModelControlFuture<'_> {
+    fn load_model(&self, selector: ModelSelector) -> ModelControlFuture<'_> {
         Box::pin(async move {
             let status = match selector.service {
                 ModelService::Asr => {
@@ -1697,6 +1695,10 @@ fn api_policy(config: &ServerConfig) -> ApiPolicy {
         max_pdf_pixels: config.server.max_pdf_pixels,
         max_pdf_output_size: config.server.max_pdf_output_size,
         max_websocket_message_size: config.server.max_websocket_message_size,
+        activity: ActivityPolicy {
+            enabled: config.activity.enabled,
+            history_capacity: config.activity.history_capacity,
+        },
         asr: config.services.asr.enabled.then(|| AsrApiPolicy {
             available_models: config.services.asr.available_models.clone(),
             stream_target_segment: config.services.asr.stream_target_segment,

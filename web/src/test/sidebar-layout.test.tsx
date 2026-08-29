@@ -30,4 +30,5 @@ test("collapsed sidebar uses compact layout classes", async () => {
   expect(html).toContain("sidebar-inner-collapsed");
   expect(html).toContain("brand-icon-collapsed");
   expect(html).toContain("nav-link-collapsed");
+  expect(html).toContain('href="/activity"');
 });

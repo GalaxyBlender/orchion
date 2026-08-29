@@ -3,6 +3,7 @@ use clap::Parser;
 use orchion_server::{
     api::http, infrastructure::orchion::AppState, logging, settings::ServerConfig,
 };
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -68,15 +69,22 @@ async fn run() -> anyhow::Result<()> {
     let state = AppState::load(config)
         .await
         .context("initialize app state")?;
-    let app = http::router(Arc::clone(&state));
+    let shutdown = http::ServerShutdown::new();
+    let app = http::router_with_shutdown(Arc::clone(&state), shutdown.clone());
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("bind {bind}"))?;
     tracing::info!(%bind, "orchion server listening");
-    let result = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("serve HTTP");
+    let result = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        shutdown.trigger();
+    })
+    .await
+    .context("serve HTTP");
     state.shutdown().await;
     result
 }

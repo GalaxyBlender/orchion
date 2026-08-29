@@ -1212,7 +1212,7 @@ pub type TtsModelCache = ModelCache<TtsModel, Tts>;
 pub type OcrModelCache = ModelCache<OcrModel, Ocr>;
 pub type OcrVlModelCache = ModelCache<OcrModel, Ocr>;
 
-#[deprecated(note = "use ModelCache lazy provisioning or a startup prewarm policy")]
+#[deprecated(note = "use ModelCache lazy provisioning or a startup preload policy")]
 #[allow(clippy::ptr_arg, reason = "preserves the previously public signature")]
 /// Provisions each requested model sequentially using the supplied provisioner.
 ///

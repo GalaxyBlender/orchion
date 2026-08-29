@@ -1,3 +1,4 @@
+use crate::api::activity::ActivityContext;
 use crate::api::http_shared::{
     authorize, read_text_field, run_inference_owned, write_multipart_file_to_temp_file,
 };
@@ -5,7 +6,7 @@ use crate::api::openai::ApiError;
 use crate::api::pdf::{self, PdfRenderRequest};
 use crate::application::ServerApplication;
 use axum::body::Body;
-use axum::extract::{Multipart, State};
+use axum::extract::{Extension, Multipart, State};
 use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
@@ -15,6 +16,7 @@ use tempfile::NamedTempFile;
 pub(super) async fn create_pdf_images<S>(
     State(state): State<Arc<S>>,
     headers: HeaderMap,
+    activity: Option<Extension<ActivityContext>>,
     multipart: Multipart,
 ) -> Result<Response, ApiError>
 where
@@ -23,7 +25,14 @@ where
     authorize(state.as_ref(), &headers)?;
     let policy = state.api_policy();
     let upload = read_pdf_images_request(multipart, policy.max_pdf_pages).await?;
-    let PdfImagesRequest { pdf_file, request } = upload;
+    let PdfImagesRequest {
+        pdf_file,
+        pdf_bytes,
+        request,
+    } = upload;
+    if let Some(Extension(activity)) = &activity {
+        activity.set_input_bytes(pdf_bytes);
+    }
     let limits = pdf::PdfRenderLimits {
         max_pages: policy.max_pdf_pages,
         max_pixels: policy.max_pdf_pixels,
@@ -55,6 +64,7 @@ where
 
 struct PdfImagesRequest {
     pdf_file: NamedTempFile,
+    pdf_bytes: u64,
     request: PdfRenderRequest,
 }
 
@@ -117,5 +127,9 @@ async fn read_pdf_images_request(
         scale: pdf::parse_scale(scale.as_deref())?,
     };
 
-    Ok(PdfImagesRequest { pdf_file, request })
+    Ok(PdfImagesRequest {
+        pdf_file,
+        pdf_bytes,
+        request,
+    })
 }

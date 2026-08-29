@@ -15,32 +15,34 @@ pub(super) async fn run(
     default_chunk_size_sec: f32,
     limits: TranscriptionStreamLimits,
     mut budget: TranscriptionStreamBudget,
+    activity: Option<WebSocketActivity>,
 ) {
     let streaming_options = start.to_streaming_options(default_chunk_size_sec);
     if let Err(error) = validate_transcription_streaming_options(&streaming_options) {
-        let _ = send_stream_error(&mut socket, error).await;
+        let _ = send_stream_error(&mut socket, error, activity.as_ref()).await;
         return;
     }
     let chunk_size_sec = streaming_options.chunk_size_sec;
-    let mut stream =
-        match await_stream_operation(&budget, limits, asr.start(streaming_options)).await {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(error)) => {
-                let _ = send_stream_error(&mut socket, ApiError::from(error)).await;
-                return;
-            }
-            Err(error) => {
-                let _ = send_stream_error(&mut socket, error).await;
-                return;
-            }
-        };
+    let mut stream = match await_stream_operation(&budget, limits, asr.start(streaming_options))
+        .await
+    {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(error)) => {
+            let _ = send_stream_error(&mut socket, ApiError::from(error), activity.as_ref()).await;
+            return;
+        }
+        Err(error) => {
+            let _ = send_stream_error(&mut socket, error, activity.as_ref()).await;
+            return;
+        }
+    };
     let mut decoder =
         match await_stream_operation(&budget, limits, start.audio_decoder(limits.max_duration))
             .await
         {
             Ok(Ok(decoder)) => decoder,
             Ok(Err(error)) | Err(error) => {
-                let _ = send_stream_error(&mut socket, error).await;
+                let _ = send_stream_error(&mut socket, error, activity.as_ref()).await;
                 return;
             }
         };
@@ -50,21 +52,27 @@ pub(super) async fn run(
         Ok(Ok(())) => {}
         Ok(Err(_)) => return,
         Err(error) => {
-            let _ = send_stream_error(&mut socket, error).await;
+            let _ = send_stream_error(&mut socket, error, activity.as_ref()).await;
             return;
         }
     }
 
     loop {
-        let message =
-            match receive_transcription_stream_message(&mut socket, &mut budget, limits).await {
-                Ok(Some(message)) => message,
-                Ok(None) => return,
-                Err(error) => {
-                    let _ = send_stream_error(&mut socket, error).await;
-                    return;
-                }
-            };
+        let message = match receive_transcription_stream_message(
+            &mut socket,
+            &mut budget,
+            limits,
+            activity.as_ref(),
+        )
+        .await
+        {
+            Ok(Some(message)) => message,
+            Ok(None) => return,
+            Err(error) => {
+                let _ = send_stream_error(&mut socket, error, activity.as_ref()).await;
+                return;
+            }
+        };
         match message {
             Message::Binary(bytes) => {
                 let audio_chunk =
@@ -74,12 +82,13 @@ pub(super) async fn run(
                             let _ = send_stream_error(
                                 &mut socket,
                                 transcription_stream_decoder_error(error, limits),
+                                activity.as_ref(),
                             )
                             .await;
                             return;
                         }
                         Err(error) => {
-                            let _ = send_stream_error(&mut socket, error).await;
+                            let _ = send_stream_error(&mut socket, error, activity.as_ref()).await;
                             return;
                         }
                     };
@@ -88,13 +97,20 @@ pub(super) async fn run(
                     audio_chunk.sample_rate,
                     limits,
                 ) {
-                    let _ = send_stream_error(&mut socket, ApiError::from(error)).await;
+                    let _ =
+                        send_stream_error(&mut socket, ApiError::from(error), activity.as_ref())
+                            .await;
                     return;
                 }
                 let chunks = match pcm_buffer.push(&audio_chunk.samples, audio_chunk.sample_rate) {
                     Ok(chunks) => chunks,
                     Err(error) => {
-                        let _ = send_stream_error(&mut socket, ApiError::from(error)).await;
+                        let _ = send_stream_error(
+                            &mut socket,
+                            ApiError::from(error),
+                            activity.as_ref(),
+                        )
+                        .await;
                         return;
                     }
                 };
@@ -107,7 +123,7 @@ pub(super) async fn run(
                 {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) | Err(error) => {
-                        let _ = send_stream_error(&mut socket, error).await;
+                        let _ = send_stream_error(&mut socket, error, activity.as_ref()).await;
                         return;
                     }
                 }
@@ -130,7 +146,9 @@ pub(super) async fn run(
                     )
                     .await;
                     if let Err(error) = result {
-                        let _ = send_stream_error(&mut socket, error).await;
+                        let _ = send_stream_error(&mut socket, error, activity.as_ref()).await;
+                    } else if let Some(activity) = &activity {
+                        activity.complete_success();
                     }
                     return;
                 }
@@ -142,12 +160,13 @@ pub(super) async fn run(
                             Some("type"),
                             Some("invalid_stream_state"),
                         ),
+                        activity.as_ref(),
                     )
                     .await;
                     return;
                 }
                 Err(error) => {
-                    let _ = send_stream_error(&mut socket, error).await;
+                    let _ = send_stream_error(&mut socket, error, activity.as_ref()).await;
                     return;
                 }
             },
@@ -182,12 +201,12 @@ async fn finish(
     {
         send_stream_transcript(socket, "partial", &transcript)
             .await
-            .map_err(|error| ApiError::internal(error.to_string()))?;
+            .map_err(websocket_disconnected_error)?;
     }
     let transcript = stream.finish().await.map_err(ApiError::from)?;
     send_stream_transcript(socket, "final", &transcript)
         .await
-        .map_err(|error| ApiError::internal(error.to_string()))
+        .map_err(websocket_disconnected_error)
 }
 
 async fn feed_chunks(
@@ -199,7 +218,7 @@ async fn feed_chunks(
         match stream.feed(&samples, sample_rate).await {
             Ok(Some(transcript)) => send_stream_transcript(socket, "partial", &transcript)
                 .await
-                .map_err(|error| ApiError::internal(error.to_string()))?,
+                .map_err(websocket_disconnected_error)?,
             Ok(None) => {}
             Err(error) => return Err(ApiError::from(error)),
         }

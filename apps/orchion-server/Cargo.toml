@@ -13,9 +13,11 @@ cuda = ["orchion/cuda"]
 
 [dependencies]
 anyhow = "1"
+async-stream = "0.3"
 axum = { version = "0.8", features = ["json", "multipart", "ws"] }
 clap = { version = "4", features = ["derive"] }
 http = "1"
+http-body = "1"
 include_dir = "0.7"
 orchion = { path = "../../libs/orchion", default-features = false, features = ["asr-qwen3", "tts-qwen3", "ocr", "ocr-vl", "docs", "audio-ffmpeg", "download-all", "audio-vad", "serde", "schema"] }
 orchion-protocol = { path = "../../libs/orchion-protocol" }
@@ -28,6 +30,7 @@ toml = "1.1"
 tower-http = { version = "0.7", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tungstenite = "0.29"
 utoipa = "5"
 utoipa-swagger-ui = { version = "9", features = ["axum"] }
 url = "2"
