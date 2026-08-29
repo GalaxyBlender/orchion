@@ -48,7 +48,7 @@ export interface PersistentOcrState {
 
 export interface PersistentUiState {
   theme: "dark";
-  activePage: "asr" | "tts" | "ocr" | "models" | "settings";
+  activePage: "activity" | "asr" | "tts" | "ocr" | "models" | "settings";
   language?: "en" | "zh-CN" | "zh-TW";
 }
 
@@ -175,7 +175,7 @@ function createDefaultPersistentState(): PersistentState {
     },
     ui: {
       theme: "dark",
-      activePage: "asr",
+      activePage: "activity",
     },
   };
 }
@@ -378,7 +378,7 @@ function parseUiState(value: unknown): Partial<PersistentUiState> | null {
   }
 
   if ("activePage" in value) {
-    if (!isOneOf(value.activePage, ["asr", "tts", "ocr", "models", "settings"])) {
+    if (!isOneOf(value.activePage, ["activity", "asr", "tts", "ocr", "models", "settings"])) {
       return null;
     }
     state.activePage = value.activePage;

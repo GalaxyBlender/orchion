@@ -33,7 +33,7 @@ export function App() {
       <BrowserRouter basename="/ui">
         <Routes>
           <Route element={<AppLayout />}>
-            <Route path="/" element={<Navigate to="/asr" replace />} />
+            <Route path="/" element={<Navigate to="/activity" replace />} />
             <Route path="/asr" element={<AsrPage />} />
             <Route path="/activity" element={<ActivityPage />} />
             <Route path="/tts" element={<TtsPage />} />
@@ -41,7 +41,7 @@ export function App() {
             <Route path="/pdf" element={<PdfPage />} />
             <Route path="/models" element={<ModelsPage />} />
             <Route path="/settings" element={<SettingsPage />} />
-            <Route path="*" element={<Navigate to="/asr" replace />} />
+            <Route path="*" element={<Navigate to="/activity" replace />} />
           </Route>
         </Routes>
       </BrowserRouter>
