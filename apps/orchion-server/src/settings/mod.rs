@@ -75,6 +75,7 @@ pub struct ModelsSection {
     pub dir: PathBuf,
     pub source: ModelSource,
     pub max_loaded: usize,
+    pub verify_file_integrity: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -317,6 +318,7 @@ impl ServerConfig {
                 dir: exe_dir.join("models"),
                 source: ModelSource::Auto,
                 max_loaded: 2,
+                verify_file_integrity: false,
             },
             services: ServicesSection {
                 asr: AsrServiceSection {
@@ -510,6 +512,9 @@ impl ServerConfig {
                     });
                 }
                 config.models.max_loaded = max_loaded;
+            }
+            if let Some(verify_file_integrity) = models.verify_file_integrity {
+                config.models.verify_file_integrity = verify_file_integrity;
             }
         }
 
@@ -1361,6 +1366,7 @@ struct RawModels {
     dir: Option<PathBuf>,
     source: Option<String>,
     max_loaded: Option<usize>,
+    verify_file_integrity: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

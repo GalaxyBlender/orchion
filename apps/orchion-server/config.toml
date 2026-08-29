@@ -19,6 +19,7 @@ history_capacity = 500
 dir = "models"
 source = "auto"
 max_loaded = 2
+verify_file_integrity = false
 
 [services.asr]
 enabled = true

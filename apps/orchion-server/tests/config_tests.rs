@@ -27,6 +27,7 @@ fn defaults_are_executable_relative() {
     assert_eq!(config.models.dir, exe_path.parent().unwrap().join("models"));
     assert_eq!(config.models.source, ModelSource::Auto);
     assert_eq!(config.models.max_loaded, 2);
+    assert!(!config.models.verify_file_integrity);
     assert!(!config.services.asr.enabled);
     assert_eq!(
         config.services.asr.default_model,
@@ -670,6 +671,7 @@ max_pdf_output_size = "16M"
 dir = "cache/models"
 source = "modelscope"
 max_loaded = 3
+verify_file_integrity = true
 
 [services.asr]
 enabled = true
@@ -713,6 +715,7 @@ api_key = "test-secret"
     );
     assert_eq!(config.models.source, ModelSource::ModelScope);
     assert_eq!(config.models.max_loaded, 3);
+    assert!(config.models.verify_file_integrity);
     assert!(config.services.asr.enabled);
     assert_eq!(
         config.services.asr.default_model,

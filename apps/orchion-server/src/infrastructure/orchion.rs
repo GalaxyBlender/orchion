@@ -555,7 +555,10 @@ impl AppState {
     ///
     /// Returns an error when configuration, provisioning, or startup model loading fails.
     pub async fn load(config: ServerConfig) -> anyhow::Result<Arc<Self>> {
-        let provisioner = Arc::new(ModelDownloader::new(config.models.source.into()));
+        let provisioner = Arc::new(
+            ModelDownloader::new(config.models.source.into())
+                .with_file_integrity_verification(config.models.verify_file_integrity),
+        );
         Self::load_with_provisioner(config, provisioner).await
     }
 

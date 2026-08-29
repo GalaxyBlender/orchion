@@ -172,6 +172,7 @@ pub struct ModelDownloader {
     providers: DownloadProviderRegistry,
     revision: Option<String>,
     repository_revisions: HashMap<String, String>,
+    verify_file_integrity: bool,
     huggingface_available: Arc<tokio::sync::OnceCell<bool>>,
 }
 
@@ -183,6 +184,7 @@ impl std::fmt::Debug for ModelDownloader {
             .field("providers", &self.providers)
             .field("revision", &self.revision)
             .field("repository_revisions", &self.repository_revisions)
+            .field("verify_file_integrity", &self.verify_file_integrity)
             .field("huggingface_available", &self.huggingface_available)
             .finish()
     }
@@ -204,6 +206,7 @@ impl ModelDownloader {
                 .with_provider(ModelScopeProvider::new()),
             revision: None,
             repository_revisions: HashMap::new(),
+            verify_file_integrity: true,
             huggingface_available: Arc::new(tokio::sync::OnceCell::const_new()),
         }
     }
@@ -223,6 +226,7 @@ impl ModelDownloader {
             providers,
             revision: None,
             repository_revisions: HashMap::new(),
+            verify_file_integrity: true,
             huggingface_available: Arc::new(tokio::sync::OnceCell::const_new()),
         }
     }
@@ -230,6 +234,13 @@ impl ModelDownloader {
     #[must_use]
     pub fn with_revision(mut self, revision: impl Into<String>) -> Self {
         self.revision = Some(revision.into());
+        self
+    }
+
+    /// Configures whether existing cache files are verified against their recorded SHA-256 hashes.
+    #[must_use]
+    pub const fn with_file_integrity_verification(mut self, verify: bool) -> Self {
+        self.verify_file_integrity = verify;
         self
     }
 
@@ -1194,7 +1205,11 @@ async fn is_ready_cache<M: ModelSpec>(
         }
     }
 
-    manifest_files_match(model, target, &manifest).await
+    if downloader.verify_file_integrity {
+        manifest_files_match(model, target, &manifest).await
+    } else {
+        required_cache_files_exist(model, target).await
+    }
 }
 
 async fn manifest_files_match<M: ModelSpec>(
@@ -2459,6 +2474,39 @@ mod downloader_tests {
                 .await
                 .unwrap(),
             "{}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ready_cache_reuses_same_size_modified_file_when_integrity_verification_is_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = FakeDownloadClient::default();
+        let calls = Arc::clone(&client.calls);
+        let env = DownloadEnv {
+            orchion_model_source: None,
+            hf_endpoint: None,
+        };
+        let downloader = ModelDownloader::new(DownloadSource::HuggingFace)
+            .with_file_integrity_verification(false);
+
+        let path = downloader
+            .download_with_client(qwen_asr_06b(), dir.path(), &client, &env)
+            .await
+            .unwrap();
+        tokio::fs::write(path.join("config.json"), "[]")
+            .await
+            .unwrap();
+        downloader
+            .download_with_client(qwen_asr_06b(), dir.path(), &client, &env)
+            .await
+            .unwrap();
+
+        assert_eq!(&*calls.lock().unwrap(), &["huggingface"]);
+        assert_eq!(
+            tokio::fs::read_to_string(path.join("config.json"))
+                .await
+                .unwrap(),
+            "[]"
         );
     }
 

@@ -101,7 +101,7 @@ cargo run -p orchion-example-tts-preset --features cpu -- "Hello from Orchion" o
 
 - `[server]`: bind address, CORS allowed origins, upload limit, and PDF page/pixel/output limits. CORS defaults to all origins (`["*"]`).
 - `[activity]`: enable request activity and set the in-memory completed-history capacity (default `500`).
-- `[models]`: model directory, source, and global residency limit.
+- `[models]`: model directory, source, global residency limit, and file integrity verification. `verify_file_integrity` defaults to `false`; set it to `true` to verify reused model files against the SHA-256 values recorded in their manifest.
 - `[services.asr]`, `[services.tts]`, `[services.ocr]`, `[services.ocr-vl]`: service enablement, defaults, allowlists, device, and per-service residency. ASR batch audio uses `max_audio_duration`; streaming captions use `stream_target_segment` and `stream_max_segment`; sessions use `stream_idle_timeout` and `stream_max_duration`. TTS uses `max_length` and `max_reference_audio_duration`; OCR-VL uses `max_tokens`.
 - `[auth]`: optional API key.
 
