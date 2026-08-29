@@ -1,6 +1,6 @@
 use super::contract::{
-    ActivityEntry, ActivityEventPayload, ActivityOperation, ActivityOutcome, ActivityPage,
-    ActivityState, ActivitySummary, ActivityTransport,
+    ActivityEntry, ActivityError, ActivityEventPayload, ActivityOperation, ActivityOutcome,
+    ActivityPage, ActivityState, ActivitySummary, ActivityTransport,
 };
 use crate::application::ActivityPolicy;
 use orchion::ModelId;
@@ -183,6 +183,7 @@ impl ActivityHub {
             outcome: None,
             input_bytes,
             error_code: None,
+            error_message: None,
         };
         let active = ActiveEntry {
             entry: entry.clone(),
@@ -400,7 +401,7 @@ impl ActivityHub {
         id: u64,
         http_status: Option<u16>,
         outcome: ActivityOutcome,
-        error_code: Option<String>,
+        activity_error: Option<ActivityError>,
     ) {
         let mut state = self.inner.state.lock().expect("activity store poisoned");
         let Some(mut active) = state.active.remove(&id) else {
@@ -411,7 +412,8 @@ impl ActivityHub {
         active.entry.duration_ms = Some(duration_ms(active.started.elapsed()));
         active.entry.http_status = http_status;
         active.entry.outcome = Some(outcome);
-        active.entry.error_code = error_code;
+        active.entry.error_code = activity_error.as_ref().and_then(|error| error.code.clone());
+        active.entry.error_message = activity_error.and_then(|error| error.message);
         active.entry.address = None;
         active.entry.user_agent = None;
         let entry = active.entry;
@@ -451,9 +453,9 @@ impl ActivityContext {
             .update(self.id, |entry| entry.input_bytes = Some(input_bytes));
     }
 
-    pub(crate) fn complete_http(&self, status: u16, error_code: Option<String>) {
+    pub(crate) fn complete_http(&self, status: u16, activity_error: Option<ActivityError>) {
         self.hub
-            .complete(self.id, Some(status), http_outcome(status), error_code);
+            .complete(self.id, Some(status), http_outcome(status), activity_error);
     }
 
     pub(crate) fn cancel(&self) {
@@ -497,25 +499,25 @@ impl WebSocketActivity {
         self.complete(ActivityOutcome::Success, None);
     }
 
-    pub fn complete_error(&self, status: u16, error_code: Option<String>) {
-        self.complete(http_outcome(status), error_code);
+    pub(crate) fn complete_error(&self, status: u16, activity_error: Option<ActivityError>) {
+        self.complete(http_outcome(status), activity_error);
     }
 
-    pub fn complete_timeout(&self, error_code: Option<String>) {
-        self.complete(ActivityOutcome::Timeout, error_code);
+    pub(crate) fn complete_timeout(&self, activity_error: Option<ActivityError>) {
+        self.complete(ActivityOutcome::Timeout, activity_error);
     }
 
     pub fn complete_disconnected(&self) {
         self.complete(ActivityOutcome::Disconnected, None);
     }
 
-    fn complete(&self, outcome: ActivityOutcome, error_code: Option<String>) {
+    fn complete(&self, outcome: ActivityOutcome, activity_error: Option<ActivityError>) {
         if self.completed.swap(true, Ordering::AcqRel) {
             return;
         }
         self.context
             .hub
-            .complete(self.context.id, Some(101), outcome, error_code);
+            .complete(self.context.id, Some(101), outcome, activity_error);
     }
 }
 
@@ -705,7 +707,10 @@ mod tests {
         let hub = hub(10);
         let context = start(&hub);
         let activity = context.handoff_to_websocket();
-        activity.complete_timeout(Some("stream_idle_timeout".to_string()));
+        activity.complete_timeout(Some(ActivityError {
+            code: Some("stream_idle_timeout".to_string()),
+            message: Some("stream idle timeout".to_string()),
+        }));
         activity.complete_success();
         drop(activity);
 

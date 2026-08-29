@@ -163,6 +163,7 @@ mod tests {
     use super::*;
     use crate::api::http_audio::parse_timestamp_granularities;
     use crate::api::http_shared::multipart_file_suffix;
+    use crate::api::openai::ApiError;
     use crate::infrastructure::orchion::AppState;
     use crate::settings::ServerConfig;
     use axum::body::Body;
@@ -446,6 +447,55 @@ mod tests {
         assert!(activity["history"][0].get("user_agent").is_none());
         assert!(!serialized.contains("activity-secret-sentinel"));
         assert!(!serialized.contains("wrong-secret-sentinel"));
+    }
+
+    #[tokio::test]
+    async fn activity_retains_internal_error_details_for_server_errors() {
+        let app = router_with_ui_routes(
+            test_state(false, false),
+            Router::new().route(
+                "/v1/audio/speech",
+                post(|| async {
+                    Err::<(), ApiError>(ApiError::internal("model inference failed: sentinel"))
+                }),
+            ),
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/audio/speech")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let response_body = json_body(response).await;
+        assert_eq!(response_body["error"]["message"], "internal server error");
+        assert!(
+            !response_body
+                .to_string()
+                .contains("model inference failed: sentinel")
+        );
+
+        let activity = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/activity")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let activity = json_body(activity).await;
+
+        assert_eq!(activity["history"][0]["error_code"], "internal_error");
+        assert_eq!(
+            activity["history"][0]["error_message"],
+            "model inference failed: sentinel"
+        );
     }
 
     #[tokio::test]

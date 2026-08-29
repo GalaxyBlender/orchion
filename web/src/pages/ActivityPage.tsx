@@ -344,6 +344,11 @@ function ActivityTable({
                   <OutcomeBadge outcome={entry.outcome} />
                 )}
                 {entry.error_code && <small className="activity-error-code">{entry.error_code}</small>}
+                {entry.error_message && (
+                  <small className="activity-error-message" title={entry.error_message}>
+                    {entry.error_message}
+                  </small>
+                )}
               </td>
               {!live && (
                 <td data-label={t("activity.columns.status")} className="activity-mono">

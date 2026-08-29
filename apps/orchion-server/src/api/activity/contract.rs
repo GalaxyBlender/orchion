@@ -62,6 +62,14 @@ pub struct ActivityEntry {
     pub input_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ActivityError {
+    pub(crate) code: Option<String>,
+    pub(crate) message: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]

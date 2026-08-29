@@ -826,7 +826,8 @@
 .activity-address,
 .activity-user-agent,
 .activity-request-cell code,
-.activity-error-code {
+.activity-error-code,
+.activity-error-message {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -860,6 +861,13 @@
   margin-top: var(--space-1);
   color: var(--color-text-tertiary);
   font-family: var(--font-mono);
+}
+
+.activity-error-message {
+  display: block;
+  max-width: 140px;
+  margin-top: var(--space-1);
+  color: var(--color-text-secondary);
 }
 
 .activity-id {
@@ -1021,6 +1029,15 @@
   }
 
   .activity-error-code {
+    grid-column: 2;
+    justify-self: start;
+    max-width: none;
+    margin-top: 0;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .activity-error-message {
     grid-column: 2;
     justify-self: start;
     max-width: none;

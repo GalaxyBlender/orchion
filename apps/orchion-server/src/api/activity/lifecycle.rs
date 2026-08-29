@@ -1,4 +1,4 @@
-use super::contract::{ActivityOperation, ActivityTransport};
+use super::contract::{ActivityError, ActivityOperation, ActivityTransport};
 use super::store::{ActivityContext, ActivityHub, LiveRequestMetadata};
 use axum::body::{Body, Bytes};
 use axum::extract::connect_info::ConnectInfo;
@@ -10,9 +10,6 @@ use http_body::{Body as HttpBody, Frame, SizeHint};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-
-#[derive(Debug, Clone)]
-pub(crate) struct ActivityErrorCode(pub(crate) String);
 
 pub(crate) async fn track_activity(
     State(hub): State<ActivityHub>,
@@ -56,18 +53,15 @@ pub(crate) async fn track_activity(
         guard.disarm();
         return response;
     }
-    let error_code = response
-        .extensions()
-        .get::<ActivityErrorCode>()
-        .map(|code| code.0.clone());
+    let activity_error = response.extensions().get::<ActivityError>().cloned();
     guard.disarm();
-    track_response_body(response, context, error_code)
+    track_response_body(response, context, activity_error)
 }
 
 fn track_response_body(
     response: Response,
     context: ActivityContext,
-    error_code: Option<String>,
+    activity_error: Option<ActivityError>,
 ) -> Response {
     let status = response.status().as_u16();
     let content_length = response
@@ -76,7 +70,7 @@ fn track_response_body(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse().ok());
     if response.body().is_end_stream() || content_length == Some(0) {
-        context.complete_http(status, error_code);
+        context.complete_http(status, activity_error);
         return response;
     }
 
@@ -88,7 +82,7 @@ fn track_response_body(
         completion: Some(HttpResponseCompletion {
             context,
             status,
-            error_code,
+            activity_error,
             completed: false,
         }),
     };
@@ -194,14 +188,14 @@ impl HttpBody for ActivityBody {
 struct HttpResponseCompletion {
     context: ActivityContext,
     status: u16,
-    error_code: Option<String>,
+    activity_error: Option<ActivityError>,
     completed: bool,
 }
 
 impl HttpResponseCompletion {
     fn complete(mut self) {
         self.context
-            .complete_http(self.status, self.error_code.take());
+            .complete_http(self.status, self.activity_error.take());
         self.completed = true;
     }
 
@@ -395,7 +389,7 @@ mod tests {
             completion: Some(HttpResponseCompletion {
                 context,
                 status: 200,
-                error_code: None,
+                activity_error: None,
                 completed: false,
             }),
         };

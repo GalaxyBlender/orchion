@@ -27,6 +27,7 @@ export interface ActivityEntry {
   outcome?: ActivityOutcome;
   input_bytes?: number;
   error_code?: string;
+  error_message?: string;
 }
 
 export interface ActivitySummary {

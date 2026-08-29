@@ -131,6 +131,13 @@ impl ApiError {
     pub(crate) const fn status(&self) -> StatusCode {
         self.status
     }
+
+    pub(crate) fn activity_error(&self) -> crate::api::activity::ActivityError {
+        crate::api::activity::ActivityError {
+            code: self.error.code.clone(),
+            message: self.log_message.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -206,6 +213,7 @@ impl ModelObject {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let activity_error = self.activity_error();
         let log_message = self.log_message.clone();
         let (status, body) = self.into_status_body();
         if status.is_server_error() {
@@ -228,15 +236,8 @@ impl IntoResponse for ApiError {
                 "request rejected"
             );
         }
-        let activity_error_code = body
-            .error
-            .code
-            .clone()
-            .map(crate::api::activity::ActivityErrorCode);
         let mut response = (status, Json(body)).into_response();
-        if let Some(error_code) = activity_error_code {
-            response.extensions_mut().insert(error_code);
-        }
+        response.extensions_mut().insert(activity_error);
         response
     }
 }

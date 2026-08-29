@@ -82,17 +82,17 @@ pub(super) async fn send_stream_error(
     error: ApiError,
     activity: Option<&WebSocketActivity>,
 ) -> Result<(), axum::Error> {
+    let activity_error = error.activity_error();
     if let Some(activity) = activity {
-        let code = error.error.code.clone();
-        if code.as_deref() == Some("websocket_disconnected") {
+        let code = activity_error.code.as_deref();
+        if code == Some("websocket_disconnected") {
             activity.complete_disconnected();
         } else if code
-            .as_deref()
             .is_some_and(|code| code.contains("timeout") || code.contains("duration_exceeded"))
         {
-            activity.complete_timeout(code);
+            activity.complete_timeout(Some(activity_error));
         } else {
-            activity.complete_error(error.status().as_u16(), code);
+            activity.complete_error(error.status().as_u16(), Some(activity_error));
         }
     }
     let event = stream_error_event(&error);
