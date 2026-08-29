@@ -49,7 +49,7 @@ impl<'a> OcrClient<'a> {
 pub struct OcrRequest {
     pub filename: String,
     pub file_bytes: Vec<u8>,
-    pub model: Option<String>,
+    pub model: String,
     pub response_format: Option<OcrResponseFormat>,
     pub task: Option<OcrTask>,
     pub layout_model: Option<String>,
@@ -59,11 +59,11 @@ pub struct OcrRequest {
 impl OcrRequest {
     /// Creates an OCR request.
     #[must_use]
-    pub fn new(filename: impl Into<String>) -> Self {
+    pub fn new(filename: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
             filename: filename.into(),
             file_bytes: Vec::new(),
-            model: None,
+            model: model.into(),
             response_format: None,
             task: None,
             layout_model: None,
@@ -88,13 +88,6 @@ impl OcrRequest {
             ClientError::build_request(format!("failed to read OCR file: {error}"))
         })?;
         Ok(self)
-    }
-
-    /// Sets the optional OCR model.
-    #[must_use]
-    pub fn with_model(mut self, model: impl Into<String>) -> Self {
-        self.model = Some(model.into());
-        self
     }
 
     /// Sets the optional response format.
@@ -133,13 +126,33 @@ impl OcrRequest {
         if self.file_bytes.is_empty() {
             return Err(ClientError::build_request("file bytes must not be empty"));
         }
+        if self.model.trim().is_empty() {
+            return Err(ClientError::build_request("model must not be empty"));
+        }
+        if self
+            .layout_model
+            .as_ref()
+            .is_some_and(|layout_model| layout_model.trim().is_empty())
+        {
+            return Err(ClientError::build_request("layout model must not be empty"));
+        }
+        if matches!(
+            self.response_format,
+            Some(OcrResponseFormat::Markdown | OcrResponseFormat::Html)
+        ) && self.layout_model.is_none()
+        {
+            return Err(ClientError::build_request(
+                "layout model is required for markdown and html responses",
+            ));
+        }
+        if self.max_tokens == Some(0) {
+            return Err(ClientError::build_request(
+                "max tokens must be greater than 0",
+            ));
+        }
 
         let file = Part::bytes(self.file_bytes).file_name(self.filename);
-        let mut form = Form::new().part("file", file);
-
-        if let Some(model) = self.model {
-            form = form.text("model", model);
-        }
+        let mut form = Form::new().part("file", file).text("model", self.model);
 
         if let Some(response_format) = self.response_format {
             form = form.text("response_format", response_format.as_str());
@@ -158,6 +171,50 @@ impl OcrRequest {
         }
 
         Ok(form)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn structured_response_requires_layout_model() {
+        for format in [OcrResponseFormat::Markdown, OcrResponseFormat::Html] {
+            let error = OcrRequest::new("document.png", "Acme/OCR")
+                .with_file_bytes(vec![1])
+                .with_response_format(format)
+                .into_form()
+                .unwrap_err();
+
+            assert!(error.to_string().contains("layout model is required"));
+        }
+    }
+
+    #[test]
+    fn blank_layout_model_is_rejected() {
+        let error = OcrRequest::new("document.png", "Acme/OCR")
+            .with_file_bytes(vec![1])
+            .with_layout_model("  ")
+            .into_form()
+            .unwrap_err();
+
+        assert!(error.to_string().contains("layout model must not be empty"));
+    }
+
+    #[test]
+    fn zero_max_tokens_is_rejected() {
+        let error = OcrRequest::new("document.png", "Acme/OCR")
+            .with_file_bytes(vec![1])
+            .with_max_tokens(0)
+            .into_form()
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("max tokens must be greater than 0")
+        );
     }
 }
 

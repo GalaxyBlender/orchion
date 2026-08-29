@@ -8,6 +8,7 @@ use crate::api::openai::{
     TranscriptionVerboseJson,
 };
 use crate::application::model_lifecycle::ModelStatus;
+use orchion::OcrTask;
 use orchion::docs::PdfImageFormat;
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi, ToSchema};
@@ -16,7 +17,7 @@ use utoipa_swagger_ui::SwaggerUi;
 #[derive(OpenApi)]
 #[openapi(
     paths(healthz_doc, list_models_doc, list_model_statuses_doc, load_model_doc, unload_model_doc, create_speech_doc, create_transcription_doc, create_ocr_doc, create_pdf_images_doc, list_activity_doc, activity_events_doc),
-    components(schemas(SpeechRequest, ErrorBody, ModelList, ModelStatusList, ModelStatus, ModelControlRequest, TranscriptionJson, TranscriptionVerboseJson, OcrJsonResponse, OcrApiFormat, PdfImageFormat, PdfImagesMultipartRequest, ActivityPage, ActivityEntry, ActivitySummary, ActivityState, ActivityTransport, ActivityOperation, ActivityOutcome)),
+    components(schemas(SpeechRequest, ErrorBody, ModelList, ModelStatusList, ModelStatus, ModelControlRequest, TranscriptionJson, TranscriptionVerboseJson, OcrJsonResponse, OcrApiFormat, OcrTask, OcrMultipartRequest, PdfImageFormat, PdfImagesMultipartRequest, ActivityPage, ActivityEntry, ActivitySummary, ActivityState, ActivityTransport, ActivityOperation, ActivityOutcome)),
     modifiers(&BearerAuth),
     tags(
         (name = "audio", description = "OpenAI-compatible audio APIs"),
@@ -59,6 +60,21 @@ struct PdfImagesMultipartRequest {
     scale: Option<f32>,
 }
 
+#[derive(ToSchema)]
+#[allow(dead_code)]
+struct OcrMultipartRequest {
+    #[schema(value_type = String, format = Binary, content_media_type = "application/octet-stream")]
+    file: String,
+    #[schema(example = "PaddlePaddle/PP-OCRv6_medium")]
+    model: String,
+    response_format: Option<OcrApiFormat>,
+    task: Option<OcrTask>,
+    #[schema(example = "PaddlePaddle/PP-DocLayoutV3")]
+    layout_model: Option<String>,
+    #[schema(minimum = 1)]
+    max_tokens: Option<usize>,
+}
+
 #[must_use]
 pub fn swagger_ui() -> SwaggerUi {
     SwaggerUi::new("/docs").url("/openapi/v1.json", ApiDoc::openapi())
@@ -76,6 +92,23 @@ mod tests {
         assert!(spec["paths"]["/v1/ocr"]["post"].is_object());
         assert!(spec["components"]["schemas"]["OcrJsonResponse"].is_object());
         assert!(spec["components"]["schemas"]["OcrApiFormat"].is_object());
+        assert_eq!(
+            spec["components"]["schemas"]["OcrMultipartRequest"]["required"],
+            serde_json::json!(["file", "model"])
+        );
+        assert_eq!(
+            spec["paths"]["/v1/ocr"]["post"]["requestBody"]["content"]["multipart/form-data"]["schema"]
+                ["$ref"],
+            "#/components/schemas/OcrMultipartRequest"
+        );
+        assert_eq!(
+            spec["components"]["schemas"]["OcrTask"]["enum"],
+            serde_json::json!(["ocr", "table", "formula", "chart", "spotting", "seal"])
+        );
+        assert_eq!(
+            spec["components"]["schemas"]["OcrMultipartRequest"]["properties"]["max_tokens"]["minimum"],
+            1
+        );
     }
 
     #[test]
@@ -353,9 +386,9 @@ fn create_transcription_doc() {}
     post,
     path = "/v1/ocr",
     request_body(
-        content = String,
+        content = OcrMultipartRequest,
         content_type = "multipart/form-data",
-        description = "POST /v1/ocr accepts multipart/form-data with file, optional model, response_format, task, layout_model, and max_tokens fields. Response formats are json, text, markdown, and html. Model IDs use {vendor}/{name}. Traditional metal maps to CoreML; OCR-VL metal maps to Candle Metal."
+        description = "POST /v1/ocr accepts multipart/form-data with required file and model fields plus optional response_format, task, layout_model, and max_tokens fields. layout_model is required for markdown and html responses. Response formats are json, text, markdown, and html. Model IDs use {vendor}/{name}. Traditional metal maps to CoreML; OCR-VL metal maps to Candle Metal."
     ),
     responses(
         (status = 200, description = "OCR response. JSON requests return OcrJsonResponse; text requests return text/plain; markdown requests return text/markdown; html requests return text/html.", body = OcrJsonResponse),

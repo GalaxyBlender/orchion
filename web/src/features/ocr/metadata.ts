@@ -44,7 +44,7 @@ export const ocrParameterMetadata: ParameterMetadata[] = [
     name: "layout_model",
     label: "Layout model",
     defaultValue: "",
-    description: "Optional OCR-VL layout detector model.",
+    description: "Layout detector model; required for Markdown and HTML responses.",
     required: false,
     supported: true,
     notice: "Only configured layout models returned by /v1/models can be selected.",

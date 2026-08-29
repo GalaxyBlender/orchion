@@ -78,7 +78,7 @@ impl ModelProvisioner<OcrModel> for FakeProvisioner {
 }
 
 #[tokio::test]
-async fn available_model_download_failure_blocks_startup() {
+async fn non_default_model_download_failure_does_not_block_startup() {
     let temp_dir = tempfile::tempdir().unwrap();
     let config = ServerConfig::from_toml_str(
         r#"
@@ -92,17 +92,17 @@ available_models = ["Qwen/Qwen3-ASR-0.6B", "Qwen/Qwen3-ASR-1.7B"]
     .unwrap();
     let provisioner = Arc::new(FakeProvisioner::failing("Qwen/Qwen3-ASR-1.7B"));
 
-    let Err(error) = AppState::load_with_provisioner(config, Arc::clone(&provisioner)).await else {
-        panic!("available model failure should block startup");
-    };
+    AppState::load_with_provisioner(config, Arc::clone(&provisioner))
+        .await
+        .unwrap();
 
     let calls = provisioner.calls();
-    assert!(calls.contains(&"Qwen/Qwen3-ASR-1.7B".to_string()));
-    assert!(format!("{error:#}").contains("injected download failure for Qwen/Qwen3-ASR-1.7B"));
+    assert!(calls.contains(&"Qwen/Qwen3-ASR-0.6B".to_string()));
+    assert!(!calls.contains(&"Qwen/Qwen3-ASR-1.7B".to_string()));
 }
 
 #[tokio::test]
-async fn all_available_asr_models_are_provisioned_at_startup() {
+async fn only_default_asr_model_is_provisioned_at_startup() {
     let temp_dir = tempfile::tempdir().unwrap();
     let config = ServerConfig::from_toml_str(
         r#"
@@ -122,16 +122,17 @@ available_models = ["Qwen/Qwen3-ASR-0.6B", "Qwen/Qwen3-ASR-1.7B"]
 
     let calls = provisioner.calls();
     assert!(calls.contains(&"Qwen/Qwen3-ASR-0.6B".to_string()));
-    assert!(calls.contains(&"Qwen/Qwen3-ASR-1.7B".to_string()));
+    assert!(!calls.contains(&"Qwen/Qwen3-ASR-1.7B".to_string()));
 }
 
 #[tokio::test]
-async fn all_available_ocr_models_are_provisioned_at_startup() {
+async fn only_default_ocr_model_is_provisioned_at_startup() {
     let temp_dir = tempfile::tempdir().unwrap();
     let config = ServerConfig::from_toml_str(
         r#"
 [services.ocr]
 enabled = true
+default_model = "PaddlePaddle/PP-OCRv6_tiny"
 available_models = ["PaddlePaddle/PP-OCRv6_tiny", "PaddlePaddle/PP-OCRv6_small"]
 "#,
         &temp_dir.path().join("orchion-server"),
@@ -145,7 +146,7 @@ available_models = ["PaddlePaddle/PP-OCRv6_tiny", "PaddlePaddle/PP-OCRv6_small"]
 
     let calls = provisioner.calls();
     assert!(calls.contains(&"PaddlePaddle/PP-OCRv6_tiny".to_string()));
-    assert!(calls.contains(&"PaddlePaddle/PP-OCRv6_small".to_string()));
+    assert!(!calls.contains(&"PaddlePaddle/PP-OCRv6_small".to_string()));
 }
 
 #[tokio::test]

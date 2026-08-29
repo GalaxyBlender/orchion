@@ -4,6 +4,8 @@
 
 Orchion 通过 `POST /v1/ocr` 和 `multipart/form-data` 提供传统 OCR 与 OCR-VL 能力。
 
+服务端的 `default_model` 和 `layout_default_model` 配置仅控制启动预置。请求仍须显式传入 `model`，结构化响应还须显式传入 `layout_model`。
+
 ## 传统 OCR
 
 ```sh
@@ -21,6 +23,7 @@ curl -X POST http://127.0.0.1:9090/v1/ocr \
 curl -X POST http://127.0.0.1:9090/v1/ocr \
   -F file=@document.png \
   -F model=PaddlePaddle/PaddleOCR-VL-1.6 \
+  -F layout_model=PaddlePaddle/PP-DocLayoutV3 \
   -F response_format=markdown
 ```
 
@@ -29,8 +32,8 @@ curl -X POST http://127.0.0.1:9090/v1/ocr \
 常用字段：
 
 - `file`：图片或文档图片文件。
-- `model`：可选模型 ID，格式为 `{vendor}/{name}`。
+- `model`：必填模型 ID，格式为 `{vendor}/{name}`。
 - `response_format`：`json`、`text`、`markdown` 或 `html`。
 - `task`：可选 OCR-VL 任务。
-- `layout_model`：可选 OCR-VL 版面模型。
+- `layout_model`：版面模型；`markdown` 和 `html` 响应必须显式传入。
 - `max_tokens`：可选 OCR-VL 生成长度上限。

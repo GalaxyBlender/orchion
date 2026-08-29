@@ -4,6 +4,8 @@
 
 Orchion exposes traditional OCR and OCR-VL through `POST /v1/ocr` with `multipart/form-data`.
 
+Server `default_model` and `layout_default_model` settings control startup provisioning only. Requests must still provide `model`, and structured responses must provide `layout_model`.
+
 ## Traditional OCR
 
 ```sh
@@ -21,6 +23,7 @@ Traditional OCR returns structured text regions and plain text.
 curl -X POST http://127.0.0.1:9090/v1/ocr \
   -F file=@document.png \
   -F model=PaddlePaddle/PaddleOCR-VL-1.6 \
+  -F layout_model=PaddlePaddle/PP-DocLayoutV3 \
   -F response_format=markdown
 ```
 
@@ -29,8 +32,8 @@ OCR-VL supports document-image tasks such as `ocr`, `table`, `formula`, `chart`,
 Useful fields:
 
 - `file`: image or document image file.
-- `model`: optional model ID in `{vendor}/{name}` format.
+- `model`: required model ID in `{vendor}/{name}` format.
 - `response_format`: `json`, `text`, `markdown`, or `html`.
 - `task`: optional OCR-VL task.
-- `layout_model`: optional OCR-VL layout model.
+- `layout_model`: layout model; required for `markdown` and `html` responses.
 - `max_tokens`: optional OCR-VL generation limit.

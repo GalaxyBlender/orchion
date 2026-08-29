@@ -324,7 +324,7 @@ const resources = {
         modelPlaceholder: "Select or enter OCR model...",
         responseFormatDescription: "Controls whether the OCR response is shown as JSON, plain text, Markdown, or HTML.",
         taskDescription: "OCR-VL task hint. Traditional OCR accepts only the OCR task.",
-        layoutModelDescription: "Optional layout model for OCR-VL document parsing, for example PaddlePaddle/PP-DocLayoutV3.",
+        layoutModelDescription: "Layout model for document parsing. Required for Markdown and HTML responses.",
         layoutModelPlaceholder: "Select layout model...",
         maxTokensDescription: "Optional positive OCR-VL generation token limit.",
         maxTokensPlaceholder: "1024",
@@ -343,6 +343,7 @@ const resources = {
         resultEmpty: "Submit an OCR request to see the response here.",
         missingFile: "Select an image before submitting.",
         missingModel: "Model is required before submitting.",
+        missingLayoutModel: "Layout model is required for Markdown and HTML responses.",
         dropZoneText: "Drag & drop an image here, or click to select",
         dropZoneActive: "Drop the image here...",
         metadata: {
@@ -350,7 +351,7 @@ const resources = {
           model: ["Model", "OCR or OCR-VL model identifier."],
           response_format: ["Response format", "Response shape returned by the backend."],
           task: ["Task", "OCR-VL task hint such as ocr, table, formula, chart, spotting, or seal.", "Traditional OCR accepts only the ocr task. Other tasks require OCR-VL models."],
-          layout_model: ["Layout model", "Optional OCR-VL layout detector model.", "Only configured layout models returned by /v1/models can be selected."],
+          layout_model: ["Layout model", "Required for Markdown and HTML responses.", "Only configured layout models returned by /v1/models can be selected."],
           max_tokens: ["Max tokens", "Optional OCR-VL generation token limit.", "This parameter is used by OCR-VL generation and is ignored by traditional OCR."],
         },
         summary: {
@@ -863,7 +864,7 @@ const resources = {
         modelPlaceholder: "选择或输入 OCR 模型...",
         responseFormatDescription: "控制 OCR 响应以 JSON、纯文本、Markdown 或 HTML 显示。",
         taskDescription: "OCR-VL 任务提示。传统 OCR 仅接受 ocr 任务。",
-        layoutModelDescription: "可选的 OCR-VL 文档解析布局模型，例如 PaddlePaddle/PP-DocLayoutV3。",
+        layoutModelDescription: "用于文档解析的布局模型；Markdown 和 HTML 响应必须选择。",
         layoutModelPlaceholder: "选择布局模型...",
         maxTokensDescription: "可选的正数 OCR-VL 生成 token 上限。",
         maxTokensPlaceholder: "1024",
@@ -882,6 +883,7 @@ const resources = {
         resultEmpty: "提交 OCR 请求后将在此处显示响应。",
         missingFile: "提交前请选择图片。",
         missingModel: "提交前必须填写模型。",
+        missingLayoutModel: "Markdown 和 HTML 响应必须选择布局模型。",
         dropZoneText: "将图片拖放到此处，或点击选择",
         dropZoneActive: "拖放图片到此处...",
         metadata: {
@@ -889,7 +891,7 @@ const resources = {
           model: ["模型", "OCR 或 OCR-VL 模型标识。"],
           response_format: ["响应格式", "后端返回的响应形态。"],
           task: ["任务", "OCR-VL 任务提示，例如 ocr、table、formula、chart、spotting 或 seal。", "传统 OCR 仅接受 ocr 任务，其他任务需要 OCR-VL 模型。"],
-          layout_model: ["布局模型", "可选的 OCR-VL 布局检测模型。", "只能选择 /v1/models 返回的已配置布局模型。"],
+          layout_model: ["布局模型", "Markdown 和 HTML 响应必须选择。", "只能选择 /v1/models 返回的已配置布局模型。"],
           max_tokens: ["最大 token", "可选的 OCR-VL 生成 token 上限。", "该参数用于 OCR-VL 生成，传统 OCR 会忽略它。"],
         },
         summary: {
@@ -1397,7 +1399,7 @@ const resources = {
         modelPlaceholder: "選擇或輸入 OCR 模型...",
         responseFormatDescription: "控制 OCR 回應以 JSON、純文字、Markdown 或 HTML 顯示。",
         taskDescription: "OCR-VL 任務提示。傳統 OCR 僅接受 ocr 任務。",
-        layoutModelDescription: "選填的 OCR-VL 文件解析佈局模型，例如 PaddlePaddle/PP-DocLayoutV3。",
+        layoutModelDescription: "用於文件解析的佈局模型；Markdown 和 HTML 回應必須選擇。",
         layoutModelPlaceholder: "選擇佈局模型...",
         maxTokensDescription: "選填的正數 OCR-VL 生成 token 上限。",
         maxTokensPlaceholder: "1024",
@@ -1416,6 +1418,7 @@ const resources = {
         resultEmpty: "提交 OCR 請求後將在此處顯示回應。",
         missingFile: "提交前請選擇圖片。",
         missingModel: "提交前必須填寫模型。",
+        missingLayoutModel: "Markdown 和 HTML 回應必須選擇佈局模型。",
         dropZoneText: "將圖片拖放到此處，或點擊選擇",
         dropZoneActive: "拖放圖片到此處...",
         metadata: {
@@ -1423,7 +1426,7 @@ const resources = {
           model: ["模型", "OCR 或 OCR-VL 模型識別。"],
           response_format: ["回應格式", "後端返回的回應形態。"],
           task: ["任務", "OCR-VL 任務提示，例如 ocr、table、formula、chart、spotting 或 seal。", "傳統 OCR 僅接受 ocr 任務，其他任務需要 OCR-VL 模型。"],
-          layout_model: ["佈局模型", "選填的 OCR-VL 佈局偵測模型。", "只能選擇 /v1/models 返回的已配置佈局模型。"],
+          layout_model: ["佈局模型", "Markdown 和 HTML 回應必須選擇。", "只能選擇 /v1/models 返回的已配置佈局模型。"],
           max_tokens: ["最大 token", "選填的 OCR-VL 生成 token 上限。", "該參數用於 OCR-VL 生成，傳統 OCR 會忽略它。"],
         },
         summary: {

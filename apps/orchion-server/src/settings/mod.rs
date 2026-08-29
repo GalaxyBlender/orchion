@@ -144,13 +144,6 @@ impl OcrServiceSection {
     pub fn active(&self) -> bool {
         self.enabled && !self.available_models.is_empty()
     }
-
-    #[must_use]
-    pub fn effective_default_model(&self) -> Option<&ModelId> {
-        self.default_model
-            .as_ref()
-            .or_else(|| self.available_models.first())
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,13 +165,6 @@ impl OcrVlServiceSection {
     #[must_use]
     pub fn active(&self) -> bool {
         self.enabled && !self.available_models.is_empty()
-    }
-
-    #[must_use]
-    pub fn effective_default_model(&self) -> Option<&ModelId> {
-        self.default_model
-            .as_ref()
-            .or_else(|| self.available_models.first())
     }
 }
 
@@ -279,11 +265,6 @@ pub enum ConfigError {
         category: &'static str,
         section: &'static str,
         default: String,
-    },
-    #[error("invalid {section}.format `{format}`: layout_default_model is required")]
-    StructuredOcrFormatWithoutLayout {
-        section: &'static str,
-        format: &'static str,
     },
     #[error("invalid {section}.format `{format}`: format is not supported by this service")]
     UnsupportedOcrDefaultFormat {
@@ -788,15 +769,6 @@ fn parse_ocr_service(
             format: "html",
         });
     }
-    if service.enabled
-        && service.format == OcrResponseFormat::Markdown
-        && service.layout_default_model.is_none()
-    {
-        return Err(ConfigError::StructuredOcrFormatWithoutLayout {
-            section: "services.ocr",
-            format: "markdown",
-        });
-    }
     Ok(service)
 }
 
@@ -872,22 +844,6 @@ fn parse_ocr_vl_service(
         service.layout_default_model.as_ref(),
         &service.layout_available_models,
     )?;
-    if service.enabled
-        && matches!(
-            service.format,
-            OcrResponseFormat::Markdown | OcrResponseFormat::Html
-        )
-        && service.layout_default_model.is_none()
-    {
-        return Err(ConfigError::StructuredOcrFormatWithoutLayout {
-            section: "services.ocr-vl",
-            format: match service.format {
-                OcrResponseFormat::Markdown => "markdown",
-                OcrResponseFormat::Html => "html",
-                OcrResponseFormat::Json | OcrResponseFormat::Text => unreachable!(),
-            },
-        });
-    }
     Ok(service)
 }
 

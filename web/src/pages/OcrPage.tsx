@@ -109,6 +109,10 @@ export function OcrPage() {
       showValidationError(t("ocr.missingModel"));
       return;
     }
+    if ((form.responseFormat === "markdown" || form.responseFormat === "html") && form.layoutModel.trim() === "") {
+      showValidationError(t("ocr.missingLayoutModel"));
+      return;
+    }
 
     setValidationError("");
     setIsSubmitting(true);

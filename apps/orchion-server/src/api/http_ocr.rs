@@ -72,6 +72,13 @@ where
         }
     }
 
+    let model = model.ok_or_else(|| {
+        ApiError::invalid_request(
+            "`model` is required",
+            Some("model"),
+            Some("missing_required_parameter"),
+        )
+    })?;
     let (image_file, image_bytes) = image_file.ok_or_else(|| {
         ApiError::invalid_request(
             "`file` is required",
@@ -88,11 +95,7 @@ where
     }
     if let Some(Extension(activity)) = &activity {
         activity.set_input_bytes(image_bytes);
-        if let Ok(choice) = resolve_service_choice(
-            &state.ocr_policy(),
-            model.as_deref(),
-            response_format.map(OcrResponseFormat::from),
-        ) {
+        if let Ok(choice) = resolve_service_choice(&state.ocr_policy(), &model) {
             activity.set_model(choice.model().to_string());
         }
     }

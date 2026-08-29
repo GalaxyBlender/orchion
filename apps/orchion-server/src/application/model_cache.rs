@@ -1,6 +1,7 @@
 use super::mark_owned_operation_dispatched;
 use super::resource_policy::InferenceLimiter;
 use orchion::{Asr, AsrModel, ModelDownloader, ModelSpec, Ocr, OcrModel, Tts, TtsModel};
+use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::ops::Deref;
@@ -23,7 +24,7 @@ pub trait ModelProvisioner<M>: Send + Sync {
 pub(crate) trait CacheTracker: Send + Sync {
     fn loaded_len(&self) -> BoxFuture<'_, usize>;
     fn lru_entry(&self) -> BoxFuture<'_, Option<TrackedLoadedModel>>;
-    fn evict_tracked(&self, key: String) -> BoxFuture<'_, bool>;
+    fn evict_tracked(&self, key: Box<dyn Any + Send + Sync>) -> BoxFuture<'_, bool>;
     fn cache_id(&self) -> &'static str;
     fn residency_domain(&self) -> ResidencyDomain;
     fn clone_tracker(&self) -> Arc<dyn CacheTracker>;
@@ -33,10 +34,9 @@ pub(crate) trait CacheTrackerSet {
     fn into_trackers(self, target: &dyn CacheTracker) -> Vec<Arc<dyn CacheTracker>>;
 }
 
-#[derive(Debug, Clone)]
 pub(crate) struct TrackedLoadedModel {
     cache_id: &'static str,
-    key: String,
+    key: Box<dyn Any + Send + Sync>,
     last_used: Instant,
 }
 
@@ -1020,6 +1020,87 @@ where
             .map_err(|error| anyhow::anyhow!("model unload task failed: {error:#}"))?
     }
 
+    pub(crate) async fn unload_many(&self, models: Vec<M>) -> anyhow::Result<Option<bool>> {
+        let cache = self.clone();
+        tokio::spawn(async move { cache.unload_many_owned(models).await })
+            .await
+            .map_err(|error| anyhow::anyhow!("model unload task failed: {error:#}"))?
+    }
+
+    async fn unload_many_owned(&self, models: Vec<M>) -> anyhow::Result<Option<bool>> {
+        let available = self.inner.lock().await.available.clone();
+        let mut seen = HashSet::new();
+        let models = models
+            .into_iter()
+            .filter(|model| seen.insert(model.clone()))
+            .filter(|model| available.contains(model))
+            .collect::<Vec<_>>();
+        if models.is_empty() {
+            return Ok(None);
+        }
+
+        loop {
+            let mut changes = self.residency.subscribe();
+            let mut load_guards = Vec::with_capacity(models.len());
+            for model in &models {
+                let loading = self
+                    .loading_mutex(model)
+                    .await
+                    .expect("model availability was checked");
+                load_guards.push(loading.lock_owned().await);
+            }
+            let mut state = self.inner.lock().await;
+            if models.iter().any(|model| {
+                state.draining.contains(model)
+                    || state.retiring.contains(model)
+                    || self
+                        .pending_loads
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .contains(model)
+            }) {
+                drop(state);
+                drop(load_guards);
+                changes
+                    .changed()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("model residency domain closed"))?;
+                continue;
+            }
+            state.draining.extend(models.iter().cloned());
+            drop(state);
+            drop(load_guards);
+            break;
+        }
+
+        loop {
+            let mut changes = self.residency.subscribe();
+            let mut state = self.inner.lock().await;
+            if models
+                .iter()
+                .filter_map(|model| state.loaded.get(model))
+                .all(|loaded| !loaded.is_active())
+            {
+                let retired = models
+                    .iter()
+                    .filter_map(|model| state.retire(model).map(|loaded| (model.clone(), loaded)))
+                    .collect::<Vec<_>>();
+                for model in &models {
+                    state.draining.remove(model);
+                }
+                drop(state);
+                let retired_any = !retired.is_empty();
+                self.destroy_retired(retired, "explicit request").await?;
+                return Ok(Some(retired_any));
+            }
+            drop(state);
+            changes
+                .changed()
+                .await
+                .map_err(|_| anyhow::anyhow!("model residency domain closed"))?;
+        }
+    }
+
     async fn unload_owned(&self, model: M) -> anyhow::Result<Option<bool>> {
         if !self.is_available(&model).await {
             return Ok(None);
@@ -1105,24 +1186,23 @@ where
                 .min_by_key(|(_, loaded)| loaded.last_used())
                 .map(|(model, loaded)| TrackedLoadedModel {
                     cache_id: self.cache_id,
-                    key: model.huggingface_repo().to_string(),
+                    key: Box::new(model.clone()),
                     last_used: loaded.last_used(),
                 })
         })
     }
 
-    fn evict_tracked(&self, key: String) -> BoxFuture<'_, bool> {
+    fn evict_tracked(&self, key: Box<dyn Any + Send + Sync>) -> BoxFuture<'_, bool> {
         Box::pin(async move {
+            let Ok(model) = key.downcast::<M>() else {
+                return false;
+            };
+            let model = *model;
             let retired = {
                 let mut state = self.inner.lock().await;
-                let Some(model) = state
-                    .loaded
-                    .keys()
-                    .find(|model| model.huggingface_repo() == key)
-                    .cloned()
-                else {
+                if !state.loaded.contains_key(&model) {
                     return false;
-                };
+                }
                 if state.draining.contains(&model)
                     || state.loaded.get(&model).is_some_and(LoadedModel::is_active)
                 {
@@ -1240,7 +1320,7 @@ where
 mod tests {
     use super::*;
     use crate::application::resource_policy::ResourcePolicy;
-    use orchion::{KnownOcrModel, OcrModel};
+    use orchion::{KnownOcrModel, ModelCategory, OcrModel};
     use std::sync::Condvar;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::sync::Notify;
@@ -1328,6 +1408,30 @@ mod tests {
         tts_model("Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    struct CompositeModel {
+        primary: AsrModel,
+        variant: u8,
+    }
+
+    impl ModelSpec for CompositeModel {
+        fn category(&self) -> ModelCategory {
+            self.primary.category()
+        }
+
+        fn huggingface_repo(&self) -> &str {
+            self.primary.huggingface_repo()
+        }
+
+        fn modelscope_repo(&self) -> &str {
+            self.primary.modelscope_repo()
+        }
+
+        fn required_files(&self) -> &'static [&'static str] {
+            self.primary.required_files()
+        }
+    }
+
     fn asr_cache(max_loaded: usize, idle_timeout: Duration) -> ModelCache<AsrModel, usize> {
         ModelCache::new(
             "asr",
@@ -1336,6 +1440,48 @@ mod tests {
             max_loaded,
             PathBuf::from("models"),
         )
+    }
+
+    #[tokio::test]
+    async fn tracker_evicts_the_exact_composite_key_when_repositories_match() {
+        let first = CompositeModel {
+            primary: qwen_asr_06b(),
+            variant: 1,
+        };
+        let second = CompositeModel {
+            primary: qwen_asr_06b(),
+            variant: 2,
+        };
+        let cache = ModelCache::new(
+            "composite",
+            vec![first.clone(), second.clone()],
+            Duration::from_mins(1),
+            2,
+            PathBuf::from("models"),
+        );
+        drop(
+            cache
+                .get_or_load(first.clone(), |_, _| async { Ok(1) })
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        drop(
+            cache
+                .get_or_load(second.clone(), |_, _| async { Ok(2) })
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+
+        let lru = cache.lru_entry().await.unwrap();
+        assert_eq!(
+            lru.key.downcast_ref::<CompositeModel>().unwrap().variant,
+            first.variant
+        );
+        assert!(cache.evict_tracked(lru.key).await);
+        assert!(!cache.is_loaded(first).await);
+        assert!(cache.is_loaded(second).await);
     }
 
     fn tts_cache(max_loaded: usize, idle_timeout: Duration) -> ModelCache<TtsModel, usize> {
@@ -1626,6 +1772,52 @@ mod tests {
         );
         assert_eq!(cache.unload(model.clone()).await.unwrap(), Some(true));
         assert_eq!(cache.unload(model).await.unwrap(), Some(false));
+    }
+
+    #[tokio::test]
+    async fn unload_many_fences_every_model_until_the_family_is_retired() {
+        let cache = asr_cache(2, Duration::from_mins(1));
+        let first = qwen_asr_06b();
+        let second = qwen_asr_17b();
+        drop(
+            cache
+                .get_or_load(first.clone(), |_, _| async { Ok(1) })
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        let active_second = cache
+            .get_or_load(second.clone(), |_, _| async { Ok(2) })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let unload = tokio::spawn({
+            let cache = cache.clone();
+            let first = first.clone();
+            let second = second.clone();
+            async move { cache.unload_many(vec![first, second]).await.unwrap() }
+        });
+        wait_for_status(&cache, &first, ModelResidencyStatus::Unloading).await;
+        let reload = tokio::spawn({
+            let cache = cache.clone();
+            let first = first.clone();
+            async move {
+                cache
+                    .get_or_load(first, |_, _| async { Ok(3) })
+                    .await
+                    .unwrap()
+                    .unwrap()
+            }
+        });
+        tokio::task::yield_now().await;
+
+        assert!(!unload.is_finished());
+        assert!(!reload.is_finished());
+        drop(active_second);
+
+        assert_eq!(unload.await.unwrap(), Some(true));
+        assert_eq!(*reload.await.unwrap(), 3);
     }
 
     #[tokio::test]

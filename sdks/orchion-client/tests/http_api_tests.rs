@@ -496,9 +496,8 @@ async fn create_ocr_posts_multipart_and_decodes_json() {
         .await;
 
     let client = Client::new(server.uri()).unwrap();
-    let request = OcrRequest::new("image.png")
-        .with_file_bytes(vec![137, 80, 78, 71])
-        .with_model("PaddlePaddle/PP-OCRv6_tiny");
+    let request = OcrRequest::new("image.png", "PaddlePaddle/PP-OCRv6_tiny")
+        .with_file_bytes(vec![137, 80, 78, 71]);
 
     let response = client.ocr().recognize(request).await.unwrap();
 

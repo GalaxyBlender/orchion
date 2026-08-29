@@ -296,7 +296,23 @@ available_models = ["PaddlePaddle/PP-OCRv6_tiny"]
 }
 
 #[test]
-fn active_ocr_without_an_explicit_default_uses_the_first_available_model() {
+fn active_ocr_accepts_multiple_layout_models() {
+    let config = ServerConfig::from_toml_str(
+        r#"
+[services.ocr]
+enabled = true
+available_models = ["PaddlePaddle/PP-OCRv6_tiny"]
+layout_available_models = ["PaddlePaddle/PP-DocLayoutV3", "Acme/Other-Layout"]
+"#,
+        std::path::Path::new("/tmp/orchion-server"),
+    )
+    .unwrap();
+
+    assert_eq!(config.services.ocr.layout_available_models.len(), 2);
+}
+
+#[test]
+fn active_ocr_without_an_explicit_default_has_no_startup_model() {
     let config = ServerConfig::from_toml_str(
         r#"
 [services.ocr]
@@ -307,10 +323,7 @@ available_models = ["PaddlePaddle/PP-OCRv6_tiny", "PaddlePaddle/PP-OCRv6_small"]
     )
     .unwrap();
 
-    assert_eq!(
-        config.services.ocr.effective_default_model(),
-        config.services.ocr.available_models.first()
-    );
+    assert_eq!(config.services.ocr.default_model, None);
 }
 
 #[test]
@@ -376,8 +389,8 @@ format = "html"
 }
 
 #[test]
-fn enabled_traditional_ocr_markdown_requires_default_layout() {
-    let error = ServerConfig::from_toml_str(
+fn enabled_traditional_ocr_markdown_does_not_require_a_startup_layout() {
+    let config = ServerConfig::from_toml_str(
         r#"
 [services.ocr]
 enabled = true
@@ -386,15 +399,9 @@ format = "markdown"
 "#,
         std::path::Path::new("/tmp/orchion-server"),
     )
-    .unwrap_err();
+    .unwrap();
 
-    assert!(matches!(
-        error,
-        ConfigError::StructuredOcrFormatWithoutLayout {
-            section: "services.ocr",
-            format: "markdown"
-        }
-    ));
+    assert_eq!(config.services.ocr.layout_default_model, None);
 }
 
 #[test]
@@ -459,8 +466,8 @@ max_pixels = 0
 }
 
 #[test]
-fn active_ocr_vl_structured_format_requires_a_default_layout_model() {
-    let error = ServerConfig::from_toml_str(
+fn active_ocr_vl_structured_format_does_not_require_a_startup_layout() {
+    let config = ServerConfig::from_toml_str(
         r#"
 [services.ocr-vl]
 enabled = true
@@ -470,10 +477,9 @@ format = "markdown"
 "#,
         std::path::Path::new("/tmp/orchion-server"),
     )
-    .unwrap_err();
+    .unwrap();
 
-    assert!(error.to_string().contains("layout_default_model"));
-    assert!(error.to_string().contains("markdown"));
+    assert_eq!(config.services.ocr_vl.layout_default_model, None);
 }
 
 #[test]

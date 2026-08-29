@@ -930,7 +930,32 @@ async fn ocr_rejects_images_above_configured_pixel_limit_before_model_load() {
 }
 
 #[tokio::test]
-async fn traditional_ocr_markdown_uses_configured_default_layout_model() {
+async fn ocr_requires_an_explicit_model() {
+    let boundary = "orchion-ocr-model-required";
+    let body = multipart_body(boundary, &[], "file", "input.png", b"not an image");
+    let response = router(test_state_with_ocr_services(None))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/ocr")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert_eq!(body["error"]["param"], "model");
+    assert_eq!(body["error"]["code"], "missing_required_parameter");
+}
+
+#[tokio::test]
+async fn traditional_ocr_markdown_does_not_use_startup_default_layout_model() {
     let layout_model = ModelId::parse("PaddlePaddle/PP-DocLayoutV3").unwrap();
     let state = test_state_with_ocr_services_config(None, |config| {
         config.services.ocr.layout_default_model = Some(layout_model.clone());
@@ -941,6 +966,45 @@ async fn traditional_ocr_markdown_uses_configured_default_layout_model() {
         boundary,
         &[
             ("model", "PaddlePaddle/PP-OCRv6_tiny"),
+            ("response_format", "markdown"),
+        ],
+        "file",
+        "input.png",
+        b"not an image",
+    );
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/ocr")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert_eq!(body["error"]["param"], "layout_model");
+    assert_eq!(body["error"]["code"], "missing_required_parameter");
+}
+
+#[tokio::test]
+async fn traditional_ocr_markdown_accepts_an_explicit_layout_model() {
+    let layout_model = ModelId::parse("PaddlePaddle/PP-DocLayoutV3").unwrap();
+    let state = test_state_with_ocr_services_config(None, |config| {
+        config.services.ocr.layout_available_models = vec![layout_model];
+    });
+    let boundary = "orchion-ocr-explicit-layout";
+    let body = multipart_body(
+        boundary,
+        &[
+            ("model", "PaddlePaddle/PP-OCRv6_tiny"),
+            ("layout_model", "PaddlePaddle/PP-DocLayoutV3"),
             ("response_format", "markdown"),
         ],
         "file",
@@ -1002,8 +1066,8 @@ async fn ocr_vl_rejects_structured_format_without_layout_before_model_load() {
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = json_body(response).await;
-    assert_eq!(body["error"]["param"], "response_format");
-    assert_eq!(body["error"]["code"], "unsupported_response_format");
+    assert_eq!(body["error"]["param"], "layout_model");
+    assert_eq!(body["error"]["code"], "missing_required_parameter");
 }
 
 #[tokio::test]

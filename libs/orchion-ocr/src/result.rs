@@ -289,7 +289,7 @@ fn build_structure_runtime(
 
     try_ort_provider_candidates(provider_model, device, |provider| {
         let builder = OARStructureBuilder::new(layout_model.to_path_buf())
-            .layout_model_name("PP-DocLayout_plus-L")
+            .layout_model_name(layout_model_name(provider_model))
             .ort_session(ort_session_config(provider));
         let builder = if let Some(assets) = ocr_assets {
             builder.with_ocr(
@@ -302,6 +302,11 @@ fn build_structure_runtime(
         };
         builder.build().map_err(model_load_error)
     })
+}
+
+#[cfg(feature = "ocr")]
+const fn layout_model_name(_model: KnownOcrModel) -> &'static str {
+    "PP-DocLayoutV3"
 }
 
 #[cfg(not(feature = "ocr"))]
@@ -1000,6 +1005,19 @@ fn model_load_error(error: impl Into<anyhow::Error>) -> OrchionError {
 fn inference_error(error: impl Into<anyhow::Error>) -> OrchionError {
     OrchionError::Inference {
         message: error.into().to_string(),
+    }
+}
+
+#[cfg(all(test, feature = "ocr"))]
+mod traditional_tests {
+    use super::*;
+
+    #[test]
+    fn pp_doclayout_v3_uses_matching_layout_preset() {
+        assert_eq!(
+            layout_model_name(KnownOcrModel::PpDocLayoutV3),
+            "PP-DocLayoutV3"
+        );
     }
 }
 
