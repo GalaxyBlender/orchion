@@ -14,6 +14,7 @@ import { Button } from "./Button";
 // FormField Wrapper
 export interface FormFieldProps {
   label: ReactNode;
+  htmlFor?: string;
   description?: string;
   error?: string;
   children: ReactNode;
@@ -22,6 +23,7 @@ export interface FormFieldProps {
 
 export const FormField: React.FC<FormFieldProps> = ({
   label,
+  htmlFor,
   description,
   error,
   children,
@@ -29,7 +31,7 @@ export const FormField: React.FC<FormFieldProps> = ({
 }) => {
   return (
     <div className={`form-field ${className}`}>
-      <label className="form-field-label">{label}</label>
+      <label className="form-field-label" htmlFor={htmlFor}>{label}</label>
       {description && <p className="form-field-desc">{description}</p>}
       <div className="form-field-control-wrapper">{children}</div>
       {error && <span className="form-field-error">{error}</span>}

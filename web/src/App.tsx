@@ -5,6 +5,7 @@ import { currentLanguageSelection, detectBrowserLanguage, syncLanguageFromSelect
 import { AppLayout, ToastProvider } from "@/shared/ui";
 import { AsrPage } from "./pages/AsrPage";
 import { ActivityPage } from "./pages/ActivityPage";
+import { LlmPage } from "./pages/LlmPage";
 import { ModelsPage } from "./pages/ModelsPage";
 import { OcrPage } from "./pages/OcrPage";
 import { PdfPage } from "./pages/PdfPage";
@@ -34,8 +35,9 @@ export function App() {
         <Routes>
           <Route element={<AppLayout />}>
             <Route path="/" element={<Navigate to="/activity" replace />} />
-            <Route path="/asr" element={<AsrPage />} />
             <Route path="/activity" element={<ActivityPage />} />
+            <Route path="/llm" element={<LlmPage />} />
+            <Route path="/asr" element={<AsrPage />} />
             <Route path="/tts" element={<TtsPage />} />
             <Route path="/ocr" element={<OcrPage />} />
             <Route path="/pdf" element={<PdfPage />} />

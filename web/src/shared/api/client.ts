@@ -68,6 +68,9 @@ async function request(settings: ApiSettings, path: string, init: RequestInit): 
 
     return response;
   } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      throw error;
+    }
     if (error instanceof Error && error.name === "ApiRequestError") {
       throw error;
     }

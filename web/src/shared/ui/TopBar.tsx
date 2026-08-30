@@ -19,9 +19,11 @@ export const TopBar: React.FC<TopBarProps> = ({
   const getPageTitle = () => {
     const path = location.pathname;
     if (path.includes("/activity")) return t("shell.nav.activity.label", "Activity");
+    if (path.includes("/llm")) return t("shell.nav.llm.label", "LLM");
     if (path.includes("/asr")) return t("shell.nav.asr.label", "ASR");
     if (path.includes("/tts")) return t("shell.nav.tts.label", "TTS");
     if (path.includes("/ocr")) return t("shell.nav.ocr.label", "OCR");
+    if (path.includes("/pdf")) return t("shell.nav.pdf.label", "PDF");
     if (path.includes("/models")) return t("shell.nav.models.label", "Models");
     if (path.includes("/settings")) return t("shell.nav.settings.label", "Settings");
     return "Orchion";

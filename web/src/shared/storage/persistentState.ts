@@ -45,9 +45,18 @@ export interface PersistentOcrState {
   maxTokens: string;
 }
 
+export interface PersistentLlmState {
+  model: string;
+  systemPrompt: string;
+  temperature: string;
+  topP: string;
+  maxCompletionTokens: string;
+  seed: string;
+}
+
 export interface PersistentUiState {
   theme: "dark";
-  activePage: "activity" | "asr" | "tts" | "ocr" | "models" | "settings";
+  activePage: "activity" | "llm" | "asr" | "tts" | "ocr" | "models" | "settings";
   language?: "en" | "zh-CN" | "zh-TW";
 }
 
@@ -57,6 +66,7 @@ export interface PersistentState {
   asr: PersistentAsrState;
   tts: PersistentTtsState;
   ocr: PersistentOcrState;
+  llm: PersistentLlmState;
   ui: PersistentUiState;
 }
 
@@ -121,6 +131,7 @@ type PartialPersistentState = {
   asr?: Partial<PersistentAsrState>;
   tts?: Partial<Omit<PersistentTtsState, "models">> & { models?: PersistentTtsModels };
   ocr?: Partial<PersistentOcrState>;
+  llm?: Partial<PersistentLlmState>;
   ui?: Partial<PersistentUiState>;
 };
 
@@ -171,6 +182,14 @@ function createDefaultPersistentState(): PersistentState {
       task: "ocr",
       maxTokens: "",
     },
+    llm: {
+      model: "",
+      systemPrompt: "",
+      temperature: "0.7",
+      topP: "0.9",
+      maxCompletionTokens: "512",
+      seed: "",
+    },
     ui: {
       theme: "dark",
       activePage: "activity",
@@ -214,6 +233,7 @@ function mergePersistentState(value: unknown): PersistentState {
       },
     },
     ocr: { ...defaults.ocr, ...parsedState.ocr },
+    llm: { ...defaults.llm, ...parsedState.llm },
     ui: { ...defaults.ui, ...parsedState.ui },
   };
 }
@@ -227,13 +247,14 @@ function parsePartialPersistentState(value: unknown): PartialPersistentState | n
   const asr = parseAsrState(value.asr);
   const tts = parseTtsState(value.tts);
   const ocr = parseOcrState(value.ocr);
+  const llm = parseLlmState(value.llm);
   const ui = parseUiState(value.ui);
 
-  if (settings === null || asr === null || tts === null || ocr === null || ui === null) {
+  if (settings === null || asr === null || tts === null || ocr === null || llm === null || ui === null) {
     return null;
   }
 
-  return { settings, asr, tts, ocr, ui };
+  return { settings, asr, tts, ocr, llm, ui };
 }
 
 function parseSettings(value: unknown): Partial<PersistentSettings> | null {
@@ -358,6 +379,17 @@ function parseOcrState(value: unknown): Partial<PersistentOcrState> | null {
   return state;
 }
 
+function parseLlmState(value: unknown): Partial<PersistentLlmState> | null {
+  return parseStringFields<PersistentLlmState>(value, [
+    "model",
+    "systemPrompt",
+    "temperature",
+    "topP",
+    "maxCompletionTokens",
+    "seed",
+  ]);
+}
+
 function parseUiState(value: unknown): Partial<PersistentUiState> | null {
   if (value === undefined) {
     return {};
@@ -376,7 +408,7 @@ function parseUiState(value: unknown): Partial<PersistentUiState> | null {
   }
 
   if ("activePage" in value) {
-    if (!isOneOf(value.activePage, ["activity", "asr", "tts", "ocr", "models", "settings"])) {
+    if (!isOneOf(value.activePage, ["activity", "llm", "asr", "tts", "ocr", "models", "settings"])) {
       return null;
     }
     state.activePage = value.activePage;
@@ -430,6 +462,7 @@ function isPersistentState(value: unknown): value is PersistentState {
   const asr = parseAsrState(value.asr);
   const tts = parseTtsState(value.tts);
   const ocr = parseOcrState(value.ocr);
+  const llm = parseLlmState(value.llm);
   const ui = parseUiState(value.ui);
 
   return (
@@ -437,11 +470,13 @@ function isPersistentState(value: unknown): value is PersistentState {
     isRecord(value.asr) &&
     isRecord(value.tts) &&
     isRecord(value.ocr) &&
+    isRecord(value.llm) &&
     isRecord(value.ui) &&
     settings !== null &&
     asr !== null &&
     tts !== null &&
     ocr !== null &&
+    llm !== null &&
     ui !== null &&
     hasStringFields(settings, ["serverBaseUrl", "apiKey"]) &&
     hasStringFields(asr, ["model", "language", "responseFormat", "prompt", "temperature"]) &&
@@ -465,6 +500,7 @@ function isPersistentState(value: unknown): value is PersistentState {
     ]) &&
     (!("models" in value.tts) || isTtsModels(value.tts.models)) &&
     hasStringFields(ocr, ["model", "responseFormat", "task", "maxTokens"]) &&
+    hasStringFields(llm, ["model", "systemPrompt", "temperature", "topP", "maxCompletionTokens", "seed"]) &&
     hasStringFields(ui, ["theme", "activePage"]) &&
     (!("language" in value.ui) || isOneOf(value.ui.language, ["en", "zh-CN", "zh-TW"]))
   );

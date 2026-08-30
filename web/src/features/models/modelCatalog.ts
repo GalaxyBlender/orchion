@@ -4,6 +4,7 @@ export type ModelKind = ModelType | "other";
 
 export interface ClassifiedModels {
   asr: ModelObject[];
+  llm: ModelObject[];
   tts: ModelObject[];
   ttsPresetVoice: ModelObject[];
   ttsVoiceClone: ModelObject[];
@@ -18,6 +19,7 @@ export interface ClassifiedModels {
 export function modelKind(model: ModelObject): ModelKind {
   switch (model.type) {
     case "asr":
+    case "llm":
     case "tts":
     case "ocr":
       return model.type;
@@ -33,6 +35,7 @@ export function hasCapability(model: ModelObject, capability: ModelCapability): 
 export function classifyModels(models: ModelObject[]): ClassifiedModels {
   const classified: ClassifiedModels = {
     asr: [],
+    llm: [],
     tts: [],
     ttsPresetVoice: [],
     ttsVoiceClone: [],
@@ -48,6 +51,9 @@ export function classifyModels(models: ModelObject[]): ClassifiedModels {
     switch (modelKind(model)) {
       case "asr":
         classified.asr.push(model);
+        break;
+      case "llm":
+        classified.llm.push(model);
         break;
       case "tts":
         classified.tts.push(model);

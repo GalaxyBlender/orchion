@@ -16,7 +16,7 @@ import type {
 import { loadPersistentState } from "@/shared/storage/persistentState";
 import { Alert, Badge, Button, StateView } from "@/shared/ui";
 
-const OPERATIONS: ActivityOperation[] = ["asr", "asr_stream", "tts", "ocr", "pdf"];
+const OPERATIONS: ActivityOperation[] = ["chat", "responses", "asr", "asr_stream", "tts", "ocr", "pdf"];
 const OUTCOMES: ActivityOutcome[] = [
   "success",
   "client_error",

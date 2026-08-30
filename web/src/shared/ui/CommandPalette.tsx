@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useMemo } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
 import { useTranslation } from "react-i18next";
-import { Activity, Search, Navigation, Settings, ShieldAlert, Sparkles, ScanText, FileText } from "lucide-react";
+import { Activity, Search, Navigation, Settings, ShieldAlert, Sparkles, ScanText, FileText, MessageSquareText } from "lucide-react";
 import { resetPersistentState } from "@/shared/storage/persistentState";
 import { useToast } from "./Toast";
 
@@ -49,12 +49,20 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ isOpen, onClose 
         action: () => { navigate("/activity"); onClose(); },
       },
       {
+        id: "nav-llm",
+        title: t("shell.commandPalette.navLlm", "Go to LLM (Text Generation)"),
+        icon: <MessageSquareText size={16} />,
+        category: "nav",
+        action: () => { navigate("/llm"); onClose(); },
+        shortcut: "⌘1"
+      },
+      {
         id: "nav-asr",
         title: t("shell.commandPalette.navAsr", "Go to ASR (Speech to Text)"),
         icon: <Sparkles size={16} />,
         category: "nav",
         action: () => { navigate("/asr"); onClose(); },
-        shortcut: "⌘1"
+        shortcut: "⌘2"
       },
       {
         id: "nav-tts",
@@ -62,7 +70,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ isOpen, onClose 
         icon: <Sparkles size={16} />,
         category: "nav",
         action: () => { navigate("/tts"); onClose(); },
-        shortcut: "⌘2"
+        shortcut: "⌘3"
       },
       {
         id: "nav-ocr",
@@ -70,7 +78,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ isOpen, onClose 
         icon: <ScanText size={16} />,
         category: "nav",
         action: () => { navigate("/ocr"); onClose(); },
-        shortcut: "⌘3"
+        shortcut: "⌘4"
       },
       {
         id: "nav-pdf",
@@ -78,7 +86,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ isOpen, onClose 
         icon: <FileText size={16} />,
         category: "nav",
         action: () => { navigate("/pdf"); onClose(); },
-        shortcut: "⌘4"
+        shortcut: "⌘5"
       },
       {
         id: "nav-models",
@@ -86,7 +94,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ isOpen, onClose 
         icon: <Navigation size={16} />,
         category: "nav",
         action: () => { navigate("/models"); onClose(); },
-        shortcut: "⌘5"
+        shortcut: "⌘6"
       },
       {
         id: "nav-settings",
@@ -94,7 +102,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ isOpen, onClose 
         icon: <Settings size={16} />,
         category: "nav",
         action: () => { navigate("/settings"); onClose(); },
-        shortcut: "⌘6"
+        shortcut: "⌘7"
       },
       {
         id: "action-reset",

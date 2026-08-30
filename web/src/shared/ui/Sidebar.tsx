@@ -1,7 +1,7 @@
 import React from "react";
 import { NavLink, useLocation } from "react-router-dom";
 import { useTranslation } from "react-i18next";
-import { Activity, Mic, Volume2, Database, Settings, Globe, ChevronLeft, ChevronRight, ScanText, FileText } from "lucide-react";
+import { Activity, Mic, Volume2, Database, Settings, Globe, ChevronLeft, ChevronRight, ScanText, FileText, MessageSquareText } from "lucide-react";
 import { Button } from "./Button";
 import { setLanguageSelection, currentLanguageSelection } from "@/shared/i18n";
 
@@ -25,6 +25,12 @@ export const Sidebar: React.FC<SidebarProps> = ({
       label: t("shell.nav.activity.label", "Activity"),
       meta: t("shell.nav.activity.meta", "request history"),
       icon: <Activity size={18} />
+    },
+    {
+      to: "/llm",
+      label: t("shell.nav.llm.label", "LLM"),
+      meta: t("shell.nav.llm.meta", "text generation"),
+      icon: <MessageSquareText size={18} />
     },
     {
       to: "/asr",

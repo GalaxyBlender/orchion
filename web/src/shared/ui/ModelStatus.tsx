@@ -6,7 +6,7 @@ export interface ModelStatusProps {
   models: string[];
   isLoading: boolean;
   error: Error | null;
-  kind: "ASR" | "TTS" | "OCR";
+  kind: "ASR" | "TTS" | "OCR" | "LLM";
   listId: string;
 }
 

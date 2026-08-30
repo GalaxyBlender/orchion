@@ -5,7 +5,7 @@ import { useModels } from "@/features/models/useModels";
 import type { ModelObject } from "@/shared/api/types";
 import { loadPersistentState } from "@/shared/storage/persistentState";
 import { Card, Button, Badge, Alert, StateView } from "@/shared/ui";
-import { Mic, Volume2, Cpu, RefreshCw, ScanText } from "lucide-react";
+import { Mic, Volume2, Cpu, RefreshCw, ScanText, MessageSquareText } from "lucide-react";
 
 export function ModelsPage() {
   const { t } = useTranslation();
@@ -46,6 +46,9 @@ export function ModelsPage() {
           <Card.Header eyebrow={t("models.asrModels")} title={catalog.classified.asr.length.toString()} />
         </Card>
         <Card variant="glass">
+          <Card.Header eyebrow={t("models.llmModels")} title={catalog.classified.llm.length.toString()} />
+        </Card>
+        <Card variant="glass">
           <Card.Header eyebrow={t("models.ttsModels")} title={catalog.classified.tts.length.toString()} />
         </Card>
         <Card variant="glass">
@@ -82,6 +85,18 @@ export function ModelsPage() {
                   icon={<Mic size={16} className="text-accent" />}
                   models={catalog.classified.asr}
                   badgeVariant="accent"
+                />
+              </Card.Body>
+            </Card>
+
+            <Card>
+              <Card.Header eyebrow={t("models.classified")} title={t("models.llmModels")} />
+              <Card.Body>
+                <ModelGroup
+                  emptyText={t("models.noLlm")}
+                  icon={<MessageSquareText size={16} className="text-accent-blue" />}
+                  models={catalog.classified.llm}
+                  badgeVariant="accent-blue"
                 />
               </Card.Body>
             </Card>

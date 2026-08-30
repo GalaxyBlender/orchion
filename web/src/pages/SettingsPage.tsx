@@ -67,6 +67,11 @@ export function SettingsPage() {
     toast.success(t("settings.resetOcr", "OCR settings reset"));
   };
 
+  const resetLlm = () => {
+    resetSection({ llm: cloneDefaultPersistentState().llm });
+    toast.success(t("settings.resetLlm", "LLM settings reset"));
+  };
+
   const resetUi = () => {
     setLanguageSelection("auto");
     setLanguageSelectionState("auto");
@@ -82,7 +87,7 @@ export function SettingsPage() {
     setTimeout(() => window.location.reload(), 500);
   };
 
-  function resetSection(section: Pick<Partial<PersistentState>, "asr" | "tts" | "ocr" | "ui">): void {
+  function resetSection(section: Pick<Partial<PersistentState>, "asr" | "tts" | "ocr" | "llm" | "ui">): void {
     setPersistentState((currentState) => {
       const nextState: PersistentState = { ...currentState, ...section };
       savePersistentState(nextState);
@@ -139,6 +144,7 @@ export function SettingsPage() {
                 <li>{t("settings.server", { value: currentServerOrigin() })}</li>
                 <li>{t("settings.apiKey", { value: settings.apiKey ? t("settings.apiKeyConfigured") : t("settings.apiKeyNotConfigured") })}</li>
                 <li>{t("settings.asrModel", { value: persistentState.asr.model || t("common.blank") })}</li>
+                <li>{t("settings.llmModel", { value: persistentState.llm.model || t("common.blank") })}</li>
                 <li>{t("settings.ttsModel", { value: persistentState.tts.model || t("common.blank") })}</li>
                 <li>{t("settings.ocrModel", { value: persistentState.ocr.model || t("common.blank") })}</li>
                 <li>{t("settings.activePage", { value: persistentState.ui.activePage })}</li>
@@ -154,6 +160,7 @@ export function SettingsPage() {
             <p className="text-sm text-muted">{t("settings.resetText")}</p>
             <div className="hstack gap-sm flex-wrap">
               <Button variant="secondary" size="sm" onClick={resetAsr}>{t("settings.resetAsr")}</Button>
+              <Button variant="secondary" size="sm" onClick={resetLlm}>{t("settings.resetLlm")}</Button>
               <Button variant="secondary" size="sm" onClick={resetTts}>{t("settings.resetTts")}</Button>
               <Button variant="secondary" size="sm" onClick={resetOcr}>{t("settings.resetOcr")}</Button>
               <Button variant="secondary" size="sm" onClick={resetUi}>{t("settings.resetUi")}</Button>
@@ -173,6 +180,7 @@ export function SettingsPage() {
               <li>{t("settings.defaultAsrFormat", { value: defaultPersistentState.asr.responseFormat })}</li>
               <li>{t("settings.defaultTtsVoice", { value: defaultPersistentState.tts.speaker })}</li>
               <li>{t("settings.defaultOcrFormat", { value: defaultPersistentState.ocr.responseFormat })}</li>
+              <li>{t("settings.defaultLlmTemperature", { value: defaultPersistentState.llm.temperature })}</li>
             </ul>
           </div>
         </Card.Body>
