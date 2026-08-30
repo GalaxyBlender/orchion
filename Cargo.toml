@@ -10,6 +10,7 @@ members = [
     "libs/orchion-audio-vad",
     "libs/orchion-download",
     "libs/orchion-docs",
+    "libs/orchion-llama-cpp",
     "libs/orchion-ocr",
     "libs/orchion-protocol",
     "libs/orchion-qwen3",

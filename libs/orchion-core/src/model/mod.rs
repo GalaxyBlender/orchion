@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 mod asr;
 mod descriptor;
 mod id;
+mod llm;
 mod ocr;
 mod tts;
 mod url;
@@ -14,6 +15,7 @@ pub use descriptor::{
     RuntimeProvider, model_descriptor, registered_model_descriptors,
 };
 pub use id::{ModelId, ParseModelIdError};
+pub use llm::LlmModel;
 pub use ocr::{
     KnownOcrModel, OcrModel, OcrModelAsset, OcrModelAssetKind, OcrModelAssetRole, OcrModelKind,
 };
@@ -26,6 +28,7 @@ pub enum ModelCategory {
     Tts,
     Ocr,
     OcrVl,
+    Llm,
 }
 
 impl ModelCategory {
@@ -35,6 +38,7 @@ impl ModelCategory {
             Self::Tts => "tts",
             Self::Ocr => "ocr",
             Self::OcrVl => "ocr-vl",
+            Self::Llm => "llm",
         }
     }
 }

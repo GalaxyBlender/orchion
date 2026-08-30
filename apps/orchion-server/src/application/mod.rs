@@ -1,3 +1,4 @@
+pub mod llm;
 pub mod model_cache;
 pub mod model_lifecycle;
 pub mod ocr;
@@ -6,6 +7,7 @@ pub mod speech;
 pub mod streaming_transcription;
 pub mod transcription;
 
+use crate::application::llm::LlmRuntime;
 use crate::application::model_lifecycle::{ModelLifecycleRuntime, ModelService};
 use crate::application::ocr::OcrRuntime;
 use crate::application::resource_policy::InferenceGuard;
@@ -132,6 +134,7 @@ pub struct ApiPolicy {
     pub asr: Option<AsrApiPolicy>,
     pub tts_models: Option<Vec<TtsModel>>,
     pub ocr_enabled: bool,
+    pub llm_enabled: bool,
 }
 
 pub trait ServerApplication:
@@ -140,6 +143,7 @@ pub trait ServerApplication:
     + OcrRuntime
     + StreamingTranscriptionRuntime
     + ModelLifecycleRuntime
+    + LlmRuntime
     + 'static
 {
     fn api_policy(&self) -> &ApiPolicy;
@@ -163,6 +167,10 @@ pub enum UseCaseError {
     ModelNotAvailable(String),
     #[error("{0} capacity is currently exhausted")]
     ResourceExhausted(&'static str),
+    #[error("{0}")]
+    Timeout(String),
+    #[error("server is shutting down")]
+    ShuttingDown,
     #[error(transparent)]
     Core(#[from] orchion::OrchionError),
     #[error("invalid reference audio: {0}")]
@@ -187,20 +195,41 @@ impl UseCaseError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
+    #[error("{message}")]
+    InvalidRequest {
+        message: String,
+        param: &'static str,
+        code: &'static str,
+    },
     #[error("{0}")]
     Internal(String),
     #[error(transparent)]
     Core(#[from] orchion::OrchionError),
     #[error("{0} capacity is currently exhausted")]
     ResourceExhausted(&'static str),
+    #[error("{0}")]
+    Timeout(String),
+    #[error("server is shutting down")]
+    ShuttingDown,
 }
 
 impl From<RuntimeError> for UseCaseError {
     fn from(error: RuntimeError) -> Self {
         match error {
+            RuntimeError::InvalidRequest {
+                message,
+                param,
+                code,
+            } => Self::InvalidRequest {
+                message,
+                param: Some(param),
+                code,
+            },
             RuntimeError::Internal(message) => Self::Internal(message),
             RuntimeError::Core(error) => Self::Core(error),
             RuntimeError::ResourceExhausted(resource) => Self::ResourceExhausted(resource),
+            RuntimeError::Timeout(message) => Self::Timeout(message),
+            RuntimeError::ShuttingDown => Self::ShuttingDown,
         }
     }
 }

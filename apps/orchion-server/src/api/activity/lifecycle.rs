@@ -100,6 +100,8 @@ fn classify(request: &Request<Body>) -> Option<(ActivityOperation, ActivityTrans
         ("POST", "/v1/audio/speech") => ActivityOperation::Tts,
         ("POST", "/v1/ocr") => ActivityOperation::Ocr,
         ("POST", "/v1/pdf/images") => ActivityOperation::Pdf,
+        ("POST", "/v1/chat/completions") => ActivityOperation::Chat,
+        ("POST", "/v1/responses") => ActivityOperation::Responses,
         _ => return None,
     };
     Some((operation, ActivityTransport::Http, route))

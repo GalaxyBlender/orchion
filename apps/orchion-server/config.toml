@@ -124,6 +124,21 @@ id = "PaddlePaddle/PaddleOCR-VL-1.5"
 model = "//PaddlePaddle/PaddleOCR-VL-1.5"
 layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
 
+[services.llm]
+enabled = false
+default_model = "qwen/Qwen3.5-0.8B-Q4_K_M"
+idle_timeout = "10m"
+max_loaded = 1
+
+[[services.llm.models]]
+id = "qwen/Qwen3.5-0.8B-Q4_K_M"
+name = "Qwen3.5 0.8B Q4_K_M"
+model = "//unsloth/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf"
+mmproj_model = "//unsloth/Qwen3.5-0.8B-GGUF/mmproj-BF16.gguf"
+runtime = { context_size = "model", gpu_layers = "all", parallel_sequences = 1, batch_size = 512, micro_batch_size = 512, threads = 0, request_queue_capacity = 8, event_queue_capacity = 16, queue_timeout = "30s", generation_timeout = "5m" }
+chat_template = { engine = "jinja", enable_thinking = false }
+generation = { max_tokens = 256, temperature = 1.0, top_p = 0.95, top_k = 20, min_p = 0.0, presence_penalty = 0.0, frequency_penalty = 0.0, repeat_penalty = 1.0 }
+
 [[services.ocr-vl.models]]
 id = "PaddlePaddle/PaddleOCR-VL-1.6"
 name = "PaddleOCR-VL 1.6"

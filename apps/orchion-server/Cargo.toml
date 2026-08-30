@@ -19,7 +19,7 @@ clap = { version = "4", features = ["derive"] }
 http = "1"
 http-body = "1"
 include_dir = "0.7"
-orchion = { path = "../../libs/orchion", default-features = false, features = ["asr-qwen3", "tts-qwen3", "ocr", "ocr-vl", "docs", "audio-ffmpeg", "download-all", "audio-vad", "serde", "schema"] }
+orchion = { path = "../../libs/orchion", default-features = false, features = ["asr-qwen3", "tts-qwen3", "ocr", "ocr-vl", "llm", "docs", "audio-ffmpeg", "download-all", "audio-vad", "serde", "schema"] }
 orchion-protocol = { path = "../../libs/orchion-protocol" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

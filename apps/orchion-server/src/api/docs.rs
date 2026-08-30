@@ -2,6 +2,10 @@ use crate::api::activity::{
     ActivityEntry, ActivityOperation, ActivityOutcome, ActivityPage, ActivityState,
     ActivitySummary, ActivityTransport,
 };
+use crate::api::http_llm::{
+    ChatCompletionRequest, ChatCompletionResponse, ChatCompletionSseEvent, ResponsesRequest,
+    ResponsesResponse, ResponsesSseEvent,
+};
 use crate::api::http_models::{ModelControlRequest, ModelStatusList};
 use crate::api::openai::{
     ErrorBody, ModelList, OcrApiFormat, OcrJsonResponse, SpeechRequest, TranscriptionJson,
@@ -11,16 +15,18 @@ use crate::application::model_lifecycle::ModelStatus;
 use orchion::OcrTask;
 use orchion::docs::PdfImageFormat;
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
+use utoipa::openapi::{Content, Ref, RefOr};
 use utoipa::{Modify, OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(healthz_doc, list_models_doc, list_model_statuses_doc, load_model_doc, unload_model_doc, create_speech_doc, create_transcription_doc, create_ocr_doc, create_pdf_images_doc, list_activity_doc, activity_events_doc),
-    components(schemas(SpeechRequest, ErrorBody, ModelList, ModelStatusList, ModelStatus, ModelControlRequest, TranscriptionJson, TranscriptionVerboseJson, OcrJsonResponse, OcrApiFormat, OcrTask, OcrMultipartRequest, PdfImageFormat, PdfImagesMultipartRequest, ActivityPage, ActivityEntry, ActivitySummary, ActivityState, ActivityTransport, ActivityOperation, ActivityOutcome)),
+    paths(healthz_doc, list_models_doc, list_model_statuses_doc, load_model_doc, unload_model_doc, create_chat_completion_doc, create_response_doc, create_speech_doc, create_transcription_doc, create_ocr_doc, create_pdf_images_doc, list_activity_doc, activity_events_doc),
+    components(schemas(ChatCompletionRequest, ChatCompletionResponse, ChatCompletionSseEvent, ResponsesRequest, ResponsesResponse, ResponsesSseEvent, SpeechRequest, ErrorBody, ModelList, ModelStatusList, ModelStatus, ModelControlRequest, TranscriptionJson, TranscriptionVerboseJson, OcrJsonResponse, OcrApiFormat, OcrTask, OcrMultipartRequest, PdfImageFormat, PdfImagesMultipartRequest, ActivityPage, ActivityEntry, ActivitySummary, ActivityState, ActivityTransport, ActivityOperation, ActivityOutcome)),
     modifiers(&BearerAuth),
     tags(
         (name = "audio", description = "OpenAI-compatible audio APIs"),
+        (name = "llm", description = "Text-only OpenAI-compatible subset"),
         (name = "ocr", description = "OCR and OCR-VL APIs"),
         (name = "pdf", description = "PDF rendering APIs"),
         (name = "models", description = "Model discovery and runtime lifecycle APIs"),
@@ -44,7 +50,27 @@ impl Modify for BearerAuth {
                 ),
             );
         }
+        add_json_response_content(openapi, "/v1/chat/completions", "ChatCompletionResponse");
+        add_json_response_content(openapi, "/v1/responses", "ResponsesResponse");
     }
+}
+
+fn add_json_response_content(openapi: &mut utoipa::openapi::OpenApi, path: &str, schema: &str) {
+    let Some(operation) = openapi
+        .paths
+        .paths
+        .get_mut(path)
+        .and_then(|item| item.post.as_mut())
+    else {
+        return;
+    };
+    let Some(RefOr::T(response)) = operation.responses.responses.get_mut("200") else {
+        return;
+    };
+    response.content.insert(
+        "application/json".to_string(),
+        Content::new(Some(Ref::from_schema_name(schema))),
+    );
 }
 
 #[derive(ToSchema)]
@@ -120,7 +146,7 @@ mod tests {
         );
         assert_eq!(
             spec["components"]["schemas"]["ModelType"]["enum"],
-            serde_json::json!(["asr", "tts", "ocr"])
+            serde_json::json!(["asr", "tts", "ocr", "llm"])
         );
         assert!(model_object["properties"].get("subtype").is_none());
         assert!(model_object["properties"]["name"].is_object());
@@ -137,7 +163,10 @@ mod tests {
                 "ocr_table_structure",
                 "ocr_vision_language",
                 "ocr_markdown",
-                "ocr_html"
+                "ocr_html",
+                "llm_chat",
+                "llm_responses",
+                "llm_streaming"
             ])
         );
     }
@@ -247,8 +276,223 @@ mod tests {
         );
         assert_eq!(
             spec["components"]["schemas"]["ActivityOperation"]["enum"],
-            serde_json::json!(["asr", "asr_stream", "tts", "ocr", "pdf"])
+            serde_json::json!([
+                "asr",
+                "asr_stream",
+                "tts",
+                "ocr",
+                "pdf",
+                "chat",
+                "responses"
+            ])
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keeps the generated LLM OpenAPI contract assertions in one inspection"
+    )]
+    fn openapi_includes_text_llm_subset() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        assert!(spec["paths"]["/v1/chat/completions"]["post"].is_object());
+        assert!(spec["paths"]["/v1/responses"]["post"].is_object());
+        assert!(spec["components"]["schemas"]["ChatCompletionRequest"].is_object());
+        assert!(spec["components"]["schemas"]["ResponsesRequest"].is_object());
+        for path in ["/v1/chat/completions", "/v1/responses"] {
+            assert_eq!(
+                spec["paths"][path]["post"]["security"][0]["bearer_auth"],
+                serde_json::json!([])
+            );
+            let content = &spec["paths"][path]["post"]["responses"]["200"]["content"];
+            assert!(content["application/json"].is_object(), "{path}: {content}");
+            assert!(
+                content["text/event-stream"].is_object(),
+                "{path}: {content}"
+            );
+        }
+        assert!(schema_references(
+            &spec["paths"]["/v1/chat/completions"]["post"]["responses"]["200"]["content"]["text/event-stream"]
+                ["schema"],
+            "ChatCompletionSseEvent"
+        ));
+        assert!(schema_references(
+            &spec["paths"]["/v1/responses"]["post"]["responses"]["200"]["content"]["text/event-stream"]
+                ["schema"],
+            "ResponsesSseEvent"
+        ));
+        assert!(spec["components"]["schemas"]["ChatCompletionSseEvent"]["oneOf"].is_array());
+        assert!(spec["components"]["schemas"]["ResponsesSseEvent"]["oneOf"].is_array());
+        assert!(schema_references(
+            &spec["components"]["schemas"]["ChatCompletionSseEvent"],
+            "ErrorBody"
+        ));
+        assert_eq!(
+            spec["components"]["schemas"]["ResponsesSseEvent"]["oneOf"]
+                .as_array()
+                .unwrap()
+                .len(),
+            11
+        );
+
+        assert!(schema_contains_number(
+            &spec["components"]["schemas"]["ResponsesRequest"]["properties"]["max_output_tokens"],
+            "minimum",
+            16
+        ));
+
+        let error_schema = &spec["components"]["schemas"]["ErrorObject"];
+        for field in ["param", "code"] {
+            assert!(
+                error_schema["required"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|value| value == field)
+            );
+            assert!(schema_contains_type(
+                &error_schema["properties"][field],
+                "null"
+            ));
+        }
+        for (schema, field) in [
+            ("ChatChoice", "logprobs"),
+            ("AssistantMessage", "refusal"),
+            ("ChatCompletionStreamChunk", "usage"),
+            ("LlmStreamErrorEvent", "code"),
+            ("LlmStreamErrorEvent", "param"),
+        ] {
+            let component = &spec["components"]["schemas"][schema];
+            assert!(
+                component["required"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|value| value == field),
+                "{schema}.{field} is not required"
+            );
+            assert!(
+                schema_contains_type(&component["properties"][field], "null"),
+                "{schema}.{field} is not nullable"
+            );
+        }
+
+        let mut event_types = Vec::new();
+        for (schema, event_type, fields) in [
+            (
+                "ResponseCreatedSseEvent",
+                "response.created",
+                &["response"][..],
+            ),
+            (
+                "ResponseInProgressSseEvent",
+                "response.in_progress",
+                &["response"][..],
+            ),
+            (
+                "ResponseOutputItemAddedSseEvent",
+                "response.output_item.added",
+                &["output_index", "item"][..],
+            ),
+            (
+                "ResponseContentPartAddedSseEvent",
+                "response.content_part.added",
+                &["item_id", "output_index", "content_index", "part"][..],
+            ),
+            (
+                "ResponseOutputTextDeltaSseEvent",
+                "response.output_text.delta",
+                &[
+                    "item_id",
+                    "output_index",
+                    "content_index",
+                    "delta",
+                    "logprobs",
+                ][..],
+            ),
+            (
+                "ResponseOutputTextDoneSseEvent",
+                "response.output_text.done",
+                &[
+                    "item_id",
+                    "output_index",
+                    "content_index",
+                    "text",
+                    "logprobs",
+                ][..],
+            ),
+            (
+                "ResponseContentPartDoneSseEvent",
+                "response.content_part.done",
+                &["item_id", "output_index", "content_index", "part"][..],
+            ),
+            (
+                "ResponseOutputItemDoneSseEvent",
+                "response.output_item.done",
+                &["output_index", "item"][..],
+            ),
+            (
+                "ResponseCompletedSseEvent",
+                "response.completed",
+                &["response"][..],
+            ),
+            (
+                "ResponseIncompleteSseEvent",
+                "response.incomplete",
+                &["response"][..],
+            ),
+            (
+                "LlmStreamErrorEvent",
+                "error",
+                &["code", "message", "param"][..],
+            ),
+        ] {
+            let component = &spec["components"]["schemas"][schema];
+            let required = component["required"].as_array().unwrap();
+            assert!(required.iter().any(|value| value == "type"), "{schema}");
+            assert!(
+                required.iter().any(|value| value == "sequence_number"),
+                "{schema}"
+            );
+            for field in fields {
+                assert!(
+                    required.iter().any(|value| value == field),
+                    "{schema}.{field}"
+                );
+            }
+            let discriminator_values = schema_enum_strings(&component["properties"]["type"]);
+            assert_eq!(discriminator_values, [event_type], "{schema}.type");
+            assert!(!event_types.contains(&event_type), "duplicate {event_type}");
+            event_types.push(event_type);
+            assert!(schema_references(
+                &spec["components"]["schemas"]["ResponsesSseEvent"],
+                schema
+            ));
+        }
+        assert_eq!(event_types.len(), 11);
+
+        let response_schema = &spec["components"]["schemas"]["ResponsesResponse"];
+        let required = response_schema["required"].as_array().unwrap();
+        for field in [
+            "error",
+            "incomplete_details",
+            "instructions",
+            "max_output_tokens",
+            "previous_response_id",
+            "temperature",
+            "top_p",
+            "usage",
+        ] {
+            assert!(
+                required.iter().any(|value| value == field),
+                "missing {field}"
+            );
+            assert!(
+                schema_contains_type(&response_schema["properties"][field], "null"),
+                "{field} is not nullable: {}",
+                response_schema["properties"][field]
+            );
+        }
     }
 
     fn schema_references(schema: &Value, schema_name: &str) -> bool {
@@ -278,6 +522,47 @@ mod tests {
                 .iter()
                 .any(|schema_type| schema_type == expected_type),
             _ => false,
+        }
+    }
+
+    fn schema_contains_type(schema: &Value, expected_type: &str) -> bool {
+        if schema_has_type(schema, expected_type) {
+            return true;
+        }
+        match schema {
+            Value::Array(items) => items
+                .iter()
+                .any(|item| schema_contains_type(item, expected_type)),
+            Value::Object(fields) => fields
+                .values()
+                .any(|value| schema_contains_type(value, expected_type)),
+            _ => false,
+        }
+    }
+
+    fn schema_contains_number(schema: &Value, key: &str, expected: u64) -> bool {
+        if schema.get(key).and_then(Value::as_u64) == Some(expected) {
+            return true;
+        }
+        match schema {
+            Value::Array(items) => items
+                .iter()
+                .any(|item| schema_contains_number(item, key, expected)),
+            Value::Object(fields) => fields
+                .values()
+                .any(|value| schema_contains_number(value, key, expected)),
+            _ => false,
+        }
+    }
+
+    fn schema_enum_strings(schema: &Value) -> Vec<&str> {
+        if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+            return values.iter().filter_map(Value::as_str).collect();
+        }
+        match schema {
+            Value::Array(items) => items.iter().flat_map(schema_enum_strings).collect(),
+            Value::Object(fields) => fields.values().flat_map(schema_enum_strings).collect(),
+            _ => Vec::new(),
         }
     }
 }
@@ -345,6 +630,38 @@ fn load_model_doc() {}
 )]
 #[allow(dead_code)]
 fn unload_model_doc() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/chat/completions",
+    request_body = ChatCompletionRequest,
+    responses(
+        (status = 200, description = "Text-only single-choice completion JSON", body = ChatCompletionResponse, content_type = "application/json"),
+        (status = 200, description = "Text-only single-choice completion SSE", body = ChatCompletionSseEvent, content_type = "text/event-stream"),
+        (status = 400, description = "OpenAI-compatible error", body = ErrorBody),
+        (status = 500, description = "OpenAI-compatible error", body = ErrorBody)
+    ),
+    security(("bearer_auth" = [])),
+    tag = "llm"
+)]
+#[allow(dead_code)]
+fn create_chat_completion_doc() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/responses",
+    request_body = ResponsesRequest,
+    responses(
+        (status = 200, description = "Stateless text-only response JSON", body = ResponsesResponse, content_type = "application/json"),
+        (status = 200, description = "Stateless text-only lifecycle SSE", body = ResponsesSseEvent, content_type = "text/event-stream"),
+        (status = 400, description = "OpenAI-compatible error", body = ErrorBody),
+        (status = 500, description = "OpenAI-compatible error", body = ErrorBody)
+    ),
+    security(("bearer_auth" = [])),
+    tag = "llm"
+)]
+#[allow(dead_code)]
+fn create_response_doc() {}
 
 #[utoipa::path(
     post,

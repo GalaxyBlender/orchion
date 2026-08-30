@@ -8,11 +8,12 @@ publish = false
 
 [features]
 default = []
-full = ["asr-qwen3", "tts-qwen3", "ocr", "ocr-vl", "docs", "audio-ffmpeg", "download-all", "audio-vad"]
+full = ["asr-qwen3", "tts-qwen3", "ocr", "ocr-vl", "llm", "docs", "audio-ffmpeg", "download-all", "audio-vad"]
 asr = ["asr-qwen3"]
 tts = ["tts-qwen3"]
 asr-engine = []
 tts-engine = []
+llm = ["dep:orchion-llama-cpp", "dep:tokio"]
 ocr = ["dep:orchion-ocr", "orchion-ocr/ocr"]
 ocr-vl = ["dep:orchion-ocr", "orchion-ocr/ocr-vl"]
 docs = ["dep:orchion-docs", "orchion-docs/serde", "orchion-docs/schema"]
@@ -24,9 +25,9 @@ audio-vad = ["dep:orchion-audio-vad"]
 serde = ["orchion-core/serde"]
 schema = ["orchion-core/schema"]
 download-all = ["dep:orchion-download", "orchion-download/all-providers"]
-cpu = ["orchion-qwen3?/cpu", "orchion-ocr?/cpu"]
+cpu = ["orchion-qwen3?/cpu", "orchion-ocr?/cpu", "orchion-llama-cpp?/cpu-openmp"]
 metal = ["orchion-qwen3?/metal", "orchion-ocr?/metal"]
-cuda = ["orchion-qwen3?/cuda", "orchion-ocr?/cuda"]
+cuda = ["orchion-qwen3?/cuda", "orchion-ocr?/cuda", "orchion-llama-cpp?/cuda"]
 flash-attn = []
 
 [dependencies]
@@ -37,6 +38,8 @@ orchion-download = { version = "0.3.0", path = "../orchion-download", default-fe
 orchion-ocr = { version = "0.3.0", path = "../orchion-ocr", default-features = false, optional = true }
 orchion-qwen3 = { version = "0.3.0", path = "../orchion-qwen3", default-features = false, optional = true }
 orchion-audio-vad = { version = "0.3.0", path = "../orchion-audio-vad", optional = true }
+orchion-llama-cpp = { version = "0.3.0", path = "../orchion-llama-cpp", optional = true }
+tokio = { version = "1", features = ["sync"], optional = true }
 tracing = "0.1"
 
 [dev-dependencies]

@@ -1,4 +1,4 @@
-export type ModelType = "asr" | "tts" | "ocr";
+export type ModelType = "asr" | "tts" | "ocr" | "llm";
 
 export type ModelCapability =
   | "asr_transcription"
@@ -11,7 +11,10 @@ export type ModelCapability =
   | "ocr_table_structure"
   | "ocr_vision_language"
   | "ocr_markdown"
-  | "ocr_html";
+  | "ocr_html"
+  | "llm_chat"
+  | "llm_responses"
+  | "llm_streaming";
 
 export interface ApiSettings {
   serverBaseUrl: string;

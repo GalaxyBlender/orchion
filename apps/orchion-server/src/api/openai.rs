@@ -25,9 +25,9 @@ pub struct ErrorObject {
     pub message: String,
     #[serde(rename = "type")]
     pub error_type: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(required = true, nullable)]
     pub param: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(required = true, nullable)]
     pub code: Option<String>,
 }
 
@@ -107,6 +107,34 @@ impl ApiError {
     }
 
     #[must_use]
+    pub fn timeout(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::REQUEST_TIMEOUT,
+            error: ErrorObject {
+                message: message.into(),
+                error_type: "invalid_request_error",
+                param: None,
+                code: Some("request_timeout".to_string()),
+            },
+            log_message: None,
+        }
+    }
+
+    #[must_use]
+    pub fn shutting_down() -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            error: ErrorObject {
+                message: "server is shutting down".to_string(),
+                error_type: "server_error",
+                param: None,
+                code: Some("server_shutdown".to_string()),
+            },
+            log_message: None,
+        }
+    }
+
+    #[must_use]
     pub fn model_not_loaded(model: &str) -> Self {
         Self::invalid_request(
             format!("model `{model}` is not loaded by this server"),
@@ -137,7 +165,10 @@ impl ApiError {
     pub(crate) fn activity_error(&self) -> crate::api::activity::ActivityError {
         crate::api::activity::ActivityError {
             code: self.error.code.clone(),
-            message: self.log_message.clone(),
+            message: self
+                .status
+                .is_server_error()
+                .then(|| self.error.message.clone()),
         }
     }
 }
@@ -154,6 +185,7 @@ pub enum ModelType {
     Asr,
     Tts,
     Ocr,
+    Llm,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
@@ -170,6 +202,9 @@ pub enum ModelCapability {
     OcrVisionLanguage,
     OcrMarkdown,
     OcrHtml,
+    LlmChat,
+    LlmResponses,
+    LlmStreaming,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -227,6 +262,9 @@ impl ModelCapability {
             ),
             (ModelCapabilities::OCR_MARKDOWN, Self::OcrMarkdown),
             (ModelCapabilities::OCR_HTML, Self::OcrHtml),
+            (ModelCapabilities::LLM_CHAT, Self::LlmChat),
+            (ModelCapabilities::LLM_RESPONSES, Self::LlmResponses),
+            (ModelCapabilities::LLM_STREAMING, Self::LlmStreaming),
         ]
         .into_iter()
         .filter_map(|(capability, value)| capabilities.contains(capability).then_some(value))
@@ -282,6 +320,11 @@ impl From<orchion::OrchionError> for ApiError {
             | orchion::OrchionError::InvalidDocument { reason } => {
                 Self::invalid_request(reason, Some("file"), Some("invalid_file"))
             }
+            error @ orchion::OrchionError::LlmContextLimit { .. } => Self::invalid_request(
+                error.to_string(),
+                Some("input"),
+                Some("context_length_exceeded"),
+            ),
             other => Self::internal(other.to_string()),
         }
     }
@@ -299,6 +342,8 @@ impl From<crate::application::UseCaseError> for ApiError {
             } => Self::invalid_request(message, param, Some(code)),
             UseCaseError::ModelNotAvailable(model) => Self::model_not_available(&model),
             UseCaseError::ResourceExhausted(resource) => Self::resource_exhausted(resource),
+            UseCaseError::Timeout(message) => Self::timeout(message),
+            UseCaseError::ShuttingDown => Self::shutting_down(),
             UseCaseError::Core(error) => Self::from(error),
             UseCaseError::ReferenceAudio(orchion::OrchionError::InvalidAudio { reason }) => {
                 Self::invalid_request(reason, Some("reference_audio"), Some("invalid_audio"))
@@ -664,5 +709,18 @@ mod tests {
             assert_eq!(body.error.param.as_deref(), Some("file"));
             assert_eq!(body.error.code.as_deref(), Some("invalid_file"));
         }
+    }
+
+    #[test]
+    fn llm_context_limit_is_a_pre_header_invalid_request() {
+        let (status, body) = ApiError::from(orchion::OrchionError::LlmContextLimit {
+            prompt_tokens: 100,
+            max_tokens: 50,
+            context_size: 128,
+        })
+        .into_status_body();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.error.param.as_deref(), Some("input"));
+        assert_eq!(body.error.code.as_deref(), Some("context_length_exceeded"));
     }
 }

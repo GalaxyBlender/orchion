@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-Orchion provides a unified Rust API library and an OpenAI-compatible server for local speech and document AI workflows. It currently focuses on Qwen3 ASR/TTS and PaddleOCR/OCR-VL, with CPU by default and optional Metal or CUDA builds.
+Orchion provides a unified Rust API library and an OpenAI-compatible server for local speech, document, and text-generation workflows. It supports Qwen3 ASR/TTS, PaddleOCR/OCR-VL, and a text-only llama.cpp tracer.
 
 ## Highlights
 
@@ -52,6 +52,8 @@ API keys and form preferences are stored in browser `localStorage`; do not save 
 - `GET /v1/audio/transcriptions/stream`: ASR WebSocket streaming.
 - `POST /v1/audio/speech`: TTS.
 - `POST /v1/ocr`: OCR and OCR-VL.
+- `POST /v1/chat/completions`: text-only, single-choice JSON or SSE.
+- `POST /v1/responses`: stateless text-only JSON or lifecycle SSE; requires `store=false`.
 - `POST /v1/pdf/images`: PDF page rendering.
 - `GET /api/activity`: in-flight requests, retained history, and summary statistics.
 - `GET /api/activity/events`: authenticated server-sent Activity events.
@@ -102,7 +104,7 @@ cargo run -p orchion-example-tts-preset --features cpu -- "Hello from Orchion" o
 - `[server]`: bind address, CORS allowed origins, upload limit, and PDF page/pixel/output limits. CORS defaults to all origins (`["*"]`).
 - `[activity]`: enable request activity and set the in-memory completed-history capacity (default `500`).
 - `[models]`: model directory, source, global residency limit, and file integrity verification. `verify_file_integrity` defaults to `false`; set it to `true` to verify reused model files against the SHA-256 values recorded in their manifest.
-- `[services.asr]`, `[services.tts]`, `[services.ocr]`, `[services.ocr-vl]`: service enablement, defaults, deployment arrays (`[[services.<service>.models]]` with `id`, optional `name`, and `model`), device, and per-service residency. OCR deployments may include `layout_model`. ASR batch audio uses `max_audio_duration`; streaming captions use `stream_target_segment` and `stream_max_segment`; sessions use `stream_idle_timeout` and `stream_max_duration`. TTS uses `max_length` and `max_reference_audio_duration`; OCR-VL uses `max_tokens`.
+- `[services.asr]`, `[services.tts]`, `[services.ocr]`, `[services.ocr-vl]`, `[services.llm]`: service deployments and residency. LLM deployments require exact main GGUF locators, optionally lock an exact mmproj artifact, and currently run text only with `parallel_sequences=1`.
 - `[auth]`: optional API key.
 
 `CORS_ALLOWED_ORIGINS` overrides `server.cors_allowed_origins` with a comma-separated origin list, for example `https://app.example.com,https://admin.example.com`; use `*` to allow all origins. `ORCHION_MODEL_SOURCE` and `models.source` accept `auto`, `huggingface`, or `modelscope`. `RUST_LOG` controls runtime logging.

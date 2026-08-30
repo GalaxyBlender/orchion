@@ -15,6 +15,7 @@ pub enum ModelService {
     Tts,
     Ocr,
     OcrVl,
+    Llm,
 }
 
 #[derive(Debug, Clone)]

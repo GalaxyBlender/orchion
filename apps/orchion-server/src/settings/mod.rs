@@ -18,6 +18,7 @@ pub const DEFAULT_TTS_MAX_LENGTH: usize = 2048;
 pub const DEFAULT_TTS_MAX_REFERENCE_AUDIO_DURATION: Duration = Duration::from_mins(5);
 pub const DEFAULT_OCR_VL_MAX_TOKENS: usize = 4096;
 pub const DEFAULT_OCR_MAX_PIXELS: u64 = 100_000_000;
+pub const DEFAULT_LLM_MAX_TOKENS: usize = 4096;
 pub const DEFAULT_MAX_CONCURRENT_INFERENCE: usize = 2;
 pub const DEFAULT_MAX_WEBSOCKET_CONNECTIONS: usize = 64;
 pub const DEFAULT_MAX_PENDING_WEBSOCKET_CONNECTIONS: usize = 16;
@@ -86,6 +87,7 @@ pub struct ServicesSection {
     pub tts: TtsServiceSection,
     pub ocr: OcrServiceSection,
     pub ocr_vl: OcrVlServiceSection,
+    pub llm: LlmServiceSection,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -236,6 +238,140 @@ impl OcrVlServiceSection {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct LlmServiceSection {
+    pub enabled: bool,
+    pub default_model: Option<ModelId>,
+    pub models: Vec<LlmModelDeployment>,
+    pub idle_timeout: Duration,
+    pub max_loaded: usize,
+}
+
+impl LlmServiceSection {
+    #[must_use]
+    pub fn active(&self) -> bool {
+        self.enabled && !self.models.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum LlmContextSize {
+    Model,
+    Tokens(u32),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum LlmGpuLayers {
+    All,
+    Count(u32),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LlmRuntimeConfig {
+    pub context_size: LlmContextSize,
+    pub gpu_layers: LlmGpuLayers,
+    pub parallel_sequences: u32,
+    pub batch_size: u32,
+    pub micro_batch_size: u32,
+    pub threads: i32,
+    pub request_queue_capacity: usize,
+    pub event_queue_capacity: usize,
+    pub queue_timeout: Duration,
+    pub generation_timeout: Duration,
+}
+
+impl Default for LlmRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            context_size: LlmContextSize::Model,
+            gpu_layers: LlmGpuLayers::All,
+            parallel_sequences: 1,
+            batch_size: 512,
+            micro_batch_size: 512,
+            threads: 0,
+            request_queue_capacity: 8,
+            event_queue_capacity: 16,
+            queue_timeout: Duration::from_secs(30),
+            generation_timeout: Duration::from_mins(5),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ChatTemplateEngine {
+    LlamaCpp,
+    Jinja,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ChatTemplateConfig {
+    pub engine: ChatTemplateEngine,
+    pub template: Option<String>,
+    pub enable_thinking: bool,
+}
+
+impl Default for ChatTemplateConfig {
+    fn default() -> Self {
+        Self {
+            engine: ChatTemplateEngine::LlamaCpp,
+            template: None,
+            enable_thinking: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LlmGenerationConfig {
+    pub max_tokens: usize,
+    pub temperature: f32,
+    pub top_p: f32,
+    pub top_k: i32,
+    pub min_p: f32,
+    pub presence_penalty: f32,
+    pub frequency_penalty: f32,
+    pub repeat_penalty: f32,
+}
+
+impl Default for LlmGenerationConfig {
+    fn default() -> Self {
+        Self {
+            max_tokens: 256,
+            temperature: 1.0,
+            top_p: 0.95,
+            top_k: 20,
+            min_p: 0.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            repeat_penalty: 1.0,
+        }
+    }
+}
+
+impl PartialEq for LlmGenerationConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.max_tokens == other.max_tokens
+            && self.temperature.to_bits() == other.temperature.to_bits()
+            && self.top_p.to_bits() == other.top_p.to_bits()
+            && self.top_k == other.top_k
+            && self.min_p.to_bits() == other.min_p.to_bits()
+            && self.presence_penalty.to_bits() == other.presence_penalty.to_bits()
+            && self.frequency_penalty.to_bits() == other.frequency_penalty.to_bits()
+            && self.repeat_penalty.to_bits() == other.repeat_penalty.to_bits()
+    }
+}
+impl Eq for LlmGenerationConfig {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmModelDeployment {
+    pub id: ModelId,
+    pub name: Option<String>,
+    pub model: ModelUrl,
+    pub mmproj_model: Option<ModelUrl>,
+    pub runtime: LlmRuntimeConfig,
+    pub chat_template: ChatTemplateConfig,
+    pub generation: LlmGenerationConfig,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelDeployment<M> {
     pub id: ModelId,
@@ -252,6 +388,11 @@ impl<M> ModelDeployment<M> {
 }
 
 impl ModelDeployment<AsrModel> {
+    /// Builds a deployment from a built-in ASR runtime.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the runtime's built-in model identifier violates the model ID or URL grammar.
     #[must_use]
     pub fn from_asr_runtime(runtime: AsrModel) -> Self {
         let id = ModelId::parse(runtime.as_str()).expect("ASR runtime contains a valid model id");
@@ -267,6 +408,11 @@ impl ModelDeployment<AsrModel> {
 }
 
 impl ModelDeployment<TtsModel> {
+    /// Builds a deployment from a built-in TTS runtime.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the runtime's built-in model identifier violates the model ID or URL grammar.
     #[must_use]
     pub fn from_tts_runtime(runtime: TtsModel) -> Self {
         let id = ModelId::parse(runtime.as_str()).expect("TTS runtime contains a valid model id");
@@ -345,6 +491,11 @@ impl OcrModelDeployment {
         self.name.as_deref().unwrap_or_else(|| self.id.name())
     }
 
+    /// Builds a deployment from a built-in OCR runtime.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the runtime's built-in model identifier cannot form a neutral model URL.
     #[must_use]
     pub fn from_runtime(runtime: OcrModel) -> Self {
         let id = runtime.id().clone();
@@ -361,6 +512,11 @@ impl OcrModelDeployment {
         }
     }
 
+    /// Adds Orchion's built-in document-layout model.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the compile-time built-in layout model URL is invalid.
     #[must_use]
     pub fn with_supported_layout(mut self) -> Self {
         self.layout_model = Some(
@@ -376,7 +532,7 @@ fn deployment_layout_ids(models: &[OcrModelDeployment]) -> Vec<ModelId> {
     let mut ids = Vec::new();
     for id in models
         .iter()
-        .filter_map(|model| model.layout_runtime.as_ref().map(|layout| layout.id()))
+        .filter_map(|model| model.layout_runtime.as_ref().map(orchion::OcrModel::id))
     {
         if !ids.contains(id) {
             ids.push(id.clone());
@@ -570,6 +726,12 @@ pub enum ConfigError {
         value: String,
         message: &'static str,
     },
+    #[error("invalid services.llm.models.{field} `{value}`: {message}")]
+    InvalidLlmSetting {
+        field: &'static str,
+        value: String,
+        message: &'static str,
+    },
 }
 
 impl ServerConfig {
@@ -646,6 +808,13 @@ impl ServerConfig {
                     format: OcrResponseFormat::Markdown,
                     max_tokens: DEFAULT_OCR_VL_MAX_TOKENS,
                     max_pixels: DEFAULT_OCR_MAX_PIXELS,
+                },
+                llm: LlmServiceSection {
+                    enabled: false,
+                    default_model: None,
+                    models: Vec::new(),
+                    idle_timeout: Duration::from_mins(10),
+                    max_loaded: 1,
                 },
             },
             auth: AuthSection { api_key: None },
@@ -815,6 +984,9 @@ impl ServerConfig {
             }
             if let Some(ocr_vl) = services.ocr_vl {
                 config.services.ocr_vl = parse_ocr_vl_service(ocr_vl, config.services.ocr_vl)?;
+            }
+            if let Some(llm) = services.llm {
+                config.services.llm = parse_llm_service(llm, config.services.llm)?;
             }
         }
 
@@ -1099,6 +1271,269 @@ fn parse_ocr_vl_service(
     Ok(service)
 }
 
+fn parse_llm_service(
+    raw: RawLlmService,
+    mut service: LlmServiceSection,
+) -> Result<LlmServiceSection, ConfigError> {
+    if let Some(enabled) = raw.enabled {
+        service.enabled = enabled;
+    }
+    if let Some(default_model) = raw.default_model {
+        service.default_model = Some(parse_model_id(
+            "services.llm.default_model",
+            &default_model,
+        )?);
+    }
+    if let Some(models) = raw.models {
+        service.models = models
+            .into_iter()
+            .map(parse_llm_deployment)
+            .collect::<Result<_, _>>()?;
+    }
+    apply_service_limits(
+        "services.llm",
+        raw.idle_timeout,
+        raw.max_loaded,
+        &mut service.idle_timeout,
+        &mut service.max_loaded,
+    )?;
+    if service.enabled && service.models.is_empty() {
+        return Err(ConfigError::ServiceEnabledWithoutModels {
+            section: "services.llm",
+        });
+    }
+    Ok(service)
+}
+
+fn parse_llm_deployment(raw: RawLlmModelDeployment) -> Result<LlmModelDeployment, ConfigError> {
+    let id = parse_model_id("services.llm", &raw.id)?;
+    Ok(LlmModelDeployment {
+        name: parse_deployment_name("services.llm", &id, raw.name)?,
+        id,
+        model: raw.model,
+        mmproj_model: raw.mmproj_model,
+        runtime: parse_llm_runtime(raw.runtime.unwrap_or_default())?,
+        chat_template: parse_chat_template(raw.chat_template.unwrap_or_default())?,
+        generation: parse_llm_generation(&raw.generation.unwrap_or_default())?,
+    })
+}
+
+fn parse_llm_runtime(raw: RawLlmRuntime) -> Result<LlmRuntimeConfig, ConfigError> {
+    let mut runtime = LlmRuntimeConfig::default();
+    if let Some(value) = raw.context_size {
+        runtime.context_size = match value {
+            RawContextSize::Name(value) if value == "model" => LlmContextSize::Model,
+            RawContextSize::Tokens(value) if value > 0 => LlmContextSize::Tokens(value),
+            value => {
+                return Err(invalid_llm(
+                    "runtime.context_size",
+                    format!("{value:?}"),
+                    "expected `model` or a positive integer",
+                ));
+            }
+        };
+    }
+    if let Some(value) = raw.gpu_layers {
+        runtime.gpu_layers = match value {
+            RawGpuLayers::Name(value) if value == "all" => LlmGpuLayers::All,
+            RawGpuLayers::Count(value) => LlmGpuLayers::Count(value),
+            RawGpuLayers::Name(value) => {
+                return Err(invalid_llm(
+                    "runtime.gpu_layers",
+                    format!("{value:?}"),
+                    "expected `all` or a nonnegative integer",
+                ));
+            }
+        };
+    }
+    if let Some(value) = raw.parallel_sequences {
+        runtime.parallel_sequences = value;
+    }
+    if runtime.parallel_sequences != 1 {
+        return Err(invalid_llm(
+            "runtime.parallel_sequences",
+            runtime.parallel_sequences.to_string(),
+            "the text tracer supports exactly one parallel sequence",
+        ));
+    }
+    if let Some(value) = raw.batch_size {
+        runtime.batch_size = nonzero_u32("runtime.batch_size", value)?;
+    }
+    if let Some(value) = raw.micro_batch_size {
+        runtime.micro_batch_size = nonzero_u32("runtime.micro_batch_size", value)?;
+    }
+    if let Some(value) = raw.threads {
+        if value < 0 {
+            return Err(invalid_llm(
+                "runtime.threads",
+                value.to_string(),
+                "value must be nonnegative",
+            ));
+        }
+        runtime.threads = value;
+    }
+    if let Some(value) = raw.request_queue_capacity {
+        runtime.request_queue_capacity = nonzero_usize("runtime.request_queue_capacity", value)?;
+    }
+    if let Some(value) = raw.event_queue_capacity {
+        runtime.event_queue_capacity = nonzero_usize("runtime.event_queue_capacity", value)?;
+    }
+    if let Some(value) = raw.queue_timeout {
+        runtime.queue_timeout = parse_duration(&value)?;
+    }
+    if let Some(value) = raw.generation_timeout {
+        runtime.generation_timeout = parse_duration(&value)?;
+    }
+    Ok(runtime)
+}
+
+fn nonzero_u32(field: &'static str, value: u32) -> Result<u32, ConfigError> {
+    if value == 0 {
+        Err(invalid_llm(
+            field,
+            value.to_string(),
+            "value must be greater than zero",
+        ))
+    } else {
+        Ok(value)
+    }
+}
+
+fn nonzero_usize(field: &'static str, value: usize) -> Result<usize, ConfigError> {
+    if value == 0 {
+        Err(invalid_llm(
+            field,
+            value.to_string(),
+            "value must be greater than zero",
+        ))
+    } else {
+        Ok(value)
+    }
+}
+
+fn parse_chat_template(raw: RawChatTemplate) -> Result<ChatTemplateConfig, ConfigError> {
+    let engine = match raw.engine.as_deref().unwrap_or("llama_cpp") {
+        "llama_cpp" => ChatTemplateEngine::LlamaCpp,
+        "jinja" => ChatTemplateEngine::Jinja,
+        value => {
+            return Err(invalid_llm(
+                "chat_template.engine",
+                value.to_string(),
+                "expected `llama_cpp` or the supported text-subset `jinja` engine",
+            ));
+        }
+    };
+    let template = raw.template.map(|value| value.trim().to_string());
+    if template.as_ref().is_some_and(String::is_empty) {
+        return Err(invalid_llm(
+            "chat_template.template",
+            String::new(),
+            "override must be nonblank",
+        ));
+    }
+    Ok(ChatTemplateConfig {
+        engine,
+        template,
+        enable_thinking: raw.enable_thinking.unwrap_or(false),
+    })
+}
+
+fn parse_llm_generation(raw: &RawLlmGeneration) -> Result<LlmGenerationConfig, ConfigError> {
+    let mut value = LlmGenerationConfig::default();
+    if let Some(v) = raw.max_tokens {
+        value.max_tokens = v;
+    }
+    if let Some(v) = raw.temperature {
+        value.temperature = v;
+    }
+    if let Some(v) = raw.top_p {
+        value.top_p = v;
+    }
+    if let Some(v) = raw.top_k {
+        value.top_k = v;
+    }
+    if let Some(v) = raw.min_p {
+        value.min_p = v;
+    }
+    if let Some(v) = raw.presence_penalty {
+        value.presence_penalty = v;
+    }
+    if let Some(v) = raw.frequency_penalty {
+        value.frequency_penalty = v;
+    }
+    if let Some(v) = raw.repeat_penalty {
+        value.repeat_penalty = v;
+    }
+    validate_llm_generation(&value)?;
+    Ok(value)
+}
+
+fn validate_llm_generation(value: &LlmGenerationConfig) -> Result<(), ConfigError> {
+    if value.max_tokens < 16 || value.max_tokens > DEFAULT_LLM_MAX_TOKENS {
+        return Err(invalid_llm(
+            "generation.max_tokens",
+            value.max_tokens.to_string(),
+            "expected 16..=4096",
+        ));
+    }
+    if !value.temperature.is_finite() || !(0.0..=2.0).contains(&value.temperature) {
+        return Err(invalid_llm(
+            "generation.temperature",
+            value.temperature.to_string(),
+            "expected a finite value in [0, 2]",
+        ));
+    }
+    if !value.top_p.is_finite() || value.top_p <= 0.0 || value.top_p > 1.0 {
+        return Err(invalid_llm(
+            "generation.top_p",
+            value.top_p.to_string(),
+            "expected a finite value in (0, 1]",
+        ));
+    }
+    if value.top_k < 0 {
+        return Err(invalid_llm(
+            "generation.top_k",
+            value.top_k.to_string(),
+            "expected a nonnegative integer",
+        ));
+    }
+    if !value.min_p.is_finite() || !(0.0..=1.0).contains(&value.min_p) {
+        return Err(invalid_llm(
+            "generation.min_p",
+            value.min_p.to_string(),
+            "expected a finite value in [0, 1]",
+        ));
+    }
+    for (field, penalty) in [
+        ("generation.presence_penalty", value.presence_penalty),
+        ("generation.frequency_penalty", value.frequency_penalty),
+    ] {
+        if !penalty.is_finite() || !(-2.0..=2.0).contains(&penalty) {
+            return Err(invalid_llm(
+                field,
+                penalty.to_string(),
+                "expected a finite value in [-2, 2]",
+            ));
+        }
+    }
+    if !value.repeat_penalty.is_finite() || value.repeat_penalty <= 0.0 {
+        return Err(invalid_llm(
+            "generation.repeat_penalty",
+            value.repeat_penalty.to_string(),
+            "expected a finite value greater than zero",
+        ));
+    }
+    Ok(())
+}
+
+fn invalid_llm(field: &'static str, value: String, message: &'static str) -> ConfigError {
+    ConfigError::InvalidLlmSetting {
+        field,
+        value,
+        message,
+    }
+}
+
 fn validate_ocr_max_pixels(section: &'static str, max_pixels: u64) -> Result<u64, ConfigError> {
     if max_pixels == 0 {
         return Err(ConfigError::InvalidResourceLimit {
@@ -1352,6 +1787,10 @@ fn validate_runtime_category(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "validates cross-service deployment IDs, runtime categories, and defaults together"
+)]
 fn validate_model_deployments(config: &ServerConfig) -> Result<(), ConfigError> {
     let mut ids = HashSet::new();
     for id in config
@@ -1363,6 +1802,7 @@ fn validate_model_deployments(config: &ServerConfig) -> Result<(), ConfigError> 
         .chain(config.services.tts.models.iter().map(|model| &model.id))
         .chain(config.services.ocr.models.iter().map(|model| &model.id))
         .chain(config.services.ocr_vl.models.iter().map(|model| &model.id))
+        .chain(config.services.llm.models.iter().map(|model| &model.id))
     {
         if !ids.insert(id) {
             return Err(ConfigError::DuplicateModelId { id: id.to_string() });
@@ -1397,6 +1837,7 @@ fn validate_model_deployments(config: &ServerConfig) -> Result<(), ConfigError> 
         OcrModelKind::OcrVl,
         "OCR-VL",
     )?;
+    validate_llm_deployments(&config.services.llm)?;
 
     ensure_default_available(
         "ASR",
@@ -1436,7 +1877,70 @@ fn validate_model_deployments(config: &ServerConfig) -> Result<(), ConfigError> 
         config.services.ocr_vl.default_model.as_ref(),
         &config.services.ocr_vl.models,
     )?;
+    if let Some(default) = config.services.llm.default_model.as_ref() {
+        ensure_default_available(
+            "LLM",
+            "services.llm",
+            default.as_str(),
+            config
+                .services
+                .llm
+                .models
+                .iter()
+                .filter(|model| model.id == *default)
+                .count()
+                == 1,
+        )?;
+    } else if config.services.llm.enabled {
+        return Err(ConfigError::DefaultModelUnavailable {
+            category: "LLM",
+            section: "services.llm",
+            default: "<missing>".to_string(),
+        });
+    }
     Ok(())
+}
+
+fn validate_llm_deployments(service: &LlmServiceSection) -> Result<(), ConfigError> {
+    if service.enabled && service.models.is_empty() {
+        return Err(ConfigError::ServiceEnabledWithoutModels {
+            section: "services.llm",
+        });
+    }
+    for deployment in &service.models {
+        validate_deployment_name("services.llm", &deployment.id, deployment.name.as_deref())?;
+        validate_exact_gguf(
+            &deployment.model,
+            "LLM main GGUF must use an exact-file locator",
+        )?;
+        if let Some(mmproj) = &deployment.mmproj_model {
+            validate_exact_gguf(mmproj, "LLM mmproj GGUF must use an exact-file locator")?;
+        }
+        validate_llm_generation(&deployment.generation)?;
+        if deployment.runtime.parallel_sequences != 1 {
+            return Err(invalid_llm(
+                "runtime.parallel_sequences",
+                deployment.runtime.parallel_sequences.to_string(),
+                "the text tracer supports exactly one parallel sequence",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_exact_gguf(url: &ModelUrl, message: &'static str) -> Result<(), ConfigError> {
+    let exact = url.source() == orchion::ModelUrlSource::File
+        || url
+            .path()
+            .is_some_and(|path| path.to_ascii_lowercase().ends_with(".gguf"));
+    if exact {
+        return Ok(());
+    }
+    Err(ConfigError::UnsupportedModelLocator {
+        section: "services.llm",
+        value: url.to_string(),
+        message,
+    })
 }
 
 fn validate_service_models<M>(
@@ -1905,6 +2409,79 @@ struct RawServices {
     ocr: Option<RawOcrService>,
     #[serde(rename = "ocr-vl")]
     ocr_vl: Option<RawOcrVlService>,
+    llm: Option<RawLlmService>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLlmService {
+    enabled: Option<bool>,
+    default_model: Option<String>,
+    models: Option<Vec<RawLlmModelDeployment>>,
+    idle_timeout: Option<String>,
+    max_loaded: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLlmModelDeployment {
+    id: String,
+    name: Option<String>,
+    model: ModelUrl,
+    mmproj_model: Option<ModelUrl>,
+    runtime: Option<RawLlmRuntime>,
+    chat_template: Option<RawChatTemplate>,
+    generation: Option<RawLlmGeneration>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawLlmRuntime {
+    context_size: Option<RawContextSize>,
+    gpu_layers: Option<RawGpuLayers>,
+    parallel_sequences: Option<u32>,
+    batch_size: Option<u32>,
+    micro_batch_size: Option<u32>,
+    threads: Option<i32>,
+    request_queue_capacity: Option<usize>,
+    event_queue_capacity: Option<usize>,
+    queue_timeout: Option<String>,
+    generation_timeout: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawContextSize {
+    Name(String),
+    Tokens(u32),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawGpuLayers {
+    Name(String),
+    Count(u32),
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawChatTemplate {
+    engine: Option<String>,
+    template: Option<String>,
+    enable_thinking: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawLlmGeneration {
+    max_tokens: Option<usize>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<i32>,
+    min_p: Option<f32>,
+    presence_penalty: Option<f32>,
+    frequency_penalty: Option<f32>,
+    repeat_penalty: Option<f32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2222,5 +2799,96 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn llm_parses_exact_main_and_mmproj_profile() {
+        let config = ServerConfig::from_toml_str(r#"
+            [services.llm]
+            enabled = true
+            default_model = "qwen/test"
+
+            [[services.llm.models]]
+            id = "qwen/test"
+            name = "Test Q4"
+            model = "//owner/repo/main-Q4.gguf"
+            mmproj_model = "//owner/repo/mmproj.gguf"
+            runtime = { context_size = 4096, gpu_layers = 0, parallel_sequences = 1, batch_size = 128, micro_batch_size = 64, threads = 4, request_queue_capacity = 2, event_queue_capacity = 3, queue_timeout = "7s", generation_timeout = "2m" }
+            chat_template = { engine = "llama_cpp", template = "chatml" }
+            generation = { max_tokens = 512, temperature = 0.7, top_p = 0.9, top_k = 40, min_p = 0.05, presence_penalty = 0.1, frequency_penalty = -0.1, repeat_penalty = 1.1 }
+        "#, Path::new("/tmp/orchion-server")).unwrap();
+        let model = &config.services.llm.models[0];
+        assert!(config.services.llm.active());
+        assert_eq!(model.id.as_str(), "qwen/test");
+        assert!(matches!(
+            model.runtime.context_size,
+            LlmContextSize::Tokens(4096)
+        ));
+        assert!(matches!(model.runtime.gpu_layers, LlmGpuLayers::Count(0)));
+        assert_eq!(model.runtime.parallel_sequences, 1);
+        assert_eq!(model.runtime.queue_timeout, Duration::from_secs(7));
+        assert_eq!(model.runtime.generation_timeout, Duration::from_mins(2));
+        assert!(model.mmproj_model.is_some());
+    }
+
+    #[test]
+    fn llm_rejects_repository_wide_download_and_parallel_sequences() {
+        for (model, parallel) in [("//owner/repo", 1), ("//owner/repo/main.gguf", 2)] {
+            let document = format!(
+                r#"
+                [services.llm]
+                enabled = true
+                default_model = "qwen/test"
+                [[services.llm.models]]
+                id = "qwen/test"
+                model = "{model}"
+                runtime = {{ parallel_sequences = {parallel} }}
+            "#
+            );
+            assert!(
+                ServerConfig::from_toml_str(&document, Path::new("/tmp/orchion-server")).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn llm_rejects_deployment_default_below_responses_minimum() {
+        let error = ServerConfig::from_toml_str(
+            r#"
+            [services.llm]
+            enabled = true
+            default_model = "qwen/test"
+            [[services.llm.models]]
+            id = "qwen/test"
+            model = "//owner/repo/main.gguf"
+            generation = { max_tokens = 15 }
+            "#,
+            Path::new("/tmp/orchion-server"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("generation.max_tokens"));
+        assert!(error.to_string().contains("16..=4096"));
+    }
+
+    #[test]
+    fn llm_accepts_text_subset_jinja_engine() {
+        let config = ServerConfig::from_toml_str(
+            r#"
+            [services.llm]
+            enabled = true
+            default_model = "qwen/test"
+            [[services.llm.models]]
+            id = "qwen/test"
+            model = "//owner/repo/main.gguf"
+            chat_template = { engine = "jinja", enable_thinking = true }
+            "#,
+            Path::new("/tmp/orchion-server"),
+        )
+        .unwrap();
+        assert_eq!(
+            config.services.llm.models[0].chat_template.engine,
+            ChatTemplateEngine::Jinja
+        );
+        assert!(config.services.llm.models[0].chat_template.enable_thinking);
     }
 }

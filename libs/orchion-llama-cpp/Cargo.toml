@@ -1,0 +1,39 @@
+[package]
+name = "orchion-llama-cpp"
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+license = "MIT"
+
+[features]
+default = []
+cpu-openmp = ["llama-cpp-2/openmp", "llama-cpp-sys-2/openmp"]
+cuda = ["llama-cpp-2/cuda", "llama-cpp-sys-2/cuda"]
+vulkan = ["llama-cpp-2/vulkan", "llama-cpp-sys-2/vulkan"]
+
+[dependencies]
+encoding_rs = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+llama-cpp-2 = { git = "https://github.com/utilityai/llama-cpp-rs", rev = "3d5f424f7cfb7cd3d1f9039440bd0286e29ca050", default-features = false, features = ["common", "mtmd"] }
+llama-cpp-sys-2 = { git = "https://github.com/utilityai/llama-cpp-rs", rev = "3d5f424f7cfb7cd3d1f9039440bd0286e29ca050", default-features = false, features = ["common", "mtmd"] }
+minijinja = { version = "2", features = ["json", "loop_controls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "sync"] }
+tracing = "0.1"
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+
+[build-dependencies]
+sha2 = "0.10"
+
+[[bin]]
+name = "native-link-probe"
+path = "src/bin/native_link_probe.rs"

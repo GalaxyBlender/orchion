@@ -4,6 +4,7 @@ use super::{KnownOcrModel, ModelCategory, ModelId};
 pub enum RuntimeProvider {
     Qwen3,
     OarOcr,
+    LlamaCpp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -28,6 +29,9 @@ impl ModelCapabilities {
     pub const OCR_MARKDOWN: Self = Self(1 << 8);
     pub const OCR_HTML: Self = Self(1 << 9);
     pub const OCR_TABLE_STRUCTURE: Self = Self(1 << 10);
+    pub const LLM_CHAT: Self = Self(1 << 11);
+    pub const LLM_RESPONSES: Self = Self(1 << 12);
+    pub const LLM_STREAMING: Self = Self(1 << 13);
 
     #[must_use]
     pub const fn union(self, other: Self) -> Self {

@@ -53,6 +53,7 @@ pub enum ModelType {
     Asr,
     Tts,
     Ocr,
+    Llm,
 }
 
 /// Capability supported by a configured model deployment.
@@ -70,4 +71,7 @@ pub enum ModelCapability {
     OcrVisionLanguage,
     OcrMarkdown,
     OcrHtml,
+    LlmChat,
+    LlmResponses,
+    LlmStreaming,
 }

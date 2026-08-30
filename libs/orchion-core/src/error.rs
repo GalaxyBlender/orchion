@@ -63,6 +63,18 @@ pub enum OrchionError {
     #[error("inference failed: {message}")]
     Inference { message: String },
 
+    #[error(
+        "prompt ({prompt_tokens} tokens) plus completion ({max_tokens} tokens) exceeds context size {context_size}"
+    )]
+    LlmContextLimit {
+        prompt_tokens: usize,
+        max_tokens: usize,
+        context_size: usize,
+    },
+
+    #[error("LLM worker failed: {message}")]
+    LlmWorkerFailed { message: String },
+
     #[error("invalid audio input: {reason}")]
     InvalidAudio { reason: String },
 

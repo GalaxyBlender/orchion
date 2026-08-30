@@ -36,6 +36,61 @@ pub trait ModelProvisioner<M>: Send + Sync {
     ) -> ModelProvisionFuture<'_>;
 }
 
+pub trait ModelCacheKey: Clone + std::fmt::Debug + Eq + Send + Sync + 'static {
+    fn cache_path(&self, cache_dir: &std::path::Path) -> PathBuf;
+
+    fn resolve_without_provisioner(
+        &self,
+        provisioning: Option<ModelProvisioning>,
+        models_dir: PathBuf,
+    ) -> ModelProvisionFuture<'_> {
+        let path = self.cache_path(&models_dir);
+        Box::pin(async move {
+            if provisioning.is_some() {
+                anyhow::bail!("this cache key does not support repository provisioning")
+            }
+            Ok(path)
+        })
+    }
+}
+
+impl<M: ModelSpec> ModelCacheKey for M {
+    fn cache_path(&self, cache_dir: &std::path::Path) -> PathBuf {
+        ModelSpec::cache_path(self, cache_dir)
+    }
+
+    fn resolve_without_provisioner(
+        &self,
+        provisioning: Option<ModelProvisioning>,
+        models_dir: PathBuf,
+    ) -> ModelProvisionFuture<'_> {
+        let model = self.clone();
+        Box::pin(async move {
+            match provisioning {
+                Some(provisioning) => match provisioning.source_plan.as_ref() {
+                    Some(plan) => ModelDownloader::resolve_prepared_model_url_path_with_plan(
+                        &model,
+                        &provisioning.model_url,
+                        &provisioning.source_intent,
+                        plan,
+                        &models_dir,
+                    )
+                    .map_err(anyhow::Error::from),
+                    None => ModelDownloader::resolve_model_url_path(
+                        &model,
+                        &provisioning.model_url,
+                        &provisioning.source_intent,
+                        &models_dir,
+                    )
+                    .await
+                    .map_err(anyhow::Error::from),
+                },
+                None => Ok(ModelSpec::cache_path(&model, &models_dir)),
+            }
+        })
+    }
+}
+
 pub(crate) trait CacheTracker: Send + Sync {
     fn loaded_len(&self) -> BoxFuture<'_, usize>;
     fn lru_entry(&self) -> BoxFuture<'_, Option<TrackedLoadedModel>>;
@@ -345,7 +400,7 @@ impl GlobalModelCacheLimiter {
         load: F,
     ) -> anyhow::Result<Option<ModelLease<E>>>
     where
-        M: ModelSpec + std::hash::Hash + 'static,
+        M: ModelCacheKey + std::hash::Hash + 'static,
         E: Clone + Send + 'static,
         C: CacheTrackerSet,
         F: FnOnce(M, PathBuf) -> Fut + Send + 'static,
@@ -538,7 +593,7 @@ impl<const N: usize> CacheTrackerSet for &[&dyn CacheTracker; N] {
 
 impl<M, E> CacheTrackerSet for &ModelCache<M, E>
 where
-    M: ModelSpec + std::hash::Hash + 'static,
+    M: ModelCacheKey + std::hash::Hash + 'static,
     E: Clone + Send + 'static,
 {
     fn into_trackers(self, target: &dyn CacheTracker) -> Vec<Arc<dyn CacheTracker>> {
@@ -583,7 +638,7 @@ async fn lru_entry(all_caches: &[Arc<dyn CacheTracker>]) -> Option<TrackedLoaded
 
 impl<M, E> ModelCache<M, E>
 where
-    M: ModelSpec + std::hash::Hash,
+    M: ModelCacheKey + std::hash::Hash,
     E: Clone,
 {
     #[must_use]
@@ -670,6 +725,10 @@ where
         )
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "cache identity, policy, storage, provisioning, and residency are independent inputs"
+    )]
     pub(crate) fn new_in_domain_with_provisioning(
         cache_id: &'static str,
         available_models: Vec<M>,
@@ -692,6 +751,10 @@ where
         )
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "centralizes construction for the public cache constructors"
+    )]
     fn build(
         cache_id: &'static str,
         available_models: Vec<M>,
@@ -896,27 +959,9 @@ where
         }
         let Some(provisioner) = self.provisioner.as_ref() else {
             let provisioning = self.inner.lock().await.provisioning.get(&model).cloned();
-            return match provisioning {
-                Some(provisioning) => match provisioning.source_plan.as_ref() {
-                    Some(plan) => ModelDownloader::resolve_prepared_model_url_path_with_plan(
-                        &model,
-                        &provisioning.model_url,
-                        &provisioning.source_intent,
-                        plan,
-                        &self.dir,
-                    )
-                    .map_err(anyhow::Error::from),
-                    None => ModelDownloader::resolve_model_url_path(
-                        &model,
-                        &provisioning.model_url,
-                        &provisioning.source_intent,
-                        &self.dir,
-                    )
-                    .await
-                    .map_err(anyhow::Error::from),
-                },
-                None => Ok(model.cache_path(&self.dir)),
-            };
+            return model
+                .resolve_without_provisioner(provisioning, self.dir.clone())
+                .await;
         };
 
         tracing::debug!(cache = self.cache_id, model = ?model, models_dir = %self.dir.display(), "ensuring model is available");
@@ -1041,7 +1086,7 @@ where
 
 impl<M, E> ModelCache<M, E>
 where
-    M: ModelSpec + std::hash::Hash + Send + 'static,
+    M: ModelCacheKey + std::hash::Hash + Send + 'static,
     E: Clone + Send + 'static,
 {
     async fn destroy_retired(
@@ -1234,7 +1279,7 @@ where
 
 impl<M, E> CacheTracker for ModelCache<M, E>
 where
-    M: ModelSpec + std::hash::Hash + Send + 'static,
+    M: ModelCacheKey + std::hash::Hash + Send + 'static,
     E: Clone + Send + 'static,
 {
     fn loaded_len(&self) -> BoxFuture<'_, usize> {
@@ -1568,7 +1613,7 @@ mod tests {
         residency: &ResidencyDomain,
     ) -> ModelCache<M, usize>
     where
-        M: ModelSpec + std::hash::Hash,
+        M: ModelCacheKey + std::hash::Hash,
     {
         ModelCache::new_in_domain(
             cache_id,
@@ -3031,7 +3076,7 @@ mod tests {
         model: &M,
         expected: ModelResidencyStatus,
     ) where
-        M: ModelSpec + std::hash::Hash,
+        M: ModelCacheKey + std::hash::Hash,
         E: Clone,
     {
         tokio::time::timeout(Duration::from_secs(1), async {

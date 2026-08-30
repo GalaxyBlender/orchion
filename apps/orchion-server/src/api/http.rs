@@ -1,6 +1,7 @@
 use crate::api::activity::{ActivityHub, track_activity};
 use crate::api::http_activity::{activity_events, list_activity};
 use crate::api::http_audio::{create_speech, create_transcription, create_transcription_ws};
+use crate::api::http_llm::{create_chat_completion, create_response};
 use crate::api::http_models::{list_model_statuses, list_models, load_model, unload_model};
 use crate::api::http_ocr::create_ocr;
 use crate::api::http_pdf_images::create_pdf_images;
@@ -85,6 +86,7 @@ where
     let tts_enabled = policy.tts_models.is_some();
     let asr_enabled = policy.asr.is_some();
     let ocr_enabled = policy.ocr_enabled;
+    let llm_enabled = policy.llm_enabled;
     let activity = ActivityHub::new(policy.activity);
     let mut router = Router::new()
         .route("/", get(root_redirect))
@@ -110,6 +112,11 @@ where
     }
     if ocr_enabled {
         router = router.route("/v1/ocr", post(create_ocr::<S>));
+    }
+    if llm_enabled {
+        router = router
+            .route("/v1/chat/completions", post(create_chat_completion::<S>))
+            .route("/v1/responses", post(create_response::<S>));
     }
 
     router
@@ -166,7 +173,10 @@ mod tests {
     use crate::api::openai::ApiError;
     use crate::infrastructure::orchion::AppState;
     use crate::settings::ServerConfig;
-    use crate::settings::{ModelDeployment, OcrModelDeployment};
+    use crate::settings::{
+        ChatTemplateConfig, LlmGenerationConfig, LlmModelDeployment, LlmRuntimeConfig,
+        ModelDeployment, OcrModelDeployment,
+    };
     use axum::body::Body;
     use axum::extract::connect_info::ConnectInfo;
     use axum::http::header::{
@@ -178,7 +188,9 @@ mod tests {
     use axum::response::Response;
     use futures_util::{SinkExt, StreamExt};
     use http_body_util::BodyExt;
-    use orchion::{AsrModel, ModelId, OcrModel, OcrModelKind, TtsModel};
+    use orchion::{
+        AsrModel, ModelId, OcrModel, OcrModelKind, TtsModel, scripted_context_limit_llm_engine,
+    };
     use serde_json::Value;
     use std::net::SocketAddr;
     use std::time::Duration;
@@ -451,13 +463,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn activity_retains_internal_error_details_for_server_errors() {
+    async fn activity_sanitizes_internal_error_details_for_server_errors() {
         let app = router_with_ui_routes(
             test_state(false, false),
             Router::new().route(
                 "/v1/audio/speech",
                 post(|| async {
-                    Err::<(), ApiError>(ApiError::internal("model inference failed: sentinel"))
+                    Err::<(), ApiError>(ApiError::internal(
+                        "model load failed at /tmp/private/model.gguf: sentinel",
+                    ))
                 }),
             ),
         );
@@ -478,7 +492,7 @@ mod tests {
         assert!(
             !response_body
                 .to_string()
-                .contains("model inference failed: sentinel")
+                .contains("/tmp/private/model.gguf")
         );
 
         let activity = app
@@ -495,8 +509,10 @@ mod tests {
         assert_eq!(activity["history"][0]["error_code"], "internal_error");
         assert_eq!(
             activity["history"][0]["error_message"],
-            "model inference failed: sentinel"
+            "internal server error"
         );
+        assert!(!activity.to_string().contains("/tmp/private/model.gguf"));
+        assert!(!activity.to_string().contains("sentinel"));
     }
 
     #[tokio::test]
@@ -577,6 +593,159 @@ mod tests {
 
         assert!(activity["history"][0].get("model").is_none());
         assert!(!activity.to_string().contains("Private/Client-Sentinel"));
+    }
+
+    #[tokio::test]
+    async fn llm_unknown_model_is_not_recorded_before_allowlist_validation() {
+        let root = tempfile::tempdir().unwrap();
+        let gguf = root.path().join("main.gguf");
+        let mmproj = root.path().join("mmproj.gguf");
+        std::fs::write(&gguf, "test gguf fixture").unwrap();
+        std::fs::write(&mmproj, "test mmproj fixture").unwrap();
+        let mut config = ServerConfig::default_for_exe(&root.path().join("orchion-server"));
+        let models_dir = config.models.dir.clone();
+        config.services.asr.enabled = false;
+        config.services.tts.enabled = false;
+        let id = ModelId::parse("qwen/test").unwrap();
+        config.services.llm.enabled = true;
+        config.services.llm.default_model = Some(id.clone());
+        config.services.llm.models = vec![LlmModelDeployment {
+            id,
+            name: None,
+            model: orchion::ModelUrl::parse(&format!("file://{}", gguf.display())).unwrap(),
+            mmproj_model: Some(
+                orchion::ModelUrl::parse(&format!("file://{}", mmproj.display())).unwrap(),
+            ),
+            runtime: LlmRuntimeConfig::default(),
+            chat_template: ChatTemplateConfig::default(),
+            generation: LlmGenerationConfig::default(),
+        }];
+        let state = AppState::load(config).await.unwrap();
+        let manifest = serde_json::from_str::<Value>(
+            &std::fs::read_to_string(find_deployment_manifest(&models_dir).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let manifest_text = manifest.to_string();
+        assert!(manifest_text.contains("llm_model"));
+        assert!(manifest_text.contains("llm_mmproj"));
+        assert!(manifest_text.contains("sha256"));
+        assert!(manifest_text.contains("size"));
+        assert!(manifest_text.contains("runtime="));
+        assert!(manifest_text.contains("generation="));
+        let lock = std::fs::read_to_string(models_dir.join("orchion-models.lock")).unwrap();
+        assert!(lock.contains("llm_model"));
+        assert!(lock.contains("llm_mmproj"));
+        assert!(models_dir.join(".orchion/blobs/sha256").is_dir());
+        let app = router_with_ui_routes(state, Router::new());
+        let listed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let listed = json_body(listed).await;
+        assert_eq!(listed["data"][0]["id"], "qwen/test");
+        assert_eq!(listed["data"][0]["type"], "llm");
+        assert_eq!(
+            listed["data"][0]["capabilities"],
+            serde_json::json!(["llm_chat", "llm_responses", "llm_streaming"])
+        );
+        assert!(!listed.to_string().contains("main.gguf"));
+        let response = app.clone().oneshot(Request::builder()
+            .method(Method::POST).uri("/v1/chat/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"model":"Private/Prompt-Sentinel","messages":[{"role":"user","content":"secret prompt"}]}"#)).unwrap())
+            .await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        response.into_body().collect().await.unwrap();
+        let activity = wait_for_activity_history(app).await;
+        assert!(activity["history"][0].get("model").is_none());
+        let serialized = activity.to_string();
+        assert!(!serialized.contains("Private/Prompt-Sentinel"));
+        assert!(!serialized.contains("secret prompt"));
+    }
+
+    #[tokio::test]
+    async fn llm_context_limit_is_json_4xx_before_sync_or_stream_headers() {
+        for stream in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let gguf = root.path().join("main.gguf");
+            std::fs::write(&gguf, "test gguf fixture").unwrap();
+            let mut config = ServerConfig::default_for_exe(&root.path().join("orchion-server"));
+            config.services.asr.enabled = false;
+            config.services.tts.enabled = false;
+            let id = ModelId::parse("qwen/test").unwrap();
+            config.services.llm.enabled = true;
+            config.services.llm.default_model = Some(id.clone());
+            config.services.llm.models = vec![LlmModelDeployment {
+                id,
+                name: None,
+                model: orchion::ModelUrl::parse(&format!("file://{}", gguf.display())).unwrap(),
+                mmproj_model: None,
+                runtime: LlmRuntimeConfig::default(),
+                chat_template: ChatTemplateConfig::default(),
+                generation: LlmGenerationConfig::default(),
+            }];
+            let state = AppState::load_with_test_llm_engine(
+                config,
+                scripted_context_limit_llm_engine(100, 50, 128),
+            )
+            .await
+            .unwrap();
+            let response = router_with_ui_routes(state.clone(), Router::new())
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/v1/chat/completions")
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "model":"qwen/test",
+                                "messages":[{"role":"user","content":"long prompt"}],
+                                "stream":stream
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_ne!(response.headers()[CONTENT_TYPE], "text/event-stream");
+            let body = json_body(response).await;
+            assert_eq!(body["error"]["code"], "context_length_exceeded");
+            assert_eq!(body["error"]["param"], "max_completion_tokens");
+
+            let response = router_with_ui_routes(state.clone(), Router::new())
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/v1/responses")
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "model":"qwen/test",
+                                "input":"long prompt",
+                                "store":false,
+                                "stream":stream
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_ne!(response.headers()[CONTENT_TYPE], "text/event-stream");
+            let body = json_body(response).await;
+            assert_eq!(body["error"]["code"], "context_length_exceeded");
+            assert_eq!(body["error"]["param"], "max_output_tokens");
+            state.shutdown().await;
+        }
     }
 
     #[tokio::test]
@@ -1151,6 +1320,23 @@ mod tests {
         }
         body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
         body
+    }
+
+    fn find_deployment_manifest(root: &std::path::Path) -> Option<std::path::PathBuf> {
+        for entry in std::fs::read_dir(root).ok()? {
+            let path = entry.ok()?.path();
+            if path.is_dir() {
+                if let Some(manifest) = find_deployment_manifest(&path) {
+                    return Some(manifest);
+                }
+            } else if path
+                .file_name()
+                .is_some_and(|name| name == "orchion-deployment.json")
+            {
+                return Some(path);
+            }
+        }
+        None
     }
 
     fn test_state(ocr_active: bool, ocr_vl_active: bool) -> Arc<AppState> {

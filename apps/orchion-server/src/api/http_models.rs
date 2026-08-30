@@ -26,6 +26,7 @@ where
                 ModelService::Asr => ModelType::Asr,
                 ModelService::Tts => ModelType::Tts,
                 ModelService::Ocr | ModelService::OcrVl => ModelType::Ocr,
+                ModelService::Llm => ModelType::Llm,
             };
             ModelObject::new(
                 model.id.to_string(),

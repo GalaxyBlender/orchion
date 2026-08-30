@@ -23,6 +23,8 @@ pub enum ActivityOperation {
     Tts,
     Ocr,
     Pdf,
+    Chat,
+    Responses,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, ToSchema)]
@@ -60,6 +62,14 @@ pub struct ActivityEntry {
     pub outcome: Option<ActivityOutcome>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_time_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eval_time_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

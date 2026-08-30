@@ -24,10 +24,13 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.95.0
 
       - name: Configure sccache
         uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Install native inference prerequisites
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake libclang-dev
 
       - name: Install Bun
         uses: oven-sh/setup-bun@v2
@@ -61,6 +64,12 @@ jobs:
       - name: Test Rust workspace
         run: cargo test --workspace
 
+      - name: Run embedded llama.cpp text and mtmd link probe
+        run: |
+          cargo run -p orchion-llama-cpp --bin native-link-probe
+          cargo run -p orchion-llama-cpp --bin native-link-probe -- --metadata-json > target/llama-build-metadata.json
+          python3 -c 'import json, pathlib; data=json.load(open("target/llama-build-metadata.json")); resolved=data["cmake_resolved"]; assert data["binding_revision"] == "3d5f424f7cfb7cd3d1f9039440bd0286e29ca050"; assert data["llama_cpp_revision"] == "e79e4bf660e19f2ad851e06c6913f7a8c5852621"; assert data["binding_features"] == "common,mtmd"; assert data["rustc_version"].startswith("rustc 1.95.0"); assert all(resolved[key] not in ("", "unset", "unavailable") for key in ("build_type", "generator", "build_shared_libs", "ggml_metal", "ggml_openmp", "ggml_cuda", "ggml_vulkan", "ggml_native")); assert len(resolved["cache_sha256"]) == 64; assert not pathlib.Path(resolved["cache_path_relative"]).is_absolute()'
+
       - name: Check client feature gates
         run: |
           cargo check -p orchion-client --no-default-features --features models
@@ -86,7 +95,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.95.0
 
       - name: Configure sccache
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -95,6 +104,13 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+
+      - name: Run macOS embedded llama.cpp link probe
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+          CMAKE_OSX_DEPLOYMENT_TARGET: "11.0"
+          GGML_METAL: "ON"
+        run: cargo run -p orchion-llama-cpp --bin native-link-probe
 
       - name: Build Metal server
         run: ./scripts/build-macos-metal.sh
@@ -108,6 +124,12 @@ jobs:
           cp "target/release/orchion-server" "dist/${package}/"
           cp "target/release/libpdfium.dylib" "dist/${package}/"
           cp "apps/orchion-server/config.toml" "dist/${package}/config.toml"
+          cp "THIRD_PARTY_NOTICES.md" "dist/${package}/"
+          cp -R "third-party-licenses" "dist/${package}/"
+          "dist/${package}/orchion-server" --build-metadata > "dist/${package}/build-metadata.json"
+          cmake_relative="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["cmake_resolved"]["cache_path_relative"])' "dist/${package}/build-metadata.json")"
+          cp "target/release/${cmake_relative}" "dist/${package}/llama-cpp-CMakeCache.txt"
+          python3 -c 'import hashlib,json,sys; metadata=json.load(open(sys.argv[1])); assert hashlib.sha256(open(sys.argv[2],"rb").read()).hexdigest() == metadata["cmake_resolved"]["cache_sha256"]' "dist/${package}/build-metadata.json" "dist/${package}/llama-cpp-CMakeCache.txt"
           "dist/${package}/orchion-server" --help >/dev/null
           python3 -c 'import ctypes, sys; ctypes.CDLL(sys.argv[1])' "dist/${package}/libpdfium.dylib"
           tar -czf "dist/${package}.tar.gz" -C dist "${package}"
@@ -131,8 +153,10 @@ jobs:
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             build-essential \
             ca-certificates \
+            cmake \
             curl \
             git \
+            libclang-dev \
             libssl-dev \
             pkg-config \
             unzip
@@ -142,7 +166,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.95.0
 
       - name: Configure sccache
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -167,6 +191,12 @@ jobs:
           cp "target/release/orchion-server" "dist/${package}/"
           cp "target/release/libpdfium.so" "dist/${package}/"
           cp "apps/orchion-server/config.toml" "dist/${package}/config.toml"
+          cp "THIRD_PARTY_NOTICES.md" "dist/${package}/"
+          cp -R "third-party-licenses" "dist/${package}/"
+          "dist/${package}/orchion-server" --build-metadata > "dist/${package}/build-metadata.json"
+          cmake_relative="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["cmake_resolved"]["cache_path_relative"])' "dist/${package}/build-metadata.json")"
+          cp "target/release/${cmake_relative}" "dist/${package}/llama-cpp-CMakeCache.txt"
+          python3 -c 'import hashlib,json,sys; metadata=json.load(open(sys.argv[1])); assert hashlib.sha256(open(sys.argv[2],"rb").read()).hexdigest() == metadata["cmake_resolved"]["cache_sha256"]' "dist/${package}/build-metadata.json" "dist/${package}/llama-cpp-CMakeCache.txt"
           "dist/${package}/orchion-server" --help >/dev/null
           python3 -c 'import ctypes, sys; ctypes.CDLL(sys.argv[1])' "dist/${package}/libpdfium.so"
           tar -czf "dist/${package}.tar.gz" -C dist "${package}"
@@ -193,6 +223,12 @@ jobs:
           cp "target/release/orchion-server" "dist/${package}/"
           cp "target/release/libpdfium.so" "dist/${package}/"
           cp "apps/orchion-server/config.toml" "dist/${package}/config.toml"
+          cp "THIRD_PARTY_NOTICES.md" "dist/${package}/"
+          cp -R "third-party-licenses" "dist/${package}/"
+          "dist/${package}/orchion-server" --build-metadata > "dist/${package}/build-metadata.json"
+          cmake_relative="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["cmake_resolved"]["cache_path_relative"])' "dist/${package}/build-metadata.json")"
+          cp "target/release/${cmake_relative}" "dist/${package}/llama-cpp-CMakeCache.txt"
+          python3 -c 'import hashlib,json,sys; metadata=json.load(open(sys.argv[1])); assert hashlib.sha256(open(sys.argv[2],"rb").read()).hexdigest() == metadata["cmake_resolved"]["cache_sha256"]' "dist/${package}/build-metadata.json" "dist/${package}/llama-cpp-CMakeCache.txt"
           "dist/${package}/orchion-server" --help >/dev/null
           python3 -c 'import ctypes, sys; ctypes.CDLL(sys.argv[1])' "dist/${package}/libpdfium.so"
           tar -czf "dist/${package}.tar.gz" -C dist "${package}"
@@ -212,7 +248,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.95.0
 
       - name: Configure sccache
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -236,6 +272,13 @@ jobs:
           Copy-Item "target/release/orchion-server.exe" "dist/$package/"
           Copy-Item "target/release/pdfium.dll" "dist/$package/"
           Copy-Item "apps/orchion-server/config.toml" "dist/$package/config.toml"
+          Copy-Item "THIRD_PARTY_NOTICES.md" "dist/$package/"
+          Copy-Item -Recurse "third-party-licenses" "dist/$package/"
+          & "dist/$package/orchion-server.exe" --build-metadata | Set-Content -Encoding utf8 "dist/$package/build-metadata.json"
+          $metadata = Get-Content "dist/$package/build-metadata.json" -Raw | ConvertFrom-Json
+          $cmakeCache = Join-Path "target/release" $metadata.cmake_resolved.cache_path_relative
+          Copy-Item $cmakeCache "dist/$package/llama-cpp-CMakeCache.txt"
+          if ((Get-FileHash "dist/$package/llama-cpp-CMakeCache.txt" -Algorithm SHA256).Hash.ToLowerInvariant() -ne $metadata.cmake_resolved.cache_sha256) { throw "llama.cpp CMake cache digest mismatch" }
           & "dist/$package/orchion-server.exe" --help | Out-Null
           $pdfium = [System.Runtime.InteropServices.NativeLibrary]::Load((Resolve-Path "dist/$package/pdfium.dll"))
           [System.Runtime.InteropServices.NativeLibrary]::Free($pdfium)
@@ -265,6 +308,13 @@ jobs:
           Copy-Item "target/release/orchion-server.exe" "dist/$package/"
           Copy-Item "target/release/pdfium.dll" "dist/$package/"
           Copy-Item "apps/orchion-server/config.toml" "dist/$package/config.toml"
+          Copy-Item "THIRD_PARTY_NOTICES.md" "dist/$package/"
+          Copy-Item -Recurse "third-party-licenses" "dist/$package/"
+          & "dist/$package/orchion-server.exe" --build-metadata | Set-Content -Encoding utf8 "dist/$package/build-metadata.json"
+          $metadata = Get-Content "dist/$package/build-metadata.json" -Raw | ConvertFrom-Json
+          $cmakeCache = Join-Path "target/release" $metadata.cmake_resolved.cache_path_relative
+          Copy-Item $cmakeCache "dist/$package/llama-cpp-CMakeCache.txt"
+          if ((Get-FileHash "dist/$package/llama-cpp-CMakeCache.txt" -Algorithm SHA256).Hash.ToLowerInvariant() -ne $metadata.cmake_resolved.cache_sha256) { throw "llama.cpp CMake cache digest mismatch" }
           & "dist/$package/orchion-server.exe" --help | Out-Null
           $pdfium = [System.Runtime.InteropServices.NativeLibrary]::Load((Resolve-Path "dist/$package/pdfium.dll"))
           [System.Runtime.InteropServices.NativeLibrary]::Free($pdfium)

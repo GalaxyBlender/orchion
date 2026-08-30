@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-Orchion 提供统一的 Rust API 库和 OpenAI 兼容服务端，面向本地语音与文档 AI 工作流。目前重点支持 Qwen3 ASR/TTS 和 PaddleOCR/OCR-VL，默认 CPU 运行，可选 Metal 或 CUDA 构建。
+Orchion 提供统一的 Rust API 库和 OpenAI 兼容服务端，面向本地语音、文档与文本生成工作流。目前支持 Qwen3 ASR/TTS、PaddleOCR/OCR-VL 和 text-only llama.cpp tracer。
 
 ## 亮点
 
@@ -52,6 +52,8 @@ API key 和表单偏好会存储在浏览器 `localStorage`；不要在共享或
 - `GET /v1/audio/transcriptions/stream`：ASR WebSocket 流式转录。
 - `POST /v1/audio/speech`：TTS。
 - `POST /v1/ocr`：OCR 和 OCR-VL。
+- `POST /v1/chat/completions`：text-only、单 choice JSON 或 SSE。
+- `POST /v1/responses`：无状态 text-only JSON 或生命周期 SSE，必须显式 `store=false`。
 - `POST /v1/pdf/images`：PDF 页面渲染。
 - `GET /api/activity`：进行中的请求、保留历史和摘要统计。
 - `GET /api/activity/events`：需要认证的 Activity 服务端事件流。
@@ -102,7 +104,7 @@ cargo run -p orchion-example-tts-preset --features cpu -- "Hello from Orchion" o
 - `[server]`：监听地址、CORS 允许来源、上传大小限制，以及 PDF 页数、像素和输出大小限制。CORS 默认允许所有来源（`["*"]`）。
 - `[activity]`：启用请求活动并设置内存中的已完成历史容量（默认 `500`）。
 - `[models]`：模型目录、下载来源、全局驻留上限和文件完整性校验。`verify_file_integrity` 默认是 `false`；设为 `true` 后，复用已下载模型时会按 manifest 中记录的 SHA-256 校验文件。
-- `[services.asr]`、`[services.tts]`、`[services.ocr]`、`[services.ocr-vl]`：服务开关、默认模型、deployment 数组（`[[services.<service>.models]]`，包含 `id`、可选 `name` 和 `model`）、运行设备和每类驻留上限。OCR deployment 可包含 `layout_model`。ASR 批量音频使用 `max_audio_duration`；流式字幕使用 `stream_target_segment` 和 `stream_max_segment`；会话使用 `stream_idle_timeout` 和 `stream_max_duration`。TTS 使用 `max_length` 和 `max_reference_audio_duration`；OCR-VL 使用 `max_tokens`。
+- `[services.asr]`、`[services.tts]`、`[services.ocr]`、`[services.ocr-vl]`、`[services.llm]`：服务 deployment 与驻留策略。LLM 主 GGUF 必须是精确文件 locator，可选 mmproj 也会精确锁定；当前仅支持文本和 `parallel_sequences=1`。
 - `[auth]`：可选 API key。
 
 `CORS_ALLOWED_ORIGINS` 使用逗号分隔的来源列表覆盖 `server.cors_allowed_origins`，例如 `https://app.example.com,https://admin.example.com`；使用 `*` 允许所有来源。`ORCHION_MODEL_SOURCE` 和 `models.source` 支持 `auto`、`huggingface`、`modelscope`。`RUST_LOG` 控制运行日志。

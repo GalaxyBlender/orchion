@@ -182,6 +182,10 @@ impl ActivityHub {
             http_status: None,
             outcome: None,
             input_bytes,
+            prompt_tokens: None,
+            completion_tokens: None,
+            queue_time_ms: None,
+            eval_time_ms: None,
             error_code: None,
             error_message: None,
         };
@@ -453,9 +457,36 @@ impl ActivityContext {
             .update(self.id, |entry| entry.input_bytes = Some(input_bytes));
     }
 
+    pub fn set_llm_usage(&self, prompt_tokens: usize, completion_tokens: usize) {
+        self.hub.update(self.id, |entry| {
+            entry.prompt_tokens = Some(prompt_tokens);
+            entry.completion_tokens = Some(completion_tokens);
+        });
+    }
+
+    pub fn set_llm_timing(&self, queue_time_ms: Option<u64>, eval_time_ms: Option<u64>) {
+        self.hub.update(self.id, |entry| {
+            entry.queue_time_ms = queue_time_ms;
+            entry.eval_time_ms = eval_time_ms;
+        });
+    }
+
+    pub(crate) fn complete_stream_failure(&self, outcome: ActivityOutcome, error: ActivityError) {
+        self.hub.complete(self.id, Some(200), outcome, Some(error));
+    }
+
     pub(crate) fn complete_http(&self, status: u16, activity_error: Option<ActivityError>) {
+        let outcome = activity_error.as_ref().map_or_else(
+            || http_outcome(status),
+            |error| match error.code.as_deref() {
+                Some("request_timeout") => ActivityOutcome::Timeout,
+                Some("resource_exhausted") => ActivityOutcome::ResourceExhausted,
+                Some("server_shutdown") => ActivityOutcome::Cancelled,
+                _ => http_outcome(status),
+            },
+        );
         self.hub
-            .complete(self.id, Some(status), http_outcome(status), activity_error);
+            .complete(self.id, Some(status), outcome, activity_error);
     }
 
     pub(crate) fn cancel(&self) {
@@ -664,6 +695,27 @@ mod tests {
             None,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn request_timeout_error_uses_timeout_outcome() {
+        let hub = ActivityHub::new(ActivityPolicy {
+            enabled: true,
+            history_capacity: 1,
+        });
+        let context = start(&hub);
+        context.complete_http(
+            408,
+            Some(ActivityError {
+                code: Some("request_timeout".to_string()),
+                message: None,
+            }),
+        );
+        let page = hub.page(&ActivityFilter {
+            limit: 1,
+            ..ActivityFilter::default()
+        });
+        assert_eq!(page.history[0].outcome, Some(ActivityOutcome::Timeout));
     }
 
     #[test]

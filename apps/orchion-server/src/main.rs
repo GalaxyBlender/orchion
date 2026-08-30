@@ -11,6 +11,9 @@ use std::sync::Arc;
 #[derive(Debug, Parser)]
 #[command(name = "orchion-server", about = "OpenAI-compatible ASR/TTS server")]
 struct Cli {
+    #[arg(long)]
+    build_metadata: bool,
+
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
 
@@ -32,6 +35,10 @@ async fn main() -> ExitCode {
 
 async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    if cli.build_metadata {
+        println!("{}", orchion::llm_build_metadata_json());
+        return Ok(());
+    }
     let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("orchion-server"));
     let work_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let rust_log = logging::init(&exe_path, &work_dir).context("initialize logging")?;
@@ -40,6 +47,10 @@ async fn run() -> anyhow::Result<()> {
         exe_path = %exe_path.display(),
         work_dir = %work_dir.display(),
         "logging initialized"
+    );
+    tracing::info!(
+        build_metadata = %orchion::llm_build_metadata_json(),
+        "LLM native build metadata"
     );
 
     let mut config = ServerConfig::load(cli.config).context("load server config")?;
@@ -79,9 +90,13 @@ async fn run() -> anyhow::Result<()> {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(async move {
-        shutdown_signal().await;
-        shutdown.trigger();
+    .with_graceful_shutdown({
+        let state = Arc::clone(&state);
+        async move {
+            shutdown_signal().await;
+            state.begin_shutdown();
+            shutdown.trigger();
+        }
     })
     .await
     .context("serve HTTP");
