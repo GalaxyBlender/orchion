@@ -18,7 +18,6 @@ pub const DEFAULT_TTS_MAX_LENGTH: usize = 2048;
 pub const DEFAULT_TTS_MAX_REFERENCE_AUDIO_DURATION: Duration = Duration::from_mins(5);
 pub const DEFAULT_OCR_VL_MAX_TOKENS: usize = 4096;
 pub const DEFAULT_OCR_MAX_PIXELS: u64 = 100_000_000;
-pub const DEFAULT_LLM_MAX_TOKENS: usize = 4096;
 pub const DEFAULT_MAX_CONCURRENT_INFERENCE: usize = 2;
 pub const DEFAULT_MAX_WEBSOCKET_CONNECTIONS: usize = 64;
 pub const DEFAULT_MAX_PENDING_WEBSOCKET_CONNECTIONS: usize = 16;
@@ -1469,11 +1468,11 @@ fn parse_llm_generation(raw: &RawLlmGeneration) -> Result<LlmGenerationConfig, C
 }
 
 fn validate_llm_generation(value: &LlmGenerationConfig) -> Result<(), ConfigError> {
-    if value.max_tokens < 16 || value.max_tokens > DEFAULT_LLM_MAX_TOKENS {
+    if value.max_tokens < 16 {
         return Err(invalid_llm(
             "generation.max_tokens",
             value.max_tokens.to_string(),
-            "expected 16..=4096",
+            "expected at least 16",
         ));
     }
     if !value.temperature.is_finite() || !(0.0..=2.0).contains(&value.temperature) {
@@ -2815,7 +2814,7 @@ mod tests {
             mmproj_model = "//owner/repo/mmproj.gguf"
             runtime = { context_size = 4096, gpu_layers = 0, parallel_sequences = 1, batch_size = 128, micro_batch_size = 64, threads = 4, request_queue_capacity = 2, event_queue_capacity = 3, queue_timeout = "7s", generation_timeout = "2m" }
             chat_template = { engine = "llama_cpp", template = "chatml" }
-            generation = { max_tokens = 512, temperature = 0.7, top_p = 0.9, top_k = 40, min_p = 0.05, presence_penalty = 0.1, frequency_penalty = -0.1, repeat_penalty = 1.1 }
+            generation = { max_tokens = 32768, temperature = 0.7, top_p = 0.9, top_k = 40, min_p = 0.05, presence_penalty = 0.1, frequency_penalty = -0.1, repeat_penalty = 1.1 }
         "#, Path::new("/tmp/orchion-server")).unwrap();
         let model = &config.services.llm.models[0];
         assert!(config.services.llm.active());
@@ -2825,6 +2824,7 @@ mod tests {
             LlmContextSize::Tokens(4096)
         ));
         assert!(matches!(model.runtime.gpu_layers, LlmGpuLayers::Count(0)));
+        assert_eq!(model.generation.max_tokens, 32768);
         assert_eq!(model.runtime.parallel_sequences, 1);
         assert_eq!(model.runtime.queue_timeout, Duration::from_secs(7));
         assert_eq!(model.runtime.generation_timeout, Duration::from_mins(2));
@@ -2867,7 +2867,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("generation.max_tokens"));
-        assert!(error.to_string().contains("16..=4096"));
+        assert!(error.to_string().contains("at least 16"));
     }
 
     #[test]
