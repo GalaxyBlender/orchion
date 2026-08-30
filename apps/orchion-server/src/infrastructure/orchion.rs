@@ -531,7 +531,7 @@ mod tests {
         AsrEngine, AsrEngineFuture, AsrOptions, AsrStreamSession, AsrStreamingOptions,
         AsrTranscript, GenerationEvent, GenerationFinishReason, KnownOcrModel, LlmMessage, LlmRole,
         LlmScriptedControl, LlmUsage, OcrEngine, OcrEngineFuture, OcrLimits, OcrOptions, OcrResult,
-        scripted_llm_engine, scripted_panicking_llm_engine,
+        OcrUsage, scripted_llm_engine, scripted_panicking_llm_engine,
         scripted_preparation_panicking_llm_engine, scripted_slow_preparation_llm_engine,
     };
 
@@ -701,10 +701,23 @@ mod tests {
         fn recognize_file_with_limits(
             &self,
             _path: PathBuf,
-            _options: OcrOptions,
+            options: OcrOptions,
             _limits: OcrLimits,
         ) -> OcrEngineFuture<'_, OcrResult> {
-            Box::pin(async { panic!("recognition is not used by this test engine") })
+            let result = OcrResult {
+                model: self.model.clone(),
+                format: options.response_format,
+                text: "test".to_string(),
+                markdown: None,
+                html: None,
+                regions: Vec::new(),
+                layout_blocks: Vec::new(),
+                usage: OcrUsage {
+                    input_pages: 1,
+                    output_tokens: None,
+                },
+            };
+            Box::pin(async move { Ok(result) })
         }
     }
 
@@ -852,6 +865,112 @@ mod tests {
         assert_eq!(
             *provisioner.models.lock().unwrap(),
             vec!["PaddlePaddle/PP-OCRv6_tiny", "PaddlePaddle/PP-DocLayoutV3"]
+        );
+        state.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ocr_vl_lifecycle_load_uses_and_reuses_the_deployment_layout_runtime() {
+        let mut config = test_config();
+        config.models.max_loaded = 1;
+        config.services.ocr_vl.enabled = true;
+        config.services.ocr_vl.max_loaded = 1;
+        let primary_id = ModelId::parse("PaddlePaddle/PaddleOCR-VL-1.6").unwrap();
+        let layout_id = ModelId::parse("PaddlePaddle/PP-DocLayoutV3").unwrap();
+        let primary = OcrModel::new(primary_id.clone(), OcrModelKind::OcrVl);
+        let layout = OcrModel::new(layout_id.clone(), OcrModelKind::Layout);
+        config.services.ocr_vl.default_model = Some(primary_id.clone());
+        config.services.ocr_vl.models =
+            vec![OcrModelDeployment::from_runtime(primary.clone()).with_supported_layout()];
+        let factory = Arc::new(RecordingOcrRuntimeFactory::default());
+        let state = AppState::load_with_components(
+            config,
+            Arc::new(RecordingModelProvisioner::default()),
+            factory.clone(),
+        )
+        .await
+        .unwrap();
+        let selector = ModelSelector {
+            model: primary_id.to_string(),
+            service: ModelService::OcrVl,
+        };
+        let full_key = OcrRuntimeKey::new(
+            primary.clone(),
+            Some(DeploymentLayoutModel::new(
+                primary_id.clone(),
+                layout.clone(),
+            )),
+        );
+        let no_layout_key = OcrRuntimeKey::new(primary.clone(), None);
+
+        let loaded = state.load_model(selector.clone()).await.unwrap().unwrap();
+        assert_eq!(loaded.status, ModelResidency::Loaded);
+        assert_eq!(
+            state.ocr_vl_models.status(&full_key).await,
+            Some(ModelResidencyStatus::Loaded)
+        );
+        assert_eq!(
+            state.ocr_vl_models.status(&no_layout_key).await,
+            Some(ModelResidencyStatus::Unloaded)
+        );
+        assert_eq!(
+            state
+                .model_statuses()
+                .await
+                .into_iter()
+                .find(|status| status.service == ModelService::OcrVl)
+                .unwrap()
+                .status,
+            ModelResidency::Loaded
+        );
+        assert_eq!(
+            *factory.layouts.lock().unwrap(),
+            vec![Some(layout_id.clone())]
+        );
+
+        let policy = state.ocr_policy();
+        let choice =
+            crate::application::ocr::resolve_service_choice(&policy, primary_id.as_str()).unwrap();
+        let result = OcrRuntime::recognize(
+            state.as_ref(),
+            choice,
+            PathBuf::from("unused.png"),
+            OcrOptions {
+                layout_model: Some(layout_id.clone()),
+                ..OcrOptions::default()
+            },
+            OcrLimits::default(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.model, primary_id);
+        drop(state.ocr_vl(primary, Some(layout)).await.unwrap().unwrap());
+        assert_eq!(*factory.layouts.lock().unwrap(), vec![Some(layout_id)]);
+        assert_eq!(
+            state.ocr_vl_models.status(&full_key).await,
+            Some(ModelResidencyStatus::Loaded)
+        );
+        assert_eq!(
+            state.ocr_vl_models.status(&no_layout_key).await,
+            Some(ModelResidencyStatus::Unloaded)
+        );
+
+        let unloaded = state.unload_model(selector).await.unwrap().unwrap();
+        assert_eq!(unloaded.status, ModelResidency::Unloaded);
+        assert_eq!(
+            state.ocr_vl_models.status(&full_key).await,
+            Some(ModelResidencyStatus::Unloaded)
+        );
+        assert_eq!(
+            state
+                .model_statuses()
+                .await
+                .into_iter()
+                .find(|status| status.service == ModelService::OcrVl)
+                .unwrap()
+                .status,
+            ModelResidency::Unloaded
         );
         state.shutdown().await;
     }
@@ -3507,8 +3626,16 @@ impl ModelLifecycleRuntime for AppState {
                     ) else {
                         return Ok(None);
                     };
+                    let layout = self
+                        .config
+                        .services
+                        .ocr_vl
+                        .models
+                        .iter()
+                        .find(|deployment| deployment.id == *model.id())
+                        .and_then(|deployment| deployment.layout_runtime.clone());
                     let Some(lease) = self
-                        .ocr_vl(model.clone(), None)
+                        .ocr_vl(model.clone(), layout)
                         .await
                         .map_err(|error| model_lifecycle_error(&error))?
                     else {
