@@ -19,6 +19,13 @@
 .text-bold { font-weight: var(--font-bold); }
 .text-medium { font-weight: var(--font-medium); }
 
+.gap-0 { gap: 0; }
+.gap-xs { gap: var(--gap-xs); }
+.gap-sm { gap: var(--gap-sm); }
+.gap-md { gap: var(--gap-md); }
+.gap-lg { gap: var(--gap-lg); }
+.gap-xl { gap: var(--gap-xl); }
+
 .truncate {
   overflow: hidden;
   text-overflow: ellipsis;
