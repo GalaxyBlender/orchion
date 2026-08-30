@@ -48,7 +48,7 @@ async fn run() -> anyhow::Result<()> {
         work_dir = %work_dir.display(),
         "logging initialized"
     );
-    tracing::info!(
+    tracing::debug!(
         build_metadata = %orchion::llm_build_metadata_json(),
         "LLM native build metadata"
     );

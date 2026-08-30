@@ -147,7 +147,7 @@ impl BackendOwner {
         let devices = llama_cpp_2::list_llama_ggml_backend_devices();
         let current = Arc::new(Self { backend });
         *owner = Arc::downgrade(&current);
-        tracing::info!(
+        tracing::debug!(
             binding_revision = BINDING_REVISION,
             llama_cpp_revision = LLAMA_CPP_REVISION,
             features = "common,mtmd",
