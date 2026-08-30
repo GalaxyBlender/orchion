@@ -23,7 +23,6 @@ export function buildLlmRequest(form: LlmFormState, messages: readonly LlmMessag
   appendOptionalNumber(request, "temperature", form.temperature);
   appendOptionalNumber(request, "top_p", form.topP);
   appendOptionalNumber(request, "max_completion_tokens", form.maxCompletionTokens);
-  appendOptionalNumber(request, "seed", form.seed);
 
   return request;
 }
@@ -41,7 +40,7 @@ export function buildLlmCurl(settings: ApiSettings, request: ChatCompletionReque
   return lines.map((line, index) => (index === lines.length - 1 ? line : `${line} \\`)).join("\n");
 }
 
-function appendOptionalNumber<K extends "temperature" | "top_p" | "max_completion_tokens" | "seed">(
+function appendOptionalNumber<K extends "temperature" | "top_p" | "max_completion_tokens">(
   request: ChatCompletionRequest,
   field: K,
   value: string,

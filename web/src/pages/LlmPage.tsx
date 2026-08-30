@@ -1,6 +1,6 @@
 import { type FormEvent, type KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Bot, Eraser, Send, Square, User } from "lucide-react";
+import { Bot, ChevronDown, Eraser, Send, Square, User } from "lucide-react";
 import { useModels } from "@/features/models/useModels";
 import { buildLlmCurl, buildLlmRequest, llmEndpointPath } from "@/features/llm/request";
 import { consumeChatCompletionStream } from "@/features/llm/stream";
@@ -88,7 +88,6 @@ export function LlmPage() {
       temperature: t("llm.validation.temperature"),
       topP: t("llm.validation.topP"),
       maxTokens: t("llm.validation.maxTokens"),
-      seed: t("llm.validation.seed"),
     });
 
     if (error) {
@@ -206,11 +205,17 @@ export function LlmPage() {
                   value={form.model}
                   onChange={(value) => updateForm("model", value)}
                   suggestions={llmModelIds}
-                  placeholder="org/model"
+                  placeholder={t("llm.modelPlaceholder")}
                   disabled={isGenerating}
                 />
+                <ModelStatus
+                  models={llmModelIds}
+                  isLoading={models.isLoading}
+                  error={models.error}
+                  kind="LLM"
+                  listId="llm-model-suggestions"
+                />
               </FormField>
-              <ModelStatus models={llmModelIds} isLoading={models.isLoading} error={models.error} kind="LLM" listId="llm-models" />
 
               <FormField htmlFor="llm-system-prompt" label={t("llm.systemPromptLabel")} description={t("llm.systemPromptDescription")}>
                 <TextArea
@@ -227,15 +232,20 @@ export function LlmPage() {
                 <NumericField id="llm-temperature" label={t("llm.temperatureLabel")} value={form.temperature} min="0" max="2" step="0.1" disabled={isGenerating} onChange={(value) => updateForm("temperature", value)} />
                 <NumericField id="llm-top-p" label={t("llm.topPLabel")} value={form.topP} min="0.01" max="1" step="0.01" disabled={isGenerating} onChange={(value) => updateForm("topP", value)} />
                 <NumericField id="llm-max-tokens" label={t("llm.maxTokensLabel")} value={form.maxCompletionTokens} min="1" step="1" disabled={isGenerating} onChange={(value) => updateForm("maxCompletionTokens", value)} />
-                <NumericField id="llm-seed" label={t("llm.seedLabel")} value={form.seed} min="0" step="1" disabled={isGenerating} onChange={(value) => updateForm("seed", value)} placeholder={t("common.optional")} />
               </div>
             </Card.Body>
           </Card>
 
-          <details className="llm-request-preview">
-            <summary>{t("llm.requestPreview")}</summary>
+          <details className="card llm-request-preview">
+            <summary>
+              <span className="card-title-group">
+                <span className="card-eyebrow">{t("llm.requestPreviewEyebrow")}</span>
+                <span className="card-title">{t("llm.requestPreview")}</span>
+              </span>
+              <ChevronDown className="llm-request-preview-chevron" size={18} aria-hidden="true" />
+            </summary>
             <div className="llm-request-preview-body">
-              <CodePreview label="POST /v1/chat/completions">{curlPreview}</CodePreview>
+              <CodePreview label="post /v1/chat/completions">{curlPreview}</CodePreview>
             </div>
           </details>
         </aside>
@@ -357,7 +367,6 @@ interface ValidationText {
   temperature: string;
   topP: string;
   maxTokens: string;
-  seed: string;
 }
 
 function validateForm(form: LlmFormState, prompt: string, text: ValidationText): string {
@@ -366,7 +375,6 @@ function validateForm(form: LlmFormState, prompt: string, text: ValidationText):
   if (!validOptionalNumber(form.temperature, (value) => value >= 0 && value <= 2)) return text.temperature;
   if (!validOptionalNumber(form.topP, (value) => value > 0 && value <= 1)) return text.topP;
   if (!validOptionalNumber(form.maxCompletionTokens, (value) => Number.isInteger(value) && value > 0)) return text.maxTokens;
-  if (!validOptionalNumber(form.seed, (value) => Number.isInteger(value) && value >= 0 && value <= 4_294_967_295)) return text.seed;
   return "";
 }
 

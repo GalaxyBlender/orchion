@@ -51,7 +51,6 @@ export interface PersistentLlmState {
   temperature: string;
   topP: string;
   maxCompletionTokens: string;
-  seed: string;
 }
 
 export interface PersistentUiState {
@@ -188,7 +187,6 @@ function createDefaultPersistentState(): PersistentState {
       temperature: "0.7",
       topP: "0.9",
       maxCompletionTokens: "512",
-      seed: "",
     },
     ui: {
       theme: "dark",
@@ -386,7 +384,6 @@ function parseLlmState(value: unknown): Partial<PersistentLlmState> | null {
     "temperature",
     "topP",
     "maxCompletionTokens",
-    "seed",
   ]);
 }
 
@@ -500,7 +497,7 @@ function isPersistentState(value: unknown): value is PersistentState {
     ]) &&
     (!("models" in value.tts) || isTtsModels(value.tts.models)) &&
     hasStringFields(ocr, ["model", "responseFormat", "task", "maxTokens"]) &&
-    hasStringFields(llm, ["model", "systemPrompt", "temperature", "topP", "maxCompletionTokens", "seed"]) &&
+    hasStringFields(llm, ["model", "systemPrompt", "temperature", "topP", "maxCompletionTokens"]) &&
     hasStringFields(ui, ["theme", "activePage"]) &&
     (!("language" in value.ui) || isOneOf(value.ui.language, ["en", "zh-CN", "zh-TW"]))
   );

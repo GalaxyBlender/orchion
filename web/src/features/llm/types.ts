@@ -14,7 +14,6 @@ export interface LlmFormState {
   temperature: string;
   topP: string;
   maxCompletionTokens: string;
-  seed: string;
 }
 
 export interface ChatCompletionMessage {
@@ -32,7 +31,6 @@ export interface ChatCompletionRequest {
   temperature?: number;
   top_p?: number;
   max_completion_tokens?: number;
-  seed?: number;
 }
 
 export interface LlmUsage {

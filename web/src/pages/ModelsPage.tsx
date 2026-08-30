@@ -43,10 +43,10 @@ export function ModelsPage() {
       {/* Mini overview cards */}
       <div className="grid gap-md" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))" }}>
         <Card variant="glass">
-          <Card.Header eyebrow={t("models.asrModels")} title={catalog.classified.asr.length.toString()} />
+          <Card.Header eyebrow={t("models.llmModels")} title={catalog.classified.llm.length.toString()} />
         </Card>
         <Card variant="glass">
-          <Card.Header eyebrow={t("models.llmModels")} title={catalog.classified.llm.length.toString()} />
+          <Card.Header eyebrow={t("models.asrModels")} title={catalog.classified.asr.length.toString()} />
         </Card>
         <Card variant="glass">
           <Card.Header eyebrow={t("models.ttsModels")} title={catalog.classified.tts.length.toString()} />
@@ -76,19 +76,7 @@ export function ModelsPage() {
         />
       ) : (
         <>
-          <div className="grid grid-cols-2 gap-md">
-            <Card>
-              <Card.Header eyebrow={t("models.classified")} title={t("models.asrModels")} />
-              <Card.Body>
-                <ModelGroup
-                  emptyText={t("models.noAsr")}
-                  icon={<Mic size={16} className="text-accent" />}
-                  models={catalog.classified.asr}
-                  badgeVariant="accent"
-                />
-              </Card.Body>
-            </Card>
-
+          <div className="stack gap-md">
             <Card>
               <Card.Header eyebrow={t("models.classified")} title={t("models.llmModels")} />
               <Card.Body>
@@ -101,41 +89,57 @@ export function ModelsPage() {
               </Card.Body>
             </Card>
 
-            <Card>
-              <Card.Header eyebrow={t("models.classified")} title={t("models.ttsModels")} />
-              <Card.Body>
-                <ModelGroup
-                  emptyText={t("models.noTts")}
-                  icon={<Volume2 size={16} className="text-accent-blue" />}
-                  models={catalog.classified.tts}
-                  badgeVariant="accent-blue"
-                />
-              </Card.Body>
-            </Card>
+            <div className="grid grid-cols-2 gap-md models-pair-row">
+              <Card>
+                <Card.Header eyebrow={t("models.classified")} title={t("models.asrModels")} />
+                <Card.Body>
+                  <ModelGroup
+                    emptyText={t("models.noAsr")}
+                    icon={<Mic size={16} className="text-accent" />}
+                    models={catalog.classified.asr}
+                    badgeVariant="accent"
+                  />
+                </Card.Body>
+              </Card>
 
-            <Card>
-              <Card.Header eyebrow={t("models.classified")} title={t("models.ocrModels")} />
-              <Card.Body>
-                <ModelGroup
-                  emptyText={t("models.noOcr")}
-                  icon={<ScanText size={16} className="text-accent" />}
-                  models={catalog.classified.ocrStandard}
-                  badgeVariant="accent"
-                />
-              </Card.Body>
-            </Card>
+              <Card>
+                <Card.Header eyebrow={t("models.classified")} title={t("models.ttsModels")} />
+                <Card.Body>
+                  <ModelGroup
+                    emptyText={t("models.noTts")}
+                    icon={<Volume2 size={16} className="text-accent-blue" />}
+                    models={catalog.classified.tts}
+                    badgeVariant="accent-blue"
+                  />
+                </Card.Body>
+              </Card>
+            </div>
 
-            <Card>
-              <Card.Header eyebrow={t("models.classified")} title={t("models.ocrVlModels")} />
-              <Card.Body>
-                <ModelGroup
-                  emptyText={t("models.noOcrVl")}
-                  icon={<ScanText size={16} className="text-accent" />}
-                  models={catalog.classified.ocrVl}
-                  badgeVariant="accent"
-                />
-              </Card.Body>
-            </Card>
+            <div className="grid grid-cols-2 gap-md models-pair-row">
+              <Card>
+                <Card.Header eyebrow={t("models.classified")} title={t("models.ocrModels")} />
+                <Card.Body>
+                  <ModelGroup
+                    emptyText={t("models.noOcr")}
+                    icon={<ScanText size={16} className="text-accent" />}
+                    models={catalog.classified.ocrStandard}
+                    badgeVariant="accent"
+                  />
+                </Card.Body>
+              </Card>
+
+              <Card>
+                <Card.Header eyebrow={t("models.classified")} title={t("models.ocrVlModels")} />
+                <Card.Body>
+                  <ModelGroup
+                    emptyText={t("models.noOcrVl")}
+                    icon={<ScanText size={16} className="text-accent" />}
+                    models={catalog.classified.ocrVl}
+                    badgeVariant="accent"
+                  />
+                </Card.Body>
+              </Card>
+            </div>
 
           </div>
 

@@ -1100,7 +1100,7 @@
 .llm-workbench {
   display: grid;
   grid-template-columns: minmax(280px, 340px) minmax(0, 1fr);
-  align-items: start;
+  align-items: stretch;
   gap: var(--space-6);
 }
 
@@ -1115,18 +1115,27 @@
 }
 
 .llm-request-preview {
-  border: 1px solid var(--color-border-subtle);
-  border-radius: var(--radius-md);
-  background: var(--color-surface-primary);
-  overflow: hidden;
+  box-shadow: var(--shadow-md);
 }
 
 .llm-request-preview summary {
-  padding: var(--space-3) var(--space-4);
-  color: var(--color-text-secondary);
-  font-size: var(--text-sm);
-  font-weight: var(--font-semibold);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: var(--space-4) var(--space-5);
+  color: var(--color-text-primary);
   cursor: pointer;
+}
+
+.llm-request-preview-chevron {
+  flex: 0 0 auto;
+  color: var(--color-text-tertiary);
+  transition: transform var(--duration-normal) var(--ease-out);
+}
+
+.llm-request-preview[open] .llm-request-preview-chevron {
+  transform: rotate(180deg);
 }
 
 .llm-request-preview[open] summary {
@@ -1135,7 +1144,7 @@
 }
 
 .llm-request-preview-body {
-  padding: var(--space-4);
+  padding: var(--space-5);
 }
 
 .llm-request-preview .code-preview {
@@ -1145,8 +1154,7 @@
 .llm-conversation-card {
   display: flex;
   flex-direction: column;
-  height: min(740px, calc(100vh - 180px));
-  min-height: 560px;
+  min-height: 760px;
 }
 
 .llm-conversation-card .card-header {
@@ -1246,8 +1254,8 @@
 }
 
 .llm-message-user .llm-message-text {
-  border-color: hsla(var(--color-accent-blue-hsl), 0.22);
-  background: hsla(var(--color-accent-blue-hsl), 0.08);
+  border-color: var(--color-border-default);
+  background: var(--color-surface-secondary);
 }
 
 .llm-thinking {
@@ -1269,7 +1277,7 @@
   flex: 0 0 auto;
   padding: var(--space-4);
   border-top: 1px solid var(--color-border-subtle);
-  background: hsla(var(--color-bg-sunken-hsl), 0.45);
+  background: var(--color-surface-primary);
 }
 
 .llm-composer-form {
@@ -1303,10 +1311,15 @@
 
   .llm-conversation-card {
     height: min(720px, 72vh);
+    min-height: 620px;
   }
 }
 
 @media (max-width: 768px) {
+  .models-pair-row {
+    grid-template-columns: 1fr;
+  }
+
   .llm-control-column {
     display: flex;
   }

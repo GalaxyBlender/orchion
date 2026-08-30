@@ -11,7 +11,6 @@ const form: LlmFormState = {
   temperature: "0.7",
   topP: "0.9",
   maxCompletionTokens: "256",
-  seed: "42",
 };
 const messages: LlmMessage[] = [
   { id: "1", role: "user", content: "Hello" },
@@ -34,7 +33,6 @@ describe("LLM chat request contract", () => {
       temperature: 0.7,
       top_p: 0.9,
       max_completion_tokens: 256,
-      seed: 42,
     });
   });
 
@@ -47,7 +45,6 @@ describe("LLM chat request contract", () => {
         temperature: "",
         topP: "",
         maxCompletionTokens: "",
-        seed: "",
       },
       messages.slice(0, 1),
     );
@@ -56,6 +53,5 @@ describe("LLM chat request contract", () => {
     expect("temperature" in request).toBeFalse();
     expect("top_p" in request).toBeFalse();
     expect("max_completion_tokens" in request).toBeFalse();
-    expect("seed" in request).toBeFalse();
   });
 });

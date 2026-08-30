@@ -45,7 +45,29 @@ test("adds LLM defaults when loading state saved before LLM support", () => {
     temperature: "0.7",
     topP: "0.9",
     maxCompletionTokens: "512",
-    seed: "",
+  });
+});
+
+test("drops a saved LLM seed while preserving supported settings", () => {
+  const storage = new MemoryStorage();
+  storage.setItem(persistentStateKey, JSON.stringify({
+    version: 1,
+    llm: {
+      model: "local/llm",
+      systemPrompt: "Be concise.",
+      temperature: "1",
+      topP: "0.8",
+      maxCompletionTokens: "256",
+      seed: "42",
+    },
+  }));
+
+  expect(loadPersistentState(storage).llm).toEqual({
+    model: "local/llm",
+    systemPrompt: "Be concise.",
+    temperature: "1",
+    topP: "0.8",
+    maxCompletionTokens: "256",
   });
 });
 
