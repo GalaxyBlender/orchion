@@ -455,7 +455,7 @@ impl ModelDownloader {
             .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
         match read_deployment_publication(&cache_dir.join(relative), plan, true) {
             Ok(publication) => {
-                validate_llm_lock_sync(cache_dir, plan, &publication)?;
+                validate_llm_lock_sync(cache_dir, plan, &publication, true)?;
                 Ok(publication)
             }
             Err(_error) if plan.category == ModelCategory::Llm => {
@@ -520,9 +520,16 @@ impl ModelDownloader {
         validate_cache_relative_ancestors(cache_dir, &target_relative, true)
             .await
             .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
-        if let Ok(publication) = read_deployment_publication(&target, plan, true)
+        if let Ok(publication) =
+            read_deployment_publication(&target, plan, self.verify_file_integrity)
             && (plan.category != ModelCategory::Llm
-                || validate_llm_lock_sync(cache_dir, plan, &publication).is_ok())
+                || validate_llm_lock_sync(
+                    cache_dir,
+                    plan,
+                    &publication,
+                    self.verify_file_integrity,
+                )
+                .is_ok())
         {
             return Ok(publication);
         }
@@ -591,7 +598,7 @@ impl ModelDownloader {
         .await
         .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
         let publication = read_deployment_publication(&target, plan, true)?;
-        validate_llm_lock_sync(cache_dir, plan, &publication)?;
+        validate_llm_lock_sync(cache_dir, plan, &publication, true)?;
         Ok(publication)
     }
 
@@ -853,8 +860,73 @@ impl ModelDownloader {
         }
     }
 
+    async fn reuse_cached_neutral_deployment_artifact<M: ModelSpec>(
+        &self,
+        model: M,
+        model_url: &ModelUrl,
+        source_intent: &str,
+        source: DownloadSource,
+        cache_dir: &Path,
+    ) -> Result<Option<PathBuf>> {
+        let repository = format!(
+            "{}/{}",
+            model_url.owner().expect("validated hub URL has owner"),
+            model_url
+                .repository()
+                .expect("validated hub URL has repository")
+        );
+        let effective_intent = if model_url.source() == ModelUrlSource::Neutral {
+            format!(
+                "{source_intent}|neutral-provider={}",
+                download_source_label(source)
+            )
+        } else {
+            source_intent.to_string()
+        };
+        let downloader = self.for_model_url_source(model_url.source(), Some(source));
+        let assets = model_hub_assets(&model);
+        let deployment_root = deployment_cache_root(&model, &effective_intent, cache_dir);
+        let expected = expected_remote_model_path(&model, model_url, &effective_intent, cache_dir)?;
+        let cached = if let Some(path) = model_url.path() {
+            if assets.len() != 1 || assets[0].repo != repository || assets[0].file != path {
+                return Err(incompatible_model_url(
+                    &model,
+                    model_url,
+                    "exact file locator does not match the runtime recipe's sole required asset",
+                ));
+            }
+            downloader
+                .reuse_cached_model(model, &deployment_root, source)
+                .await?
+        } else if !assets.is_empty() {
+            if repository != model.huggingface_repo() {
+                return Err(incompatible_model_url(
+                    &model,
+                    model_url,
+                    "repository locator cannot replace a multi-repository runtime recipe",
+                ));
+            }
+            downloader
+                .reuse_cached_model(model, &deployment_root, source)
+                .await?
+        } else {
+            downloader
+                .reuse_cached_model(
+                    LocatedRepositoryModel { model, repository },
+                    &deployment_root,
+                    source,
+                )
+                .await?
+        };
+        if let Some(path) = cached.as_ref() {
+            debug_assert_eq!(path, &expected);
+        }
+        Ok(cached)
+    }
+
     #[allow(
         clippy::too_many_arguments,
+        clippy::too_many_lines,
         reason = "keeps deployment selection and injectable provider adapters explicit"
     )]
     async fn download_neutral_deployment_artifact<
@@ -875,6 +947,28 @@ impl ModelDownloader {
         let mut selections = self.deployment_sources.lock().await;
         loop {
             if !selections.contains_key(&plan.key) {
+                if plan.artifacts.len() == 1 {
+                    for source in plan.candidates.iter().copied().filter(|source| {
+                        plan.artifacts.iter().all(|artifact| {
+                            artifact
+                                .required_source
+                                .is_none_or(|required| required == *source)
+                        })
+                    }) {
+                        if let Some(path) = self
+                            .reuse_cached_neutral_deployment_artifact(
+                                model.clone(),
+                                model_url,
+                                source_intent,
+                                source,
+                                cache_dir,
+                            )
+                            .await?
+                        {
+                            return Ok(path);
+                        }
+                    }
+                }
                 let (source, artifacts) = self
                     .preflight_deployment_candidates(plan, &[], client, env)
                     .await?;
@@ -1621,6 +1715,80 @@ impl ModelDownloader {
             ModelUrlSource::File => unreachable!("local locators do not select a provider"),
         };
         downloader
+    }
+
+    async fn reuse_cached_model<M: ModelSpec>(
+        &self,
+        model: M,
+        cache_dir: &Path,
+        source: DownloadSource,
+    ) -> Result<Option<PathBuf>> {
+        if let Some(revision) = self.revision.as_deref() {
+            validate_revision(model.huggingface_repo(), revision)?;
+        }
+        for (repo, revision) in &self.repository_revisions {
+            validate_repo_id(repo)?;
+            validate_revision(repo, revision)?;
+        }
+        validate_repo_id(model.huggingface_repo())?;
+        validate_repo_id(model.modelscope_repo())?;
+        for asset in model_hub_assets(&model) {
+            validate_repo_id(asset.repo)?;
+        }
+        let target = validated_model_cache_path(&model, cache_dir)?;
+
+        tokio::fs::create_dir_all(cache_dir)
+            .await
+            .map_err(|error| OrchionError::Download {
+                source_name: "cache",
+                repo: model.huggingface_repo().to_string(),
+                message: error.to_string(),
+            })?;
+        ensure_cache_state_dir(cache_dir)
+            .await
+            .map_err(|error| OrchionError::Download {
+                source_name: "cache",
+                repo: model.huggingface_repo().to_string(),
+                message: error.to_string(),
+            })?;
+        let model_lock =
+            transaction::acquire_model_lock(cache_dir, model.huggingface_repo()).await?;
+        for repo in std::iter::once(model.huggingface_repo())
+            .chain(model_hub_assets(&model).iter().map(|asset| asset.repo))
+        {
+            validate_repo_cache_ancestors(cache_dir, repo)
+                .await
+                .map_err(|error| OrchionError::Download {
+                    source_name: "cache",
+                    repo: repo.to_string(),
+                    message: error.to_string(),
+                })?;
+        }
+        let (_model_lock, _) = recover_with_owned_locks(
+            cache_dir.to_path_buf(),
+            model.huggingface_repo().to_string(),
+            model_lock,
+        )
+        .await?;
+        let staging_prefix = transaction::model_staging_prefix(model.huggingface_repo());
+        let staging_dir = cache_state_path(cache_dir, DOWNLOAD_STAGING_DIR);
+        if let Err(error) = cleanup_stale_model_downloads(&staging_dir, &staging_prefix).await {
+            tracing::warn!(
+                model = ?model,
+                path = %cache_dir.display(),
+                %error,
+                "failed to clean stale model download staging directories"
+            );
+        }
+
+        let Some(provider) = self.providers.provider(download_source_label(source)) else {
+            return Ok(None);
+        };
+        if is_ready_cache(&model, &target, std::slice::from_ref(&provider), self).await? {
+            tracing::debug!(model = ?model, path = %target.display(), "model cache ready");
+            return Ok(Some(target));
+        }
+        Ok(None)
     }
 
     #[cfg(test)]
@@ -2899,6 +3067,7 @@ fn validate_llm_lock_sync(
     cache_dir: &Path,
     plan: &DeploymentArtifactPlan,
     publication: &DeploymentPublication,
+    verify_file_integrity: bool,
 ) -> Result<()> {
     if plan.category != ModelCategory::Llm {
         return Ok(());
@@ -2936,21 +3105,36 @@ fn validate_llm_lock_sync(
             .iter()
             .find(|entry| entry["source_file"].as_str() == Some(relative.as_ref()))
             .ok_or_else(|| deployment_cache_error(plan, "LLM lock file mapping mismatch"))?;
-        let expected_size = locked["size"]
-            .as_u64()
-            .ok_or_else(|| deployment_cache_error(plan, "LLM lock size is invalid"))?;
-        let expected_sha256 = locked["sha256"]
-            .as_str()
-            .ok_or_else(|| deployment_cache_error(plan, "LLM lock digest is invalid"))?;
-        let (size, sha256) = cache_file_integrity_sync(file)
-            .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
         let blob_relative = safe_manifest_relative_path(
             locked["blob"]
                 .as_str()
                 .ok_or_else(|| deployment_cache_error(plan, "LLM lock blob path is invalid"))?,
             plan,
         )?;
-        let (blob_size, blob_sha256) = cache_file_integrity_sync(&cache_dir.join(blob_relative))
+        let blob = cache_dir.join(blob_relative);
+        let blob_metadata = std::fs::symlink_metadata(&blob)
+            .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
+        if blob_metadata.file_type().is_symlink()
+            || !blob_metadata.is_file()
+            || blob_metadata.len() == 0
+        {
+            return Err(deployment_cache_error(
+                plan,
+                "LLM lock blob is not a regular file",
+            ));
+        }
+        let expected_size = locked["size"]
+            .as_u64()
+            .ok_or_else(|| deployment_cache_error(plan, "LLM lock size is invalid"))?;
+        let expected_sha256 = locked["sha256"]
+            .as_str()
+            .ok_or_else(|| deployment_cache_error(plan, "LLM lock digest is invalid"))?;
+        if !verify_file_integrity {
+            continue;
+        }
+        let (size, sha256) = cache_file_integrity_sync(file)
+            .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
+        let (blob_size, blob_sha256) = cache_file_integrity_sync(&blob)
             .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
         if size != expected_size
             || blob_size != expected_size
@@ -3126,7 +3310,7 @@ async fn recover_llm_from_lock<C: DownloadClient>(
         plan,
         true,
     )?;
-    validate_llm_lock_sync(cache_dir, plan, &publication)?;
+    validate_llm_lock_sync(cache_dir, plan, &publication, true)?;
     Ok(publication)
 }
 
@@ -6809,6 +6993,61 @@ mod downloader_tests {
     }
 
     #[tokio::test]
+    async fn cached_neutral_deployment_skips_remote_preflight() {
+        let cache = tempfile::tempdir().unwrap();
+        let model = qwen_asr_06b();
+        let url = ModelUrl::parse("//Mirror/Shared-Package").unwrap();
+        let source_intent = "id=model|neutral-policy=auto";
+        let modelscope_plan = DeploymentSourcePlan {
+            key: "prepopulate-modelscope-cache".to_string(),
+            artifacts: ModelDownloader::model_artifact_plan(&model, &url).unwrap(),
+            candidates: vec![DownloadSource::ModelScope],
+        };
+        let env = DownloadEnv {
+            orchion_model_source: None,
+            hf_endpoint: None,
+        };
+        let populate_client = FakeDownloadClient::default();
+        ModelDownloader::new(DownloadSource::Auto)
+            .download_neutral_deployment_artifact(
+                model.clone(),
+                &url,
+                source_intent,
+                &modelscope_plan,
+                cache.path(),
+                &populate_client,
+                &AlwaysAvailableProbe,
+                &env,
+            )
+            .await
+            .unwrap();
+
+        let all_sources_plan = DeploymentSourcePlan {
+            key: "reuse-modelscope-cache".to_string(),
+            artifacts: modelscope_plan.artifacts.clone(),
+            candidates: vec![DownloadSource::HuggingFace, DownloadSource::ModelScope],
+        };
+        let reuse_client = FakeDownloadClient::default();
+        let path = ModelDownloader::new(DownloadSource::Auto)
+            .download_neutral_deployment_artifact(
+                model,
+                &url,
+                source_intent,
+                &all_sources_plan,
+                cache.path(),
+                &reuse_client,
+                &AlwaysAvailableProbe,
+                &env,
+            )
+            .await
+            .unwrap();
+
+        assert!(path.is_dir());
+        assert_eq!(*reuse_client.preflight_calls.lock().unwrap(), 0);
+        assert!(reuse_client.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn auxiliary_locator_change_invalidates_primary_package_path() {
         let dir = tempfile::tempdir().unwrap();
         let model = qwen_asr_06b();
@@ -8482,6 +8721,52 @@ mod downloader_tests {
     }
 
     #[tokio::test]
+    async fn disabled_integrity_verification_reuses_llm_deployment_without_hashing() {
+        let cache = tempfile::tempdir().unwrap();
+        let (_, plan) = remote_llm_plan();
+        let client = FakeDownloadClient {
+            echo_requested_revision: true,
+            ..FakeDownloadClient::default()
+        };
+        let env = DownloadEnv {
+            orchion_model_source: None,
+            hf_endpoint: None,
+        };
+        let verified = ModelDownloader::new(DownloadSource::HuggingFace);
+        let publication = verified
+            .provision_deployment_core(&plan, cache.path(), &client, &env, None)
+            .await
+            .unwrap();
+        let model = publication
+            .artifact_file(ArtifactRole::LlmModel)
+            .unwrap()
+            .to_path_buf();
+        std::fs::write(&model, b"modified model").unwrap();
+        let lock: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(cache.path().join(MODELS_LOCK_FILE)).unwrap())
+                .unwrap();
+        let blob = cache.path().join(
+            lock["deployments"][plan.deployment_id.as_str()]["files"][0]["blob"]
+                .as_str()
+                .unwrap(),
+        );
+        std::fs::write(blob, b"modified blob").unwrap();
+
+        let unchecked = ModelDownloader::new(DownloadSource::HuggingFace)
+            .with_file_integrity_verification(false);
+        let reused = unchecked
+            .provision_deployment_core(&plan, cache.path(), &client, &env, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(reused.artifact_file(ArtifactRole::LlmModel).unwrap()).unwrap(),
+            b"modified model"
+        );
+        assert_eq!(&*client.calls.lock().unwrap(), &["huggingface"]);
+    }
+
+    #[tokio::test]
     async fn llm_lock_recovers_publication_and_redownloads_missing_blob_at_locked_revision() {
         let cache = tempfile::tempdir().unwrap();
         let (_model, plan) = remote_llm_plan();
@@ -8680,7 +8965,7 @@ mod downloader_tests {
                 .unwrap();
         assert!(lock["deployments"]["acme/first"].is_object());
         assert!(lock["deployments"]["acme/second"].is_object());
-        validate_llm_lock_sync(cache.path(), &first.0, &first.1).unwrap();
+        validate_llm_lock_sync(cache.path(), &first.0, &first.1, true).unwrap();
         ensure_llm_lock(cache.path(), &first.0, &first.1)
             .await
             .unwrap();
@@ -8691,7 +8976,24 @@ mod downloader_tests {
                 .unwrap(),
         );
         std::fs::write(blob, b"corrupt").unwrap();
-        assert!(validate_llm_lock_sync(cache.path(), &first.0, &first.1).is_err());
+        assert!(validate_llm_lock_sync(cache.path(), &first.0, &first.1, true).is_err());
+
+        let mut malformed = lock;
+        malformed["deployments"]["acme/first"]["files"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("sha256");
+        malformed["deployments"]["acme/first"]["profiles"]
+            [llm_source_intent_fingerprint(&first.0.source_intent)]["files"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("sha256");
+        std::fs::write(
+            cache.path().join(MODELS_LOCK_FILE),
+            serde_json::to_vec(&malformed).unwrap(),
+        )
+        .unwrap();
+        assert!(validate_llm_lock_sync(cache.path(), &first.0, &first.1, false).is_err());
     }
 
     async fn llm_lock_fixture(
