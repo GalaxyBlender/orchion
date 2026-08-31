@@ -189,7 +189,8 @@ mod tests {
     use futures_util::{SinkExt, StreamExt};
     use http_body_util::BodyExt;
     use orchion::{
-        AsrModel, ModelId, OcrModel, OcrModelKind, TtsModel, scripted_context_limit_llm_engine,
+        AsrModel, ModelCategory, ModelDownloader, ModelId, ModelSpec, ModelUrl, ModelUrlSource,
+        OcrModel, OcrModelKind, TtsModel, scripted_context_limit_llm_engine,
     };
     use serde_json::Value;
     use std::net::SocketAddr;
@@ -396,7 +397,7 @@ mod tests {
         let boundary = "activity-auth";
         let body = multipart_body(
             boundary,
-            &[("model", "Qwen/Qwen3-ASR-0.6B")],
+            &[("model", "alibaba/qwen3-asr-0.6b")],
             Some(("file", "audio.wav", b"audio")),
         );
         let state = test_state_with_config(false, false, |config| {
@@ -630,12 +631,20 @@ mod tests {
         assert!(manifest_text.contains("llm_mmproj"));
         assert!(manifest_text.contains("sha256"));
         assert!(manifest_text.contains("size"));
-        assert!(manifest_text.contains("runtime="));
-        assert!(manifest_text.contains("generation="));
+        assert!(!manifest_text.contains("runtime="));
+        assert!(!manifest_text.contains("generation="));
+        assert!(
+            !manifest["source_intent"]
+                .as_str()
+                .unwrap()
+                .contains("qwen/test")
+        );
+        assert!(manifest_text.contains(&gguf.to_string_lossy().to_string()));
+        assert!(manifest_text.contains(&mmproj.to_string_lossy().to_string()));
         let lock = std::fs::read_to_string(models_dir.join("orchion-models.lock")).unwrap();
         assert!(lock.contains("llm_model"));
         assert!(lock.contains("llm_mmproj"));
-        assert!(models_dir.join(".orchion/blobs/sha256").is_dir());
+        assert!(!models_dir.join(".orchion/blobs").exists());
         let app = router_with_ui_routes(state, Router::new());
         let listed = app
             .clone()
@@ -845,7 +854,7 @@ mod tests {
         let boundary = "activity-limit";
         let body = multipart_body(
             boundary,
-            &[("model", "Qwen/Qwen3-ASR-0.6B")],
+            &[("model", "alibaba/qwen3-asr-0.6b")],
             Some(("file", "audio.wav", &[0_u8; 64])),
         );
         let content_length = body.len();
@@ -1015,7 +1024,7 @@ mod tests {
                 .unwrap();
         socket
             .send(Message::Text(
-                r#"{"type":"start","model":"Qwen/Qwen3-ASR-0.6B","input_audio_format":"pcm_s16le","sample_rate":16000}"#
+                r#"{"type":"start","model":"alibaba/qwen3-asr-0.6b","input_audio_format":"pcm_s16le","sample_rate":16000}"#
                     .into(),
             ))
             .await
@@ -1077,7 +1086,7 @@ mod tests {
     #[tokio::test]
     async fn multipart_ocr_requires_file() {
         let boundary = "orchion-ocr-missing-file";
-        let body = multipart_body(boundary, &[("model", "PaddlePaddle/PP-OCRv6_tiny")], None);
+        let body = multipart_body(boundary, &[("model", "paddlepaddle/pp-ocrv6-tiny")], None);
 
         let response = post_ocr(test_state(true, false), boundary, body).await;
 
@@ -1092,7 +1101,7 @@ mod tests {
         let boundary = "orchion-ocr-empty-file";
         let body = multipart_body(
             boundary,
-            &[("model", "PaddlePaddle/PP-OCRv6_tiny")],
+            &[("model", "paddlepaddle/pp-ocrv6-tiny")],
             Some(("file", "empty.png", b"")),
         );
 
@@ -1348,13 +1357,14 @@ mod tests {
         ocr_vl_active: bool,
         configure: impl FnOnce(&mut ServerConfig),
     ) -> Arc<AppState> {
-        let mut config = ServerConfig::default_for_exe(std::path::Path::new("/tmp/orchion-server"));
+        let root = tempfile::tempdir().unwrap().keep();
+        let mut config = ServerConfig::default_for_exe(&root.join("orchion-server"));
         config.services.asr.enabled = false;
         config.services.tts.enabled = false;
         config.services.ocr.enabled = ocr_active;
         config.services.ocr.default_model =
-            Some(ModelId::parse("PaddlePaddle/PP-OCRv6_tiny").unwrap());
-        config.services.ocr.models = ["PaddlePaddle/PP-OCRv6_tiny", "PaddlePaddle/PP-OCRv6_small"]
+            Some(ModelId::parse("paddlepaddle/pp-ocrv6-tiny").unwrap());
+        config.services.ocr.models = ["paddlepaddle/pp-ocrv6-tiny", "paddlepaddle/pp-ocrv6-small"]
             .into_iter()
             .map(|id| {
                 OcrModelDeployment::from_runtime(OcrModel::new(
@@ -1365,21 +1375,156 @@ mod tests {
             .collect();
         config.services.ocr_vl.enabled = ocr_vl_active;
         config.services.ocr_vl.default_model =
-            Some(ModelId::parse("PaddlePaddle/PaddleOCR-VL-1.6").unwrap());
+            Some(ModelId::parse("paddlepaddle/paddleocr-vl-1.6").unwrap());
         config.services.ocr_vl.models = vec![OcrModelDeployment::from_runtime(OcrModel::new(
-            ModelId::parse("PaddlePaddle/PaddleOCR-VL-1.6").unwrap(),
+            ModelId::parse("paddlepaddle/paddleocr-vl-1.6").unwrap(),
             OcrModelKind::OcrVl,
         ))];
         config.services.asr.models = vec![ModelDeployment::from_asr_runtime(
-            AsrModel::parse("Qwen/Qwen3-ASR-0.6B").unwrap(),
+            AsrModel::parse("alibaba/qwen3-asr-0.6b").unwrap(),
         )];
         config.services.tts.models = vec![ModelDeployment::from_tts_runtime(
-            TtsModel::parse("Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice").unwrap(),
+            TtsModel::parse("alibaba/qwen3-tts-12hz-0.6b-customvoice").unwrap(),
         )];
         config.services.asr.idle_timeout = Duration::from_mins(10);
         config.services.tts.idle_timeout = Duration::from_mins(10);
         configure(&mut config);
+        if config.services.asr.enabled {
+            for deployment in &config.services.asr.models {
+                write_ready_fixture(
+                    &config.models.dir,
+                    &deployment.runtime,
+                    &deployment.model,
+                    "huggingface",
+                );
+            }
+        }
+        if config.services.tts.enabled {
+            for deployment in &config.services.tts.models {
+                write_ready_fixture(
+                    &config.models.dir,
+                    &deployment.runtime,
+                    &deployment.model,
+                    "huggingface",
+                );
+            }
+        }
+        if config.services.ocr.enabled {
+            for deployment in &config.services.ocr.models {
+                write_ready_fixture(
+                    &config.models.dir,
+                    &deployment.runtime,
+                    &deployment.model,
+                    "modelscope",
+                );
+            }
+        }
+        if config.services.ocr_vl.enabled {
+            for deployment in &config.services.ocr_vl.models {
+                write_ready_fixture(
+                    &config.models.dir,
+                    &deployment.runtime,
+                    &deployment.model,
+                    "modelscope",
+                );
+            }
+        }
 
         Arc::new(AppState::from_prepared_config(config).unwrap())
+    }
+
+    fn write_ready_fixture<M: ModelSpec>(
+        models_dir: &std::path::Path,
+        model: &M,
+        model_url: &ModelUrl,
+        neutral_source: &str,
+    ) {
+        if model_url.source() == ModelUrlSource::File {
+            return;
+        }
+        let locator_repo = format!(
+            "{}/{}",
+            model_url.owner().unwrap(),
+            model_url.repository().unwrap()
+        );
+        let source = match model_url.source() {
+            ModelUrlSource::HuggingFace => "huggingface",
+            ModelUrlSource::ModelScope => "modelscope",
+            ModelUrlSource::Neutral => neutral_source,
+            ModelUrlSource::File => unreachable!(),
+        };
+        let target = if matches!(model.category(), ModelCategory::Ocr | ModelCategory::OcrVl) {
+            ModelSpec::cache_path(model, models_dir)
+        } else {
+            models_dir.join(&locator_repo)
+        };
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("fixture.json"), "{}").unwrap();
+        let cache_repo = target
+            .strip_prefix(models_dir)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let repo_id = if matches!(model.category(), ModelCategory::Ocr | ModelCategory::OcrVl) {
+            if source == "modelscope" {
+                model.modelscope_repo()
+            } else {
+                model.huggingface_repo()
+            }
+        } else {
+            locator_repo.as_str()
+        };
+        let requested_revision = if source == "modelscope" {
+            "master"
+        } else {
+            "main"
+        };
+        let resolved_revision = "1111111111111111111111111111111111111111";
+        let mut repository_identities = ModelDownloader::model_artifact_plan(model, model_url)
+            .unwrap()
+            .into_iter()
+            .map(|artifact| artifact.repository)
+            .collect::<Vec<_>>();
+        repository_identities.sort();
+        repository_identities.dedup();
+        let repositories = repository_identities
+            .iter()
+            .map(|identity| {
+                let actual_repo = if identity == model.huggingface_repo() && source == "modelscope"
+                {
+                    model.modelscope_repo()
+                } else {
+                    identity
+                };
+                serde_json::json!({
+                    "identity": identity,
+                    "repo_id": actual_repo,
+                    "requested_revision": requested_revision,
+                    "resolved_revision": resolved_revision,
+                })
+            })
+            .collect::<Vec<_>>();
+        let manifest = serde_json::json!({
+            "schema_version": 3,
+            "source": source,
+            "repo_id": repo_id,
+            "downloaded_repos": repositories.iter().map(|repository| repository["repo_id"].clone()).collect::<Vec<_>>(),
+            "revision": requested_revision,
+            "resolved_revision": resolved_revision,
+            "repositories": repositories,
+            "layout": "model-hub-native",
+            "files": [{
+                "repo": cache_repo,
+                "path": "fixture.json",
+                "file_type": "file",
+                "size": 2,
+                "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+            }],
+        });
+        std::fs::write(
+            target.join(".orchion-ready.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
     }
 }

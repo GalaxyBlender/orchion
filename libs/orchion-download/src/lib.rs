@@ -9,9 +9,11 @@ pub use provider::{
 };
 
 use assets::{ModelHubAsset, ModelHubAssetKind, uses_modelscope_file_assets};
+#[cfg(test)]
+use orchion_core::OcrModelAssetRole;
 use orchion_core::{
     DownloadFailure, DownloadRetryability, KnownOcrModel, ModelCategory, ModelId, ModelSpec,
-    ModelUrl, ModelUrlSource, OcrModelAssetRole, OrchionError, Result,
+    ModelUrl, ModelUrlSource, OrchionError, Result,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -28,10 +30,9 @@ const READY_MANIFEST_FILE: &str = ".orchion-ready.json";
 const READY_MANIFEST_SCHEMA_VERSION: u64 = 3;
 const READY_MANIFEST_LAYOUT: &str = "model-hub-native";
 const DEPLOYMENT_MANIFEST_FILE: &str = "orchion-deployment.json";
-const DEPLOYMENT_MANIFEST_SCHEMA_VERSION: u64 = 1;
+const DEPLOYMENT_MANIFEST_SCHEMA_VERSION: u64 = 2;
 const MODELS_LOCK_FILE: &str = "orchion-models.lock";
 const MODELS_LOCK_SCHEMA_VERSION: u64 = 1;
-const BLOB_DIR: &str = "blobs/sha256";
 const CACHE_STATE_DIR: &str = ".orchion";
 const DOWNLOAD_STAGING_DIR: &str = "staging";
 const MODEL_LOCK_DIR: &str = "locks";
@@ -219,22 +220,6 @@ pub enum ArtifactRole {
     OcrTableStructureDictionary,
 }
 
-impl ArtifactRole {
-    const fn path_segment(self) -> &'static str {
-        match self {
-            Self::Model => "primary",
-            Self::LlmModel => "llm-model",
-            Self::LlmMmproj => "llm-mmproj",
-            Self::OcrDetector => "ocr-detector",
-            Self::OcrRecognizer => "ocr-recognizer",
-            Self::OcrDictionary => "ocr-dictionary",
-            Self::OcrLayout => "layout",
-            Self::OcrTableStructureModel => "table-structure-model",
-            Self::OcrTableStructureDictionary => "table-structure-dictionary",
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeploymentArtifactSource {
     Neutral,
@@ -290,8 +275,8 @@ impl DeploymentPublication {
     }
 
     #[must_use]
-    pub fn role_root(&self, role: ArtifactRole) -> PathBuf {
-        self.root.join(role.path_segment())
+    pub fn role_root(&self, _role: ArtifactRole) -> PathBuf {
+        self.root.clone()
     }
 
     #[must_use]
@@ -453,7 +438,7 @@ impl ModelDownloader {
         }
         validate_cache_relative_ancestors_sync(cache_dir, &relative, true)
             .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
-        match read_deployment_publication(&cache_dir.join(relative), plan, true) {
+        match read_deployment_publication(&cache_dir.join(relative), cache_dir, plan, true) {
             Ok(publication) => {
                 validate_llm_lock_sync(cache_dir, plan, &publication, true)?;
                 Ok(publication)
@@ -521,7 +506,7 @@ impl ModelDownloader {
             .await
             .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
         if let Ok(publication) =
-            read_deployment_publication(&target, plan, self.verify_file_integrity)
+            read_deployment_publication(&target, cache_dir, plan, self.verify_file_integrity)
             && (plan.category != ModelCategory::Llm
                 || validate_llm_lock_sync(
                     cache_dir,
@@ -553,23 +538,46 @@ impl ModelDownloader {
             .prefix(&transaction::model_staging_prefix(&lock_key))
             .tempdir_in(&staging_dir)
             .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
-        let staged_root = staging.path().join(&target_relative);
-        tokio::fs::create_dir_all(&staged_root)
+        let staged_manifest_root = staging.path().join(&target_relative);
+        tokio::fs::create_dir_all(&staged_manifest_root)
             .await
             .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
 
         let published = self
-            .download_resolved_deployment_artifacts(plan, &resolved, &staged_root, client, env)
+            .download_resolved_deployment_artifacts(plan, &resolved, staging.path(), client, env)
             .await?;
-        if let Some(preparation) = preparation.as_ref() {
-            prepare_deployment_primary(preparation, &staged_root, plan).await?;
-        }
-        write_deployment_manifest(&staged_root, plan, &published).await?;
-        read_deployment_publication(&staged_root, plan, true)?;
+        let generated = if let Some(preparation) = preparation.as_ref() {
+            prepare_deployment_primary(preparation, staging.path(), plan).await?
+        } else {
+            Vec::new()
+        };
+        write_deployment_manifest(
+            &staged_manifest_root,
+            staging.path(),
+            plan,
+            &published,
+            &generated,
+        )
+        .await?;
+        read_deployment_publication(&staged_manifest_root, staging.path(), plan, true)?;
+        let mut publication_paths = published
+            .iter()
+            .filter(|artifact| !matches!(artifact.source, DeploymentArtifactSource::File(_)))
+            .flat_map(|artifact| artifact.files.iter())
+            .chain(generated.iter())
+            .map(|path| {
+                path.strip_prefix(staging.path())
+                    .map(Path::to_path_buf)
+                    .map_err(|error| deployment_cache_error(plan, error.to_string()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        publication_paths.push(target_relative.clone());
+        publication_paths.sort();
+        publication_paths.dedup();
         let (model_lock, publication) = if plan.category == ModelCategory::Llm {
             publish_staged_llm_cache(
                 lock_key,
-                target_relative,
+                publication_paths,
                 staging,
                 cache_dir.to_path_buf(),
                 model_lock,
@@ -580,7 +588,7 @@ impl ModelDownloader {
         } else {
             publish_staged_relative_cache(
                 lock_key,
-                vec![target_relative],
+                publication_paths,
                 staging,
                 cache_dir.to_path_buf(),
                 "deployment",
@@ -597,7 +605,7 @@ impl ModelDownloader {
         )
         .await
         .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
-        let publication = read_deployment_publication(&target, plan, true)?;
+        let publication = read_deployment_publication(&target, cache_dir, plan, true)?;
         validate_llm_lock_sync(cache_dir, plan, &publication, true)?;
         Ok(publication)
     }
@@ -738,8 +746,9 @@ impl ModelDownloader {
 
     /// Provisions a model using a deployment source-intent identity and optional provider choice.
     ///
-    /// `source_intent` affects only local cache identity. `source_override` is applied only to a
-    /// neutral locator; explicit locator schemes always remain authoritative.
+    /// `source_intent` is retained for diagnostics and provider planning, but does not affect the
+    /// physical cache path. `source_override` is applied only to a neutral locator; explicit
+    /// locator schemes always remain authoritative.
     ///
     /// # Errors
     ///
@@ -885,7 +894,7 @@ impl ModelDownloader {
         };
         let downloader = self.for_model_url_source(model_url.source(), Some(source));
         let assets = model_hub_assets(&model);
-        let deployment_root = deployment_cache_root(&model, &effective_intent, cache_dir);
+        let deployment_root = deployment_cache_root(cache_dir);
         let expected = expected_remote_model_path(&model, model_url, &effective_intent, cache_dir)?;
         let cached = if let Some(path) = model_url.path() {
             if assets.len() != 1 || assets[0].repo != repository || assets[0].file != path {
@@ -1320,18 +1329,12 @@ impl ModelDownloader {
             let DeploymentArtifactSource::File(source) = &artifact.source else {
                 unreachable!();
             };
-            let target = staged_root
-                .join(artifact.role.path_segment())
-                .join("local")
-                .join(source.file_name().ok_or_else(|| {
-                    deployment_cache_error(plan, "local artifact has no file name")
-                })?);
-            copy_local_deployment_artifact(plan, source, &target).await?;
+            validate_local_deployment_artifact(plan, source).await?;
             published.push(PublishedDeploymentArtifact {
                 role: artifact.role,
                 source: artifact.source.clone(),
                 repository: None,
-                files: vec![target],
+                files: vec![source.clone()],
                 source_files: artifact.files.clone(),
                 requested_revision: None,
                 resolved_revision: None,
@@ -1351,9 +1354,7 @@ impl ModelDownloader {
                 .provider(download_source_label(source))
                 .expect("resolved provider remains registered");
             for group in group_resolved_deployment_artifacts(plan, &source_artifacts)? {
-                let download_root = staged_root
-                    .join(".downloads")
-                    .join(download_source_label(source));
+                let download_root = staged_root.to_path_buf();
                 let download_target = repo_cache_path(&download_root, &group.repository);
                 let file_refs = group.files.iter().map(String::as_str).collect::<Vec<_>>();
                 let requested_revision = group.resolved_revision.as_str();
@@ -1389,10 +1390,6 @@ impl ModelDownloader {
                     ));
                 }
                 for artifact in group.artifacts {
-                    let role_target = repo_cache_path(
-                        &staged_root.join(artifact.role.path_segment()),
-                        &group.repository,
-                    );
                     let mut files = Vec::with_capacity(artifact.files.len());
                     for file in &artifact.files {
                         let source_path = download_target.join(file);
@@ -1405,9 +1402,7 @@ impl ModelDownloader {
                                 ),
                             )
                         })?;
-                        let role_path = role_target.join(file);
-                        materialize_deployment_role_file(plan, &source_path, &role_path).await?;
-                        files.push(role_path);
+                        files.push(source_path);
                     }
                     published.push(PublishedDeploymentArtifact {
                         role: artifact.role,
@@ -1420,15 +1415,6 @@ impl ModelDownloader {
                     });
                 }
             }
-        }
-        let downloads = staged_root.join(".downloads");
-        if path_exists(&downloads)
-            .await
-            .map_err(|error| deployment_cache_error(plan, error.to_string()))?
-        {
-            tokio::fs::remove_dir_all(downloads)
-                .await
-                .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
         }
         Ok(published)
     }
@@ -1474,14 +1460,32 @@ impl ModelDownloader {
         if model_url.source() == ModelUrlSource::File {
             validate_local_model_path_sync(model, model_url)
         } else {
-            expected_remote_model_path(model, model_url, source_intent, cache_dir.as_ref())
+            let path =
+                expected_remote_model_path(model, model_url, source_intent, cache_dir.as_ref())?;
+            let allowed_sources = match model_url.source() {
+                ModelUrlSource::HuggingFace => vec![DownloadSource::HuggingFace],
+                ModelUrlSource::ModelScope => vec![DownloadSource::ModelScope],
+                ModelUrlSource::Neutral => {
+                    vec![DownloadSource::HuggingFace, DownloadSource::ModelScope]
+                }
+                ModelUrlSource::File => unreachable!(),
+            };
+            let artifacts = Self::model_artifact_plan(model, model_url)?;
+            validate_prepared_ready_cache(
+                model,
+                model_url,
+                cache_dir.as_ref(),
+                &path,
+                &allowed_sources,
+                Some(&artifacts),
+            )?;
+            Ok(path)
         }
     }
 
     /// Resolves a prepared path under a deployment provider policy.
     ///
-    /// Existing candidate-specific cache paths are checked in policy order. If none exists, the
-    /// first candidate path is returned, matching normal mode's first preflight candidate.
+    /// The locator-derived cache path is checked for each provider candidate in policy order.
     ///
     /// # Errors
     ///
@@ -1501,30 +1505,23 @@ impl ModelDownloader {
                 cache_dir,
             );
         }
-        let mut paths = plan
-            .candidates
-            .iter()
-            .copied()
-            .map(|source| {
-                let intent = format!(
-                    "{source_intent}|neutral-provider={}",
-                    download_source_label(source)
-                );
-                expected_remote_model_path(model, model_url, &intent, cache_dir.as_ref())
-            })
-            .collect::<Result<Vec<_>>>()?;
-        if paths.is_empty() {
+        if plan.candidates.is_empty() {
             return Err(OrchionError::Download {
                 source_name: "provider-policy",
                 repo: model.huggingface_repo().to_string(),
                 message: "neutral deployment has no provider candidates".to_string(),
             });
         }
-        Ok(paths
-            .iter()
-            .find(|path| path.exists())
-            .cloned()
-            .unwrap_or_else(|| paths.remove(0)))
+        let path = expected_remote_model_path(model, model_url, source_intent, cache_dir.as_ref())?;
+        validate_prepared_ready_cache(
+            model,
+            model_url,
+            cache_dir.as_ref(),
+            &path,
+            &plan.candidates,
+            Some(&plan.artifacts),
+        )?;
+        Ok(path)
     }
 
     #[cfg(test)]
@@ -1639,7 +1636,7 @@ impl ModelDownloader {
         );
         let downloader = self.for_model_url_source(model_url.source(), source_override);
         let assets = model_hub_assets(&model);
-        let deployment_root = deployment_cache_root(&model, source_intent, cache_dir.as_ref());
+        let deployment_root = deployment_cache_root(cache_dir.as_ref());
         let expected =
             expected_remote_model_path(&model, model_url, source_intent, cache_dir.as_ref())?;
         if let Some(path) = model_url.path() {
@@ -2219,7 +2216,7 @@ struct LocatedRepositoryModel<M> {
 fn expected_remote_model_path<M: ModelSpec>(
     model: &M,
     model_url: &ModelUrl,
-    source_intent: &str,
+    _source_intent: &str,
     cache_dir: &Path,
 ) -> Result<PathBuf> {
     let repository = format!(
@@ -2252,29 +2249,220 @@ fn expected_remote_model_path<M: ModelSpec>(
         model.huggingface_repo()
     };
     Ok(repo_cache_path(
-        &deployment_cache_root(model, source_intent, cache_dir),
+        &deployment_cache_root(cache_dir),
         package_repository,
     ))
 }
 
-fn deployment_cache_root<M: ModelSpec>(
+fn validate_prepared_ready_cache<M: ModelSpec>(
     model: &M,
-    source_intent: &str,
+    model_url: &ModelUrl,
     cache_dir: &Path,
-) -> PathBuf {
-    let digest = Sha256::digest(source_intent.as_bytes());
-    let fingerprint = encode_hex(&digest);
-    model
-        .huggingface_repo()
-        .split('/')
-        .fold(
-            cache_dir
-                .join(CACHE_STATE_DIR)
-                .join("deployments")
-                .join(model.category().cache_segment()),
-            |path, segment| path.join(segment),
+    target: &Path,
+    allowed_sources: &[DownloadSource],
+    artifacts: Option<&[ArtifactRequest]>,
+) -> Result<()> {
+    let manifest_path = target.join(READY_MANIFEST_FILE);
+    let metadata = std::fs::symlink_metadata(&manifest_path).map_err(|error| {
+        prepared_cache_error(
+            model,
+            format!(
+                "prepared cache metadata `{}` is unavailable: {error}",
+                manifest_path.display()
+            ),
         )
-        .join(fingerprint)
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(prepared_cache_error(
+            model,
+            "prepared cache metadata is not a regular file",
+        ));
+    }
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&manifest_path)
+            .map_err(|error| prepared_cache_error(model, error.to_string()))?,
+    )
+    .map_err(|error| prepared_cache_error(model, error.to_string()))?;
+    if manifest["schema_version"].as_u64() != Some(READY_MANIFEST_SCHEMA_VERSION)
+        || manifest["layout"].as_str() != Some(READY_MANIFEST_LAYOUT)
+    {
+        return Err(prepared_cache_error(
+            model,
+            "prepared cache metadata schema mismatch",
+        ));
+    }
+    let source = match manifest["source"].as_str() {
+        Some("huggingface") => DownloadSource::HuggingFace,
+        Some("modelscope") => DownloadSource::ModelScope,
+        _ => {
+            return Err(prepared_cache_error(
+                model,
+                "prepared cache has invalid provider provenance",
+            ));
+        }
+    };
+    if !allowed_sources.contains(&source) {
+        return Err(prepared_cache_error(
+            model,
+            format!(
+                "prepared cache provider provenance `{}` is not allowed",
+                download_source_label(source)
+            ),
+        ));
+    }
+    let locator_repository = format!(
+        "{}/{}",
+        model_url.owner().expect("validated hub URL has owner"),
+        model_url
+            .repository()
+            .expect("validated hub URL has repository")
+    );
+    let expected_repo = if model_hub_assets(model).is_empty() {
+        locator_repository.as_str()
+    } else {
+        match source {
+            DownloadSource::HuggingFace => model.huggingface_repo(),
+            DownloadSource::ModelScope => model.modelscope_repo(),
+            DownloadSource::Auto => unreachable!(),
+        }
+    };
+    if manifest["repo_id"].as_str() != Some(expected_repo) {
+        return Err(prepared_cache_error(
+            model,
+            "prepared cache repository provenance mismatch",
+        ));
+    }
+    let repositories = manifest["repositories"]
+        .as_array()
+        .ok_or_else(|| prepared_cache_error(model, "prepared cache has no repository metadata"))?;
+    if repositories.is_empty() {
+        return Err(prepared_cache_error(
+            model,
+            "prepared cache has no repository metadata",
+        ));
+    }
+    for repository in repositories {
+        let identity = repository["identity"].as_str().ok_or_else(|| {
+            prepared_cache_error(model, "prepared repository identity is invalid")
+        })?;
+        validate_repo_id(identity)?;
+        let requested = repository["requested_revision"].as_str().ok_or_else(|| {
+            prepared_cache_error(model, "prepared repository requested revision is invalid")
+        })?;
+        let resolved = repository["resolved_revision"].as_str().ok_or_else(|| {
+            prepared_cache_error(model, "prepared repository resolved revision is invalid")
+        })?;
+        let default_revision = match source {
+            DownloadSource::HuggingFace => "main",
+            DownloadSource::ModelScope => "master",
+            DownloadSource::Auto => unreachable!(),
+        };
+        if !provider::is_immutable_revision(resolved)
+            || (provider::is_immutable_revision(requested) && requested != resolved)
+            || (!provider::is_immutable_revision(requested) && requested != default_revision)
+        {
+            return Err(prepared_cache_error(
+                model,
+                "prepared repository immutable revision mismatch",
+            ));
+        }
+    }
+    if let Some(artifacts) = artifacts {
+        for artifact in artifacts {
+            if artifact
+                .required_source
+                .is_some_and(|required| required != source)
+            {
+                return Err(prepared_cache_error(
+                    model,
+                    "prepared cache provider provenance does not satisfy the artifact plan",
+                ));
+            }
+            let actual = repositories.iter().find(|repository| {
+                repository["identity"].as_str() == Some(artifact.repository.as_str())
+            });
+            let Some(actual) = actual else {
+                return Err(prepared_cache_error(
+                    model,
+                    "prepared cache is missing artifact repository metadata",
+                ));
+            };
+            if let Some(expected_revision) = artifact.resolved_revision.as_deref() {
+                if actual["resolved_revision"].as_str() != Some(expected_revision) {
+                    return Err(prepared_cache_error(
+                        model,
+                        "prepared artifact resolved revision mismatch",
+                    ));
+                }
+            }
+        }
+    }
+    let files = manifest["files"]
+        .as_array()
+        .ok_or_else(|| prepared_cache_error(model, "prepared cache has no file metadata"))?;
+    if files.is_empty() {
+        return Err(prepared_cache_error(
+            model,
+            "prepared cache has no file metadata",
+        ));
+    }
+    for file in files {
+        let repo = file["repo"].as_str().ok_or_else(|| {
+            prepared_cache_error(model, "prepared cache file repository is invalid")
+        })?;
+        validate_repo_id(repo)?;
+        let relative = safe_ready_manifest_file_path(
+            file["path"].as_str().ok_or_else(|| {
+                prepared_cache_error(model, "prepared cache file path is invalid")
+            })?,
+            model,
+        )?;
+        let path = repo_cache_path(cache_dir, repo).join(relative);
+        let expected_size = file["size"]
+            .as_u64()
+            .filter(|size| *size > 0)
+            .ok_or_else(|| prepared_cache_error(model, "prepared cache file size is invalid"))?;
+        let expected_sha = file["sha256"]
+            .as_str()
+            .filter(|sha| sha.len() == 64)
+            .ok_or_else(|| prepared_cache_error(model, "prepared cache file digest is invalid"))?;
+        let (size, sha) = cache_file_integrity_sync(&path)
+            .map_err(|error| prepared_cache_error(model, error.to_string()))?;
+        if size != expected_size || sha != expected_sha {
+            return Err(prepared_cache_error(
+                model,
+                "prepared cache file integrity mismatch",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn safe_ready_manifest_file_path<M: ModelSpec>(value: &str, model: &M) -> Result<PathBuf> {
+    let path = Path::new(value);
+    if path.is_absolute()
+        || !path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(prepared_cache_error(
+            model,
+            "prepared cache contains an unsafe file path",
+        ));
+    }
+    Ok(path.to_path_buf())
+}
+
+fn prepared_cache_error<M: ModelSpec>(model: &M, message: impl Into<String>) -> OrchionError {
+    OrchionError::Download {
+        source_name: "cache",
+        repo: model.huggingface_repo().to_string(),
+        message: message.into(),
+    }
+}
+
+fn deployment_cache_root(cache_dir: &Path) -> PathBuf {
+    cache_dir.to_path_buf()
 }
 
 #[cfg(test)]
@@ -2283,21 +2471,78 @@ fn deployment_publication_path(plan: &DeploymentArtifactPlan, cache_dir: &Path) 
 }
 
 fn deployment_publication_relative_path(plan: &DeploymentArtifactPlan) -> PathBuf {
-    let fingerprint = encode_hex(&Sha256::digest(plan.source_intent.as_bytes()));
-    plan.deployment_id
-        .as_str()
-        .split('/')
-        .fold(
-            PathBuf::from(CACHE_STATE_DIR)
-                .join("deployments")
-                .join(plan.category.cache_segment()),
-            |path, segment| path.join(segment),
-        )
-        .join(fingerprint)
+    PathBuf::from(CACHE_STATE_DIR)
+        .join("manifests")
+        .join(deployment_artifact_fingerprint(plan))
 }
 
 fn deployment_model_lock_key(plan: &DeploymentArtifactPlan) -> String {
-    format!("deployment:{}:{}", plan.category, plan.deployment_id)
+    format!(
+        "deployment-targets:{}",
+        deployment_physical_target_fingerprint(plan)
+    )
+}
+
+// Provider and role metadata do not distinguish writers to the same files. Such plans serialize;
+// a later successful publication may replace those exact targets, but never unrelated repo files.
+fn deployment_physical_target_fingerprint(plan: &DeploymentArtifactPlan) -> String {
+    let mut targets = plan
+        .artifacts
+        .iter()
+        .flat_map(|artifact| match &artifact.source {
+            DeploymentArtifactSource::File(path) => vec![format!("local:{}", path.display())],
+            _ => {
+                let repository = artifact
+                    .repository
+                    .as_deref()
+                    .expect("validated remote artifact has a repository");
+                artifact
+                    .files
+                    .iter()
+                    .map(|file| format!("remote:{repository}/{file}"))
+                    .collect()
+            }
+        })
+        .collect::<Vec<_>>();
+    targets.sort();
+    targets.dedup();
+    let identity = targets.join("\0");
+    encode_hex(&Sha256::digest(identity.as_bytes()))
+}
+
+fn deployment_artifact_fingerprint(plan: &DeploymentArtifactPlan) -> String {
+    let mut identity = format!("category={}|", plan.category.cache_segment());
+    for artifact in &plan.artifacts {
+        identity.push_str(artifact_role_label(artifact.role));
+        identity.push('|');
+        match &artifact.source {
+            DeploymentArtifactSource::Neutral => identity.push_str("neutral"),
+            DeploymentArtifactSource::HuggingFace => identity.push_str("huggingface"),
+            DeploymentArtifactSource::ModelScope => identity.push_str("modelscope"),
+            DeploymentArtifactSource::File(path) => {
+                identity.push_str("file:");
+                identity.push_str(&path.to_string_lossy());
+            }
+        }
+        identity.push('|');
+        identity.push_str(artifact.repository.as_deref().unwrap_or(""));
+        identity.push('|');
+        for file in &artifact.files {
+            identity.push_str(file);
+            identity.push('\0');
+        }
+        identity.push('|');
+        if let Some(source) = artifact.required_source {
+            identity.push_str(download_source_label(source));
+        }
+        identity.push(';');
+    }
+    identity.push_str("candidates=");
+    for source in &plan.neutral_candidates {
+        identity.push_str(download_source_label(*source));
+        identity.push(',');
+    }
+    encode_hex(&Sha256::digest(identity.as_bytes()))
 }
 
 fn group_deployment_preflight_requests(
@@ -2400,7 +2645,7 @@ fn validate_deployment_plan<M: ModelSpec>(
     primary: &M,
     plan: &DeploymentArtifactPlan,
 ) -> Result<()> {
-    validate_deployment_identity(primary.huggingface_repo(), primary.category(), plan)
+    validate_deployment_identity(primary.model_id(), primary.category(), plan)
 }
 
 fn validate_deployment_identity(
@@ -2511,10 +2756,9 @@ fn require_preflight_immutable_revision(
         })
 }
 
-async fn copy_local_deployment_artifact(
+async fn validate_local_deployment_artifact(
     plan: &DeploymentArtifactPlan,
     source: &Path,
-    target: &Path,
 ) -> Result<()> {
     let metadata = tokio::fs::symlink_metadata(source)
         .await
@@ -2528,34 +2772,7 @@ async fn copy_local_deployment_artifact(
             ),
         ));
     }
-    if let Some(parent) = target.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
-    }
-    tokio::fs::copy(source, target)
-        .await
-        .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
     Ok(())
-}
-
-async fn materialize_deployment_role_file(
-    plan: &DeploymentArtifactPlan,
-    source: &Path,
-    target: &Path,
-) -> Result<()> {
-    if let Some(parent) = target.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
-    }
-    match tokio::fs::hard_link(source, target).await {
-        Ok(()) => Ok(()),
-        Err(_) => tokio::fs::copy(source, target)
-            .await
-            .map(|_| ())
-            .map_err(|error| deployment_cache_error(plan, error.to_string())),
-    }
 }
 
 struct PrimaryPreparation {
@@ -2576,15 +2793,14 @@ async fn prepare_deployment_primary(
     primary: &PrimaryPreparation,
     root: &Path,
     plan: &DeploymentArtifactPlan,
-) -> Result<()> {
-    let primary_root = root.join(ArtifactRole::Model.path_segment());
-    let target = repo_cache_path(&primary_root, &primary.canonical_repo);
+) -> Result<Vec<PathBuf>> {
+    let mut generated = Vec::new();
+    let target = repo_cache_path(root, &primary.canonical_repo);
     tokio::fs::create_dir_all(&target)
         .await
         .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
     for asset in &primary.assets {
-        let role_root = root.join(artifact_role_for_ocr_asset(asset.role).path_segment());
-        let source = repo_cache_path(&role_root, asset.repo).join(asset.file);
+        let source = repo_cache_path(root, asset.repo).join(asset.file);
         cache_file_size(&source).await.map_err(|error| {
             deployment_cache_error(
                 plan,
@@ -2594,18 +2810,19 @@ async fn prepare_deployment_primary(
                 ),
             )
         })?;
-        let consolidated = repo_cache_path(&primary_root, asset.repo).join(asset.file);
-        materialize_deployment_role_file(plan, &source, &consolidated).await?;
         if let ModelHubAssetKind::PaddleOcrDictionary { output_file } = asset.kind {
             let dictionary = build_paddle_ocr_dictionary("deployment", asset.repo, &source).await?;
-            tokio::fs::write(target.join(output_file), dictionary)
+            let output = target.join(output_file);
+            tokio::fs::write(&output, dictionary)
                 .await
                 .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
+            generated.push(output);
         }
     }
-    Ok(())
+    Ok(generated)
 }
 
+#[cfg(test)]
 const fn artifact_role_for_ocr_asset(role: OcrModelAssetRole) -> ArtifactRole {
     match role {
         OcrModelAssetRole::Detector => ArtifactRole::OcrDetector,
@@ -2617,25 +2834,27 @@ const fn artifact_role_for_ocr_asset(role: OcrModelAssetRole) -> ArtifactRole {
 
 async fn write_deployment_manifest(
     root: &Path,
+    cache_root: &Path,
     plan: &DeploymentArtifactPlan,
     artifacts: &[PublishedDeploymentArtifact],
+    generated: &[PathBuf],
 ) -> Result<()> {
-    let mut files = Vec::new();
-    collect_deployment_files(root, root, &mut files)
-        .await
-        .map_err(|error| {
-            deployment_cache_error(
-                plan,
-                format!("failed to enumerate deployment files: {error}"),
-            )
-        })?;
+    let mut files = artifacts
+        .iter()
+        .flat_map(|artifact| artifact.files.iter().cloned())
+        .chain(generated.iter().cloned())
+        .collect::<Vec<_>>();
+    files.sort();
+    files.dedup();
     let mut file_entries = Vec::with_capacity(files.len());
-    for (relative, absolute) in files {
-        let (size, sha256) = cache_file_integrity(absolute)
+    for absolute in files {
+        let (size, sha256) = cache_file_integrity(absolute.clone())
             .await
             .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
+        let (path, local) = deployment_manifest_path(cache_root, &absolute);
         file_entries.push(serde_json::json!({
-            "path": relative.to_string_lossy(),
+            "path": path,
+            "local": local,
             "size": size,
             "sha256": sha256,
         }));
@@ -2649,8 +2868,7 @@ async fn write_deployment_manifest(
                 "repository": artifact.repository,
                 "source_files": artifact.source_files,
                 "files": artifact.files.iter().map(|path| {
-                    path.strip_prefix(root).expect("published artifact is under deployment root")
-                        .to_string_lossy().to_string()
+                    deployment_manifest_path(cache_root, path).0
                 }).collect::<Vec<_>>(),
                 "requested_revision": artifact.requested_revision,
                 "resolved_revision": artifact.resolved_revision,
@@ -2659,6 +2877,7 @@ async fn write_deployment_manifest(
         .collect::<Vec<_>>();
     let manifest = serde_json::json!({
         "schema_version": DEPLOYMENT_MANIFEST_SCHEMA_VERSION,
+        "artifact_fingerprint": deployment_artifact_fingerprint(plan),
         "deployment_id": plan.deployment_id.as_str(),
         "category": plan.category.cache_segment(),
         "source_intent": plan.source_intent,
@@ -2684,6 +2903,7 @@ async fn write_deployment_manifest(
 )]
 fn read_deployment_publication(
     root: &Path,
+    cache_root: &Path,
     plan: &DeploymentArtifactPlan,
     verify_integrity: bool,
 ) -> Result<DeploymentPublication> {
@@ -2705,9 +2925,9 @@ fn read_deployment_publication(
     let manifest: serde_json::Value = serde_json::from_str(&manifest)
         .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
     if manifest["schema_version"].as_u64() != Some(DEPLOYMENT_MANIFEST_SCHEMA_VERSION)
-        || manifest["deployment_id"].as_str() != Some(plan.deployment_id.as_str())
         || manifest["category"].as_str() != Some(plan.category.cache_segment())
-        || manifest["source_intent"].as_str() != Some(plan.source_intent.as_str())
+        || manifest["artifact_fingerprint"].as_str()
+            != Some(deployment_artifact_fingerprint(plan).as_str())
     {
         return Err(deployment_cache_error(
             plan,
@@ -2764,34 +2984,36 @@ fn read_deployment_publication(
         ) && (requested_revision.as_deref().is_none_or(str::is_empty)
             || resolved_revision
                 .as_deref()
-                .is_none_or(|revision| !provider::is_immutable_revision(revision)))
+                .is_none_or(|revision| !provider::is_immutable_revision(revision))
+            || requested_revision.as_deref().is_some_and(|requested| {
+                provider::is_immutable_revision(requested)
+                    && resolved_revision.as_deref() != Some(requested)
+            }))
         {
             return Err(deployment_cache_error(
                 plan,
                 "hub deployment artifact has no immutable resolved revision",
             ));
         }
-        let files = entry["files"]
+        let manifest_files = entry["files"]
             .as_array()
             .ok_or_else(|| deployment_cache_error(plan, "deployment artifact files are invalid"))?
             .iter()
             .map(|file| {
-                let relative = safe_manifest_relative_path(
-                    file.as_str().ok_or_else(|| {
-                        deployment_cache_error(plan, "deployment artifact path is invalid")
-                    })?,
-                    plan,
-                )?;
-                validate_cache_relative_ancestors_sync(root, &relative, true)
-                    .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
-                Ok(root.join(relative))
+                file.as_str().map(str::to_string).ok_or_else(|| {
+                    deployment_cache_error(plan, "deployment artifact path is invalid")
+                })
             })
             .collect::<Result<Vec<_>>>()?;
-        let role_root = root.join(request.role.path_segment());
-        if files.is_empty() || files.iter().any(|path| !path.starts_with(&role_root)) {
+        let files = deployment_artifact_paths(cache_root, request)?;
+        let expected_manifest_files = files
+            .iter()
+            .map(|path| deployment_manifest_path(cache_root, path).0)
+            .collect::<Vec<_>>();
+        if manifest_files != expected_manifest_files {
             return Err(deployment_cache_error(
                 plan,
-                "deployment artifact is outside its role root",
+                "deployment artifact path does not match its configured locator",
             ));
         }
         artifacts.push(PublishedDeploymentArtifact {
@@ -2828,15 +3050,24 @@ fn read_deployment_publication(
     }
     let mut manifest_paths = Vec::with_capacity(files.len());
     for file in files {
-        let relative = safe_manifest_relative_path(
-            file["path"].as_str().ok_or_else(|| {
-                deployment_cache_error(plan, "deployment manifest path is invalid")
-            })?,
-            plan,
-        )?;
-        validate_cache_relative_ancestors_sync(root, &relative, true)
-            .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
-        let path = root.join(relative);
+        let value = file["path"]
+            .as_str()
+            .ok_or_else(|| deployment_cache_error(plan, "deployment manifest path is invalid"))?;
+        let path = if file["local"].as_bool() == Some(true) {
+            let path = PathBuf::from(value);
+            if !path.is_absolute() {
+                return Err(deployment_cache_error(
+                    plan,
+                    "local manifest path is not absolute",
+                ));
+            }
+            path
+        } else {
+            let relative = safe_manifest_relative_path(value, plan)?;
+            validate_cache_relative_ancestors_sync(cache_root, &relative, true)
+                .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
+            cache_root.join(relative)
+        };
         manifest_paths.push(path.clone());
         let metadata = std::fs::symlink_metadata(&path)
             .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
@@ -2875,139 +3106,44 @@ fn read_deployment_publication(
         ));
     }
     Ok(DeploymentPublication {
-        root: root.to_path_buf(),
+        root: cache_root.to_path_buf(),
         artifacts,
     })
 }
 
-#[cfg(test)]
-async fn ensure_llm_lock(
-    cache_dir: &Path,
-    plan: &DeploymentArtifactPlan,
-    publication: &DeploymentPublication,
-) -> Result<()> {
-    if plan.category != ModelCategory::Llm {
-        return Ok(());
-    }
-    ensure_cache_state_dir(cache_dir)
-        .await
-        .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
-    let _lock =
-        transaction::acquire_publication_lock(cache_dir, plan.deployment_id.as_str()).await?;
-    let blob_root = cache_state_path(cache_dir, BLOB_DIR);
-    tokio::fs::create_dir_all(&blob_root)
-        .await
-        .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
-    let mut files = Vec::new();
-    for artifact in publication.artifacts() {
-        for file in &artifact.files {
-            let (size, sha256) = cache_file_integrity(file.clone())
-                .await
-                .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
-            let blob = blob_root.join(&sha256);
-            ensure_blob(file, &blob, size, &sha256, plan).await?;
-            files.push(serde_json::json!({
-                "role": artifact_role_label(artifact.role),
-                "source_file": file.strip_prefix(publication.root())
-                    .map_err(|error| deployment_cache_error(plan, error.to_string()))?
-                    .to_string_lossy(),
-                "blob": blob.strip_prefix(cache_dir)
-                    .map_err(|error| deployment_cache_error(plan, error.to_string()))?
-                    .to_string_lossy(),
-                "size": size,
-                "sha256": sha256,
-                "resolved_revision": artifact.resolved_revision,
-            }));
-        }
-    }
-    let lock_path = cache_dir.join(MODELS_LOCK_FILE);
-    let mut lock = if lock_path.exists() {
-        serde_json::from_slice::<serde_json::Value>(&std::fs::read(&lock_path).map_err(
-            |error| deployment_cache_error(plan, format!("{}: {error}", lock_path.display())),
-        )?)
-        .map_err(|error| deployment_cache_error(plan, error.to_string()))?
-    } else {
-        serde_json::json!({"schema_version":MODELS_LOCK_SCHEMA_VERSION,"deployments":{}})
-    };
-    if lock["schema_version"].as_u64() != Some(MODELS_LOCK_SCHEMA_VERSION)
-        || !lock["deployments"].is_object()
-    {
-        return Err(deployment_cache_error(
-            plan,
-            "invalid orchion-models.lock schema",
-        ));
-    }
-    merge_llm_lock_entry(&mut lock, plan, &files)?;
-    atomic_write_json(&lock_path, &lock)
-        .await
-        .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
-    sync_directory(cache_dir)
-        .await
-        .map_err(|error| deployment_cache_error(plan, error.to_string()))
+fn deployment_manifest_path(cache_root: &Path, path: &Path) -> (String, bool) {
+    path.strip_prefix(cache_root).map_or_else(
+        |_| (path.to_string_lossy().to_string(), true),
+        |relative| (relative.to_string_lossy().to_string(), false),
+    )
 }
 
-#[cfg(test)]
-async fn ensure_blob(
-    source: &Path,
-    blob: &Path,
-    expected_size: u64,
-    expected_sha256: &str,
-    plan: &DeploymentArtifactPlan,
-) -> Result<()> {
-    if blob.exists() {
-        let (size, sha256) = cache_file_integrity(blob.to_path_buf())
-            .await
-            .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
-        if size != expected_size || sha256 != expected_sha256 {
-            return Err(deployment_cache_error(
-                plan,
-                "content-addressed blob integrity mismatch",
-            ));
-        }
-        return Ok(());
+fn deployment_artifact_paths(
+    cache_root: &Path,
+    request: &DeploymentArtifactRequest,
+) -> Result<Vec<PathBuf>> {
+    if let DeploymentArtifactSource::File(path) = &request.source {
+        return Ok(vec![path.clone()]);
     }
-    let temporary = blob.with_extension("tmp");
-    if temporary.exists() {
-        tokio::fs::remove_file(&temporary)
-            .await
-            .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
-    }
-    tokio::fs::copy(source, &temporary)
-        .await
-        .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
-    let file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .open(&temporary)
-        .await
-        .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
-    file.sync_all()
-        .await
-        .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
-    tokio::fs::rename(&temporary, blob)
-        .await
-        .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
-    sync_directory(blob.parent().expect("blob has a parent"))
-        .await
-        .map_err(|error| deployment_cache_error(plan, error.to_string()))
-}
-
-fn llm_source_intent_fingerprint(source_intent: &str) -> String {
-    encode_hex(&Sha256::digest(source_intent.as_bytes()))
+    let repository = request
+        .repository
+        .as_deref()
+        .expect("validated remote artifact has a repository");
+    Ok(request
+        .files
+        .iter()
+        .map(|file| repo_cache_path(cache_root, repository).join(file))
+        .collect())
 }
 
 fn matching_llm_lock_entry<'a>(
     lock: &'a serde_json::Value,
     plan: &DeploymentArtifactPlan,
 ) -> Option<&'a serde_json::Value> {
-    let deployment = lock["deployments"].get(plan.deployment_id.as_str())?;
-    let fingerprint = llm_source_intent_fingerprint(&plan.source_intent);
-    deployment["profiles"]
+    let fingerprint = deployment_artifact_fingerprint(plan);
+    lock["deployments"]
         .get(&fingerprint)
-        .filter(|entry| entry["source_intent"].as_str() == Some(plan.source_intent.as_str()))
-        .or_else(|| {
-            (deployment["source_intent"].as_str() == Some(plan.source_intent.as_str()))
-                .then_some(deployment)
-        })
+        .filter(|entry| entry["artifact_fingerprint"].as_str() == Some(fingerprint.as_str()))
 }
 
 fn llm_lock_has_matching_entry(cache_dir: &Path, plan: &DeploymentArtifactPlan) -> bool {
@@ -3028,38 +3164,15 @@ fn merge_llm_lock_entry(
     let deployments = lock["deployments"]
         .as_object_mut()
         .ok_or_else(|| deployment_cache_error(plan, "invalid orchion-models.lock deployments"))?;
-    let previous = deployments
-        .remove(plan.deployment_id.as_str())
-        .unwrap_or_else(|| serde_json::json!({}));
-    let mut profiles = previous["profiles"]
-        .as_object()
-        .cloned()
-        .unwrap_or_default();
-    if let Some(previous_intent) = previous["source_intent"].as_str()
-        && previous["files"].is_array()
-    {
-        profiles
-            .entry(llm_source_intent_fingerprint(previous_intent))
-            .or_insert_with(|| {
-                serde_json::json!({
-                    "category": previous["category"],
-                    "source_intent": previous_intent,
-                    "files": previous["files"],
-                })
-            });
-    }
+    let fingerprint = deployment_artifact_fingerprint(plan);
     let entry = serde_json::json!({
+        "artifact_fingerprint": fingerprint,
+        "deployment_id": plan.deployment_id.as_str(),
         "category": plan.category.cache_segment(),
         "source_intent": plan.source_intent,
         "files": files,
     });
-    profiles.insert(
-        llm_source_intent_fingerprint(&plan.source_intent),
-        entry.clone(),
-    );
-    let mut deployment = entry;
-    deployment["profiles"] = serde_json::Value::Object(profiles);
-    deployments.insert(plan.deployment_id.as_str().to_string(), deployment);
+    deployments.insert(fingerprint, entry);
     Ok(())
 }
 
@@ -3097,32 +3210,14 @@ fn validate_llm_lock_sync(
         return Err(deployment_cache_error(plan, "LLM lock file count mismatch"));
     }
     for file in publication_files {
-        let relative = file
-            .strip_prefix(publication.root())
-            .map_err(|error| deployment_cache_error(plan, error.to_string()))?
-            .to_string_lossy();
+        let (source_file, local) = deployment_manifest_path(publication.root(), file);
         let locked = locked_files
             .iter()
-            .find(|entry| entry["source_file"].as_str() == Some(relative.as_ref()))
+            .find(|entry| {
+                entry["source_file"].as_str() == Some(source_file.as_str())
+                    && entry["local"].as_bool() == Some(local)
+            })
             .ok_or_else(|| deployment_cache_error(plan, "LLM lock file mapping mismatch"))?;
-        let blob_relative = safe_manifest_relative_path(
-            locked["blob"]
-                .as_str()
-                .ok_or_else(|| deployment_cache_error(plan, "LLM lock blob path is invalid"))?,
-            plan,
-        )?;
-        let blob = cache_dir.join(blob_relative);
-        let blob_metadata = std::fs::symlink_metadata(&blob)
-            .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
-        if blob_metadata.file_type().is_symlink()
-            || !blob_metadata.is_file()
-            || blob_metadata.len() == 0
-        {
-            return Err(deployment_cache_error(
-                plan,
-                "LLM lock blob is not a regular file",
-            ));
-        }
         let expected_size = locked["size"]
             .as_u64()
             .ok_or_else(|| deployment_cache_error(plan, "LLM lock size is invalid"))?;
@@ -3134,31 +3229,11 @@ fn validate_llm_lock_sync(
         }
         let (size, sha256) = cache_file_integrity_sync(file)
             .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
-        let (blob_size, blob_sha256) = cache_file_integrity_sync(&blob)
-            .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
-        if size != expected_size
-            || blob_size != expected_size
-            || sha256 != expected_sha256
-            || blob_sha256 != expected_sha256
-        {
-            return Err(deployment_cache_error(
-                plan,
-                "LLM lock or blob integrity mismatch",
-            ));
+        if size != expected_size || sha256 != expected_sha256 {
+            return Err(deployment_cache_error(plan, "LLM lock integrity mismatch"));
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-async fn atomic_write_json(path: &Path, value: &serde_json::Value) -> std::io::Result<()> {
-    let temporary = path.with_extension("tmp");
-    write_synced_file(
-        &temporary,
-        serde_json::to_vec_pretty(value).map_err(std::io::Error::other)?,
-    )
-    .await?;
-    tokio::fs::rename(temporary, path).await
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -3171,7 +3246,8 @@ async fn recover_llm_from_lock<C: DownloadClient>(
     allow_download: bool,
 ) -> Result<DeploymentPublication> {
     let _publication_lock =
-        transaction::acquire_publication_lock(cache_dir, plan.deployment_id.as_str()).await?;
+        transaction::acquire_publication_lock(cache_dir, &deployment_artifact_fingerprint(plan))
+            .await?;
     recover_interrupted_publication(cache_dir)
         .await
         .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
@@ -3203,11 +3279,11 @@ async fn recover_llm_from_lock<C: DownloadClient>(
         .tempdir_in(&staging_dir)
         .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
     let target_relative = deployment_publication_relative_path(plan);
-    let staged_deployment = staging.path().join(&target_relative);
-    tokio::fs::create_dir_all(&staged_deployment)
+    let staged_manifest = staging.path().join(&target_relative);
+    tokio::fs::create_dir_all(&staged_manifest)
         .await
         .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
-    let mut blob_paths = Vec::new();
+    let mut publication_paths = vec![target_relative];
     let mut artifacts = Vec::with_capacity(plan.artifacts.len());
     for request in &plan.artifacts {
         let role = artifact_role_label(request.role);
@@ -3222,70 +3298,75 @@ async fn recover_llm_from_lock<C: DownloadClient>(
             ));
         }
         let mut published_files = Vec::with_capacity(role_entries.len());
-        for locked in role_entries {
+        for (index, locked) in role_entries.into_iter().enumerate() {
             let expected_size = locked["size"]
                 .as_u64()
                 .ok_or_else(|| deployment_cache_error(plan, "LLM lock size is invalid"))?;
             let expected_sha = locked["sha256"]
                 .as_str()
                 .ok_or_else(|| deployment_cache_error(plan, "LLM lock digest is invalid"))?;
-            let blob_relative = safe_manifest_relative_path(
-                locked["blob"]
-                    .as_str()
-                    .ok_or_else(|| deployment_cache_error(plan, "LLM lock blob is invalid"))?,
-                plan,
-            )?;
-            let live_blob = cache_dir.join(&blob_relative);
-            let blob_valid = cache_file_integrity_sync(&live_blob)
-                .is_ok_and(|(size, sha)| size == expected_size && sha == expected_sha);
-            if blob_valid {
-                let staged_blob = staging.path().join(&blob_relative);
-                if let Some(parent) = staged_blob.parent() {
-                    tokio::fs::create_dir_all(parent)
-                        .await
-                        .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
-                }
-                tokio::fs::copy(&live_blob, &staged_blob)
-                    .await
+            let source = locked_deployment_source(locked_files, role, plan)?;
+            if let DeploymentArtifactSource::File(path) = &source {
+                let (size, sha) = cache_file_integrity_sync(path)
                     .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
-                blob_paths.push(blob_relative.clone());
-            } else {
-                if !allow_download {
+                if size != expected_size || sha != expected_sha {
                     return Err(deployment_cache_error(
                         plan,
-                        "locked LLM blob is missing or corrupt; network recovery is disabled",
+                        "local locked LLM artifact integrity mismatch",
                     ));
                 }
-                redownload_locked_blob(
-                    downloader,
-                    client,
-                    env,
-                    plan,
-                    locked,
-                    staging.path(),
-                    &blob_relative,
-                    expected_size,
-                    expected_sha,
-                )
-                .await?;
-                blob_paths.push(blob_relative.clone());
-            }
-            let source_relative = safe_manifest_relative_path(
-                locked["source_file"].as_str().ok_or_else(|| {
+                published_files.push(path.clone());
+            } else {
+                let relative = deployment_artifact_paths(Path::new(""), request)?
+                    .get(index)
+                    .cloned()
+                    .ok_or_else(|| {
+                        deployment_cache_error(plan, "LLM lock file mapping mismatch")
+                    })?;
+                let locked_source = locked["source_file"].as_str().ok_or_else(|| {
                     deployment_cache_error(plan, "LLM lock source path is invalid")
-                })?,
-                plan,
-            )?;
-            let staged_file = staged_deployment.join(&source_relative);
-            if let Some(parent) = staged_file.parent() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
+                })?;
+                if locked_source != relative.to_string_lossy() {
+                    return Err(deployment_cache_error(
+                        plan,
+                        "LLM lock file mapping mismatch",
+                    ));
+                }
+                let live_file = cache_dir.join(&relative);
+                let staged_file = staging.path().join(&relative);
+                if cache_file_integrity_sync(&live_file)
+                    .is_ok_and(|(size, sha)| size == expected_size && sha == expected_sha)
+                {
+                    if let Some(parent) = staged_file.parent() {
+                        tokio::fs::create_dir_all(parent)
+                            .await
+                            .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
+                    }
+                    tokio::fs::copy(&live_file, &staged_file)
+                        .await
+                        .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
+                } else {
+                    if !allow_download {
+                        return Err(deployment_cache_error(
+                            plan,
+                            "locked LLM artifact is missing or corrupt; network recovery is disabled",
+                        ));
+                    }
+                    redownload_locked_artifact(
+                        downloader,
+                        client,
+                        env,
+                        plan,
+                        locked,
+                        staging.path(),
+                        expected_size,
+                        expected_sha,
+                    )
+                    .await?;
+                }
+                publication_paths.push(relative);
+                published_files.push(staged_file);
             }
-            tokio::fs::copy(staging.path().join(&blob_relative), &staged_file)
-                .await
-                .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
-            published_files.push(staged_file);
         }
         artifacts.push(PublishedDeploymentArtifact {
             role: request.role,
@@ -3297,16 +3378,15 @@ async fn recover_llm_from_lock<C: DownloadClient>(
             resolved_revision: locked_revision(locked_files, role, "resolved_revision"),
         });
     }
-    write_deployment_manifest(&staged_deployment, plan, &artifacts).await?;
-    let mut paths = vec![target_relative];
-    paths.extend(blob_paths);
-    paths.sort();
-    paths.dedup();
-    publish_staged_relative_paths(staging.path(), cache_dir, &paths)
+    write_deployment_manifest(&staged_manifest, staging.path(), plan, &artifacts, &[]).await?;
+    publication_paths.sort();
+    publication_paths.dedup();
+    publish_staged_relative_paths(staging.path(), cache_dir, &publication_paths)
         .await
         .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
     let publication = read_deployment_publication(
         &cache_dir.join(deployment_publication_relative_path(plan)),
+        cache_dir,
         plan,
         true,
     )?;
@@ -3347,14 +3427,13 @@ fn locked_revision(files: &[serde_json::Value], role: &str, field: &str) -> Opti
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn redownload_locked_blob<C: DownloadClient>(
+async fn redownload_locked_artifact<C: DownloadClient>(
     downloader: &ModelDownloader,
     client: &C,
     env: &DownloadEnv,
     plan: &DeploymentArtifactPlan,
     locked: &serde_json::Value,
     staging_root: &Path,
-    blob_relative: &Path,
     expected_size: u64,
     expected_sha: &str,
 ) -> Result<()> {
@@ -3364,7 +3443,7 @@ async fn redownload_locked_blob<C: DownloadClient>(
         _ => {
             return Err(deployment_cache_error(
                 plan,
-                "local locked LLM blob is missing and cannot be redownloaded",
+                "local locked LLM artifact cannot be redownloaded",
             ));
         }
     };
@@ -3382,7 +3461,7 @@ async fn redownload_locked_blob<C: DownloadClient>(
         .as_str()
         .filter(|revision| provider::is_immutable_revision(revision))
         .ok_or_else(|| deployment_cache_error(plan, "locked LLM revision is not immutable"))?;
-    let download_root = staging_root.join("locked-download");
+    let download_root = staging_root.to_path_buf();
     let target = repo_cache_path(&download_root, repository);
     let provider_repository = provider.repository(ProviderModel::for_repository(repository));
     let result = client
@@ -3412,16 +3491,7 @@ async fn redownload_locked_blob<C: DownloadClient>(
             "locked LLM redownload digest mismatch",
         ));
     }
-    let staged_blob = staging_root.join(blob_relative);
-    if let Some(parent) = staged_blob.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
-    }
-    tokio::fs::copy(&downloaded_file, &staged_blob)
-        .await
-        .map(|_| ())
-        .map_err(|error| deployment_cache_error(plan, error.to_string()))
+    Ok(())
 }
 
 fn safe_manifest_relative_path(value: &str, plan: &DeploymentArtifactPlan) -> Result<PathBuf> {
@@ -3537,34 +3607,6 @@ fn cache_file_integrity_sync(path: &Path) -> std::io::Result<(u64, String)> {
     Ok((metadata.len(), encode_hex(&hasher.finalize())))
 }
 
-fn collect_deployment_files<'a>(
-    root: &'a Path,
-    directory: &'a Path,
-    files: &'a mut Vec<(PathBuf, PathBuf)>,
-) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + 'a>> {
-    Box::pin(async move {
-        let mut entries = tokio::fs::read_dir(directory).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            let metadata = entry.metadata().await?;
-            if metadata.is_dir() {
-                collect_deployment_files(root, &path, files).await?;
-            } else if metadata.is_file()
-                && path.file_name().and_then(std::ffi::OsStr::to_str)
-                    != Some(DEPLOYMENT_MANIFEST_FILE)
-            {
-                files.push((
-                    path.strip_prefix(root)
-                        .map_err(std::io::Error::other)?
-                        .to_path_buf(),
-                    path,
-                ));
-            }
-        }
-        Ok(())
-    })
-}
-
 impl<M: ModelSpec> ModelSpec for LocatedRepositoryModel<M> {
     fn category(&self) -> ModelCategory {
         self.model.category()
@@ -3619,7 +3661,7 @@ async fn validate_local_model_path<M: ModelSpec>(model: &M, url: &ModelUrl) -> R
             "local model path must be a regular file or directory",
         ));
     }
-    if model.huggingface_repo() == KnownOcrModel::PpDocLayoutV3.id() {
+    if model.model_id() == KnownOcrModel::PpDocLayoutV3.id() {
         return Err(local_model_error(
             model,
             &path,
@@ -3686,7 +3728,7 @@ fn validate_local_model_path_sync<M: ModelSpec>(model: &M, url: &ModelUrl) -> Re
             "local model path must be a regular file or directory",
         ));
     }
-    if model.huggingface_repo() == KnownOcrModel::PpDocLayoutV3.id() {
+    if model.model_id() == KnownOcrModel::PpDocLayoutV3.id() {
         return Err(local_model_error(
             model,
             &path,
@@ -3907,7 +3949,7 @@ async fn publish_staged_relative_cache(
 #[allow(clippy::too_many_arguments)]
 async fn publish_staged_llm_cache(
     model_key: String,
-    target_relative: PathBuf,
+    publication_paths: Vec<PathBuf>,
     staging: tempfile::TempDir,
     cache_dir: PathBuf,
     model_lock: transaction::CacheLock,
@@ -3918,11 +3960,13 @@ async fn publish_staged_llm_cache(
         let publication = async {
             let _publication_lock =
                 transaction::acquire_publication_lock(&cache_dir, &model_key).await?;
-            let deployment_root = staging.path().join(&target_relative);
-            let publication = DeploymentPublication::from_artifacts(deployment_root, artifacts);
+            let publication =
+                DeploymentPublication::from_artifacts(staging.path().to_path_buf(), artifacts);
             let mut paths =
                 stage_llm_supply_chain(&cache_dir, staging.path(), &plan, &publication).await?;
-            paths.insert(0, target_relative);
+            paths.extend(publication_paths);
+            paths.sort();
+            paths.dedup();
             publish_staged_relative_paths(staging.path(), &cache_dir, &paths)
                 .await
                 .map_err(|error| deployment_cache_error(&plan, error.to_string()))
@@ -3941,33 +3985,20 @@ async fn stage_llm_supply_chain(
     plan: &DeploymentArtifactPlan,
     publication: &DeploymentPublication,
 ) -> Result<Vec<PathBuf>> {
-    let mut paths = Vec::new();
     let mut files = Vec::new();
     for artifact in publication.artifacts() {
         for (index, file) in artifact.files.iter().enumerate() {
             let (size, sha256) = cache_file_integrity(file.clone())
                 .await
                 .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
-            let blob_relative = PathBuf::from(CACHE_STATE_DIR).join(BLOB_DIR).join(&sha256);
-            let staged_blob = staging_root.join(&blob_relative);
-            if let Some(parent) = staged_blob.parent() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
-            }
-            tokio::fs::copy(file, &staged_blob)
-                .await
-                .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
-            paths.push(blob_relative.clone());
+            let (source_file, local) = deployment_manifest_path(publication.root(), file);
             files.push(serde_json::json!({
                 "role": artifact_role_label(artifact.role),
                 "source": deployment_source_label(&artifact.source),
                 "repository": artifact.repository,
                 "hub_file": artifact.source_files.get(index),
-                "source_file": file.strip_prefix(publication.root())
-                    .map_err(|error| deployment_cache_error(plan, error.to_string()))?
-                    .to_string_lossy(),
-                "blob": blob_relative.to_string_lossy(),
+                "source_file": source_file,
+                "local": local,
                 "size": size,
                 "sha256": sha256,
                 "requested_revision": artifact.requested_revision,
@@ -3975,8 +4006,6 @@ async fn stage_llm_supply_chain(
             }));
         }
     }
-    paths.sort();
-    paths.dedup();
     let lock_path = cache_dir.join(MODELS_LOCK_FILE);
     let mut lock = if lock_path.exists() {
         serde_json::from_slice::<serde_json::Value>(&std::fs::read(&lock_path).map_err(
@@ -4003,8 +4032,7 @@ async fn stage_llm_supply_chain(
     )
     .await
     .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
-    paths.push(PathBuf::from(MODELS_LOCK_FILE));
-    Ok(paths)
+    Ok(vec![PathBuf::from(MODELS_LOCK_FILE)])
 }
 
 #[allow(clippy::too_many_lines)]
@@ -4013,8 +4041,69 @@ async fn publish_staged_repositories(
     cache_dir: &Path,
     repos: &[String],
 ) -> std::io::Result<()> {
-    let relative_paths = repos.iter().map(PathBuf::from).collect::<Vec<_>>();
+    let mut relative_paths = Vec::new();
+    for repo in repos {
+        validate_repo_id(repo).map_err(std::io::Error::other)?;
+        let relative = PathBuf::from(repo);
+        validate_cache_relative_ancestors(staging_root, &relative, true).await?;
+        collect_staged_publication_files(
+            staging_root,
+            &staging_root.join(&relative),
+            &mut relative_paths,
+        )
+        .await?;
+    }
+    relative_paths.sort();
+    relative_paths.dedup();
     publish_staged_relative_paths(staging_root, cache_dir, &relative_paths).await
+}
+
+fn collect_staged_publication_files<'a>(
+    staging_root: &'a Path,
+    directory: &'a Path,
+    files: &'a mut Vec<PathBuf>,
+) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+        let metadata = tokio::fs::symlink_metadata(directory).await?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "staged repository path is not a regular directory: {}",
+                    directory.display()
+                ),
+            ));
+        }
+        let mut entries = tokio::fs::read_dir(directory).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            let metadata = tokio::fs::symlink_metadata(&path).await?;
+            if metadata.file_type().is_symlink() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("staged publication contains a symlink: {}", path.display()),
+                ));
+            }
+            if metadata.is_dir() {
+                collect_staged_publication_files(staging_root, &path, files).await?;
+            } else if metadata.is_file() {
+                files.push(
+                    path.strip_prefix(staging_root)
+                        .map_err(std::io::Error::other)?
+                        .to_path_buf(),
+                );
+            } else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "staged publication contains a non-regular entry: {}",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -4957,7 +5046,7 @@ fn cache_root_from_target(target: &Path) -> Option<&Path> {
 }
 
 fn model_hub_assets<M: ModelSpec>(model: &M) -> &'static [ModelHubAsset] {
-    assets::for_model(model.huggingface_repo())
+    assets::for_model(model.model_id())
 }
 
 fn artifact_requests_for_assets(assets: &[ModelHubAsset]) -> Vec<ArtifactRequest> {
@@ -6154,7 +6243,7 @@ mod downloader_tests {
             };
             let primary = qwen_asr_06b();
             let plan = DeploymentArtifactPlan {
-                deployment_id: ModelId::parse(primary.huggingface_repo()).unwrap(),
+                deployment_id: ModelId::parse(primary.model_id()).unwrap(),
                 category: ModelCategory::Asr,
                 source_intent: format!("built-in-preflight-{revision}"),
                 artifacts: vec![DeploymentArtifactRequest {
@@ -6193,6 +6282,12 @@ mod downloader_tests {
     #[tokio::test]
     async fn deployment_publication_downloads_neutral_and_same_repo_table_roles() {
         let cache = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir_all(cache.path().join("Acme/Table"))
+            .await
+            .unwrap();
+        tokio::fs::write(cache.path().join("Acme/Table/unrelated.bin"), b"keep")
+            .await
+            .unwrap();
         let (primary, plan) = ocr_deployment_plan(
             "ocr-table-neutral",
             DeploymentArtifactSource::Neutral,
@@ -6257,7 +6352,41 @@ mod downloader_tests {
                 .as_deref()
                 .is_some_and(provider::is_immutable_revision)
         );
-        assert!(publication.root().join(DEPLOYMENT_MANIFEST_FILE).is_file());
+        assert_eq!(
+            publication.artifact_file(ArtifactRole::OcrTableStructureModel),
+            Some(cache.path().join("Acme/Table/table.onnx").as_path())
+        );
+        assert_eq!(
+            publication.artifact_file(ArtifactRole::OcrTableStructureDictionary),
+            Some(cache.path().join("Acme/Table/table_dict.txt").as_path())
+        );
+        assert!(
+            deployment_publication_path(&plan, cache.path())
+                .join(DEPLOYMENT_MANIFEST_FILE)
+                .is_file()
+        );
+        assert!(
+            !cache
+                .path()
+                .join(CACHE_STATE_DIR)
+                .join("deployments")
+                .exists()
+        );
+        assert_eq!(
+            std::fs::read(cache.path().join("Acme/Table/unrelated.bin")).unwrap(),
+            b"keep"
+        );
+        for artifact in publication.artifacts() {
+            if let Some(repository) = artifact.repository.as_deref() {
+                assert_eq!(
+                    artifact.files[0],
+                    cache
+                        .path()
+                        .join(repository)
+                        .join(&artifact.source_files[0])
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -6386,7 +6515,7 @@ mod downloader_tests {
             .unwrap();
         symlink(
             outside.path(),
-            cache.path().join(CACHE_STATE_DIR).join("deployments"),
+            cache.path().join(CACHE_STATE_DIR).join("manifests"),
         )
         .unwrap();
         let (primary, plan) = ocr_deployment_plan(
@@ -6547,6 +6676,41 @@ mod downloader_tests {
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
     }
 
+    #[test]
+    fn deployment_lock_key_depends_only_on_physical_target_paths() {
+        let mut first = DeploymentArtifactPlan {
+            deployment_id: ModelId::parse("public/first").unwrap(),
+            category: ModelCategory::Llm,
+            source_intent: "first".to_string(),
+            artifacts: vec![DeploymentArtifactRequest {
+                role: ArtifactRole::LlmModel,
+                source: DeploymentArtifactSource::HuggingFace,
+                repository: Some("Acme/Shared".to_string()),
+                files: vec!["model.bin".to_string()],
+                required_source: None,
+            }],
+            neutral_candidates: Vec::new(),
+        };
+        let mut second = first.clone();
+        second.deployment_id = ModelId::parse("public/second").unwrap();
+        second.category = ModelCategory::Ocr;
+        second.source_intent = "second".to_string();
+        second.artifacts[0].role = ArtifactRole::OcrLayout;
+        second.artifacts[0].source = DeploymentArtifactSource::ModelScope;
+        second.artifacts[0].required_source = Some(DownloadSource::ModelScope);
+
+        assert_eq!(
+            deployment_model_lock_key(&first),
+            deployment_model_lock_key(&second)
+        );
+
+        first.artifacts[0].files = vec!["different.bin".to_string()];
+        assert_ne!(
+            deployment_model_lock_key(&first),
+            deployment_model_lock_key(&second)
+        );
+    }
+
     #[tokio::test]
     async fn interrupted_deployment_replacement_recovers_backup() {
         let cache = tempfile::tempdir().unwrap();
@@ -6601,7 +6765,8 @@ mod downloader_tests {
             ModelDownloader::resolve_prepared_deployment(&primary, &plan, cache.path()).unwrap();
         assert_eq!(prepared, publication);
 
-        let manifest_path = publication.root().join(DEPLOYMENT_MANIFEST_FILE);
+        let manifest_path =
+            deployment_publication_path(&plan, cache.path()).join(DEPLOYMENT_MANIFEST_FILE);
         let original = std::fs::read_to_string(&manifest_path).unwrap();
         let mut manifest: serde_json::Value = serde_json::from_str(&original).unwrap();
         manifest["schema_version"] = serde_json::json!(0);
@@ -6650,7 +6815,7 @@ mod downloader_tests {
             ModelDownloader::resolve_prepared_deployment(&primary, &plan, cache.path())
                 .unwrap_err()
                 .to_string()
-                .contains("inconsistent revisions")
+                .contains("immutable resolved revision")
         );
         std::fs::write(&manifest_path, &original).unwrap();
 
@@ -6662,9 +6827,7 @@ mod downloader_tests {
                 &disallowed_provider,
                 cache.path()
             )
-            .unwrap_err()
-            .to_string()
-            .contains("provider mismatch")
+            .is_err()
         );
 
         let (_, changed) = ocr_deployment_plan(
@@ -6672,12 +6835,12 @@ mod downloader_tests {
             DeploymentArtifactSource::Neutral,
             DeploymentArtifactSource::Neutral,
         );
-        assert_ne!(
+        assert_eq!(
             deployment_publication_path(&plan, cache.path()),
             deployment_publication_path(&changed, cache.path())
         );
         assert!(
-            ModelDownloader::resolve_prepared_deployment(&primary, &changed, cache.path()).is_err()
+            ModelDownloader::resolve_prepared_deployment(&primary, &changed, cache.path()).is_ok()
         );
     }
 
@@ -6753,7 +6916,7 @@ mod downloader_tests {
             transaction_dir.join(PUBLISH_TRANSACTION_MANIFEST),
             serde_json::json!({
                 "paths": [{
-                    "path": ".orchion/deployments/ocr/Other/Model/fingerprint",
+                    "path": ".orchion/manifests/unrelated-fingerprint",
                     "had_target": false
                 }]
             })
@@ -6854,11 +7017,11 @@ mod downloader_tests {
     }
 
     #[tokio::test]
-    async fn deployment_cache_identity_separates_logical_ids_and_locator_profiles() {
+    async fn model_cache_path_uses_locator_not_public_id_or_profile() {
         let dir = tempfile::tempdir().unwrap();
         let shared_url = ModelUrl::parse("//Mirror/Shared-Package").unwrap();
         let first = qwen_asr_06b();
-        let second = AsrModel::parse("Qwen/Qwen3-ASR-1.7B").unwrap();
+        let second = AsrModel::parse("alibaba/qwen3-asr-1.7b").unwrap();
         let first_path = ModelDownloader::resolve_model_url_path(
             &first,
             &shared_url,
@@ -6875,7 +7038,9 @@ mod downloader_tests {
         )
         .await
         .unwrap();
-        assert_ne!(first_path, second_path);
+        let expected = dir.path().join("Mirror").join("Shared-Package");
+        assert_eq!(first_path, expected);
+        assert_eq!(second_path, expected);
 
         let hf_url = ModelUrl::parse("hf://Mirror/Shared-Package").unwrap();
         let ms_url = ModelUrl::parse("ms://Mirror/Shared-Package").unwrap();
@@ -6887,15 +7052,37 @@ mod downloader_tests {
             ModelDownloader::resolve_model_url_path(&first, &ms_url, ms_url.as_str(), dir.path())
                 .await
                 .unwrap();
-        assert_ne!(hf_path, ms_path);
+        assert_eq!(hf_path, expected);
+        assert_eq!(ms_path, expected);
+    }
+
+    #[tokio::test]
+    async fn speech_package_roots_are_direct_configured_repositories() {
+        let dir = tempfile::tempdir().unwrap();
+        let asr = qwen_asr_06b();
+        let tts = TtsModel::parse("alibaba/qwen3-tts-12hz-0.6b-customvoice").unwrap();
+        let asr_url = ModelUrl::parse("//Qwen/Qwen3-ASR-0.6B").unwrap();
+        let tts_url = ModelUrl::parse("//Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice").unwrap();
+
+        assert_eq!(
+            ModelDownloader::resolve_model_url_path(&asr, &asr_url, "public=ignored", dir.path())
+                .await
+                .unwrap(),
+            dir.path().join("Qwen/Qwen3-ASR-0.6B")
+        );
+        assert_eq!(
+            ModelDownloader::resolve_model_url_path(&tts, &tts_url, "profile=ignored", dir.path())
+                .await
+                .unwrap(),
+            dir.path().join("Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")
+        );
     }
 
     #[test]
-    fn neutral_provider_policy_and_selection_separate_cache_identity() {
+    fn neutral_provider_policy_does_not_change_locator_cache_path() {
         let cache = tempfile::tempdir().unwrap();
         let model = qwen_asr_06b();
         let url = ModelUrl::parse("//Mirror/Shared-Package").unwrap();
-        let artifacts = ModelDownloader::model_artifact_plan(&model, &url).unwrap();
         let cases = [
             (
                 "id=model|neutral-policy=huggingface",
@@ -6912,34 +7099,17 @@ mod downloader_tests {
         ];
         let paths = cases
             .into_iter()
-            .map(|(intent, candidates)| {
-                ModelDownloader::resolve_prepared_model_url_path_with_plan(
-                    &model,
-                    &url,
-                    intent,
-                    &DeploymentSourcePlan {
-                        key: intent.to_string(),
-                        artifacts: artifacts.clone(),
-                        candidates,
-                    },
-                    cache.path(),
-                )
-                .unwrap()
+            .map(|(intent, _candidates)| {
+                expected_remote_model_path(&model, &url, intent, cache.path()).unwrap()
             })
             .collect::<Vec<_>>();
 
-        assert_ne!(paths[0], paths[1]);
-        assert_ne!(paths[0], paths[2]);
-        assert_ne!(paths[1], paths[2]);
+        assert_eq!(paths[0], paths[1]);
+        assert_eq!(paths[0], paths[2]);
 
         let explicit = ModelUrl::parse("hf://Mirror/Shared-Package").unwrap();
-        let explicit_path = ModelDownloader::resolve_prepared_model_url_path(
-            &model,
-            &explicit,
-            explicit.as_str(),
-            cache.path(),
-        )
-        .unwrap();
+        let explicit_path =
+            expected_remote_model_path(&model, &explicit, explicit.as_str(), cache.path()).unwrap();
         assert!(!explicit_path.to_string_lossy().contains("neutral-policy"));
     }
 
@@ -6989,6 +7159,188 @@ mod downloader_tests {
                 .unwrap()
                 .iter()
                 .all(|files| { files.as_ref().is_some_and(|files| !files.is_empty()) })
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_explicit_locator_rejects_wrong_provider_provenance() {
+        let cache = tempfile::tempdir().unwrap();
+        let model = qwen_asr_06b();
+        let hf_url = ModelUrl::parse("hf://Qwen/Qwen3-ASR-0.6B").unwrap();
+        ModelDownloader::new(DownloadSource::HuggingFace)
+            .download_model_url_with_client_and_probe(
+                model.clone(),
+                &hf_url,
+                cache.path(),
+                &FakeDownloadClient::default(),
+                &AlwaysAvailableProbe,
+                &DownloadEnv {
+                    orchion_model_source: None,
+                    hf_endpoint: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let ms_url = ModelUrl::parse("ms://Qwen/Qwen3-ASR-0.6B").unwrap();
+        let error = ModelDownloader::resolve_prepared_model_url_path(
+            &model,
+            &ms_url,
+            ms_url.as_str(),
+            cache.path(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("provider provenance"));
+    }
+
+    #[tokio::test]
+    async fn prepared_explicit_locator_rejects_wrong_immutable_revision() {
+        let cache = tempfile::tempdir().unwrap();
+        let model = qwen_asr_06b();
+        let url = ModelUrl::parse("hf://Qwen/Qwen3-ASR-0.6B").unwrap();
+        ModelDownloader::new(DownloadSource::HuggingFace)
+            .with_revision("1111111111111111111111111111111111111111")
+            .download_model_url_with_client_and_probe(
+                model.clone(),
+                &url,
+                cache.path(),
+                &FakeDownloadClient {
+                    echo_requested_revision: true,
+                    ..FakeDownloadClient::default()
+                },
+                &AlwaysAvailableProbe,
+                &DownloadEnv {
+                    orchion_model_source: None,
+                    hf_endpoint: None,
+                },
+            )
+            .await
+            .unwrap();
+        let manifest_path = cache
+            .path()
+            .join("Qwen/Qwen3-ASR-0.6B")
+            .join(READY_MANIFEST_FILE);
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["repositories"][0]["resolved_revision"] =
+            serde_json::json!("2222222222222222222222222222222222222222");
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        let error = ModelDownloader::resolve_prepared_model_url_path(
+            &model,
+            &url,
+            url.as_str(),
+            cache.path(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("immutable revision"));
+    }
+
+    #[tokio::test]
+    async fn prepared_explicit_locator_rejects_unexpected_mutable_revision() {
+        let cache = tempfile::tempdir().unwrap();
+        let model = qwen_asr_06b();
+        let url = ModelUrl::parse("hf://Qwen/Qwen3-ASR-0.6B").unwrap();
+        ModelDownloader::new(DownloadSource::HuggingFace)
+            .download_model_url_with_client_and_probe(
+                model.clone(),
+                &url,
+                cache.path(),
+                &FakeDownloadClient::default(),
+                &AlwaysAvailableProbe,
+                &DownloadEnv {
+                    orchion_model_source: None,
+                    hf_endpoint: None,
+                },
+            )
+            .await
+            .unwrap();
+        let manifest_path = cache
+            .path()
+            .join("Qwen/Qwen3-ASR-0.6B")
+            .join(READY_MANIFEST_FILE);
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["repositories"][0]["requested_revision"] = serde_json::json!("dev");
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        let error = ModelDownloader::resolve_prepared_model_url_path(
+            &model,
+            &url,
+            url.as_str(),
+            cache.path(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("immutable revision"));
+    }
+
+    #[tokio::test]
+    async fn prepared_neutral_locator_selects_manifest_provider_provenance() {
+        let cache = tempfile::tempdir().unwrap();
+        let model = qwen_asr_06b();
+        let ms_url = ModelUrl::parse("ms://Qwen/Qwen3-ASR-0.6B").unwrap();
+        ModelDownloader::new(DownloadSource::ModelScope)
+            .download_model_url_with_client_and_probe(
+                model.clone(),
+                &ms_url,
+                cache.path(),
+                &FakeDownloadClient::default(),
+                &AlwaysAvailableProbe,
+                &DownloadEnv {
+                    orchion_model_source: None,
+                    hf_endpoint: None,
+                },
+            )
+            .await
+            .unwrap();
+        let neutral = ModelUrl::parse("//Qwen/Qwen3-ASR-0.6B").unwrap();
+        let artifacts = ModelDownloader::model_artifact_plan(&model, &neutral).unwrap();
+        let matching = DeploymentSourcePlan {
+            key: "matching".to_string(),
+            artifacts: artifacts.clone(),
+            candidates: vec![DownloadSource::HuggingFace, DownloadSource::ModelScope],
+        };
+        assert!(
+            ModelDownloader::resolve_prepared_model_url_path_with_plan(
+                &model,
+                &neutral,
+                "neutral",
+                &matching,
+                cache.path(),
+            )
+            .is_ok()
+        );
+        let mut revision_artifacts = artifacts.clone();
+        revision_artifacts[0].resolved_revision =
+            Some("2222222222222222222222222222222222222222".to_string());
+        let wrong_revision = DeploymentSourcePlan {
+            key: "wrong-revision".to_string(),
+            artifacts: revision_artifacts,
+            candidates: vec![DownloadSource::ModelScope],
+        };
+        let error = ModelDownloader::resolve_prepared_model_url_path_with_plan(
+            &model,
+            &neutral,
+            "neutral",
+            &wrong_revision,
+            cache.path(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("artifact resolved revision"));
+        let wrong = DeploymentSourcePlan {
+            key: "wrong".to_string(),
+            artifacts,
+            candidates: vec![DownloadSource::HuggingFace],
+        };
+        assert!(
+            ModelDownloader::resolve_prepared_model_url_path_with_plan(
+                &model,
+                &neutral,
+                "neutral",
+                &wrong,
+                cache.path(),
+            )
+            .is_err()
         );
     }
 
@@ -7048,7 +7400,7 @@ mod downloader_tests {
     }
 
     #[tokio::test]
-    async fn auxiliary_locator_change_invalidates_primary_package_path() {
+    async fn auxiliary_locator_change_does_not_change_primary_package_path() {
         let dir = tempfile::tempdir().unwrap();
         let model = qwen_asr_06b();
         let url = ModelUrl::parse("//Mirror/Shared-Package").unwrap();
@@ -7069,7 +7421,7 @@ mod downloader_tests {
         .await
         .unwrap();
 
-        assert_ne!(without_layout, with_layout);
+        assert_eq!(without_layout, with_layout);
     }
 
     #[tokio::test]
@@ -7629,6 +7981,30 @@ mod downloader_tests {
             .unwrap();
 
         assert_eq!(&*calls.lock().unwrap(), &["modelscope", "huggingface"]);
+    }
+
+    #[tokio::test]
+    async fn legacy_repository_republication_preserves_unrelated_same_repo_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = DownloadEnv {
+            orchion_model_source: None,
+            hf_endpoint: None,
+        };
+        let model = qwen_asr_06b();
+        let first_client = FakeDownloadClient::default();
+        let path = ModelDownloader::new(DownloadSource::ModelScope)
+            .download_with_client(model.clone(), dir.path(), &first_client, &env)
+            .await
+            .unwrap();
+        let unrelated = path.join("user-note.txt");
+        tokio::fs::write(&unrelated, b"keep me").await.unwrap();
+
+        ModelDownloader::new(DownloadSource::HuggingFace)
+            .download_with_client(model, dir.path(), &FakeDownloadClient::default(), &env)
+            .await
+            .unwrap();
+
+        assert_eq!(tokio::fs::read(unrelated).await.unwrap(), b"keep me");
     }
 
     #[tokio::test]
@@ -8584,11 +8960,11 @@ mod downloader_tests {
     }
 
     fn qwen_asr_06b() -> AsrModel {
-        AsrModel::parse("Qwen/Qwen3-ASR-0.6B").unwrap()
+        AsrModel::parse("alibaba/qwen3-asr-0.6b").unwrap()
     }
 
     fn qwen_tts_base() -> TtsModel {
-        TtsModel::parse("Qwen/Qwen3-TTS-12Hz-0.6B-Base").unwrap()
+        TtsModel::parse("alibaba/qwen3-tts-12hz-0.6b-base").unwrap()
     }
 
     fn remote_llm_plan() -> (ModelId, DeploymentArtifactPlan) {
@@ -8613,6 +8989,111 @@ mod downloader_tests {
                 neutral_candidates: Vec::new(),
             },
         )
+    }
+
+    #[tokio::test]
+    async fn atomic_llm_plan_publishes_exact_direct_files_and_reuses_renamed_id() {
+        let cache = tempfile::tempdir().unwrap();
+        let (_, mut plan) = remote_llm_plan_for("public/first", "Acme/Main-GGUF");
+        plan.artifacts.push(DeploymentArtifactRequest {
+            role: ArtifactRole::LlmMmproj,
+            source: DeploymentArtifactSource::HuggingFace,
+            repository: Some("Acme/Vision-GGUF".to_string()),
+            files: vec!["mmproj.gguf".to_string()],
+            required_source: None,
+        });
+        let client = FakeDownloadClient {
+            echo_requested_revision: true,
+            ..FakeDownloadClient::default()
+        };
+        let downloader = ModelDownloader::new(DownloadSource::HuggingFace);
+        let env = DownloadEnv {
+            orchion_model_source: None,
+            hf_endpoint: None,
+        };
+
+        let first = downloader
+            .provision_deployment_core(&plan, cache.path(), &client, &env, None)
+            .await
+            .unwrap();
+        let mut renamed = plan.clone();
+        renamed.deployment_id = ModelId::parse("public/renamed").unwrap();
+        let reused = downloader
+            .provision_deployment_core(&renamed, cache.path(), &client, &env, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            first.artifact_file(ArtifactRole::LlmModel),
+            Some(cache.path().join("Acme/Main-GGUF/model.gguf").as_path())
+        );
+        assert_eq!(
+            first.artifact_file(ArtifactRole::LlmMmproj),
+            Some(cache.path().join("Acme/Vision-GGUF/mmproj.gguf").as_path())
+        );
+        assert_eq!(first, reused);
+        assert_eq!(client.calls.lock().unwrap().len(), 2);
+        assert!(
+            !cache
+                .path()
+                .join(CACHE_STATE_DIR)
+                .join("deployments")
+                .exists()
+        );
+        assert!(!cache.path().join(CACHE_STATE_DIR).join("blobs").exists());
+    }
+
+    #[tokio::test]
+    async fn atomic_local_llm_locator_remains_the_original_absolute_file() {
+        let cache = tempfile::tempdir().unwrap();
+        let local = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(local.path(), b"local gguf").unwrap();
+        let id = ModelId::parse("public/local-llm").unwrap();
+        let plan = DeploymentArtifactPlan {
+            deployment_id: id.clone(),
+            category: ModelCategory::Llm,
+            source_intent: "local locator".to_string(),
+            artifacts: vec![DeploymentArtifactRequest {
+                role: ArtifactRole::LlmModel,
+                source: DeploymentArtifactSource::File(local.path().to_path_buf()),
+                repository: None,
+                files: vec![
+                    local
+                        .path()
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_string(),
+                ],
+                required_source: None,
+            }],
+            neutral_candidates: Vec::new(),
+        };
+
+        let publication = ModelDownloader::new(DownloadSource::Auto)
+            .provision_deployment_core(
+                &plan,
+                cache.path(),
+                &FakeDownloadClient::default(),
+                &DownloadEnv {
+                    orchion_model_source: None,
+                    hf_endpoint: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            publication.artifact_file(ArtifactRole::LlmModel),
+            Some(local.path())
+        );
+        assert!(
+            !cache
+                .path()
+                .join(local.path().file_name().unwrap())
+                .exists()
+        );
     }
 
     #[tokio::test]
@@ -8643,17 +9124,16 @@ mod downloader_tests {
         let lock: serde_json::Value =
             serde_json::from_slice(&std::fs::read(cache.path().join(MODELS_LOCK_FILE)).unwrap())
                 .unwrap();
-        assert!(lock["deployments"]["acme/first-llm"].is_object());
-        assert!(lock["deployments"]["acme/second-llm"].is_object());
+        assert!(lock["deployments"][deployment_artifact_fingerprint(&first)].is_object());
+        assert!(lock["deployments"][deployment_artifact_fingerprint(&second)].is_object());
     }
 
     #[tokio::test]
-    async fn llm_lock_preserves_profiles_for_the_same_logical_deployment() {
+    async fn llm_publication_reuses_artifacts_when_only_deployment_id_changes() {
         let cache = tempfile::tempdir().unwrap();
         let (_, first) = remote_llm_plan();
         let mut second = first.clone();
-        second.source_intent = "locked-llm-v2".to_string();
-        second.artifacts[0].repository = Some("Acme/Locked-V2-GGUF".to_string());
+        second.deployment_id = ModelId::parse("public/renamed-llm").unwrap();
         let client = FakeDownloadClient {
             echo_requested_revision: true,
             ..FakeDownloadClient::default()
@@ -8664,11 +9144,11 @@ mod downloader_tests {
             hf_endpoint: None,
         };
 
-        downloader
+        let first_publication = downloader
             .provision_deployment_core(&first, cache.path(), &client, &env, None)
             .await
             .unwrap();
-        downloader
+        let second_publication = downloader
             .provision_deployment_core(&second, cache.path(), &client, &env, None)
             .await
             .unwrap();
@@ -8676,22 +9156,22 @@ mod downloader_tests {
         let lock: serde_json::Value =
             serde_json::from_slice(&std::fs::read(cache.path().join(MODELS_LOCK_FILE)).unwrap())
                 .unwrap();
-        assert_eq!(
-            lock["deployments"][first.deployment_id.as_str()]["profiles"]
-                .as_object()
-                .unwrap()
-                .len(),
-            2
-        );
+        assert_eq!(lock["deployments"].as_object().unwrap().len(), 1);
         assert!(matching_llm_lock_entry(&lock, &first).is_some());
         assert!(matching_llm_lock_entry(&lock, &second).is_some());
-
-        let calls_before = client.calls.lock().unwrap().len();
-        downloader
-            .provision_deployment_core(&first, cache.path(), &client, &env, None)
-            .await
-            .unwrap();
-        assert_eq!(client.calls.lock().unwrap().len(), calls_before);
+        assert_eq!(client.calls.lock().unwrap().len(), 1);
+        assert_eq!(first_publication, second_publication);
+        assert_eq!(
+            first_publication.artifact_file(ArtifactRole::LlmModel),
+            Some(cache.path().join("Acme/Locked-GGUF/model.gguf").as_path())
+        );
+        assert!(
+            !cache
+                .path()
+                .join(CACHE_STATE_DIR)
+                .join("deployments")
+                .exists()
+        );
     }
 
     #[tokio::test]
@@ -8721,6 +9201,48 @@ mod downloader_tests {
     }
 
     #[tokio::test]
+    async fn model_deployment_rejects_primary_and_plan_id_mismatch() {
+        let cache = tempfile::tempdir().unwrap();
+        let local = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(local.path(), b"artifact").unwrap();
+        let plan = DeploymentArtifactPlan {
+            deployment_id: ModelId::parse("public/not-the-primary").unwrap(),
+            category: ModelCategory::Asr,
+            source_intent: "local".to_string(),
+            artifacts: vec![DeploymentArtifactRequest {
+                role: ArtifactRole::Model,
+                source: DeploymentArtifactSource::File(local.path().to_path_buf()),
+                repository: None,
+                files: vec![
+                    local
+                        .path()
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_string(),
+                ],
+                required_source: None,
+            }],
+            neutral_candidates: Vec::new(),
+        };
+
+        let error = ModelDownloader::new(DownloadSource::Auto)
+            .provision_deployment_with_client(
+                qwen_asr_06b(),
+                &plan,
+                cache.path(),
+                &FakeDownloadClient::default(),
+                &DownloadEnv {
+                    orchion_model_source: None,
+                    hf_endpoint: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("deployment identity"));
+    }
+
+    #[tokio::test]
     async fn disabled_integrity_verification_reuses_llm_deployment_without_hashing() {
         let cache = tempfile::tempdir().unwrap();
         let (_, plan) = remote_llm_plan();
@@ -8742,16 +9264,6 @@ mod downloader_tests {
             .unwrap()
             .to_path_buf();
         std::fs::write(&model, b"modified model").unwrap();
-        let lock: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(cache.path().join(MODELS_LOCK_FILE)).unwrap())
-                .unwrap();
-        let blob = cache.path().join(
-            lock["deployments"][plan.deployment_id.as_str()]["files"][0]["blob"]
-                .as_str()
-                .unwrap(),
-        );
-        std::fs::write(blob, b"modified blob").unwrap();
-
         let unchecked = ModelDownloader::new(DownloadSource::HuggingFace)
             .with_file_integrity_verification(false);
         let reused = unchecked
@@ -8767,7 +9279,7 @@ mod downloader_tests {
     }
 
     #[tokio::test]
-    async fn llm_lock_recovers_publication_and_redownloads_missing_blob_at_locked_revision() {
+    async fn llm_lock_recovers_manifest_and_redownloads_direct_artifact_at_locked_revision() {
         let cache = tempfile::tempdir().unwrap();
         let (_model, plan) = remote_llm_plan();
         let client = FakeDownloadClient {
@@ -8783,17 +9295,7 @@ mod downloader_tests {
             .provision_deployment_core(&plan, cache.path(), &client, &env, None)
             .await
             .unwrap();
-        let lock: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(cache.path().join(MODELS_LOCK_FILE)).unwrap())
-                .unwrap();
-        let blob = cache.path().join(
-            lock["deployments"][plan.deployment_id.as_str()]["files"][0]["blob"]
-                .as_str()
-                .unwrap(),
-        );
-        assert!(blob.is_file());
-
-        std::fs::remove_dir_all(first.root()).unwrap();
+        std::fs::remove_dir_all(deployment_publication_path(&plan, cache.path())).unwrap();
         let recovered = downloader
             .provision_deployment_core(&plan, cache.path(), &client, &env, None)
             .await
@@ -8807,8 +9309,8 @@ mod downloader_tests {
         assert_eq!(client.revisions.lock().unwrap().len(), 1);
         assert_eq!(*client.preflight_calls.lock().unwrap(), 1);
 
-        std::fs::remove_dir_all(recovered.root()).unwrap();
-        std::fs::remove_file(&blob).unwrap();
+        std::fs::remove_dir_all(deployment_publication_path(&plan, cache.path())).unwrap();
+        std::fs::remove_file(first.artifact_file(ArtifactRole::LlmModel).unwrap()).unwrap();
         let moved_branch_client = FakeDownloadClient {
             echo_requested_revision: true,
             preflight_revision: Some("2222222222222222222222222222222222222222"),
@@ -8835,7 +9337,7 @@ mod downloader_tests {
     }
 
     #[tokio::test]
-    async fn llm_prepared_readers_recover_corrupt_publication_from_blob_concurrently() {
+    async fn llm_prepared_readers_reject_corrupt_direct_artifact_concurrently() {
         let cache = tempfile::tempdir().unwrap();
         let (model, plan) = remote_llm_plan();
         let client = FakeDownloadClient {
@@ -8879,12 +9381,12 @@ mod downloader_tests {
         let (first, second) = tokio::join!(first, second);
         let first = first.unwrap();
         let second = second.unwrap();
-        assert!(first.is_ok(), "first recovery failed: {first:?}");
-        assert!(second.is_ok(), "second recovery failed: {second:?}");
+        assert!(first.is_err());
+        assert!(second.is_err());
     }
 
     #[tokio::test]
-    async fn llm_mid_commit_recovery_restores_deployment_blob_and_lock_together() {
+    async fn llm_mid_commit_recovery_restores_manifest_artifact_and_lock_together() {
         let cache = tempfile::tempdir().unwrap();
         let (model, plan) = remote_llm_plan();
         let client = FakeDownloadClient {
@@ -8903,11 +9405,12 @@ mod downloader_tests {
         let lock: serde_json::Value =
             serde_json::from_slice(&std::fs::read(cache.path().join(MODELS_LOCK_FILE)).unwrap())
                 .unwrap();
+        let fingerprint = deployment_artifact_fingerprint(&plan);
         let paths = vec![
             deployment_publication_relative_path(&plan),
             PathBuf::from(MODELS_LOCK_FILE),
             PathBuf::from(
-                lock["deployments"][plan.deployment_id.as_str()]["files"][0]["blob"]
+                lock["deployments"][fingerprint]["files"][0]["source_file"]
                     .as_str()
                     .unwrap(),
             ),
@@ -8947,92 +9450,6 @@ mod downloader_tests {
         assert!(cache.path().join(MODELS_LOCK_FILE).is_file());
         assert!(cache.path().join(&paths[2]).is_file());
         assert!(!transaction.exists());
-    }
-
-    #[tokio::test]
-    async fn llm_lock_merges_concurrently_and_validates_cas_on_restart() {
-        let cache = tempfile::tempdir().unwrap();
-        let first = llm_lock_fixture(cache.path(), "acme/first", b"first model").await;
-        let second = llm_lock_fixture(cache.path(), "acme/second", b"second model").await;
-        let (first_result, second_result) = tokio::join!(
-            ensure_llm_lock(cache.path(), &first.0, &first.1),
-            ensure_llm_lock(cache.path(), &second.0, &second.1),
-        );
-        first_result.unwrap();
-        second_result.unwrap();
-        let lock: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(cache.path().join(MODELS_LOCK_FILE)).unwrap())
-                .unwrap();
-        assert!(lock["deployments"]["acme/first"].is_object());
-        assert!(lock["deployments"]["acme/second"].is_object());
-        validate_llm_lock_sync(cache.path(), &first.0, &first.1, true).unwrap();
-        ensure_llm_lock(cache.path(), &first.0, &first.1)
-            .await
-            .unwrap();
-
-        let blob = cache.path().join(
-            lock["deployments"]["acme/first"]["files"][0]["blob"]
-                .as_str()
-                .unwrap(),
-        );
-        std::fs::write(blob, b"corrupt").unwrap();
-        assert!(validate_llm_lock_sync(cache.path(), &first.0, &first.1, true).is_err());
-
-        let mut malformed = lock;
-        malformed["deployments"]["acme/first"]["files"][0]
-            .as_object_mut()
-            .unwrap()
-            .remove("sha256");
-        malformed["deployments"]["acme/first"]["profiles"]
-            [llm_source_intent_fingerprint(&first.0.source_intent)]["files"][0]
-            .as_object_mut()
-            .unwrap()
-            .remove("sha256");
-        std::fs::write(
-            cache.path().join(MODELS_LOCK_FILE),
-            serde_json::to_vec(&malformed).unwrap(),
-        )
-        .unwrap();
-        assert!(validate_llm_lock_sync(cache.path(), &first.0, &first.1, false).is_err());
-    }
-
-    async fn llm_lock_fixture(
-        cache: &Path,
-        id: &str,
-        contents: &[u8],
-    ) -> (DeploymentArtifactPlan, DeploymentPublication) {
-        let deployment_id = ModelId::parse(id).unwrap();
-        let root = cache.join("fixtures").join(deployment_id.name());
-        let role_root = root.join(ArtifactRole::LlmModel.path_segment());
-        tokio::fs::create_dir_all(&role_root).await.unwrap();
-        let file = role_root.join("model.gguf");
-        tokio::fs::write(&file, contents).await.unwrap();
-        let plan = DeploymentArtifactPlan {
-            deployment_id,
-            category: ModelCategory::Llm,
-            source_intent: format!("fixture={id}"),
-            artifacts: vec![DeploymentArtifactRequest {
-                role: ArtifactRole::LlmModel,
-                source: DeploymentArtifactSource::File(file.clone()),
-                repository: None,
-                files: vec!["model.gguf".to_string()],
-                required_source: None,
-            }],
-            neutral_candidates: Vec::new(),
-        };
-        let publication = DeploymentPublication::from_artifacts(
-            root,
-            vec![PublishedDeploymentArtifact {
-                role: ArtifactRole::LlmModel,
-                source: DeploymentArtifactSource::File(file.clone()),
-                repository: None,
-                files: vec![file],
-                source_files: vec!["model.gguf".to_string()],
-                requested_revision: None,
-                resolved_revision: None,
-            }],
-        );
-        (plan, publication)
     }
 
     async fn write_asr_tokenizer_json(target: &Path) {

@@ -82,12 +82,7 @@ impl std::fmt::Display for LlmRuntimeKey {
 
 impl ModelCacheKey for LlmRuntimeKey {
     fn cache_path(&self, cache_dir: &std::path::Path) -> PathBuf {
-        self.id()
-            .as_str()
-            .split('/')
-            .fold(cache_dir.join(".llm-logical"), |path, segment| {
-                path.join(segment)
-            })
+        cache_dir.to_path_buf()
     }
 }
 
@@ -590,16 +585,18 @@ mod tests {
     async fn known_ocr_model_reaches_injected_runtime_factory() {
         let mut config = test_config();
         config.services.ocr.enabled = true;
-        let model_id = ModelId::parse("PaddlePaddle/PP-OCRv6_tiny").unwrap();
+        let model_id = ModelId::parse("paddlepaddle/pp-ocrv6-tiny").unwrap();
         config.services.ocr.models = vec![OcrModelDeployment::from_runtime(OcrModel::new(
             model_id.clone(),
             OcrModelKind::TraditionalOcr,
         ))];
 
-        let state = AppState::from_prepared_config_with_runtime_factory(
+        let state = AppState::load_with_components(
             config,
+            Arc::new(RecordingModelProvisioner::default()),
             Arc::new(FailingRuntimeFactory),
         )
+        .await
         .unwrap();
         let Err(error) = state
             .ocr(OcrModel::new(model_id, OcrModelKind::TraditionalOcr), None)
@@ -615,16 +612,18 @@ mod tests {
     async fn known_ocr_vl_model_reaches_injected_runtime_factory() {
         let mut config = test_config();
         config.services.ocr_vl.enabled = true;
-        let model_id = ModelId::parse("PaddlePaddle/PaddleOCR-VL-1.6").unwrap();
+        let model_id = ModelId::parse("paddlepaddle/paddleocr-vl-1.6").unwrap();
         config.services.ocr_vl.models = vec![OcrModelDeployment::from_runtime(OcrModel::new(
             model_id.clone(),
             OcrModelKind::OcrVl,
         ))];
 
-        let state = AppState::from_prepared_config_with_runtime_factory(
+        let state = AppState::load_with_components(
             config,
+            Arc::new(RecordingModelProvisioner::default()),
             Arc::new(FailingRuntimeFactory),
         )
+        .await
         .unwrap();
         let Err(error) = state
             .ocr_vl(OcrModel::new(model_id, OcrModelKind::OcrVl), None)
@@ -835,7 +834,7 @@ mod tests {
         config.models.max_loaded = 3;
         config.services.ocr.enabled = true;
         config.services.ocr.max_loaded = 3;
-        let primary_id = ModelId::parse("PaddlePaddle/PP-OCRv6_tiny").unwrap();
+        let primary_id = ModelId::parse("paddlepaddle/pp-ocrv6-tiny").unwrap();
         let layout_id = ModelId::parse("PaddlePaddle/PP-DocLayoutV3").unwrap();
         let primary = OcrModel::new(primary_id.clone(), OcrModelKind::TraditionalOcr);
         config.services.ocr.models =
@@ -875,7 +874,7 @@ mod tests {
         config.models.max_loaded = 1;
         config.services.ocr_vl.enabled = true;
         config.services.ocr_vl.max_loaded = 1;
-        let primary_id = ModelId::parse("PaddlePaddle/PaddleOCR-VL-1.6").unwrap();
+        let primary_id = ModelId::parse("paddlepaddle/paddleocr-vl-1.6").unwrap();
         let layout_id = ModelId::parse("PaddlePaddle/PP-DocLayoutV3").unwrap();
         let primary = OcrModel::new(primary_id.clone(), OcrModelKind::OcrVl);
         let layout = OcrModel::new(layout_id.clone(), OcrModelKind::Layout);
@@ -1127,7 +1126,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepared_remote_model_uses_deterministic_deployment_path() {
+    async fn prepared_remote_model_requires_ready_manifest_at_deterministic_path() {
         let mut config = test_config();
         config.services.asr.enabled = true;
         config.models.source = crate::settings::ModelSource::HuggingFace;
@@ -1138,15 +1137,18 @@ mod tests {
             deployment_provisioning(&config.services.asr.models, &[DownloadSource::HuggingFace])
                 .remove(&model)
                 .unwrap();
-        let expected =
-            resolve_prepared_provisioning_path(&model, &provisioning, &config.models.dir).unwrap();
-        let factory = Arc::new(RecordingAsrPathRuntimeFactory::default());
-        let state =
-            AppState::from_prepared_config_with_runtime_factory(config, factory.clone()).unwrap();
-
-        drop(state.asr(model).await.unwrap().unwrap());
-
-        assert_eq!(*factory.paths.lock().unwrap(), [expected]);
+        let error = resolve_prepared_provisioning_path(&model, &provisioning, &config.models.dir)
+            .unwrap_err();
+        assert!(error.to_string().contains(".orchion-ready.json"));
+        let state = AppState::from_prepared_config_with_runtime_factory(
+            config,
+            Arc::new(RecordingAsrPathRuntimeFactory::default()),
+        )
+        .unwrap();
+        let Err(error) = state.asr(model).await else {
+            panic!("prepared remote model without ready metadata should fail on first load");
+        };
+        assert!(error.to_string().contains(".orchion-ready.json"));
     }
 
     #[tokio::test]
@@ -1244,15 +1246,15 @@ mod tests {
             r#"
 [services.ocr]
 enabled = true
-default_model = "PaddlePaddle/PP-OCRv6_tiny"
+default_model = "paddlepaddle/pp-ocrv6-tiny"
 
 [[services.ocr.models]]
-id = "PaddlePaddle/PP-OCRv6_tiny"
+id = "paddlepaddle/pp-ocrv6-tiny"
 model = "//PaddlePaddle/PP-OCRv6_tiny"
 layout_model = "hf://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
 
 [[services.ocr.models]]
-id = "PaddlePaddle/PP-OCRv6_small"
+id = "paddlepaddle/pp-ocrv6-small"
 model = "//PaddlePaddle/PP-OCRv6_small"
 layout_model = "ms://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
 "#,
@@ -1293,10 +1295,12 @@ layout_model = "ms://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
         let mut config = test_config();
         config.services.asr.enabled = true;
         let model = config.services.asr.default_model.clone();
-        let state = AppState::from_prepared_config_with_runtime_factory(
+        let state = AppState::load_with_components(
             config,
+            Arc::new(RecordingModelProvisioner::default()),
             Arc::new(FailingRuntimeFactory),
         )
+        .await
         .unwrap();
 
         let Err(error) = state.asr(model).await else {
@@ -1311,10 +1315,12 @@ layout_model = "ms://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
         let mut config = test_config();
         config.services.asr.enabled = true;
         let model = config.services.asr.default_model.clone();
-        let state = AppState::from_prepared_config_with_runtime_factory(
+        let state = AppState::load_with_components(
             config,
+            Arc::new(RecordingModelProvisioner::default()),
             Arc::new(SuccessfulAsrRuntimeFactory),
         )
+        .await
         .unwrap();
         let selector = ModelSelector {
             model: model.as_str().to_string(),
@@ -1355,10 +1361,12 @@ layout_model = "ms://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
         config.services.asr.idle_timeout = std::time::Duration::from_millis(20);
         let model = config.services.asr.default_model.clone();
         let state = Arc::new(
-            AppState::from_prepared_config_with_runtime_factory(
+            AppState::load_with_components(
                 config,
+                Arc::new(RecordingModelProvisioner::default()),
                 Arc::new(SuccessfulAsrRuntimeFactory),
             )
+            .await
             .unwrap(),
         );
         state.spawn_idle_cleanup();
@@ -1391,7 +1399,7 @@ layout_model = "ms://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
     #[test]
     fn builtin_runtime_factory_rejects_foreign_registered_speech_models() {
         let mut config = test_config();
-        let model = AsrModel::parse("PaddlePaddle/PaddleOCR-VL-1.6").unwrap();
+        let model = AsrModel::parse("paddlepaddle/paddleocr-vl-1.6").unwrap();
         config.services.asr.enabled = true;
         config.services.asr.default_model = model.clone();
         config.services.asr.models = vec![ModelDeployment::from_asr_runtime(model)];
@@ -1429,7 +1437,7 @@ layout_model = "ms://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
     }
 
     #[test]
-    fn llm_plan_uses_exact_main_and_mmproj_roles_and_profiles_source_intent() {
+    fn llm_plan_uses_exact_roles_and_id_free_locator_source_intent() {
         let config = ServerConfig::from_toml_str(
             r#"
             [services.llm]
@@ -1446,8 +1454,9 @@ layout_model = "ms://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
             std::path::Path::new("/tmp/orchion-server"),
         )
         .unwrap();
+        let deployment = &config.services.llm.models[0];
         let plan = llm_deployment_artifact_plan(
-            &config.services.llm.models[0],
+            deployment,
             &[DownloadSource::HuggingFace, DownloadSource::ModelScope],
         );
         assert_eq!(plan.category, ModelCategory::Llm);
@@ -1456,11 +1465,11 @@ layout_model = "ms://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
         assert_eq!(plan.artifacts[0].files, ["main.gguf"]);
         assert_eq!(plan.artifacts[1].role, ArtifactRole::LlmMmproj);
         assert_eq!(plan.artifacts[1].files, ["mmproj.gguf"]);
-        assert!(plan.source_intent.contains("parallel_sequences: 1"));
-        assert!(plan.source_intent.contains("generation="));
-        assert!(plan.source_intent.contains("engine: Jinja"));
-        assert!(plan.source_intent.contains("enable_thinking: false"));
-        assert!(plan.source_intent.contains("add_generation_prompt"));
+        assert_eq!(
+            plan.source_intent,
+            "model=//owner/repo/main.gguf|mmproj=//owner/repo/mmproj.gguf|neutral-policy=huggingface,modelscope"
+        );
+        assert!(!plan.source_intent.contains(deployment.id.as_str()));
     }
 
     #[tokio::test]
@@ -1476,6 +1485,7 @@ layout_model = "ms://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
                         total_tokens: 3,
                         queue_time_ms: None,
                         eval_time_ms: None,
+                        timings: orchion::LlmTimings::default(),
                     },
                 },
             ],
@@ -1754,6 +1764,7 @@ layout_model = "ms://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
                     total_tokens: 2,
                     queue_time_ms: None,
                     eval_time_ms: None,
+                    timings: orchion::LlmTimings::default(),
                 },
             }]);
         let (_root, state, control) = scripted_llm_state_with_engines(
@@ -1886,6 +1897,7 @@ layout_model = "ms://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
                 total_tokens: 2,
                 queue_time_ms: None,
                 eval_time_ms: None,
+                timings: orchion::LlmTimings::default(),
             },
         }]);
         let (_root, state, control) = scripted_llm_state_with_engines(
@@ -2970,15 +2982,7 @@ async fn load_ocr_runtime(
     } else {
         None
     };
-    let primary_cache_root =
-        if primary_path.starts_with(models_dir.join(".orchion").join("deployments")) {
-            primary_path
-                .parent()
-                .and_then(std::path::Path::parent)
-                .map_or_else(|| models_dir.clone(), std::path::Path::to_path_buf)
-        } else {
-            models_dir.clone()
-        };
+    let primary_cache_root = models_dir.clone();
     anyhow::ensure!(
         key.table_structure.is_none(),
         "OCR table structure deployment has no atomic artifact plan"
@@ -3004,14 +3008,8 @@ async fn load_published_ocr_runtime(
     runtime_factory: Arc<dyn ModelRuntimeFactory>,
     device: DevicePreference,
 ) -> anyhow::Result<Ocr> {
-    let primary_cache_root = publication.role_root(ArtifactRole::Model);
-    let primary_path = primary
-        .id()
-        .as_str()
-        .split('/')
-        .fold(primary_cache_root.clone(), |path, segment| {
-            path.join(segment)
-        });
+    let primary_cache_root = publication.root().to_path_buf();
+    let primary_path = ModelSpec::cache_path(&primary, &primary_cache_root);
     let layout = layout
         .map(|layout| {
             publication
@@ -4236,8 +4234,7 @@ fn resolve_configured_ocr_models(
             );
             let url = deployment.layout_model.as_ref()?;
             let source_intent = format!(
-                "deployment={}|layout={url}{}",
-                deployment.id,
+                "layout={url}{}",
                 neutral_policy_suffix(
                     (url.source() == ModelUrlSource::Neutral).then_some(source_candidates)
                 )
@@ -4368,16 +4365,12 @@ fn llm_deployment_source_intent(
             .as_ref()
             .is_some_and(|model| model.source() == ModelUrlSource::Neutral);
     format!(
-        "id={}|model={}|mmproj={}|runtime={:?}|template={:?}|generation={:?}{}",
-        deployment.id,
+        "model={}|mmproj={}{}",
         deployment.model,
         deployment
             .mmproj_model
             .as_ref()
             .map_or("none", orchion::ModelUrl::as_str),
-        deployment.runtime,
-        deployment.chat_template,
-        deployment.generation,
         neutral_policy_suffix(neutral.then_some(source_candidates)),
     )
 }
@@ -4464,8 +4457,7 @@ where
         .iter()
         .map(|deployment| {
             let source_intent = format!(
-                "id={}|model={}{}",
-                deployment.id,
+                "model={}{}",
                 deployment.model,
                 neutral_policy_suffix(
                     (deployment.model.source() == ModelUrlSource::Neutral)
@@ -4493,31 +4485,32 @@ fn validate_prepared_model_paths(
     source_candidates: &[DownloadSource],
     ocr: &ResolvedOcrModels,
 ) -> anyhow::Result<()> {
-    for (model, provisioning) in
-        deployment_provisioning(&config.services.asr.models, source_candidates)
-    {
-        resolve_prepared_provisioning_path(&model, &provisioning, &config.models.dir)?;
+    if config.services.asr.enabled {
+        for (model, provisioning) in
+            deployment_provisioning(&config.services.asr.models, source_candidates)
+        {
+            if provisioning.model_url.source() == ModelUrlSource::File {
+                resolve_prepared_provisioning_path(&model, &provisioning, &config.models.dir)?;
+            }
+        }
     }
-    for (model, provisioning) in
-        deployment_provisioning(&config.services.tts.models, source_candidates)
-    {
-        resolve_prepared_provisioning_path(&model, &provisioning, &config.models.dir)?;
+    if config.services.tts.enabled {
+        for (model, provisioning) in
+            deployment_provisioning(&config.services.tts.models, source_candidates)
+        {
+            if provisioning.model_url.source() == ModelUrlSource::File {
+                resolve_prepared_provisioning_path(&model, &provisioning, &config.models.dir)?;
+            }
+        }
     }
     for (model, provisioning) in &ocr.asset_locators {
-        resolve_prepared_provisioning_path(model, provisioning, &config.models.dir)?;
+        if provisioning.model_url.source() == ModelUrlSource::File {
+            resolve_prepared_provisioning_path(model, provisioning, &config.models.dir)?;
+        }
     }
     for (model, provisioning) in &ocr.layout_locators {
-        resolve_prepared_provisioning_path(&model.model, provisioning, &config.models.dir)?;
-    }
-    if config.services.llm.active() {
-        for deployment in &config.services.llm.models {
-            let plan = llm_deployment_artifact_plan(deployment, source_candidates);
-            ModelDownloader::resolve_prepared_logical_deployment(
-                &deployment.id,
-                ModelCategory::Llm,
-                &plan,
-                &config.models.dir,
-            )?;
+        if provisioning.model_url.source() == ModelUrlSource::File {
+            resolve_prepared_provisioning_path(&model.model, provisioning, &config.models.dir)?;
         }
     }
     Ok(())
@@ -4574,20 +4567,10 @@ fn ocr_deployment_source_intent(
         });
     let table = deployment.table_structure.as_ref().map_or_else(
         || "none".to_string(),
-        |table| {
-            format!(
-                "model={},dictionary={},type={},score={:08x},max_length={}",
-                table.model,
-                table.dictionary,
-                table.table_type.as_str(),
-                table.score_threshold.to_bits(),
-                table.max_structure_length
-            )
-        },
+        |table| format!("model={},dictionary={}", table.model, table.dictionary),
     );
     format!(
-        "id={}|model={}|layout={}|table={table}{}",
-        deployment.id,
+        "model={}|layout={}|table={table}{}",
         deployment.model,
         deployment
             .layout_model
@@ -4646,7 +4629,7 @@ fn ocr_deployment_source_plan(
         );
     }
     deployment_source_plan(
-        format!("ocr-deployment={}", deployment.id),
+        ocr_deployment_source_intent(deployment, source_candidates),
         artifacts,
         source_candidates,
     )

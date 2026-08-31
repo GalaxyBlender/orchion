@@ -62,6 +62,16 @@ impl OcrEngine for TestOcrEngine {
 
 struct SuccessfulOcrRuntimeFactory {
     fail: bool,
+    paths: Arc<Mutex<Vec<ObservedOcrRuntimePaths>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObservedOcrRuntimePaths {
+    model_dir: PathBuf,
+    cache_root: PathBuf,
+    layout: PathBuf,
+    table_model: PathBuf,
+    table_dictionary: PathBuf,
 }
 
 impl ModelRuntimeFactory for SuccessfulOcrRuntimeFactory {
@@ -86,13 +96,14 @@ impl ModelRuntimeFactory for SuccessfulOcrRuntimeFactory {
     fn load_ocr(
         &self,
         model: OcrModel,
-        _model_dir: PathBuf,
-        _cache_root: PathBuf,
+        model_dir: PathBuf,
+        cache_root: PathBuf,
         layout: Option<(OcrModel, PathBuf)>,
         table: Option<TableStructureAssets>,
         _device: DevicePreference,
     ) -> OcrRuntimeFuture<'_> {
         let fail = self.fail;
+        let paths = Arc::clone(&self.paths);
         Box::pin(async move {
             anyhow::ensure!(!fail, "injected OCR runtime probe failure");
             let (_, layout_path) = layout.context("layout was not assembled")?;
@@ -103,6 +114,13 @@ impl ModelRuntimeFactory for SuccessfulOcrRuntimeFactory {
                 table.dictionary.is_file(),
                 "table dictionary path was not published"
             );
+            paths.lock().unwrap().push(ObservedOcrRuntimePaths {
+                model_dir,
+                cache_root,
+                layout: layout_path,
+                table_model: table.model,
+                table_dictionary: table.dictionary,
+            });
             Ok(Ocr::from_engine(Arc::new(TestOcrEngine {
                 model: model.id().clone(),
             })))
@@ -197,9 +215,9 @@ async fn table_structure_uses_exact_model_and_dictionary_deployment_plan() {
 source = "modelscope"
 [services.ocr]
 enabled = true
-default_model = "PaddlePaddle/PP-OCRv6_tiny"
+default_model = "paddlepaddle/pp-ocrv6-tiny"
 [[services.ocr.models]]
-id = "PaddlePaddle/PP-OCRv6_tiny"
+id = "paddlepaddle/pp-ocrv6-tiny"
 model = "//PaddlePaddle/PP-OCRv6_tiny"
 layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
 table_structure = { model = "//Acme/Table/table.onnx", dictionary = "//Acme/Table/table_dict.txt", table_type = "wireless" }
@@ -247,9 +265,9 @@ enabled = false
 enabled = false
 [services.ocr]
 enabled = true
-default_model = "PaddlePaddle/PP-OCRv6_tiny"
+default_model = "paddlepaddle/pp-ocrv6-tiny"
 [[services.ocr.models]]
-id = "PaddlePaddle/PP-OCRv6_tiny"
+id = "paddlepaddle/pp-ocrv6-tiny"
 model = "//PaddlePaddle/PP-OCRv6_tiny"
 layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
 table_structure = { model = "//Acme/Table/table.onnx", dictionary = "//Acme/Table/table_dict.txt", table_type = "wired" }
@@ -257,8 +275,9 @@ table_structure = { model = "//Acme/Table/table.onnx", dictionary = "//Acme/Tabl
         &temp_dir.path().join("orchion-server"),
     )
     .unwrap();
+    let models_dir = config.models.dir.clone();
     let primary = OcrModel::new(
-        ModelId::parse("PaddlePaddle/PP-OCRv6_tiny").unwrap(),
+        ModelId::parse("paddlepaddle/pp-ocrv6-tiny").unwrap(),
         orchion::OcrModelKind::TraditionalOcr,
     );
     let layout = OcrModel::new(
@@ -268,7 +287,10 @@ table_structure = { model = "//Acme/Table/table.onnx", dictionary = "//Acme/Tabl
     let failed_state = AppState::load_with_components(
         config.clone(),
         Arc::new(FakeProvisioner::default()),
-        Arc::new(SuccessfulOcrRuntimeFactory { fail: true }),
+        Arc::new(SuccessfulOcrRuntimeFactory {
+            fail: true,
+            paths: Arc::default(),
+        }),
     )
     .await
     .unwrap();
@@ -283,10 +305,14 @@ table_structure = { model = "//Acme/Table/table.onnx", dictionary = "//Acme/Tabl
             .capabilities
             .contains(ModelCapabilities::OCR_TABLE_STRUCTURE)
     );
+    let observed_paths = Arc::new(Mutex::new(Vec::new()));
     let state = AppState::load_with_components(
         config,
         Arc::new(FakeProvisioner::default()),
-        Arc::new(SuccessfulOcrRuntimeFactory { fail: false }),
+        Arc::new(SuccessfulOcrRuntimeFactory {
+            fail: false,
+            paths: Arc::clone(&observed_paths),
+        }),
     )
     .await
     .unwrap();
@@ -300,6 +326,16 @@ table_structure = { model = "//Acme/Table/table.onnx", dictionary = "//Acme/Tabl
     );
 
     let lease = state.ocr(primary, Some(layout)).await.unwrap().unwrap();
+    assert_eq!(
+        observed_paths.lock().unwrap().as_slice(),
+        [ObservedOcrRuntimePaths {
+            model_dir: models_dir.join("PaddlePaddle/PP-OCRv6_tiny"),
+            cache_root: models_dir.clone(),
+            layout: models_dir.join("PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"),
+            table_model: models_dir.join("Acme/Table/table.onnx"),
+            table_dictionary: models_dir.join("Acme/Table/table_dict.txt"),
+        }]
+    );
 
     let after = state.model_catalog().await;
     assert_eq!(after.len(), 1);
@@ -331,7 +367,7 @@ table_structure = { model = "//Acme/Table/table.onnx", dictionary = "//Acme/Tabl
     drop(lease);
     state
         .unload_model(ModelSelector {
-            model: "PaddlePaddle/PP-OCRv6_tiny".to_string(),
+            model: "paddlepaddle/pp-ocrv6-tiny".to_string(),
             service: ModelService::Ocr,
         })
         .await
@@ -351,11 +387,15 @@ async fn explicit_table_artifact_failure_blocks_the_default_deployment() {
     let config = ServerConfig::from_toml_str(
         &format!(
             r#"
+[services.asr]
+enabled = false
+[services.tts]
+enabled = false
 [services.ocr]
 enabled = true
-default_model = "PaddlePaddle/PP-OCRv6_tiny"
+default_model = "paddlepaddle/pp-ocrv6-tiny"
 [[services.ocr.models]]
-id = "PaddlePaddle/PP-OCRv6_tiny"
+id = "paddlepaddle/pp-ocrv6-tiny"
 model = "hf://PaddlePaddle/PP-OCRv6_tiny"
 layout_model = "hf://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
 table_structure = {{ model = "hf://Acme/Table/table.onnx", dictionary = "{dictionary}", table_type = "wired" }}
@@ -380,9 +420,9 @@ async fn explicit_table_artifacts_preserve_intentional_mixed_providers() {
         r#"
 [services.ocr]
 enabled = true
-default_model = "PaddlePaddle/PP-OCRv6_tiny"
+default_model = "paddlepaddle/pp-ocrv6-tiny"
 [[services.ocr.models]]
-id = "PaddlePaddle/PP-OCRv6_tiny"
+id = "paddlepaddle/pp-ocrv6-tiny"
 model = "hf://PaddlePaddle/PP-OCRv6_tiny"
 layout_model = "ms://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
 table_structure = { model = "hf://Acme/Table/table.onnx", dictionary = "ms://Acme/Table/table_dict.txt", table_type = "wireless" }
@@ -416,11 +456,15 @@ async fn prepared_load_rejects_missing_deployment_publication() {
     let config = ServerConfig::from_toml_str(
         &format!(
             r#"
+[services.asr]
+enabled = false
+[services.tts]
+enabled = false
 [services.ocr]
 enabled = true
-default_model = "PaddlePaddle/PP-OCRv6_tiny"
+default_model = "paddlepaddle/pp-ocrv6-tiny"
 [[services.ocr.models]]
-id = "PaddlePaddle/PP-OCRv6_tiny"
+id = "paddlepaddle/pp-ocrv6-tiny"
 model = "//PaddlePaddle/PP-OCRv6_tiny"
 layout_model = "file://{}"
 table_structure = {{ model = "file://{}", dictionary = "file://{}", table_type = "wired" }}
@@ -435,7 +479,7 @@ table_structure = {{ model = "file://{}", dictionary = "file://{}", table_type =
 
     let state = AppState::from_prepared_config(config).unwrap();
     let model = OcrModel::new(
-        orchion::ModelId::parse("PaddlePaddle/PP-OCRv6_tiny").unwrap(),
+        orchion::ModelId::parse("paddlepaddle/pp-ocrv6-tiny").unwrap(),
         orchion::OcrModelKind::TraditionalOcr,
     );
     let layout = OcrModel::new(
@@ -449,7 +493,7 @@ table_structure = {{ model = "file://{}", dictionary = "file://{}", table_type =
 }
 
 #[tokio::test]
-async fn table_structure_config_changes_source_intent() {
+async fn table_structure_locator_but_not_runtime_profile_changes_source_intent() {
     async fn intent_for(table_model: &str, extra: &str) -> String {
         let temp_dir = tempfile::tempdir().unwrap();
         let document = format!(
@@ -458,9 +502,9 @@ async fn table_structure_config_changes_source_intent() {
 source = "modelscope"
 [services.ocr]
 enabled = true
-default_model = "PaddlePaddle/PP-OCRv6_tiny"
+default_model = "paddlepaddle/pp-ocrv6-tiny"
 [[services.ocr.models]]
-id = "PaddlePaddle/PP-OCRv6_tiny"
+id = "paddlepaddle/pp-ocrv6-tiny"
 model = "//PaddlePaddle/PP-OCRv6_tiny"
 layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
 table_structure = {{ model = "//Acme/Table/{table_model}", dictionary = "//Acme/Table/table_dict.txt", table_type = "wired"{extra} }}
@@ -476,7 +520,7 @@ table_structure = {{ model = "//Acme/Table/{table_model}", dictionary = "//Acme/
         provisioner.deployment_plans()[0].source_intent.clone()
     }
 
-    assert_ne!(
+    assert_eq!(
         intent_for("table.onnx", "").await,
         intent_for("table.onnx", ", score_threshold = 0.8").await
     );
@@ -522,7 +566,7 @@ impl ModelProvisioner<OcrModel> for FakeProvisioner {
 impl OcrDeploymentProvisioner for FakeProvisioner {
     fn provision_deployment(
         &self,
-        _primary: OcrModel,
+        primary: OcrModel,
         plan: DeploymentArtifactPlan,
         models_dir: PathBuf,
     ) -> OcrDeploymentFuture<'_> {
@@ -548,19 +592,26 @@ impl OcrDeploymentProvisioner for FakeProvisioner {
             if let Some(locator) = failed {
                 anyhow::bail!("injected download failure for {locator}");
             }
-            let root = models_dir.join("fake-ocr-deployment");
+            tokio::fs::create_dir_all(ModelSpec::cache_path(&primary, &models_dir)).await?;
             let mut published = Vec::new();
-            for (index, artifact) in plan.artifacts.into_iter().enumerate() {
-                let role = format!("{:?}", artifact.role);
-                let role_root = root.join(format!("{index}-{role}"));
+            for artifact in plan.artifacts {
                 let mut files = Vec::new();
-                for file in &artifact.files {
-                    let path = role_root.join(file);
-                    if let Some(parent) = path.parent() {
-                        tokio::fs::create_dir_all(parent).await?;
+                match &artifact.source {
+                    DeploymentArtifactSource::File(path) => files.push(path.clone()),
+                    _ => {
+                        let repository = artifact
+                            .repository
+                            .as_deref()
+                            .context("remote fake artifact has no repository")?;
+                        for file in &artifact.files {
+                            let path = models_dir.join(repository).join(file);
+                            if let Some(parent) = path.parent() {
+                                tokio::fs::create_dir_all(parent).await?;
+                            }
+                            tokio::fs::write(&path, b"artifact").await?;
+                            files.push(path);
+                        }
                     }
-                    tokio::fs::write(&path, b"artifact").await?;
-                    files.push(path);
                 }
                 published.push(PublishedDeploymentArtifact {
                     role: artifact.role,
@@ -575,7 +626,7 @@ impl OcrDeploymentProvisioner for FakeProvisioner {
                     resolved_revision: None,
                 });
             }
-            Ok(DeploymentPublication::from_artifacts(root, published))
+            Ok(DeploymentPublication::from_artifacts(models_dir, published))
         })
     }
 }
@@ -599,7 +650,7 @@ fn prepared_state_rejects_programmatic_duplicate_ids() {
 #[tokio::test]
 async fn load_with_provisioner_rejects_programmatic_default_mismatch() {
     let mut config = ServerConfig::default_for_exe(std::path::Path::new("/tmp/orchion-server"));
-    config.services.asr.default_model = AsrModel::parse("Qwen/Qwen3-ASR-1.7B").unwrap();
+    config.services.asr.default_model = AsrModel::parse("alibaba/qwen3-asr-1.7b").unwrap();
     let provisioner = Arc::new(FakeProvisioner::default());
 
     let Err(error) = AppState::load_with_provisioner(config, provisioner).await else {
@@ -616,12 +667,12 @@ async fn non_default_model_download_failure_does_not_block_startup() {
         r#"
 [services.asr]
 enabled = true
-default_model = "Qwen/Qwen3-ASR-0.6B"
+default_model = "alibaba/qwen3-asr-0.6b"
 [[services.asr.models]]
-id = "Qwen/Qwen3-ASR-0.6B"
+id = "alibaba/qwen3-asr-0.6b"
 model = "//Qwen/Qwen3-ASR-0.6B"
 [[services.asr.models]]
-id = "Qwen/Qwen3-ASR-1.7B"
+id = "alibaba/qwen3-asr-1.7b"
 model = "//Qwen/Qwen3-ASR-1.7B"
 "#,
         &temp_dir.path().join("orchion-server"),
@@ -645,12 +696,12 @@ async fn only_default_asr_model_is_provisioned_at_startup() {
         r#"
 [services.asr]
 enabled = true
-default_model = "Qwen/Qwen3-ASR-0.6B"
+default_model = "alibaba/qwen3-asr-0.6b"
 [[services.asr.models]]
-id = "Qwen/Qwen3-ASR-0.6B"
+id = "alibaba/qwen3-asr-0.6b"
 model = "//Qwen/Qwen3-ASR-0.6B"
 [[services.asr.models]]
-id = "Qwen/Qwen3-ASR-1.7B"
+id = "alibaba/qwen3-asr-1.7b"
 model = "//Qwen/Qwen3-ASR-1.7B"
 "#,
         &temp_dir.path().join("orchion-server"),
@@ -675,7 +726,7 @@ async fn configured_model_locator_reaches_startup_provisioner() {
 [services.asr]
 enabled = true
 [[services.asr.models]]
-id = "Qwen/Qwen3-ASR-0.6B"
+id = "alibaba/qwen3-asr-0.6b"
 model = "hf://Mirror/Qwen3-ASR-Package"
 "#,
         &temp_dir.path().join("orchion-server"),
@@ -703,12 +754,12 @@ source = "modelscope"
 
 [services.ocr]
 enabled = true
-default_model = "PaddlePaddle/PP-OCRv6_tiny"
+default_model = "paddlepaddle/pp-ocrv6-tiny"
 [[services.ocr.models]]
-id = "PaddlePaddle/PP-OCRv6_tiny"
+id = "paddlepaddle/pp-ocrv6-tiny"
 model = "//PaddlePaddle/PP-OCRv6_tiny"
 [[services.ocr.models]]
-id = "PaddlePaddle/PP-OCRv6_small"
+id = "paddlepaddle/pp-ocrv6-small"
 model = "//PaddlePaddle/PP-OCRv6_small"
 "#,
         &temp_dir.path().join("orchion-server"),
@@ -732,12 +783,12 @@ async fn default_model_download_failure_still_blocks_startup() {
         r#"
 [services.asr]
 enabled = true
-default_model = "Qwen/Qwen3-ASR-0.6B"
+default_model = "alibaba/qwen3-asr-0.6b"
 [[services.asr.models]]
-id = "Qwen/Qwen3-ASR-0.6B"
+id = "alibaba/qwen3-asr-0.6b"
 model = "//Qwen/Qwen3-ASR-0.6B"
 [[services.asr.models]]
-id = "Qwen/Qwen3-ASR-1.7B"
+id = "alibaba/qwen3-asr-1.7b"
 model = "//Qwen/Qwen3-ASR-1.7B"
 "#,
         &temp_dir.path().join("orchion-server"),
@@ -765,9 +816,9 @@ source = "modelscope"
 
 [services.ocr]
 enabled = true
-default_model = "PaddlePaddle/PP-OCRv6_tiny"
+default_model = "paddlepaddle/pp-ocrv6-tiny"
 [[services.ocr.models]]
-id = "PaddlePaddle/PP-OCRv6_tiny"
+id = "paddlepaddle/pp-ocrv6-tiny"
 model = "//PaddlePaddle/PP-OCRv6_tiny"
 layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
 "#,
@@ -806,9 +857,9 @@ source = "modelscope"
 
 [services.ocr]
 enabled = true
-default_model = "PaddlePaddle/PP-OCRv6_tiny"
+default_model = "paddlepaddle/pp-ocrv6-tiny"
 [[services.ocr.models]]
-id = "PaddlePaddle/PP-OCRv6_tiny"
+id = "paddlepaddle/pp-ocrv6-tiny"
 model = "hf://PaddlePaddle/PP-OCRv6_tiny"
 layout_model = "ms://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
 "#,
@@ -835,8 +886,8 @@ layout_model = "ms://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
 #[tokio::test]
 async fn non_default_model_is_provisioned_lazily_with_a_single_flight() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let default = AsrModel::parse("Qwen/Qwen3-ASR-0.6B").unwrap();
-    let optional = AsrModel::parse("Qwen/Qwen3-ASR-1.7B").unwrap();
+    let default = AsrModel::parse("alibaba/qwen3-asr-0.6b").unwrap();
+    let optional = AsrModel::parse("alibaba/qwen3-asr-1.7b").unwrap();
     let provisioner = Arc::new(FakeProvisioner::delayed(Duration::from_millis(20)));
     let cache = ModelCache::new_with_provisioner(
         "asr",
@@ -887,28 +938,28 @@ async fn startup_model_provisioning_has_bounded_concurrency() {
 [services.asr]
 enabled = true
 [[services.asr.models]]
-id = "Qwen/Qwen3-ASR-0.6B"
+id = "alibaba/qwen3-asr-0.6b"
 model = "//Qwen/Qwen3-ASR-0.6B"
 
 [services.tts]
 enabled = true
 [[services.tts.models]]
-id = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+id = "alibaba/qwen3-tts-12hz-0.6b-customvoice"
 model = "//Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
 
 [services.ocr]
 enabled = true
-default_model = "PaddlePaddle/PP-OCRv6_tiny"
+default_model = "paddlepaddle/pp-ocrv6-tiny"
 [[services.ocr.models]]
-id = "PaddlePaddle/PP-OCRv6_tiny"
+id = "paddlepaddle/pp-ocrv6-tiny"
 model = "//PaddlePaddle/PP-OCRv6_tiny"
 layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
 
 [services.ocr-vl]
 enabled = true
-default_model = "PaddlePaddle/PaddleOCR-VL-1.6"
+default_model = "paddlepaddle/paddleocr-vl-1.6"
 [[services.ocr-vl.models]]
-id = "PaddlePaddle/PaddleOCR-VL-1.6"
+id = "paddlepaddle/paddleocr-vl-1.6"
 model = "//PaddlePaddle/PaddleOCR-VL-1.6"
 layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
 "#,
