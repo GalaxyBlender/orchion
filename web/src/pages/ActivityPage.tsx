@@ -5,6 +5,7 @@ import { useActivity } from "@/features/activity/useActivity";
 import {
   activityDurationMs,
   formatActivityDuration,
+  formatActivityTokensPerSecond,
   monotonicNowMs,
 } from "@/features/activity/timing";
 import type {
@@ -291,6 +292,12 @@ function ActivityTable({
               <th scope="col" className="activity-col-status">{t("activity.columns.status")}</th>
             )}
             <th scope="col" className="activity-col-duration">{t("activity.columns.duration")}</th>
+            {!live && (
+              <>
+                <th scope="col" className="activity-col-throughput">{t("activity.columns.prefill")}</th>
+                <th scope="col" className="activity-col-throughput">{t("activity.columns.decode")}</th>
+              </>
+            )}
             <th scope="col" className="activity-col-input">{t("activity.columns.input")}</th>
             <th scope="col" className="activity-col-id">{t("activity.columns.id")}</th>
           </tr>
@@ -358,6 +365,16 @@ function ActivityTable({
               <td data-label={t("activity.columns.duration")} className="activity-mono">
                 {formatActivityDuration(live ? activityDurationMs(entry, now) : entry.duration_ms)}
               </td>
+              {!live && (
+                <>
+                  <td data-label={t("activity.columns.prefill")} className="activity-mono">
+                    {formatActivityTokensPerSecond(entry.operation, entry.prefill_tokens_per_second)}
+                  </td>
+                  <td data-label={t("activity.columns.decode")} className="activity-mono">
+                    {formatActivityTokensPerSecond(entry.operation, entry.decode_tokens_per_second)}
+                  </td>
+                </>
+              )}
               <td data-label={t("activity.columns.input")} className="activity-mono">
                 {formatBytes(entry.input_bytes)}
               </td>

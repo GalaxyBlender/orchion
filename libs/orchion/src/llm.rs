@@ -74,6 +74,17 @@ pub fn scripted_llm_engine(script: Vec<GenerationEvent>) -> (LlmEngine, LlmScrip
                 usage: backend::Usage {
                     prompt_tokens: usage.prompt_tokens,
                     completion_tokens: usage.completion_tokens,
+                    timings: backend::Timings {
+                        cache_n: usage.timings.cache_n,
+                        prompt_n: usage.timings.prompt_n,
+                        prompt_ms: usage.timings.prompt_ms,
+                        prompt_per_token_ms: usage.timings.prompt_per_token_ms,
+                        prompt_per_second: usage.timings.prompt_per_second,
+                        predicted_n: usage.timings.predicted_n,
+                        predicted_ms: usage.timings.predicted_ms,
+                        predicted_per_token_ms: usage.timings.predicted_per_token_ms,
+                        predicted_per_second: usage.timings.predicted_per_second,
+                    },
                 },
             },
         })
@@ -208,16 +219,46 @@ pub enum GenerationFinishReason {
     Cancelled,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LlmTimings {
+    pub cache_n: usize,
+    pub prompt_n: usize,
+    pub prompt_ms: f64,
+    pub prompt_per_token_ms: f64,
+    pub prompt_per_second: f64,
+    pub predicted_n: usize,
+    pub predicted_ms: f64,
+    pub predicted_per_token_ms: f64,
+    pub predicted_per_second: f64,
+}
+
+impl Default for LlmTimings {
+    fn default() -> Self {
+        Self {
+            cache_n: 0,
+            prompt_n: 0,
+            prompt_ms: 0.0,
+            prompt_per_token_ms: 0.0,
+            prompt_per_second: 0.0,
+            predicted_n: 0,
+            predicted_ms: 0.0,
+            predicted_per_token_ms: 0.0,
+            predicted_per_second: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LlmUsage {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
     pub total_tokens: usize,
     pub queue_time_ms: Option<u64>,
     pub eval_time_ms: Option<u64>,
+    pub timings: LlmTimings,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum GenerationEvent {
     ContentDelta(String),
     Finished {
@@ -226,7 +267,7 @@ pub enum GenerationEvent {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LlmComplete {
     pub text: String,
     pub finish_reason: GenerationFinishReason,
@@ -464,6 +505,17 @@ fn map_terminal(reason: backend::FinishReason, usage: backend::Usage) -> Generat
             total_tokens: usage.prompt_tokens + usage.completion_tokens,
             queue_time_ms: None,
             eval_time_ms: None,
+            timings: LlmTimings {
+                cache_n: usage.timings.cache_n,
+                prompt_n: usage.timings.prompt_n,
+                prompt_ms: usage.timings.prompt_ms,
+                prompt_per_token_ms: usage.timings.prompt_per_token_ms,
+                prompt_per_second: usage.timings.prompt_per_second,
+                predicted_n: usage.timings.predicted_n,
+                predicted_ms: usage.timings.predicted_ms,
+                predicted_per_token_ms: usage.timings.predicted_per_token_ms,
+                predicted_per_second: usage.timings.predicted_per_second,
+            },
         },
     }
 }
@@ -498,6 +550,7 @@ mod tests {
         let usage = backend::Usage {
             prompt_tokens: 3,
             completion_tokens: 2,
+            timings: backend::Timings::default(),
         };
         let script = vec![
             backend::Event::Content("hel".to_string()),

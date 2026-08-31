@@ -39,7 +39,7 @@ pub enum ActivityOutcome {
     ResourceExhausted,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
 pub struct ActivityEntry {
     pub id: String,
     pub state: ActivityState,
@@ -70,6 +70,10 @@ pub struct ActivityEntry {
     pub queue_time_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub eval_time_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_tokens_per_second: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decode_tokens_per_second: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

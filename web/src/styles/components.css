@@ -771,7 +771,7 @@
 
 .activity-table {
   width: 100%;
-  min-width: 1080px;
+  min-width: 1272px;
   border-collapse: collapse;
   table-layout: fixed;
 }
@@ -819,6 +819,7 @@
 .activity-col-result { width: 152px; }
 .activity-col-status { width: 64px; }
 .activity-col-duration { width: 92px; }
+.activity-col-throughput { width: 96px; }
 .activity-col-input { width: 88px; }
 .activity-col-id { width: 68px; }
 

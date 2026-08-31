@@ -30,6 +30,8 @@ export interface ActivityEntry {
   completion_tokens?: number;
   queue_time_ms?: number;
   eval_time_ms?: number;
+  prefill_tokens_per_second?: number;
+  decode_tokens_per_second?: number;
   error_code?: string;
   error_message?: string;
 }

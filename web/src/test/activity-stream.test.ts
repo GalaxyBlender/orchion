@@ -8,6 +8,7 @@ import {
 import {
   activityDurationMs,
   formatActivityDuration,
+  formatActivityTokensPerSecond,
   observeActivityEntry,
 } from "../features/activity/timing";
 import type { ActivityEntry, ActivityPage } from "../features/activity/types";
@@ -78,14 +79,14 @@ test("activity reducer applies live model and client metadata updates", () => {
       cursor: "2",
       entry: {
         ...entry,
-        model: "Qwen/Qwen3-ASR-0.6B",
+        model: "alibaba/qwen3-asr-0.6b",
         address: "203.0.113.7",
         user_agent: "orchion-test-agent/1.0",
       },
     },
   })!;
 
-  expect(updated.active[0]?.model).toBe("Qwen/Qwen3-ASR-0.6B");
+  expect(updated.active[0]?.model).toBe("alibaba/qwen3-asr-0.6b");
   expect(updated.active[0]?.address).toBe("203.0.113.7");
   expect(updated.active[0]?.user_agent).toBe("orchion-test-agent/1.0");
 });
@@ -172,6 +173,16 @@ test("activity durations render with two decimal places", () => {
   expect(formatActivityDuration(42)).toBe("42.00 ms");
   expect(formatActivityDuration(1_234)).toBe("1.23 s");
   expect(formatActivityDuration(61_250)).toBe("1m 1.25s");
+});
+
+test("activity LLM throughput renders finite values with one decimal place", () => {
+  expect(formatActivityTokensPerSecond("chat", 123.456)).toBe("123.5 tok/s");
+  expect(formatActivityTokensPerSecond("responses", 0)).toBe("0.0 tok/s");
+  expect(formatActivityTokensPerSecond("chat", undefined)).toBe("-");
+  expect(formatActivityTokensPerSecond("chat", Number.NaN)).toBe("-");
+  expect(formatActivityTokensPerSecond("responses", Number.POSITIVE_INFINITY)).toBe("-");
+  expect(formatActivityTokensPerSecond("chat", -1)).toBe("-");
+  expect(formatActivityTokensPerSecond("asr", 123.456)).toBe("-");
 });
 
 test("completed requests remove live client metadata from the replay buffer", () => {

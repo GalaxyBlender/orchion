@@ -16,7 +16,7 @@ use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use orchion::{GenerationEvent, GenerationFinishReason, LlmMessage, LlmRole, LlmUsage};
+use orchion::{GenerationEvent, GenerationFinishReason, LlmMessage, LlmRole, LlmTimings, LlmUsage};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use std::convert::Infallible;
@@ -160,6 +160,7 @@ pub struct ChatCompletionResponse {
     pub model: String,
     pub choices: Vec<ChatChoice>,
     pub usage: UsageObject,
+    pub timings: TimingObject,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -184,6 +185,19 @@ pub struct UsageObject {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
     pub total_tokens: usize,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+pub struct TimingObject {
+    pub cache_n: usize,
+    pub prompt_n: usize,
+    pub prompt_ms: f64,
+    pub prompt_per_token_ms: f64,
+    pub prompt_per_second: f64,
+    pub predicted_n: usize,
+    pub predicted_ms: f64,
+    pub predicted_per_token_ms: f64,
+    pub predicted_per_second: f64,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -350,6 +364,8 @@ pub struct ResponsesResponse {
     pub metadata: Value,
     #[schema(required = true, nullable)]
     pub usage: Option<ResponsesUsage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timings: Option<TimingObject>,
 }
 
 #[derive(ToSchema)]
@@ -370,6 +386,7 @@ pub struct ChatCompletionStreamChunk {
     choices: Vec<ChatCompletionStreamChoice>,
     #[schema(required = true, nullable)]
     usage: Option<UsageObject>,
+    timings: Option<TimingObject>,
 }
 
 #[derive(ToSchema)]
@@ -553,6 +570,7 @@ pub struct ResponseCompletedSseEvent {
     #[schema(rename = "type", inline)]
     kind: ResponseCompletedSseEventType,
     response: ResponsesResponse,
+    timings: TimingObject,
     sequence_number: u64,
 }
 
@@ -562,6 +580,7 @@ pub struct ResponseIncompleteSseEvent {
     #[schema(rename = "type", inline)]
     kind: ResponseIncompleteSseEventType,
     response: ResponsesResponse,
+    timings: TimingObject,
     sequence_number: u64,
 }
 
@@ -642,7 +661,7 @@ where
         let (text, reason, usage) = collect_generation(generation).await?;
         if let Some(activity) = &activity {
             activity.set_llm_usage(usage.prompt_tokens, usage.completion_tokens);
-            activity.set_llm_timing(usage.queue_time_ms, usage.eval_time_ms);
+            set_activity_timing(activity, usage);
         }
         Ok(Json(ChatCompletionResponse {
             id,
@@ -660,6 +679,7 @@ where
                 logprobs: None,
             }],
             usage: usage.into(),
+            timings: usage.timings.into(),
         })
         .into_response())
     }
@@ -711,7 +731,7 @@ where
         let (text, reason, usage) = collect_generation(generation).await?;
         if let Some(activity) = &activity {
             activity.set_llm_usage(usage.prompt_tokens, usage.completion_tokens);
-            activity.set_llm_timing(usage.queue_time_ms, usage.eval_time_ms);
+            set_activity_timing(activity, usage);
         }
         let output = vec![response_message(
             &message_id,
@@ -730,6 +750,7 @@ where
             text,
             Some(reason),
             Some(usage),
+            true,
             &response_config,
         ))
         .into_response())
@@ -1084,18 +1105,19 @@ fn chat_stream(
     activity: Option<ActivityContext>,
 ) -> Response {
     let stream = async_stream::stream! {
-        yield Ok::<Bytes, Infallible>(Bytes::from(chat_chunk(&id, created, &model, json!({"role":"assistant"}), None, None)));
+        yield Ok::<Bytes, Infallible>(Bytes::from(chat_chunk(&id, created, &model, json!({"role":"assistant"}), None, None, None)));
         while let Some(event) = generation.next().await {
             match event {
-                Ok(GenerationEvent::ContentDelta(delta)) => yield Ok(Bytes::from(chat_chunk(&id, created, &model, json!({"content":delta}), None, None))),
+                Ok(GenerationEvent::ContentDelta(delta)) => yield Ok(Bytes::from(chat_chunk(&id, created, &model, json!({"content":delta}), None, None, None))),
                 Ok(GenerationEvent::Finished { reason: GenerationFinishReason::Cancelled, .. }) => break,
                 Ok(GenerationEvent::Finished { reason, usage }) => {
                     if let Some(activity) = &activity {
                         activity.set_llm_usage(usage.prompt_tokens, usage.completion_tokens);
-                        activity.set_llm_timing(usage.queue_time_ms, usage.eval_time_ms);
+                        set_activity_timing(activity, usage);
                     }
-                    yield Ok(Bytes::from(chat_chunk(&id, created, &model, json!({}), Some(finish_reason(reason)), None)));
-                    if include_usage { yield Ok(Bytes::from(chat_chunk(&id, created, &model, json!({}), None, Some(usage)))); }
+                    let terminal_timings = (!include_usage).then_some(usage.timings);
+                    yield Ok(Bytes::from(chat_chunk(&id, created, &model, json!({}), Some(finish_reason(reason)), None, terminal_timings)));
+                    if include_usage { yield Ok(Bytes::from(chat_chunk(&id, created, &model, json!({}), None, Some(usage), Some(usage.timings)))); }
                     yield Ok(Bytes::from_static(b"data: [DONE]\n\n"));
                     break;
                 }
@@ -1121,6 +1143,7 @@ fn chat_chunk(
     delta: Value,
     finish: Option<&str>,
     usage: Option<LlmUsage>,
+    timings: Option<LlmTimings>,
 ) -> String {
     let (choices, usage) = if let Some(usage) = usage {
         (
@@ -1133,10 +1156,11 @@ fn chat_chunk(
             Value::Null,
         )
     };
-    format!(
-        "data: {}\n\n",
-        json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":choices,"usage":usage})
-    )
+    let mut payload = json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":choices,"usage":usage});
+    if let Some(timings) = timings {
+        payload["timings"] = serde_json::to_value(TimingObject::from(timings)).unwrap();
+    }
+    format!("data: {}\n\n", payload)
 }
 
 fn responses_stream(
@@ -1170,15 +1194,16 @@ fn responses_stream(
                 Ok(GenerationEvent::Finished { reason, usage }) => {
                     if let Some(activity) = &activity {
                         activity.set_llm_usage(usage.prompt_tokens, usage.completion_tokens);
-                        activity.set_llm_timing(usage.queue_time_ms, usage.eval_time_ms);
+                        set_activity_timing(activity, usage);
                     }
                     let final_event = if reason == GenerationFinishReason::Length { "response.incomplete" } else { "response.completed" };
                     let output_status = if reason == GenerationFinishReason::Length { "incomplete" } else { "completed" };
+                    let terminal_response = response_snapshot(&id,created,&model,vec![response_message(&message_id,output_status,&text)],Some(reason),Some(usage),&config);
                     let events = [
                         ("response.output_text.done", json!({"type":"response.output_text.done","item_id":message_id,"output_index":0,"content_index":0,"text":text,"logprobs":[]})),
                         ("response.content_part.done", json!({"type":"response.content_part.done","item_id":message_id,"output_index":0,"content_index":0,"part":output_part(&text)})),
                         ("response.output_item.done", json!({"type":"response.output_item.done","output_index":0,"item":response_message(&message_id,output_status,&text)})),
-                        (final_event, json!({"type":final_event,"response":response_snapshot(&id,created,&model,vec![response_message(&message_id,output_status,&text)],Some(reason),Some(usage),&config)})),
+                        (final_event, json!({"type":final_event,"response":terminal_response,"timings":TimingObject::from(usage.timings)})),
                     ];
                     for (name, data) in events { yield Ok(Bytes::from(event_frame(name, with_sequence(data, sequence)))); sequence += 1; }
                     break;
@@ -1220,6 +1245,7 @@ fn response_snapshot(
         output_text,
         reason,
         usage,
+        false,
         config,
     ))
     .expect("Responses response object is serializable")
@@ -1234,9 +1260,15 @@ fn response_object(
     output_text: String,
     reason: Option<GenerationFinishReason>,
     usage: Option<LlmUsage>,
+    include_timings: bool,
     config: &ResponseConfig,
 ) -> ResponsesResponse {
     let incomplete = reason == Some(GenerationFinishReason::Length);
+    let timings = if include_timings {
+        usage.map(|usage| usage.timings.into())
+    } else {
+        None
+    };
     ResponsesResponse {
         id,
         object: "response",
@@ -1269,6 +1301,7 @@ fn response_object(
         truncation: "disabled",
         metadata: json!({}),
         usage: usage.map(ResponsesUsage::from),
+        timings,
     }
 }
 
@@ -1339,6 +1372,30 @@ impl From<LlmUsage> for UsageObject {
             total_tokens: value.total_tokens,
         }
     }
+}
+impl From<LlmTimings> for TimingObject {
+    fn from(value: LlmTimings) -> Self {
+        Self {
+            cache_n: value.cache_n,
+            prompt_n: value.prompt_n,
+            prompt_ms: value.prompt_ms,
+            prompt_per_token_ms: value.prompt_per_token_ms,
+            prompt_per_second: value.prompt_per_second,
+            predicted_n: value.predicted_n,
+            predicted_ms: value.predicted_ms,
+            predicted_per_token_ms: value.predicted_per_token_ms,
+            predicted_per_second: value.predicted_per_second,
+        }
+    }
+}
+
+fn set_activity_timing(activity: &ActivityContext, usage: LlmUsage) {
+    activity.set_llm_timing(
+        usage.queue_time_ms,
+        usage.eval_time_ms,
+        usage.timings.prompt_per_second,
+        usage.timings.predicted_per_second,
+    );
 }
 impl From<LlmUsage> for ResponsesUsage {
     fn from(value: LlmUsage) -> Self {
@@ -1543,6 +1600,17 @@ mod tests {
             total_tokens: 3,
             queue_time_ms: Some(4),
             eval_time_ms: Some(5),
+            timings: LlmTimings {
+                cache_n: 0,
+                prompt_n: 2,
+                prompt_ms: 8.0,
+                prompt_per_token_ms: 4.0,
+                prompt_per_second: 250.0,
+                predicted_n: 1,
+                predicted_ms: 5.0,
+                predicted_per_token_ms: 5.0,
+                predicted_per_second: 200.0,
+            },
         }
     }
 
@@ -1577,7 +1645,49 @@ mod tests {
         assert!(body.contains("\"finish_reason\":\"stop\""));
         assert!(body.contains("\"choices\":[]"));
         assert!(body.contains("\"prompt_tokens\":2"));
+        let usage_chunk = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|chunk| chunk["choices"] == json!([]))
+            .unwrap();
+        assert_eq!(usage_chunk["timings"]["prompt_per_second"], 250.0);
+        assert_eq!(usage_chunk["timings"]["predicted_per_second"], 200.0);
         assert_eq!(body.matches("data: [DONE]").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn chat_sse_without_usage_puts_timings_on_the_terminal_choice_chunk() {
+        let response = chat_stream(
+            generation([Ok(GenerationEvent::Finished {
+                reason: GenerationFinishReason::Stop,
+                usage: usage(),
+            })]),
+            "chat-1".to_string(),
+            1,
+            "qwen/test".to_string(),
+            false,
+            None,
+        );
+        let body = String::from_utf8(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        let terminal = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|chunk| chunk["choices"][0]["finish_reason"] == "stop")
+            .unwrap();
+        assert_eq!(terminal["usage"], Value::Null);
+        assert_eq!(terminal["timings"]["prompt_n"], 2);
+        assert_eq!(terminal["timings"]["predicted_n"], 1);
     }
 
     #[tokio::test]
@@ -1607,11 +1717,16 @@ mod tests {
                 logprobs: None,
             }],
             usage: usage.into(),
+            timings: usage.timings.into(),
         })
         .unwrap();
         assert_eq!(chat["choices"][0]["message"]["refusal"], Value::Null);
         assert_eq!(chat["choices"][0]["logprobs"], Value::Null);
         assert_eq!(chat["usage"]["total_tokens"], 3);
+        assert_eq!(chat["timings"]["cache_n"], 0);
+        assert_eq!(chat["timings"]["prompt_n"], 2);
+        assert_eq!(chat["timings"]["predicted_n"], 1);
+        assert_eq!(chat["timings"]["prompt_per_second"], 250.0);
 
         let responses = serde_json::to_value(response_object(
             "resp-1".to_string(),
@@ -1621,12 +1736,15 @@ mod tests {
             text,
             Some(reason),
             Some(usage),
+            true,
             &response_config(),
         ))
         .unwrap();
         assert_eq!(responses["output"][0]["role"], "assistant");
         assert_eq!(responses["output"][0]["content"][0]["type"], "output_text");
         assert_eq!(responses["usage"]["total_tokens"], 3);
+        assert_eq!(responses["timings"]["prompt_ms"], 8.0);
+        assert_eq!(responses["timings"]["predicted_ms"], 5.0);
         assert_eq!(
             responses["usage"]["input_tokens_details"]["cached_tokens"],
             0
@@ -1692,6 +1810,15 @@ mod tests {
         }
         assert!(body.contains("\"logprobs\":[]"));
         assert!(body.contains("\"content\":[]"));
+        let completed = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|event| event["type"] == "response.completed")
+            .unwrap();
+        assert_eq!(completed["timings"]["prompt_n"], 2);
+        assert_eq!(completed["timings"]["predicted_n"], 1);
+        assert!(completed["response"].get("timings").is_none());
         assert!(!body.contains("[DONE]"));
         assert_monotonic_sequence_numbers(&body);
     }
@@ -1738,6 +1865,7 @@ mod tests {
             "partial".to_string(),
             Some(GenerationFinishReason::Length),
             Some(usage()),
+            true,
             &response_config(),
         ))
         .unwrap();

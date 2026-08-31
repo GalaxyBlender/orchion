@@ -12,6 +12,8 @@ const llmKeys = [
   "models.capabilities.llm_chat",
   "activity.operations.chat",
   "activity.operations.responses",
+  "activity.columns.prefill",
+  "activity.columns.decode",
   "settings.llmModel",
   "settings.resetLlm",
   "settings.defaultLlmTemperature",

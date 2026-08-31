@@ -211,13 +211,43 @@ pub enum FinishReason {
     Cancelled,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct Timings {
+    pub cache_n: usize,
+    pub prompt_n: usize,
+    pub prompt_ms: f64,
+    pub prompt_per_token_ms: f64,
+    pub prompt_per_second: f64,
+    pub predicted_n: usize,
+    pub predicted_ms: f64,
+    pub predicted_per_token_ms: f64,
+    pub predicted_per_second: f64,
+}
+
+impl Default for Timings {
+    fn default() -> Self {
+        Self {
+            cache_n: 0,
+            prompt_n: 0,
+            prompt_ms: 0.0,
+            prompt_per_token_ms: 0.0,
+            prompt_per_second: 0.0,
+            predicted_n: 0,
+            predicted_ms: 0.0,
+            predicted_per_token_ms: 0.0,
+            predicted_per_second: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct Usage {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
+    pub timings: Timings,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     Content(String),
     Finished { reason: FinishReason, usage: Usage },
@@ -644,6 +674,7 @@ fn scripted_worker(
                         usage: Usage {
                             prompt_tokens: 0,
                             completion_tokens: 0,
+                            timings: Timings::default(),
                         },
                     });
                     for event in script.iter().cloned() {
@@ -1325,6 +1356,7 @@ fn run_generation(
     if cancelled.load(Ordering::Acquire) {
         return Err(Error::Cancelled);
     }
+    context.reset_timings();
     let context_size = effective_context_size(model, config);
     let batch_size =
         usize::try_from(config.batch_size).map_err(|error| Error::Generation(error.to_string()))?;
@@ -1350,6 +1382,10 @@ fn run_generation(
             .map_err(|error| Error::Generation(error.to_string()))?;
         batch.clear();
     }
+    // Native decode may be asynchronous; reading logits synchronizes before
+    // taking the prompt-phase performance snapshot.
+    let _ = context.get_logits();
+    let prompt_timings = context.timings();
     let mut samplers = vec![LlamaSampler::penalties(
         model.n_vocab(),
         i32::try_from(context_size).map_err(|error| Error::Generation(error.to_string()))?,
@@ -1381,10 +1417,13 @@ fn run_generation(
         if model.is_eog_token(token) {
             stop_filter.flush(events, cancelled)?;
             return Ok(finish(
+                context,
+                prompt_timings,
                 FinishReason::Stop,
                 Usage {
                     prompt_tokens: tokens.len(),
                     completion_tokens,
+                    timings: Timings::default(),
                 },
             ));
         }
@@ -1394,15 +1433,21 @@ fn run_generation(
             .map_err(|error| Error::Generation(error.to_string()))?;
         if stop_filter.push(&piece, events, cancelled)? {
             return Ok(finish(
+                context,
+                prompt_timings,
                 FinishReason::Stop,
                 Usage {
                     prompt_tokens: tokens.len(),
                     completion_tokens,
+                    timings: Timings::default(),
                 },
             ));
         }
         if cancelled.load(Ordering::Acquire) {
             return Err(Error::Cancelled);
+        }
+        if completion_tokens == request.options.max_tokens {
+            break;
         }
         batch
             .add(
@@ -1419,16 +1464,87 @@ fn run_generation(
     }
     stop_filter.flush(events, cancelled)?;
     Ok(finish(
+        context,
+        prompt_timings,
         FinishReason::Length,
         Usage {
             prompt_tokens: tokens.len(),
             completion_tokens,
+            timings: Timings::default(),
         },
     ))
 }
 
-fn finish(reason: FinishReason, usage: Usage) -> Event {
+fn finish(
+    context: &mut llama_cpp_2::context::LlamaContext<'_>,
+    prompt_timings: llama_cpp_2::timing::LlamaTimings,
+    reason: FinishReason,
+    mut usage: Usage,
+) -> Event {
+    usage.timings = timings_from_native(
+        prompt_timings,
+        context.timings(),
+        usage.prompt_tokens,
+        usage.completion_tokens,
+    );
     Event::Finished { reason, usage }
+}
+
+fn timings_from_native(
+    prompt: llama_cpp_2::timing::LlamaTimings,
+    completed: llama_cpp_2::timing::LlamaTimings,
+    prompt_n: usize,
+    predicted_n: usize,
+) -> Timings {
+    // llama.cpp classifies one-token batches as generation evals. Snapshotting at
+    // the phase boundary keeps a final one-token prompt batch in prefill timing.
+    let prompt_ms = finite_nonnegative(
+        finite_nonnegative(prompt.t_p_eval_ms()) + finite_nonnegative(prompt.t_eval_ms()),
+    );
+    let predicted_ms = finite_nonnegative(
+        timing_delta(completed.t_p_eval_ms(), prompt.t_p_eval_ms())
+            + timing_delta(completed.t_eval_ms(), prompt.t_eval_ms()),
+    );
+    let (prompt_per_token_ms, prompt_per_second) = timing_rates(prompt_n, prompt_ms);
+    let (predicted_per_token_ms, predicted_per_second) =
+        timing_rates(predicted_n.saturating_sub(1), predicted_ms);
+    Timings {
+        cache_n: 0,
+        prompt_n,
+        prompt_ms,
+        prompt_per_token_ms,
+        prompt_per_second,
+        predicted_n,
+        predicted_ms,
+        predicted_per_token_ms,
+        predicted_per_second,
+    }
+}
+
+fn timing_delta(completed: f64, prompt: f64) -> f64 {
+    finite_nonnegative(completed - prompt)
+}
+
+fn finite_nonnegative(value: f64) -> f64 {
+    if value.is_finite() && value >= 0.0 {
+        value
+    } else {
+        0.0
+    }
+}
+
+fn timing_rates(tokens: usize, milliseconds: f64) -> (f64, f64) {
+    if tokens == 0 || milliseconds <= 0.0 {
+        return (0.0, 0.0);
+    }
+    let Ok(tokens) = u32::try_from(tokens) else {
+        return (0.0, 0.0);
+    };
+    let tokens = f64::from(tokens);
+    (
+        finite_nonnegative(milliseconds / tokens),
+        finite_nonnegative(tokens * 1_000.0 / milliseconds),
+    )
 }
 
 fn send_event(
@@ -1589,6 +1705,33 @@ mod tests {
             enable_thinking: false,
         };
         assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn native_timings_map_to_llama_server_fields_and_finite_rates() {
+        let prompt = llama_cpp_2::timing::LlamaTimings::new(0.0, 0.0, 18.0, 2.0, 9, 1, 0);
+        let completed = llama_cpp_2::timing::LlamaTimings::new(0.0, 0.0, 18.0, 10.0, 9, 5, 0);
+        let timings = timings_from_native(prompt, completed, 10, 5);
+        assert_eq!(timings.cache_n, 0);
+        assert_eq!(timings.prompt_n, 10);
+        assert!((timings.prompt_ms - 20.0).abs() < f64::EPSILON);
+        assert!((timings.prompt_per_token_ms - 2.0).abs() < f64::EPSILON);
+        assert!((timings.prompt_per_second - 500.0).abs() < f64::EPSILON);
+        assert_eq!(timings.predicted_n, 5);
+        assert!((timings.predicted_ms - 8.0).abs() < f64::EPSILON);
+        assert!((timings.predicted_per_token_ms - 2.0).abs() < f64::EPSILON);
+        assert!((timings.predicted_per_second - 500.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn timing_rates_are_zero_for_invalid_or_zero_elapsed_values() {
+        for milliseconds in [0.0, f64::NAN, f64::INFINITY, -1.0] {
+            let (per_token, per_second) = timing_rates(4, finite_nonnegative(milliseconds));
+            assert_eq!((per_token, per_second), (0.0, 0.0));
+            assert!(per_token.is_finite());
+            assert!(per_second.is_finite());
+        }
+        assert_eq!(timing_rates(0, 4.0), (0.0, 0.0));
     }
 
     #[test]

@@ -91,7 +91,7 @@ struct PdfImagesMultipartRequest {
 struct OcrMultipartRequest {
     #[schema(value_type = String, format = Binary, content_media_type = "application/octet-stream")]
     file: String,
-    #[schema(example = "PaddlePaddle/PP-OCRv6_medium")]
+    #[schema(example = "paddlepaddle/pp-ocrv6-medium")]
     model: String,
     response_format: Option<OcrApiFormat>,
     task: Option<OcrTask>,
@@ -323,6 +323,28 @@ mod tests {
         ));
         assert!(spec["components"]["schemas"]["ChatCompletionSseEvent"]["oneOf"].is_array());
         assert!(spec["components"]["schemas"]["ResponsesSseEvent"]["oneOf"].is_array());
+        let timing_schema = &spec["components"]["schemas"]["TimingObject"];
+        for field in [
+            "cache_n",
+            "prompt_n",
+            "prompt_ms",
+            "prompt_per_token_ms",
+            "prompt_per_second",
+            "predicted_n",
+            "predicted_ms",
+            "predicted_per_token_ms",
+            "predicted_per_second",
+        ] {
+            assert!(timing_schema["properties"][field].is_object(), "{field}");
+        }
+        assert!(schema_references(
+            &spec["components"]["schemas"]["ChatCompletionResponse"]["properties"]["timings"],
+            "TimingObject"
+        ));
+        assert!(schema_references(
+            &spec["components"]["schemas"]["ResponsesResponse"]["properties"]["timings"],
+            "TimingObject"
+        ));
         assert!(schema_references(
             &spec["components"]["schemas"]["ChatCompletionSseEvent"],
             "ErrorBody"

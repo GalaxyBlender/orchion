@@ -186,6 +186,8 @@ impl ActivityHub {
             completion_tokens: None,
             queue_time_ms: None,
             eval_time_ms: None,
+            prefill_tokens_per_second: None,
+            decode_tokens_per_second: None,
             error_code: None,
             error_message: None,
         };
@@ -464,10 +466,22 @@ impl ActivityContext {
         });
     }
 
-    pub fn set_llm_timing(&self, queue_time_ms: Option<u64>, eval_time_ms: Option<u64>) {
+    pub fn set_llm_timing(
+        &self,
+        queue_time_ms: Option<u64>,
+        eval_time_ms: Option<u64>,
+        prefill_tokens_per_second: f64,
+        decode_tokens_per_second: f64,
+    ) {
         self.hub.update(self.id, |entry| {
             entry.queue_time_ms = queue_time_ms;
             entry.eval_time_ms = eval_time_ms;
+            entry.prefill_tokens_per_second = (prefill_tokens_per_second.is_finite()
+                && prefill_tokens_per_second >= 0.0)
+                .then_some(prefill_tokens_per_second);
+            entry.decode_tokens_per_second = (decode_tokens_per_second.is_finite()
+                && decode_tokens_per_second >= 0.0)
+                .then_some(decode_tokens_per_second);
         });
     }
 
@@ -738,6 +752,22 @@ mod tests {
     }
 
     #[test]
+    fn completed_llm_activity_retains_prefill_and_decode_rates() {
+        let hub = hub(1);
+        let context = start(&hub);
+        context.set_llm_timing(Some(3), Some(9), 125.5, 42.25);
+        context.complete_http(200, None);
+
+        let page = hub.page(&ActivityFilter {
+            limit: 1,
+            ..ActivityFilter::default()
+        });
+        let entry = &page.history[0];
+        assert_eq!(entry.prefill_tokens_per_second, Some(125.5));
+        assert_eq!(entry.decode_tokens_per_second, Some(42.25));
+    }
+
+    #[test]
     fn websocket_drop_completes_once_as_disconnected() {
         let hub = hub(10);
         let context = start(&hub);
@@ -813,7 +843,7 @@ mod tests {
                 ),
             )
             .unwrap();
-        context.set_model("Qwen/Qwen3-ASR-0.6B");
+        context.set_model("alibaba/qwen3-asr-0.6b");
         let active = hub.page(&ActivityFilter::default());
         assert_eq!(active.active[0].address.as_deref(), Some("203.0.113.7"));
         assert_eq!(
@@ -822,7 +852,7 @@ mod tests {
         );
         assert_eq!(
             active.active[0].model.as_deref(),
-            Some("Qwen/Qwen3-ASR-0.6B")
+            Some("alibaba/qwen3-asr-0.6b")
         );
 
         let mut events = hub.subscribe();
@@ -840,7 +870,7 @@ mod tests {
         assert!(history.history[0].user_agent.is_none());
         assert_eq!(
             history.history[0].model.as_deref(),
-            Some("Qwen/Qwen3-ASR-0.6B")
+            Some("alibaba/qwen3-asr-0.6b")
         );
     }
 

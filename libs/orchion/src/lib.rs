@@ -66,7 +66,7 @@ pub use orchion_ocr::validate_image_file as validate_ocr_image_file;
 pub use llm::{
     GenerationEvent, GenerationFinishReason, GenerationOptions, GenerationRequest, LlmBackendGuard,
     LlmComplete, LlmEngine, LlmEngineConfig, LlmGeneration, LlmMessage, LlmReservation, LlmRole,
-    LlmScriptedControl, LlmTemplateEngine, LlmUsage, initialize_llm_backend,
+    LlmScriptedControl, LlmTemplateEngine, LlmTimings, LlmUsage, initialize_llm_backend,
     llm_build_metadata_json, scripted_context_limit_llm_engine, scripted_llm_engine,
     scripted_panicking_llm_engine, scripted_preparation_panicking_llm_engine,
     scripted_slow_preparation_llm_engine,

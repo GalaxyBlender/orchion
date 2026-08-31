@@ -1,4 +1,4 @@
-import type { ActivityEntry, ActivityPage, ActivityStreamEvent } from "./types";
+import type { ActivityEntry, ActivityOperation, ActivityPage, ActivityStreamEvent } from "./types";
 
 export function observeActivityEntry(
   entry: ActivityEntry,
@@ -46,6 +46,19 @@ export function formatActivityDuration(value?: number | null): string {
   if (value < 1_000) return `${value.toFixed(2)} ms`;
   if (value < 60_000) return `${(value / 1_000).toFixed(2)} s`;
   return `${Math.floor(value / 60_000)}m ${((value % 60_000) / 1_000).toFixed(2)}s`;
+}
+
+export function formatActivityTokensPerSecond(
+  operation: ActivityOperation,
+  value?: number,
+): string {
+  if (
+    (operation !== "chat" && operation !== "responses")
+    || typeof value !== "number"
+    || !Number.isFinite(value)
+    || value < 0
+  ) return "-";
+  return `${value.toFixed(1)} tok/s`;
 }
 
 export function monotonicNowMs(): number {
