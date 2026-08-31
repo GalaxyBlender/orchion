@@ -81,7 +81,7 @@ use orchion::{Asr, AsrModel, Result};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let model = AsrModel::parse("Qwen/Qwen3-ASR-0.6B")?;
+    let model = AsrModel::parse("alibaba/qwen3-asr-0.6b")?;
     let asr = Asr::load_or_download(model, "models").await?;
     let transcript = asr.transcribe_file("audio.wav").await?;
     println!("{}", transcript.text);

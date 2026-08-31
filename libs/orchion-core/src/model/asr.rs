@@ -43,6 +43,10 @@ impl ModelSpec for AsrModel {
         ModelCategory::Asr
     }
 
+    fn model_id(&self) -> &str {
+        self.as_str()
+    }
+
     fn huggingface_repo(&self) -> &str {
         self.descriptor().map_or(self.as_str(), |descriptor| {
             descriptor.source_locators.hugging_face
@@ -74,9 +78,9 @@ mod tests {
 
     #[test]
     fn parses_asr_model_names_and_repositories() {
-        let model = AsrModel::from_str("Qwen/Qwen3-ASR-0.6B").unwrap();
+        let model = AsrModel::from_str("alibaba/qwen3-asr-0.6b").unwrap();
 
-        assert_eq!(model, AsrModel::parse("Qwen/Qwen3-ASR-0.6B").unwrap());
+        assert_eq!(model, AsrModel::parse("alibaba/qwen3-asr-0.6b").unwrap());
         assert_eq!(model.huggingface_repo(), "Qwen/Qwen3-ASR-0.6B");
         assert_eq!(model.modelscope_repo(), "Qwen/Qwen3-ASR-0.6B");
     }
@@ -97,11 +101,13 @@ mod tests {
     #[test]
     fn asr_models_expose_stable_metadata() {
         assert_eq!(
-            AsrModel::parse("Qwen/Qwen3-ASR-0.6B").unwrap().category(),
+            AsrModel::parse("alibaba/qwen3-asr-0.6b")
+                .unwrap()
+                .category(),
             ModelCategory::Asr
         );
         assert_eq!(
-            AsrModel::parse("Qwen/Qwen3-ASR-1.7B")
+            AsrModel::parse("alibaba/qwen3-asr-1.7b")
                 .unwrap()
                 .huggingface_repo(),
             "Qwen/Qwen3-ASR-1.7B"

@@ -96,10 +96,10 @@ mod tests {
 
     #[test]
     fn accepts_vendor_name_model_ids() {
-        let id = ModelId::parse("PaddlePaddle/PaddleOCR-VL-1.6").unwrap();
-        assert_eq!(id.as_str(), "PaddlePaddle/PaddleOCR-VL-1.6");
-        assert_eq!(id.vendor(), "PaddlePaddle");
-        assert_eq!(id.name(), "PaddleOCR-VL-1.6");
+        let id = ModelId::parse("paddlepaddle/paddleocr-vl-1.6").unwrap();
+        assert_eq!(id.as_str(), "paddlepaddle/paddleocr-vl-1.6");
+        assert_eq!(id.vendor(), "paddlepaddle");
+        assert_eq!(id.name(), "paddleocr-vl-1.6");
     }
 
     #[test]
@@ -115,8 +115,8 @@ mod tests {
             "vendor/.",
             "vendor/..",
             "vendor/name with space",
-            " PaddlePaddle/PaddleOCR-VL-1.6",
-            "PaddlePaddle/PaddleOCR-VL-1.6 ",
+            " paddlepaddle/paddleocr-vl-1.6",
+            "paddlepaddle/paddleocr-vl-1.6 ",
         ] {
             assert!(ModelId::parse(value).is_err(), "{value} should be rejected");
         }
@@ -125,8 +125,8 @@ mod tests {
     #[cfg(feature = "serde")]
     #[test]
     fn model_id_deserialization_validates_input() {
-        let id = serde_json::from_str::<ModelId>("\"PaddlePaddle/PaddleOCR-VL-1.6\"").unwrap();
-        assert_eq!(id.as_str(), "PaddlePaddle/PaddleOCR-VL-1.6");
+        let id = serde_json::from_str::<ModelId>("\"paddlepaddle/paddleocr-vl-1.6\"").unwrap();
+        assert_eq!(id.as_str(), "paddlepaddle/paddleocr-vl-1.6");
 
         assert!(serde_json::from_str::<ModelId>("\"bad id with space\"").is_err());
     }

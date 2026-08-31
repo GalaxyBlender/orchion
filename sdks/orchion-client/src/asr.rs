@@ -1004,17 +1004,19 @@ mod tests {
 
     #[test]
     fn stream_start_serializes_server_protocol_fields() {
-        let request =
-            StreamingStartRequest::new("Qwen/Qwen3-ASR-Flash", StreamingInputAudioFormat::PcmS16Le)
-                .with_sample_rate(16_000)
-                .with_language("zh")
-                .with_prompt("context")
-                .with_chunk_size_sec(2.0);
+        let request = StreamingStartRequest::new(
+            "alibaba/qwen3-asr-flash",
+            StreamingInputAudioFormat::PcmS16Le,
+        )
+        .with_sample_rate(16_000)
+        .with_language("zh")
+        .with_prompt("context")
+        .with_chunk_size_sec(2.0);
 
         let value = serde_json::to_value(request).unwrap();
 
         assert_eq!(value["type"], "start");
-        assert_eq!(value["model"], "Qwen/Qwen3-ASR-Flash");
+        assert_eq!(value["model"], "alibaba/qwen3-asr-flash");
         assert_eq!(value["input_audio_format"], "pcm_s16le");
         assert_eq!(value["sample_rate"], 16000);
         assert_eq!(value["language"], "zh");
@@ -1024,10 +1026,12 @@ mod tests {
 
     #[test]
     fn public_stream_start_wrapper_round_trips_through_shared_wire_dto() {
-        let request =
-            StreamingStartRequest::new("Qwen/Qwen3-ASR-Flash", StreamingInputAudioFormat::PcmS16Le)
-                .with_sample_rate(16_000)
-                .with_caption_endpointing(CaptionEndpointing::default());
+        let request = StreamingStartRequest::new(
+            "alibaba/qwen3-asr-flash",
+            StreamingInputAudioFormat::PcmS16Le,
+        )
+        .with_sample_rate(16_000)
+        .with_caption_endpointing(CaptionEndpointing::default());
 
         let text = serde_json::to_string(&request).unwrap();
         let wire = AsrStreamStartMessage::from_text(&text).unwrap();
@@ -1044,10 +1048,12 @@ mod tests {
 
     #[test]
     fn stream_start_serializes_caption_mode_with_default_endpointing() {
-        let request =
-            StreamingStartRequest::new("Qwen/Qwen3-ASR-Flash", StreamingInputAudioFormat::PcmS16Le)
-                .with_sample_rate(16_000)
-                .with_caption_mode();
+        let request = StreamingStartRequest::new(
+            "alibaba/qwen3-asr-flash",
+            StreamingInputAudioFormat::PcmS16Le,
+        )
+        .with_sample_rate(16_000)
+        .with_caption_mode();
 
         let value = serde_json::to_value(request).unwrap();
 
@@ -1074,10 +1080,12 @@ mod tests {
             min_silence_ms: 650,
             speech_padding_ms: 120,
         };
-        let request =
-            StreamingStartRequest::new("Qwen/Qwen3-ASR-Flash", StreamingInputAudioFormat::PcmS16Le)
-                .with_sample_rate(16_000)
-                .with_caption_endpointing(endpointing);
+        let request = StreamingStartRequest::new(
+            "alibaba/qwen3-asr-flash",
+            StreamingInputAudioFormat::PcmS16Le,
+        )
+        .with_sample_rate(16_000)
+        .with_caption_endpointing(endpointing);
 
         let value = serde_json::to_value(request).unwrap();
 
@@ -1090,11 +1098,13 @@ mod tests {
 
     #[test]
     fn stream_start_caption_mode_after_endpointing_omits_endpointing() {
-        let request =
-            StreamingStartRequest::new("Qwen/Qwen3-ASR-Flash", StreamingInputAudioFormat::PcmS16Le)
-                .with_sample_rate(16_000)
-                .with_caption_endpointing(CaptionEndpointing::default())
-                .with_caption_mode();
+        let request = StreamingStartRequest::new(
+            "alibaba/qwen3-asr-flash",
+            StreamingInputAudioFormat::PcmS16Le,
+        )
+        .with_sample_rate(16_000)
+        .with_caption_endpointing(CaptionEndpointing::default())
+        .with_caption_mode();
 
         let value = serde_json::to_value(request).unwrap();
 
@@ -1105,9 +1115,11 @@ mod tests {
     #[tokio::test]
     async fn stream_start_rejects_endpointing_without_caption_mode() {
         let client = Client::new("http://localhost:8080").unwrap();
-        let mut request =
-            StreamingStartRequest::new("Qwen/Qwen3-ASR-Flash", StreamingInputAudioFormat::PcmS16Le)
-                .with_sample_rate(16_000);
+        let mut request = StreamingStartRequest::new(
+            "alibaba/qwen3-asr-flash",
+            StreamingInputAudioFormat::PcmS16Le,
+        )
+        .with_sample_rate(16_000);
         request.endpointing = Some(CaptionEndpointing::default());
 
         let Err(error) = client.asr().start_streaming(request).await else {
@@ -1124,10 +1136,12 @@ mod tests {
     #[tokio::test]
     async fn stream_start_rejects_caption_pcm_s16le_without_16000_hz() {
         let client = Client::new("http://localhost:8080").unwrap();
-        let request =
-            StreamingStartRequest::new("Qwen/Qwen3-ASR-Flash", StreamingInputAudioFormat::PcmS16Le)
-                .with_sample_rate(44_100)
-                .with_caption_mode();
+        let request = StreamingStartRequest::new(
+            "alibaba/qwen3-asr-flash",
+            StreamingInputAudioFormat::PcmS16Le,
+        )
+        .with_sample_rate(44_100)
+        .with_caption_mode();
 
         let Err(error) = client.asr().start_streaming(request).await else {
             panic!("streaming request unexpectedly succeeded");
@@ -1188,7 +1202,7 @@ mod tests {
         for (endpointing, expected_message) in cases {
             let client = Client::new("http://localhost:8080").unwrap();
             let request = StreamingStartRequest::new(
-                "Qwen/Qwen3-ASR-Flash",
+                "alibaba/qwen3-asr-flash",
                 StreamingInputAudioFormat::PcmS16Le,
             )
             .with_sample_rate(16_000)

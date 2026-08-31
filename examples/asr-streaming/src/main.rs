@@ -22,7 +22,7 @@ async fn main() -> Result<()> {
             reason: source.to_string(),
         })?;
 
-    let model = AsrModel::parse("Qwen/Qwen3-ASR-0.6B").expect("example model id is valid");
+    let model = AsrModel::parse("alibaba/qwen3-asr-0.6b").expect("example model id is valid");
     let asr = Asr::load_or_download(model, cache_dir).await?;
     let mut stream = asr.start_streaming().await?;
     for chunk in samples.chunks(sample_rate as usize) {

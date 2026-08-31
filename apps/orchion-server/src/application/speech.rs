@@ -357,7 +357,7 @@ mod tests {
 
     fn command() -> SpeechCommand {
         SpeechCommand {
-            model: "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice".into(),
+            model: "alibaba/qwen3-tts-12hz-0.6b-customvoice".into(),
             input: "hello".into(),
             voice: "ryan".into(),
             output_format: None,

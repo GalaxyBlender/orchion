@@ -57,6 +57,7 @@ pub struct ModelCapabilityRequirement {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ModelDescriptor {
     pub canonical_id: &'static str,
+    pub display_name: &'static str,
     pub source_locators: ModelSourceLocators,
     pub category: ModelCategory,
     pub capabilities: ModelCapabilities,
@@ -81,32 +82,54 @@ const ASR_CAPABILITIES: ModelCapabilities =
     ModelCapabilities::ASR_TRANSCRIPTION.union(ModelCapabilities::ASR_STREAMING);
 
 const ASR_MODELS: [ModelDescriptor; 2] = [
-    qwen_descriptor("Qwen/Qwen3-ASR-0.6B", ModelCategory::Asr, ASR_CAPABILITIES),
-    qwen_descriptor("Qwen/Qwen3-ASR-1.7B", ModelCategory::Asr, ASR_CAPABILITIES),
+    qwen_descriptor(
+        "alibaba/qwen3-asr-0.6b",
+        "Qwen3-ASR 0.6B",
+        "Qwen/Qwen3-ASR-0.6B",
+        ModelCategory::Asr,
+        ASR_CAPABILITIES,
+    ),
+    qwen_descriptor(
+        "alibaba/qwen3-asr-1.7b",
+        "Qwen3-ASR 1.7B",
+        "Qwen/Qwen3-ASR-1.7B",
+        ModelCategory::Asr,
+        ASR_CAPABILITIES,
+    ),
 ];
 
 const TTS_MODELS: [ModelDescriptor; 5] = [
     qwen_descriptor(
+        "alibaba/qwen3-tts-12hz-0.6b-base",
+        "Qwen3-TTS 12Hz 0.6B Base",
         "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
         ModelCategory::Tts,
         ModelCapabilities::TTS_VOICE_CLONING,
     ),
     qwen_descriptor(
+        "alibaba/qwen3-tts-12hz-0.6b-customvoice",
+        "Qwen3-TTS 12Hz 0.6B CustomVoice",
         "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
         ModelCategory::Tts,
         ModelCapabilities::TTS_PRESET_SPEAKERS,
     ),
     qwen_descriptor(
+        "alibaba/qwen3-tts-12hz-1.7b-base",
+        "Qwen3-TTS 12Hz 1.7B Base",
         "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
         ModelCategory::Tts,
         ModelCapabilities::TTS_VOICE_CLONING,
     ),
     qwen_descriptor(
+        "alibaba/qwen3-tts-12hz-1.7b-customvoice",
+        "Qwen3-TTS 12Hz 1.7B CustomVoice",
         "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
         ModelCategory::Tts,
         ModelCapabilities::TTS_PRESET_SPEAKERS,
     ),
     qwen_descriptor(
+        "alibaba/qwen3-tts-12hz-1.7b-voicedesign",
+        "Qwen3-TTS 12Hz 1.7B VoiceDesign",
         "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
         ModelCategory::Tts,
         ModelCapabilities::TTS_VOICE_DESIGN,
@@ -115,14 +138,17 @@ const TTS_MODELS: [ModelDescriptor; 5] = [
 
 const fn qwen_descriptor(
     canonical_id: &'static str,
+    display_name: &'static str,
+    source_locator: &'static str,
     category: ModelCategory,
     capabilities: ModelCapabilities,
 ) -> ModelDescriptor {
     ModelDescriptor {
         canonical_id,
+        display_name,
         source_locators: ModelSourceLocators {
-            hugging_face: canonical_id,
-            model_scope: canonical_id,
+            hugging_face: source_locator,
+            model_scope: source_locator,
         },
         category,
         capabilities,

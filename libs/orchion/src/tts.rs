@@ -155,7 +155,7 @@ mod provider_tests {
     #[test]
     fn qwen_loader_rejects_models_registered_to_another_provider() {
         assert!(
-            ensure_qwen_tts_model(&TtsModel::parse("PaddlePaddle/PaddleOCR-VL-1.6").unwrap())
+            ensure_qwen_tts_model(&TtsModel::parse("paddlepaddle/paddleocr-vl-1.6").unwrap())
                 .is_err()
         );
     }

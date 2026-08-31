@@ -454,8 +454,8 @@ mod tests {
 
     #[test]
     fn model_capability_checks_match_voice_variants() {
-        let preset_model = TtsModel::parse("Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice").unwrap();
-        let clone_model = TtsModel::parse("Qwen/Qwen3-TTS-12Hz-0.6B-Base").unwrap();
+        let preset_model = TtsModel::parse("alibaba/qwen3-tts-12hz-0.6b-customvoice").unwrap();
+        let clone_model = TtsModel::parse("alibaba/qwen3-tts-12hz-0.6b-base").unwrap();
 
         assert!(
             ensure_voice_supported(
@@ -487,7 +487,7 @@ mod tests {
     #[test]
     fn exposes_explicit_device_loader_api() {
         let future = Tts::load_with_device(
-            TtsModel::parse("Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice").unwrap(),
+            TtsModel::parse("alibaba/qwen3-tts-12hz-0.6b-customvoice").unwrap(),
             "models/qwen3-tts-0.6b-custom-voice",
             orchion_core::DevicePreference::Cpu,
         );

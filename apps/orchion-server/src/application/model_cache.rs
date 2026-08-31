@@ -1509,15 +1509,15 @@ mod tests {
     }
 
     fn qwen_asr_06b() -> AsrModel {
-        asr_model("Qwen/Qwen3-ASR-0.6B")
+        asr_model("alibaba/qwen3-asr-0.6b")
     }
 
     fn qwen_asr_17b() -> AsrModel {
-        asr_model("Qwen/Qwen3-ASR-1.7B")
+        asr_model("alibaba/qwen3-asr-1.7b")
     }
 
     fn qwen_tts_custom_voice() -> TtsModel {
-        tts_model("Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")
+        tts_model("alibaba/qwen3-tts-12hz-0.6b-customvoice")
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Hash)]

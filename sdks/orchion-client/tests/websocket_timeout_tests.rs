@@ -24,7 +24,7 @@ async fn streaming_connect_times_out_when_the_server_stalls_during_handshake() {
         .unwrap();
     let client = Client::from_config(config).unwrap();
     let request =
-        StreamingStartRequest::new("Qwen/Qwen3-ASR-Flash", StreamingInputAudioFormat::Mp3);
+        StreamingStartRequest::new("alibaba/qwen3-asr-flash", StreamingInputAudioFormat::Mp3);
 
     let result = tokio::time::timeout(TEST_WATCHDOG, client.asr().start_streaming(request))
         .await
@@ -56,7 +56,7 @@ async fn streaming_reads_each_receive_the_configured_timeout() {
         .unwrap();
     let client = Client::from_config(config).unwrap();
     let request =
-        StreamingStartRequest::new("Qwen/Qwen3-ASR-Flash", StreamingInputAudioFormat::Mp3);
+        StreamingStartRequest::new("alibaba/qwen3-asr-flash", StreamingInputAudioFormat::Mp3);
     let mut session = tokio::time::timeout(TEST_WATCHDOG, client.asr().start_streaming(request))
         .await
         .expect("streaming handshake exceeded the test watchdog")
@@ -90,7 +90,7 @@ async fn send_audio_timeout_makes_the_public_session_terminal() {
         .unwrap();
     let client = Client::from_config(config).unwrap();
     let request =
-        StreamingStartRequest::new("Qwen/Qwen3-ASR-Flash", StreamingInputAudioFormat::Mp3);
+        StreamingStartRequest::new("alibaba/qwen3-asr-flash", StreamingInputAudioFormat::Mp3);
     let mut session = tokio::time::timeout(TEST_WATCHDOG, client.asr().start_streaming(request))
         .await
         .expect("streaming handshake exceeded the test watchdog")

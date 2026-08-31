@@ -19,7 +19,7 @@ Start 消息：
 ```json
 {
   "type": "start",
-  "model": "Qwen/Qwen3-ASR-Flash",
+  "model": "alibaba/qwen3-asr-flash",
   "input_audio_format": "pcm_s16le",
   "sample_rate": 16000
 }
@@ -44,7 +44,7 @@ Captions 模式下使用 `pcm_s16le` 时，必须传 `sample_rate`，且值必�
 {
   "type": "start",
   "mode": "caption",
-  "model": "Qwen/Qwen3-ASR-Flash",
+  "model": "alibaba/qwen3-asr-flash",
   "input_audio_format": "pcm_s16le",
   "sample_rate": 16000
 }
@@ -58,7 +58,7 @@ Endpointing 值单位为毫秒。`min_speech_ms + speech_padding_ms` 必须小�
 {
   "type": "start",
   "mode": "caption",
-  "model": "Qwen/Qwen3-ASR-Flash",
+  "model": "alibaba/qwen3-asr-flash",
   "input_audio_format": "pcm_s16le",
   "sample_rate": 16000,
   "endpointing": {

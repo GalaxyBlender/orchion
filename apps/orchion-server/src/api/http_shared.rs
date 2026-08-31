@@ -353,7 +353,7 @@ mod tests {
     async fn disconnected_inference_waiter_never_dispatches() {
         let resources = ResourcePolicy::new(1, 1, 1);
         let global_permit = resources.acquire_inference().await;
-        let model = AsrModel::parse("Qwen/Qwen3-ASR-0.6B").unwrap();
+        let model = AsrModel::parse("alibaba/qwen3-asr-0.6b").unwrap();
         let cache = ModelCache::new(
             "asr",
             vec![model.clone()],

@@ -23,7 +23,7 @@ verify_file_integrity = false
 
 [services.asr]
 enabled = true
-default_model = "Qwen/Qwen3-ASR-0.6B"
+default_model = "alibaba/qwen3-asr-0.6b"
 device = "auto"
 idle_timeout = "10m"
 stream_chunk_size = 2.0
@@ -35,18 +35,18 @@ max_audio_duration = "30m"
 max_loaded = 1
 
 [[services.asr.models]]
-id = "Qwen/Qwen3-ASR-0.6B"
-name = "Qwen3 ASR 0.6B"
+id = "alibaba/qwen3-asr-0.6b"
+name = "Qwen3-ASR 0.6B"
 model = "//Qwen/Qwen3-ASR-0.6B"
 
 [[services.asr.models]]
-id = "Qwen/Qwen3-ASR-1.7B"
-name = "Qwen3 ASR 1.7B"
+id = "alibaba/qwen3-asr-1.7b"
+name = "Qwen3-ASR 1.7B"
 model = "//Qwen/Qwen3-ASR-1.7B"
 
 [services.tts]
 enabled = true
-default_model = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+default_model = "alibaba/qwen3-tts-12hz-0.6b-customvoice"
 device = "auto"
 idle_timeout = "10m"
 max_loaded = 1
@@ -55,28 +55,33 @@ max_length = 2048
 max_reference_audio_duration = "5m"
 
 [[services.tts.models]]
-id = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+id = "alibaba/qwen3-tts-12hz-0.6b-base"
+name = "Qwen3-TTS 12Hz 0.6B Base"
 model = "//Qwen/Qwen3-TTS-12Hz-0.6B-Base"
 
 [[services.tts.models]]
-id = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+id = "alibaba/qwen3-tts-12hz-0.6b-customvoice"
+name = "Qwen3-TTS 12Hz 0.6B CustomVoice"
 model = "//Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
 
 [[services.tts.models]]
-id = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+id = "alibaba/qwen3-tts-12hz-1.7b-base"
+name = "Qwen3-TTS 12Hz 1.7B Base"
 model = "//Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 
 [[services.tts.models]]
-id = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+id = "alibaba/qwen3-tts-12hz-1.7b-customvoice"
+name = "Qwen3-TTS 12Hz 1.7B CustomVoice"
 model = "//Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
 
 [[services.tts.models]]
-id = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+id = "alibaba/qwen3-tts-12hz-1.7b-voicedesign"
+name = "Qwen3-TTS 12Hz 1.7B VoiceDesign"
 model = "//Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
 
 [services.ocr]
 enabled = true
-default_model = "PaddlePaddle/PP-OCRv6_tiny"
+default_model = "paddlepaddle/pp-ocrv6-tiny"
 device = "auto"
 idle_timeout = "10m"
 max_loaded = 1
@@ -84,34 +89,38 @@ format = "json"
 max_pixels = 100000000
 
 [[services.ocr.models]]
-id = "PaddlePaddle/PP-OCRv5_mobile"
+id = "paddlepaddle/pp-ocrv5-mobile"
+name = "PP-OCRv5 Mobile"
 model = "//PaddlePaddle/PP-OCRv5_mobile"
 layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
 
 [[services.ocr.models]]
-id = "PaddlePaddle/PP-OCRv5_server"
+id = "paddlepaddle/pp-ocrv5-server"
+name = "PP-OCRv5 Server"
 model = "//PaddlePaddle/PP-OCRv5_server"
 layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
 
 [[services.ocr.models]]
-id = "PaddlePaddle/PP-OCRv6_tiny"
+id = "paddlepaddle/pp-ocrv6-tiny"
 name = "PP-OCRv6 Tiny"
 model = "//PaddlePaddle/PP-OCRv6_tiny"
 layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
 
 [[services.ocr.models]]
-id = "PaddlePaddle/PP-OCRv6_small"
+id = "paddlepaddle/pp-ocrv6-small"
+name = "PP-OCRv6 Small"
 model = "//PaddlePaddle/PP-OCRv6_small"
 layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
 
 [[services.ocr.models]]
-id = "PaddlePaddle/PP-OCRv6_medium"
+id = "paddlepaddle/pp-ocrv6-medium"
+name = "PP-OCRv6 Medium"
 model = "//PaddlePaddle/PP-OCRv6_medium"
 layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
 
 [services.ocr-vl]
 enabled = true
-default_model = "PaddlePaddle/PaddleOCR-VL-1.6"
+default_model = "paddlepaddle/paddleocr-vl-1.6"
 device = "auto"
 idle_timeout = "10m"
 max_loaded = 1
@@ -120,19 +129,20 @@ max_tokens = 4096
 max_pixels = 100000000
 
 [[services.ocr-vl.models]]
-id = "PaddlePaddle/PaddleOCR-VL-1.5"
+id = "paddlepaddle/paddleocr-vl-1.5"
+name = "PaddleOCR-VL 1.5"
 model = "//PaddlePaddle/PaddleOCR-VL-1.5"
 layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
 
 [services.llm]
 enabled = true
-default_model = "qwen/Qwen3.5-0.8B-Q4_K_M"
+default_model = "alibaba/qwen3.5-0.8b"
 idle_timeout = "10m"
 max_loaded = 1
 
 [[services.llm.models]]
-id = "qwen/Qwen3.5-0.8B-Q4_K_M"
-name = "Qwen3.5 0.8B Q4_K_M"
+id = "alibaba/qwen3.5-0.8b"
+name = "Qwen3.5 0.8B"
 model = "//unsloth/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf"
 mmproj_model = "//unsloth/Qwen3.5-0.8B-GGUF/mmproj-BF16.gguf"
 runtime = { context_size = "model", gpu_layers = "all", parallel_sequences = 1, batch_size = 512, micro_batch_size = 512, threads = 0, request_queue_capacity = 8, event_queue_capacity = 16, queue_timeout = "30s", generation_timeout = "5m" }
@@ -140,7 +150,7 @@ chat_template = { engine = "jinja", enable_thinking = false }
 generation = { max_tokens = 32768, temperature = 1.0, top_p = 0.95, top_k = 20, min_p = 0.0, presence_penalty = 0.0, frequency_penalty = 0.0, repeat_penalty = 1.0 }
 
 [[services.ocr-vl.models]]
-id = "PaddlePaddle/PaddleOCR-VL-1.6"
+id = "paddlepaddle/paddleocr-vl-1.6"
 name = "PaddleOCR-VL 1.6"
 model = "//PaddlePaddle/PaddleOCR-VL-1.6"
 layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"

@@ -382,8 +382,10 @@ mod tests {
 
     #[test]
     fn start_message_round_trips_all_wire_fields() {
-        let mut message =
-            AsrStreamStartMessage::new("Qwen/Qwen3-ASR-Flash", AsrStreamInputAudioFormat::PcmS16Le);
+        let mut message = AsrStreamStartMessage::new(
+            "alibaba/qwen3-asr-flash",
+            AsrStreamInputAudioFormat::PcmS16Le,
+        );
         message.mode = Some(AsrStreamMode::Caption.as_str().to_string());
         message.language = Some("zh".to_string());
         message.prompt = Some("context".to_string());

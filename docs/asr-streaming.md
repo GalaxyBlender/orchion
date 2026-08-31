@@ -19,7 +19,7 @@ Start message:
 ```json
 {
   "type": "start",
-  "model": "Qwen/Qwen3-ASR-Flash",
+  "model": "alibaba/qwen3-asr-flash",
   "input_audio_format": "pcm_s16le",
   "sample_rate": 16000
 }
@@ -44,7 +44,7 @@ For `pcm_s16le` in caption mode, `sample_rate` is required and must be `16000`.
 {
   "type": "start",
   "mode": "caption",
-  "model": "Qwen/Qwen3-ASR-Flash",
+  "model": "alibaba/qwen3-asr-flash",
   "input_audio_format": "pcm_s16le",
   "sample_rate": 16000
 }
@@ -58,7 +58,7 @@ Endpointing values are milliseconds. `min_speech_ms + speech_padding_ms` must be
 {
   "type": "start",
   "mode": "caption",
-  "model": "Qwen/Qwen3-ASR-Flash",
+  "model": "alibaba/qwen3-asr-flash",
   "input_audio_format": "pcm_s16le",
   "sample_rate": 16000,
   "endpointing": {

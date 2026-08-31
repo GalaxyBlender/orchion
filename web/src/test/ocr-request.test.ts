@@ -7,7 +7,7 @@ mock.module("@/shared/api/client", () => ({
 
 const input: OcrRequestInput = {
   file: new File(["image"], "document.png", { type: "image/png" }),
-  model: "PaddlePaddle/PP-OCRv6_tiny",
+  model: "paddlepaddle/pp-ocrv6-tiny",
   responseFormat: "markdown",
   task: "ocr",
   maxTokens: "",
@@ -18,7 +18,7 @@ describe("OCR request contract", () => {
     const { buildOcrCurl, buildOcrFormData } = await import("../features/ocr/request");
     const form = buildOcrFormData(input);
 
-    expect(form.get("model")).toBe("PaddlePaddle/PP-OCRv6_tiny");
+    expect(form.get("model")).toBe("paddlepaddle/pp-ocrv6-tiny");
     expect(form.get("response_format")).toBe("markdown");
     expect(form.has("layout_model")).toBe(false);
     expect(buildOcrCurl({ serverBaseUrl: "", apiKey: "" }, input)).not.toContain("layout_model");

@@ -68,6 +68,10 @@ impl ModelSpec for TtsModel {
         ModelCategory::Tts
     }
 
+    fn model_id(&self) -> &str {
+        self.as_str()
+    }
+
     fn huggingface_repo(&self) -> &str {
         self.descriptor().map_or(self.as_str(), |descriptor| {
             descriptor.source_locators.hugging_face
@@ -95,7 +99,7 @@ mod tests {
 
     #[test]
     fn parses_tts_model_names_and_repositories() {
-        let model = TtsModel::from_str("Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign").unwrap();
+        let model = TtsModel::from_str("alibaba/qwen3-tts-12hz-1.7b-voicedesign").unwrap();
 
         assert_eq!(
             model.huggingface_repo(),
@@ -136,16 +140,16 @@ mod tests {
     #[test]
     fn tts_models_expose_stable_metadata() {
         assert_eq!(
-            TtsModel::parse("Qwen/Qwen3-TTS-12Hz-0.6B-Base")
+            TtsModel::parse("alibaba/qwen3-tts-12hz-0.6b-base")
                 .unwrap()
                 .category(),
             ModelCategory::Tts
         );
-        let voice_design = TtsModel::parse("Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign").unwrap();
+        let voice_design = TtsModel::parse("alibaba/qwen3-tts-12hz-1.7b-voicedesign").unwrap();
         assert!(voice_design.supports_voice_design());
         assert!(!voice_design.supports_preset_speakers());
 
-        let base = TtsModel::parse("Qwen/Qwen3-TTS-12Hz-1.7B-Base").unwrap();
+        let base = TtsModel::parse("alibaba/qwen3-tts-12hz-1.7b-base").unwrap();
         assert!(base.supports_voice_cloning());
     }
 }

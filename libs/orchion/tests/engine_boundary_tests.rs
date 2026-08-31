@@ -15,7 +15,7 @@ struct TestAsrEngine {
 
 impl AsrEngine for TestAsrEngine {
     fn model(&self) -> AsrModel {
-        AsrModel::parse("Qwen/Qwen3-ASR-0.6B").unwrap()
+        AsrModel::parse("alibaba/qwen3-asr-0.6b").unwrap()
     }
 
     fn transcribe_file_with(
@@ -73,7 +73,7 @@ struct TestTtsEngine {
 
 impl TtsEngine for TestTtsEngine {
     fn model(&self) -> TtsModel {
-        TtsModel::parse("Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice").unwrap()
+        TtsModel::parse("alibaba/qwen3-tts-12hz-0.6b-customvoice").unwrap()
     }
 
     fn synthesize_with(
@@ -105,7 +105,7 @@ async fn asr_facade_dispatches_through_a_provider_neutral_engine_and_stream() ->
         calls: Arc::clone(&calls),
     }));
 
-    assert_eq!(asr.model().as_str(), "Qwen/Qwen3-ASR-0.6B");
+    assert_eq!(asr.model().as_str(), "alibaba/qwen3-asr-0.6b");
     assert_eq!(
         asr.transcribe_samples(&[0.0, 0.5], 16_000).await?.text,
         "2@16000"
@@ -132,7 +132,10 @@ async fn tts_facade_dispatches_through_a_provider_neutral_engine() -> Result<()>
         language: TtsLanguage::English,
     };
 
-    assert_eq!(tts.model().as_str(), "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice");
+    assert_eq!(
+        tts.model().as_str(),
+        "alibaba/qwen3-tts-12hz-0.6b-customvoice"
+    );
     assert_eq!(tts.synthesize("hello", voice).await?.samples, [5.0]);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_send_sync(tts);

@@ -9,7 +9,7 @@ describe("ASR batch request contract", () => {
   test("omits parameters that the batch runtime does not support", async () => {
     const { buildAsrFormData } = await import("../features/asr/request");
     const input: AsrRequestInput = {
-      model: "Qwen/Qwen3-ASR-0.6B",
+      model: "alibaba/qwen3-asr-0.6b",
       file: new File(["audio"], "audio.wav"),
       language: "English",
       responseFormat: "json",

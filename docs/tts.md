@@ -10,7 +10,7 @@ Orchion exposes speech synthesis through `POST /v1/audio/speech`.
 curl http://127.0.0.1:9090/v1/audio/speech \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+    "model": "alibaba/qwen3-tts-12hz-0.6b-customvoice",
     "input": "Hello from Orchion.",
     "voice": "ryan",
     "seed": 42,
@@ -23,7 +23,7 @@ curl http://127.0.0.1:9090/v1/audio/speech \
 
 ```sh
 curl http://127.0.0.1:9090/v1/audio/speech \
-  -F model=Qwen/Qwen3-TTS-12Hz-0.6B-Base \
+  -F model=alibaba/qwen3-tts-12hz-0.6b-base \
   -F input='Read this with the reference voice.' \
   -F voice=clone \
   -F reference_audio=@reference.wav \
@@ -39,7 +39,7 @@ curl http://127.0.0.1:9090/v1/audio/speech \
 curl http://127.0.0.1:9090/v1/audio/speech \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+    "model": "alibaba/qwen3-tts-12hz-1.7b-voicedesign",
     "input": "Read this with a designed voice.",
     "voice": "design",
     "voice_prompt": "A calm narrator with a warm studio tone.",

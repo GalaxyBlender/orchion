@@ -11,7 +11,7 @@ import {
 import type { AsrFormState } from "../features/asr/types";
 
 const baseForm: AsrFormState = {
-  model: "Qwen/Qwen3-ASR-0.6B",
+  model: "alibaba/qwen3-asr-0.6b",
   language: "",
   responseFormat: "json",
   prompt: "",
@@ -46,7 +46,7 @@ describe("ASR streaming protocol helpers", () => {
 
     expect(captionStart).toMatchObject({
       type: "start",
-      model: "Qwen/Qwen3-ASR-0.6B",
+      model: "alibaba/qwen3-asr-0.6b",
       input_audio_format: "mp3",
       mode: "caption",
       endpointing: {

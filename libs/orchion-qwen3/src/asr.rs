@@ -324,7 +324,7 @@ mod tests {
     #[test]
     fn exposes_explicit_device_loader_api() {
         let future = Asr::load_with_device(
-            AsrModel::parse("Qwen/Qwen3-ASR-0.6B").unwrap(),
+            AsrModel::parse("alibaba/qwen3-asr-0.6b").unwrap(),
             "models/qwen3-asr-0.6b",
             orchion_core::DevicePreference::Cpu,
         );

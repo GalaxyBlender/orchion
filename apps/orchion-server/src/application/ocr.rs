@@ -292,25 +292,25 @@ mod tests {
     use super::*;
 
     fn traditional_model() -> ModelId {
-        ModelId::parse("PaddlePaddle/PP-OCRv6_tiny").unwrap()
+        ModelId::parse("paddlepaddle/pp-ocrv6-tiny").unwrap()
     }
 
     fn ocr_vl_model() -> ModelId {
-        ModelId::parse("PaddlePaddle/PaddleOCR-VL-1.6").unwrap()
+        ModelId::parse("paddlepaddle/paddleocr-vl-1.6").unwrap()
     }
 
     fn policy() -> OcrPolicy {
         OcrPolicy {
             ocr: OcrServicePolicy {
                 active: true,
-                models: vec![ModelId::parse("PaddlePaddle/PP-OCRv6_tiny").unwrap()],
+                models: vec![ModelId::parse("paddlepaddle/pp-ocrv6-tiny").unwrap()],
                 model_layouts: Vec::new(),
                 format: OcrResponseFormat::Json,
                 max_pixels: 1_000,
             },
             ocr_vl: OcrVlServicePolicy {
                 active: true,
-                models: vec![ModelId::parse("PaddlePaddle/PaddleOCR-VL-1.6").unwrap()],
+                models: vec![ModelId::parse("paddlepaddle/paddleocr-vl-1.6").unwrap()],
                 model_layouts: Vec::new(),
                 format: OcrResponseFormat::Markdown,
                 max_tokens: 64,
@@ -425,7 +425,7 @@ mod tests {
     #[test]
     fn layout_configuration_is_scoped_to_the_selected_deployment() {
         let layout = ModelId::parse("PaddlePaddle/PP-DocLayoutV3").unwrap();
-        let other = ModelId::parse("PaddlePaddle/PP-OCRv6_small").unwrap();
+        let other = ModelId::parse("paddlepaddle/pp-ocrv6-small").unwrap();
         let mut policy = policy();
         policy.ocr.models.push(other.clone());
         policy.ocr.model_layouts = vec![(traditional_model(), layout.clone())];
@@ -482,7 +482,7 @@ mod tests {
 
         let mut only_vl = policy();
         only_vl.ocr.active = false;
-        let error = resolve_service_choice(&only_vl, "PaddlePaddle/PP-OCRv6_tiny").unwrap_err();
+        let error = resolve_service_choice(&only_vl, "paddlepaddle/pp-ocrv6-tiny").unwrap_err();
         assert!(matches!(error, UseCaseError::ModelNotAvailable(_)));
     }
 }

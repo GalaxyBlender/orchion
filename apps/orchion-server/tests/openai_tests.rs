@@ -28,7 +28,7 @@ fn error_response_uses_openai_shape() {
 #[test]
 fn speech_preset_voice_maps_to_tts_voice() {
     let request = SpeechRequest {
-        model: "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice".to_string(),
+        model: "alibaba/qwen3-tts-12hz-0.6b-customvoice".to_string(),
         input: "Hello".to_string(),
         voice: "ryan".to_string(),
         response_format: Some(SpeechFormat::Wav),
@@ -57,7 +57,7 @@ fn speech_preset_voice_maps_to_tts_voice() {
 #[test]
 fn speech_omitted_language_maps_to_auto_tts_voice() {
     let request = SpeechRequest {
-        model: "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice".to_string(),
+        model: "alibaba/qwen3-tts-12hz-0.6b-customvoice".to_string(),
         input: "Hello".to_string(),
         voice: "ryan".to_string(),
         response_format: Some(SpeechFormat::Wav),
@@ -86,7 +86,7 @@ fn speech_omitted_language_maps_to_auto_tts_voice() {
 #[test]
 fn speech_auto_language_maps_to_auto_tts_voice() {
     let request = SpeechRequest {
-        model: "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice".to_string(),
+        model: "alibaba/qwen3-tts-12hz-0.6b-customvoice".to_string(),
         input: "Hello".to_string(),
         voice: "ryan".to_string(),
         response_format: Some(SpeechFormat::Wav),
@@ -115,7 +115,7 @@ fn speech_auto_language_maps_to_auto_tts_voice() {
 #[test]
 fn speech_clone_voice_requires_reference_audio() {
     let request = SpeechRequest {
-        model: "Qwen/Qwen3-TTS-12Hz-0.6B-Base".to_string(),
+        model: "alibaba/qwen3-tts-12hz-0.6b-base".to_string(),
         input: "Hello".to_string(),
         voice: "clone".to_string(),
         response_format: Some(SpeechFormat::Wav),
@@ -140,7 +140,7 @@ fn speech_clone_voice_requires_reference_audio() {
 #[test]
 fn speech_design_voice_maps_prompt() {
     let request = SpeechRequest {
-        model: "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign".to_string(),
+        model: "alibaba/qwen3-tts-12hz-1.7b-voicedesign".to_string(),
         input: "Hello".to_string(),
         voice: "design".to_string(),
         response_format: Some(SpeechFormat::Wav),
@@ -169,7 +169,7 @@ fn speech_design_voice_maps_prompt() {
 #[test]
 fn speech_options_default_to_seed_42_and_upstream_sampling_defaults() {
     let request = SpeechRequest {
-        model: "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice".to_string(),
+        model: "alibaba/qwen3-tts-12hz-0.6b-customvoice".to_string(),
         input: "Hello".to_string(),
         voice: "ryan".to_string(),
         response_format: Some(SpeechFormat::Wav),
@@ -203,7 +203,7 @@ fn speech_options_default_to_seed_42_and_upstream_sampling_defaults() {
 #[test]
 fn speech_options_accept_qwen3_tts_sampling_overrides() {
     let request = SpeechRequest {
-        model: "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice".to_string(),
+        model: "alibaba/qwen3-tts-12hz-1.7b-customvoice".to_string(),
         input: "Hello".to_string(),
         voice: "ryan".to_string(),
         response_format: Some(SpeechFormat::Wav),
@@ -233,7 +233,7 @@ fn speech_options_accept_qwen3_tts_sampling_overrides() {
 #[test]
 fn speech_options_reject_invalid_sampling_values() {
     let mut request = SpeechRequest {
-        model: "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice".to_string(),
+        model: "alibaba/qwen3-tts-12hz-0.6b-customvoice".to_string(),
         input: "Hello".to_string(),
         voice: "ryan".to_string(),
         response_format: Some(SpeechFormat::Wav),
@@ -277,7 +277,7 @@ fn speech_options_reject_invalid_sampling_values() {
 #[test]
 fn speech_options_reject_non_finite_values() {
     let mut request = SpeechRequest {
-        model: "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice".to_string(),
+        model: "alibaba/qwen3-tts-12hz-0.6b-customvoice".to_string(),
         input: "Hello".to_string(),
         voice: "ryan".to_string(),
         response_format: Some(SpeechFormat::Wav),

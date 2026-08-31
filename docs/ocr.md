@@ -11,7 +11,7 @@ Server `default_model` selects one `[[services.ocr.models]]` or `[[services.ocr-
 ```sh
 curl -X POST http://127.0.0.1:9090/v1/ocr \
   -F file=@document.png \
-  -F model=PaddlePaddle/PP-OCRv6_tiny \
+  -F model=paddlepaddle/pp-ocrv6-tiny \
   -F response_format=json
 ```
 
@@ -22,7 +22,7 @@ Traditional OCR always supports JSON and plain text. A deployment with a configu
 ```sh
 curl -X POST http://127.0.0.1:9090/v1/ocr \
   -F file=@document.png \
-  -F model=PaddlePaddle/PaddleOCR-VL-1.6 \
+  -F model=paddlepaddle/paddleocr-vl-1.6 \
   -F response_format=markdown
 ```
 

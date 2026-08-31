@@ -3,7 +3,7 @@ import { normalizeOcrFormForCapabilities, ocrStateToForm } from "../features/ocr
 import type { OcrFormState } from "../features/ocr/types";
 
 const form: OcrFormState = {
-  model: "PaddlePaddle/PP-OCRv5_mobile",
+  model: "paddlepaddle/pp-ocrv5-mobile",
   responseFormat: "json",
   task: "table",
   maxTokens: "2048",

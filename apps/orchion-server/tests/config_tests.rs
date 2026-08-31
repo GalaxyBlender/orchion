@@ -32,7 +32,7 @@ fn defaults_are_executable_relative_and_use_neutral_deployments() {
     assert_eq!(config.services.asr.models.len(), 1);
     assert_eq!(
         config.services.asr.models[0].id.as_str(),
-        "Qwen/Qwen3-ASR-0.6B"
+        "alibaba/qwen3-asr-0.6b"
     );
     assert_eq!(
         config.services.asr.models[0].model.source(),
@@ -40,7 +40,7 @@ fn defaults_are_executable_relative_and_use_neutral_deployments() {
     );
     assert_eq!(
         config.services.tts.models[0].id.as_str(),
-        "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+        "alibaba/qwen3-tts-12hz-0.6b-customvoice"
     );
     assert!(config.services.ocr.models.is_empty());
     assert!(config.services.ocr_vl.models.is_empty());
@@ -53,11 +53,11 @@ fn deployment_arrays_parse_and_replace_defaults() {
     let config = ServerConfig::from_toml_str(
         r#"
 [services.asr]
-default_model = "Qwen/Qwen3-ASR-1.7B"
+default_model = "alibaba/qwen3-asr-1.7b"
 
 [[services.asr.models]]
-id = "Qwen/Qwen3-ASR-1.7B"
-name = "  Qwen3 ASR 1.7B  "
+id = "alibaba/qwen3-asr-1.7b"
+name = "  Qwen3-ASR 1.7B  "
 model = "ms://Qwen/Qwen3-ASR-1.7B"
 "#,
         exe(),
@@ -66,10 +66,10 @@ model = "ms://Qwen/Qwen3-ASR-1.7B"
 
     assert_eq!(config.services.asr.models.len(), 1);
     let deployment = &config.services.asr.models[0];
-    assert_eq!(deployment.id.as_str(), "Qwen/Qwen3-ASR-1.7B");
+    assert_eq!(deployment.id.as_str(), "alibaba/qwen3-asr-1.7b");
     assert_eq!(deployment.runtime.as_str(), deployment.id.as_str());
-    assert_eq!(deployment.name.as_deref(), Some("Qwen3 ASR 1.7B"));
-    assert_eq!(deployment.display_name(), "Qwen3 ASR 1.7B");
+    assert_eq!(deployment.name.as_deref(), Some("Qwen3-ASR 1.7B"));
+    assert_eq!(deployment.display_name(), "Qwen3-ASR 1.7B");
     assert_eq!(deployment.model.as_str(), "ms://Qwen/Qwen3-ASR-1.7B");
     assert_eq!(deployment.model.source(), ModelUrlSource::ModelScope);
 }
@@ -79,7 +79,7 @@ fn omitted_name_falls_back_to_model_id_name_segment() {
     let config = ServerConfig::from_toml_str(
         r#"
 [[services.tts.models]]
-id = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+id = "alibaba/qwen3-tts-12hz-0.6b-customvoice"
 model = "//Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
 "#,
         exe(),
@@ -88,7 +88,7 @@ model = "//Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
 
     assert_eq!(
         config.services.tts.models[0].display_name(),
-        "Qwen3-TTS-12Hz-0.6B-CustomVoice"
+        "qwen3-tts-12hz-0.6b-customvoice"
     );
 }
 
@@ -97,7 +97,7 @@ fn blank_names_are_rejected() {
     let error = ServerConfig::from_toml_str(
         r#"
 [[services.asr.models]]
-id = "Qwen/Qwen3-ASR-0.6B"
+id = "alibaba/qwen3-asr-0.6b"
 name = "   "
 model = "//Qwen/Qwen3-ASR-0.6B"
 "#,
@@ -126,10 +126,10 @@ fn defaults_must_match_exactly_one_local_deployment_even_when_disabled() {
         r#"
 [services.asr]
 enabled = false
-default_model = "Qwen/Qwen3-ASR-1.7B"
+default_model = "alibaba/qwen3-asr-1.7b"
 
 [[services.asr.models]]
-id = "Qwen/Qwen3-ASR-0.6B"
+id = "alibaba/qwen3-asr-0.6b"
 model = "//Qwen/Qwen3-ASR-0.6B"
 "#,
         exe(),
@@ -145,11 +145,11 @@ fn model_ids_are_globally_unique_including_disabled_services() {
     let error = ServerConfig::from_toml_str(
         r#"
 [[services.asr.models]]
-id = "Qwen/Qwen3-ASR-0.6B"
+id = "alibaba/qwen3-asr-0.6b"
 model = "//Qwen/Qwen3-ASR-0.6B"
 
 [[services.tts.models]]
-id = "Qwen/Qwen3-ASR-0.6B"
+id = "alibaba/qwen3-asr-0.6b"
 model = "//Qwen/Qwen3-ASR-0.6B"
 "#,
         exe(),
@@ -161,11 +161,11 @@ model = "//Qwen/Qwen3-ASR-0.6B"
     let error = ServerConfig::from_toml_str(
         r#"
 [[services.ocr.models]]
-id = "PaddlePaddle/PP-OCRv6_tiny"
+id = "paddlepaddle/pp-ocrv6-tiny"
 model = "//PaddlePaddle/PP-OCRv6_tiny"
 
 [[services.ocr-vl.models]]
-id = "PaddlePaddle/PP-OCRv6_tiny"
+id = "paddlepaddle/pp-ocrv6-tiny"
 model = "//PaddlePaddle/PP-OCRv6_tiny"
 "#,
         exe(),
@@ -182,10 +182,10 @@ fn duplicate_ids_within_one_disabled_service_are_rejected() {
 enabled = false
 
 [[services.ocr.models]]
-id = "PaddlePaddle/PP-OCRv6_tiny"
+id = "paddlepaddle/pp-ocrv6-tiny"
 model = "//PaddlePaddle/PP-OCRv6_tiny"
 [[services.ocr.models]]
-id = "PaddlePaddle/PP-OCRv6_tiny"
+id = "paddlepaddle/pp-ocrv6-tiny"
 model = "hf://PaddlePaddle/PP-OCRv6_tiny"
 "#,
         exe(),
@@ -200,9 +200,9 @@ fn configured_ids_must_match_the_service_runtime_category() {
     let error = ServerConfig::from_toml_str(
         r#"
 [services.asr]
-default_model = "PaddlePaddle/PaddleOCR-VL-1.6"
+default_model = "paddlepaddle/paddleocr-vl-1.6"
 [[services.asr.models]]
-id = "PaddlePaddle/PaddleOCR-VL-1.6"
+id = "paddlepaddle/paddleocr-vl-1.6"
 model = "//PaddlePaddle/PaddleOCR-VL-1.6"
 "#,
         exe(),
@@ -213,7 +213,7 @@ model = "//PaddlePaddle/PaddleOCR-VL-1.6"
     let error = ServerConfig::from_toml_str(
         r#"
 [[services.ocr.models]]
-id = "PaddlePaddle/PaddleOCR-VL-1.6"
+id = "paddlepaddle/paddleocr-vl-1.6"
 model = "//PaddlePaddle/PaddleOCR-VL-1.6"
 "#,
         exe(),
@@ -257,7 +257,7 @@ fn repository_runtime_rejects_exact_file_model_locator() {
     let error = ServerConfig::from_toml_str(
         r#"
 [[services.asr.models]]
-id = "Qwen/Qwen3-ASR-0.6B"
+id = "alibaba/qwen3-asr-0.6b"
 model = "//Qwen/Qwen3-ASR-0.6B/model.safetensors"
 "#,
         exe(),
@@ -273,10 +273,10 @@ fn ocr_deployment_accepts_supported_layout_recipe_and_projects_runtime_id() {
         r#"
 [services.ocr]
 enabled = true
-default_model = "PaddlePaddle/PP-OCRv6_tiny"
+default_model = "paddlepaddle/pp-ocrv6-tiny"
 
 [[services.ocr.models]]
-id = "PaddlePaddle/PP-OCRv6_tiny"
+id = "paddlepaddle/pp-ocrv6-tiny"
 model = "hf://PaddlePaddle/PP-OCRv6_tiny"
 layout_model = "ms://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
 "#,
@@ -311,7 +311,7 @@ fn unsupported_layout_recipe_is_rejected() {
     let error = ServerConfig::from_toml_str(
         r#"
 [[services.ocr-vl.models]]
-id = "PaddlePaddle/PaddleOCR-VL-1.6"
+id = "paddlepaddle/paddleocr-vl-1.6"
 model = "//PaddlePaddle/PaddleOCR-VL-1.6"
 layout_model = "//Acme/Layout/model.onnx"
 "#,
@@ -326,7 +326,7 @@ fn local_layout_artifact_uses_the_supported_layout_runtime_recipe() {
     let config = ServerConfig::from_toml_str(
         r#"
 [[services.ocr-vl.models]]
-id = "PaddlePaddle/PaddleOCR-VL-1.6"
+id = "paddlepaddle/paddleocr-vl-1.6"
 model = "//PaddlePaddle/PaddleOCR-VL-1.6"
 layout_model = "file:///tmp/layout.onnx"
 "#,
@@ -351,15 +351,15 @@ fn separate_ocr_deployments_accept_distinct_layout_locators() {
         r#"
 [services.ocr]
 enabled = true
-default_model = "PaddlePaddle/PP-OCRv6_tiny"
+default_model = "paddlepaddle/pp-ocrv6-tiny"
 
 [[services.ocr.models]]
-id = "PaddlePaddle/PP-OCRv6_tiny"
+id = "paddlepaddle/pp-ocrv6-tiny"
 model = "//PaddlePaddle/PP-OCRv6_tiny"
 layout_model = "hf://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
 
 [[services.ocr.models]]
-id = "PaddlePaddle/PP-OCRv6_small"
+id = "paddlepaddle/pp-ocrv6-small"
 model = "//PaddlePaddle/PP-OCRv6_small"
 layout_model = "ms://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
 "#,
@@ -390,7 +390,7 @@ fn layout_model_is_rejected_for_speech_deployments() {
     let error = ServerConfig::from_toml_str(
         r#"
 [[services.asr.models]]
-id = "Qwen/Qwen3-ASR-0.6B"
+id = "alibaba/qwen3-asr-0.6b"
 model = "//Qwen/Qwen3-ASR-0.6B"
 layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
 "#,
@@ -405,7 +405,7 @@ fn table_config(extra: &str) -> String {
     format!(
         r#"
 [[services.ocr.models]]
-id = "PaddlePaddle/PP-OCRv6_tiny"
+id = "paddlepaddle/pp-ocrv6-tiny"
 model = "//PaddlePaddle/PP-OCRv6_tiny"
 layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
 table_structure = {{ model = "//Acme/Table/table.onnx", dictionary = "//Acme/Table/table_dict.txt", table_type = "wired"{extra} }}
@@ -505,8 +505,12 @@ fn ocr_vl_rejects_table_structure() {
     let document = table_config("")
         .replace("services.ocr.models", "services.ocr-vl.models")
         .replace(
-            "PaddlePaddle/PP-OCRv6_tiny",
-            "PaddlePaddle/PaddleOCR-VL-1.6",
+            "paddlepaddle/pp-ocrv6-tiny",
+            "paddlepaddle/paddleocr-vl-1.6",
+        )
+        .replace(
+            "//PaddlePaddle/PP-OCRv6_tiny",
+            "//PaddlePaddle/PaddleOCR-VL-1.6",
         );
     let error = ServerConfig::from_toml_str(&document, exe()).unwrap_err();
     assert!(matches!(
@@ -603,7 +607,7 @@ fn model_url_validation_runs_during_toml_deserialization() {
     let error = ServerConfig::from_toml_str(
         r#"
 [[services.asr.models]]
-id = "Qwen/Qwen3-ASR-0.6B"
+id = "alibaba/qwen3-asr-0.6b"
 model = "https://huggingface.co/Qwen/Qwen3-ASR-0.6B"
 "#,
         exe(),
@@ -649,7 +653,7 @@ max_length = 1024
 }
 
 #[test]
-fn shipped_config_uses_the_new_contract() {
+fn shipped_config_uses_canonical_public_identity_and_preserves_artifact_locators() {
     let document = include_str!("../config.toml");
     let config = ServerConfig::from_toml_str(document, exe()).unwrap();
 
@@ -659,6 +663,90 @@ fn shipped_config_uses_the_new_contract() {
     assert_eq!(config.services.ocr.models.len(), 5);
     assert_eq!(config.services.ocr_vl.models.len(), 2);
     assert_eq!(config.services.ocr.layout_ids().len(), 1);
+    assert_eq!(
+        config
+            .services
+            .asr
+            .models
+            .iter()
+            .map(|model| (model.id.as_str(), model.display_name()))
+            .collect::<Vec<_>>(),
+        [
+            ("alibaba/qwen3-asr-0.6b", "Qwen3-ASR 0.6B"),
+            ("alibaba/qwen3-asr-1.7b", "Qwen3-ASR 1.7B"),
+        ]
+    );
+    assert_eq!(
+        config
+            .services
+            .tts
+            .models
+            .iter()
+            .map(|model| (model.id.as_str(), model.display_name()))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "alibaba/qwen3-tts-12hz-0.6b-base",
+                "Qwen3-TTS 12Hz 0.6B Base"
+            ),
+            (
+                "alibaba/qwen3-tts-12hz-0.6b-customvoice",
+                "Qwen3-TTS 12Hz 0.6B CustomVoice",
+            ),
+            (
+                "alibaba/qwen3-tts-12hz-1.7b-base",
+                "Qwen3-TTS 12Hz 1.7B Base"
+            ),
+            (
+                "alibaba/qwen3-tts-12hz-1.7b-customvoice",
+                "Qwen3-TTS 12Hz 1.7B CustomVoice",
+            ),
+            (
+                "alibaba/qwen3-tts-12hz-1.7b-voicedesign",
+                "Qwen3-TTS 12Hz 1.7B VoiceDesign",
+            ),
+        ]
+    );
+    assert_eq!(
+        config
+            .services
+            .ocr
+            .models
+            .iter()
+            .map(|model| (model.id.as_str(), model.display_name()))
+            .collect::<Vec<_>>(),
+        [
+            ("paddlepaddle/pp-ocrv5-mobile", "PP-OCRv5 Mobile"),
+            ("paddlepaddle/pp-ocrv5-server", "PP-OCRv5 Server"),
+            ("paddlepaddle/pp-ocrv6-tiny", "PP-OCRv6 Tiny"),
+            ("paddlepaddle/pp-ocrv6-small", "PP-OCRv6 Small"),
+            ("paddlepaddle/pp-ocrv6-medium", "PP-OCRv6 Medium"),
+        ]
+    );
+    assert_eq!(
+        config
+            .services
+            .ocr_vl
+            .models
+            .iter()
+            .map(|model| (model.id.as_str(), model.display_name()))
+            .collect::<Vec<_>>(),
+        [
+            ("paddlepaddle/paddleocr-vl-1.5", "PaddleOCR-VL 1.5"),
+            ("paddlepaddle/paddleocr-vl-1.6", "PaddleOCR-VL 1.6"),
+        ]
+    );
+    let llm = &config.services.llm.models[0];
+    assert_eq!(llm.id.as_str(), "alibaba/qwen3.5-0.8b");
+    assert_eq!(llm.name.as_deref(), Some("Qwen3.5 0.8B"));
+    assert_eq!(
+        llm.model.as_str(),
+        "//unsloth/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf"
+    );
+    assert_eq!(
+        llm.mmproj_model.as_ref().map(ModelUrl::as_str),
+        Some("//unsloth/Qwen3.5-0.8B-GGUF/mmproj-BF16.gguf")
+    );
 }
 
 #[test]

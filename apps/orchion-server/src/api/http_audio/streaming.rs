@@ -435,7 +435,7 @@ mod tests {
         let start = parse_transcription_stream_start(
             r#"{
                 "type":"start",
-                "model":"Qwen/Qwen3-ASR-Flash",
+                "model":"alibaba/qwen3-asr-flash",
                 "language":"zh",
                 "prompt":"previous context",
                 "api_key":"secret-key",
@@ -445,7 +445,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(start.model, "Qwen/Qwen3-ASR-Flash");
+        assert_eq!(start.model, "alibaba/qwen3-asr-flash");
         assert_eq!(start.language.as_deref(), Some("zh"));
         assert_eq!(start.prompt.as_deref(), Some("previous context"));
         assert_eq!(start.api_key.as_deref(), Some("secret-key"));
@@ -459,7 +459,7 @@ mod tests {
         let start = parse_transcription_stream_start(
             r#"{
                 "type":"start",
-                "model":"Qwen/Qwen3-ASR-Flash",
+                "model":"alibaba/qwen3-asr-flash",
                 "input_audio_format":"wav"
             }"#,
         )
@@ -474,7 +474,7 @@ mod tests {
         let start = parse_transcription_stream_start(
             r#"{
                 "type":"start",
-                "model":"Qwen/Qwen3-ASR-Flash",
+                "model":"alibaba/qwen3-asr-flash",
                 "input_audio_format":"auto"
             }"#,
         )
@@ -496,7 +496,7 @@ mod tests {
 
         for (format, expected) in cases {
             let start = parse_transcription_stream_start(&format!(
-                r#"{{"type":"start","model":"Qwen/Qwen3-ASR-Flash","input_audio_format":"{format}"}}"#
+                r#"{{"type":"start","model":"alibaba/qwen3-asr-flash","input_audio_format":"{format}"}}"#
             ))
             .unwrap();
 
@@ -510,7 +510,7 @@ mod tests {
         let start = parse_transcription_stream_start(
             r#"{
                 "type":"start",
-                "model":"Qwen/Qwen3-ASR-Flash",
+                "model":"alibaba/qwen3-asr-flash",
                 "input_audio_format":"mp3"
             }"#,
         )
@@ -526,7 +526,7 @@ mod tests {
             r#"{
                 "type":"start",
                 "mode":"caption",
-                "model":"Qwen/Qwen3-ASR-Flash",
+                "model":"alibaba/qwen3-asr-flash",
                 "input_audio_format":"pcm_s16le",
                 "sample_rate":16000
             }"#,
@@ -551,7 +551,7 @@ mod tests {
             r#"{
                 "type":"start",
                 "mode":"caption",
-                "model":"Qwen/Qwen3-ASR-Flash",
+                "model":"alibaba/qwen3-asr-flash",
                 "input_audio_format":"pcm_s16le",
                 "sample_rate":16000,
                 "endpointing":{
@@ -576,7 +576,7 @@ mod tests {
             r#"{
                 "type":"start",
                 "mode":"caption",
-                "model":"Qwen/Qwen3-ASR-Flash",
+                "model":"alibaba/qwen3-asr-flash",
                 "input_audio_format":"pcm_s16le",
                 "sample_rate":48000
             }"#,
@@ -593,7 +593,7 @@ mod tests {
             r#"{
                 "type":"start",
                 "mode":"caption",
-                "model":"Qwen/Qwen3-ASR-Flash",
+                "model":"alibaba/qwen3-asr-flash",
                 "input_audio_format":"pcm_s16le",
                 "sample_rate":16000,
                 "chunk_size_sec":0.0
@@ -614,7 +614,7 @@ mod tests {
             r#"{
                 "type":"start",
                 "mode":"caption",
-                "model":"Qwen/Qwen3-ASR-Flash",
+                "model":"alibaba/qwen3-asr-flash",
                 "input_audio_format":"pcm_s16le",
                 "sample_rate":16000,
                 "max_new_tokens_streaming":0
@@ -638,7 +638,7 @@ mod tests {
             r#"{
                 "type":"start",
                 "mode":"caption",
-                "model":"Qwen/Qwen3-ASR-Flash",
+                "model":"alibaba/qwen3-asr-flash",
                 "input_audio_format":"pcm_s16le",
                 "sample_rate":16000,
                 "max_new_tokens_final":0
@@ -659,7 +659,7 @@ mod tests {
             r#"{
                 "type":"start",
                 "mode":"sentence",
-                "model":"Qwen/Qwen3-ASR-Flash",
+                "model":"alibaba/qwen3-asr-flash",
                 "input_audio_format":"mp3"
             }"#,
         )
@@ -674,7 +674,7 @@ mod tests {
         let error = parse_transcription_stream_start(
             r#"{
                 "type":"start",
-                "model":"Qwen/Qwen3-ASR-Flash",
+                "model":"alibaba/qwen3-asr-flash",
                 "input_audio_format":"mp3",
                 "endpointing":{"min_silence_ms":700}
             }"#,
@@ -694,7 +694,7 @@ mod tests {
             r#"{
                 "type":"start",
                 "mode":"caption",
-                "model":"Qwen/Qwen3-ASR-Flash",
+                "model":"alibaba/qwen3-asr-flash",
                 "input_audio_format":"pcm_s16le",
                 "sample_rate":16000,
                 "endpointing":{"min_speech_ms":0}
@@ -715,7 +715,7 @@ mod tests {
             r#"{
                 "type":"start",
                 "mode":"caption",
-                "model":"Qwen/Qwen3-ASR-Flash",
+                "model":"alibaba/qwen3-asr-flash",
                 "input_audio_format":"pcm_s16le",
                 "sample_rate":16000,
                 "endpointing":{"min_silence_ms":0}
@@ -736,7 +736,7 @@ mod tests {
             r#"{
                 "type":"start",
                 "mode":"caption",
-                "model":"Qwen/Qwen3-ASR-Flash",
+                "model":"alibaba/qwen3-asr-flash",
                 "input_audio_format":"pcm_s16le",
                 "sample_rate":16000,
                 "endpointing":{"min_speech_ms":300}
@@ -758,7 +758,7 @@ mod tests {
             r#"{
                 "type":"start",
                 "mode":"caption",
-                "model":"Qwen/Qwen3-ASR-Flash",
+                "model":"alibaba/qwen3-asr-flash",
                 "input_audio_format":"pcm_s16le",
                 "sample_rate":16000,
                 "endpointing":{"max_segment_ms":60001}
@@ -775,7 +775,7 @@ mod tests {
             r#"{
                 "type":"start",
                 "mode":"caption",
-                "model":"Qwen/Qwen3-ASR-Flash",
+                "model":"alibaba/qwen3-asr-flash",
                 "input_audio_format":"pcm_s16le",
                 "sample_rate":16000,
                 "endpointing":{"min_silence":700}
@@ -792,7 +792,7 @@ mod tests {
             r#"{
                 "type":"start",
                 "mode":"caption",
-                "model":"Qwen/Qwen3-ASR-Flash",
+                "model":"alibaba/qwen3-asr-flash",
                 "input_audio_format":"pcm_s16le",
                 "sample_rate":16000,
                 "endpointing":{"speech_padding_ms":60000}
@@ -813,7 +813,7 @@ mod tests {
             r#"{
                 "type":"start",
                 "mode":"caption",
-                "model":"Qwen/Qwen3-ASR-Flash",
+                "model":"alibaba/qwen3-asr-flash",
                 "input_audio_format":"pcm_s16le",
                 "sample_rate":16000,
                 "endpointing":{"min_speech_ms":21,"speech_padding_ms":0}
@@ -871,7 +871,7 @@ mod tests {
         let error = parse_transcription_stream_start(
             r#"{
                 "type":"start",
-                "model":"Qwen/Qwen3-ASR-Flash",
+                "model":"alibaba/qwen3-asr-flash",
                 "input_audio_format":"pcm_s16le"
             }"#,
         )
@@ -889,7 +889,7 @@ mod tests {
         let error = parse_transcription_stream_start(
             r#"{
                 "type":"start",
-                "model":"Qwen/Qwen3-ASR-Flash",
+                "model":"alibaba/qwen3-asr-flash",
                 "response_format":"text",
                 "input_audio_format":"mp3"
             }"#,
@@ -908,7 +908,7 @@ mod tests {
         let error = parse_transcription_stream_start(
             r#"{
                 "type":"start",
-                "model":"Qwen/Qwen3-ASR-Flash",
+                "model":"alibaba/qwen3-asr-flash",
                 "response_format":"verbose_json",
                 "input_audio_format":"mp3"
             }"#,

@@ -51,6 +51,9 @@ impl fmt::Display for ModelCategory {
 
 pub trait ModelSpec: Clone + fmt::Debug + Eq + Send + Sync + 'static {
     fn category(&self) -> ModelCategory;
+    fn model_id(&self) -> &str {
+        self.huggingface_repo()
+    }
     fn huggingface_repo(&self) -> &str;
     fn modelscope_repo(&self) -> &str;
 
@@ -73,12 +76,12 @@ mod tests {
 
     #[test]
     fn model_cache_paths_are_repository_scoped() {
-        let path = AsrModel::parse("Qwen/Qwen3-ASR-0.6B")
+        let path = AsrModel::parse("alibaba/qwen3-asr-0.6b")
             .unwrap()
             .cache_path("models");
         assert!(path.ends_with("Qwen/Qwen3-ASR-0.6B"));
 
-        let path = TtsModel::parse("Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")
+        let path = TtsModel::parse("alibaba/qwen3-tts-12hz-0.6b-customvoice")
             .unwrap()
             .cache_path("models");
         assert!(path.ends_with("Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"));
@@ -86,8 +89,9 @@ mod tests {
 
     #[test]
     fn registry_separates_canonical_ids_sources_capabilities_and_runtime() {
-        let asr = model_descriptor("Qwen/Qwen3-ASR-1.7B").unwrap();
-        assert_eq!(asr.canonical_id, "Qwen/Qwen3-ASR-1.7B");
+        let asr = model_descriptor("alibaba/qwen3-asr-1.7b").unwrap();
+        assert_eq!(asr.canonical_id, "alibaba/qwen3-asr-1.7b");
+        assert_eq!(asr.display_name, "Qwen3-ASR 1.7B");
         assert_eq!(asr.category, ModelCategory::Asr);
         assert_eq!(asr.runtime_provider, RuntimeProvider::Qwen3);
         assert_eq!(asr.source_locators.hugging_face, "Qwen/Qwen3-ASR-1.7B");
@@ -98,7 +102,7 @@ mod tests {
         );
         assert!(asr.capabilities.contains(ModelCapabilities::ASR_STREAMING));
 
-        let voice_design = model_descriptor("Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign").unwrap();
+        let voice_design = model_descriptor("alibaba/qwen3-tts-12hz-1.7b-voicedesign").unwrap();
         assert!(
             voice_design
                 .capabilities
@@ -116,7 +120,10 @@ mod tests {
         let asr_ids = registered_model_descriptors(ModelCategory::Asr)
             .map(|descriptor| descriptor.canonical_id)
             .collect::<Vec<_>>();
-        assert_eq!(asr_ids, ["Qwen/Qwen3-ASR-0.6B", "Qwen/Qwen3-ASR-1.7B"]);
+        assert_eq!(
+            asr_ids,
+            ["alibaba/qwen3-asr-0.6b", "alibaba/qwen3-asr-1.7b"]
+        );
 
         let tts_ids = registered_model_descriptors(ModelCategory::Tts)
             .map(|descriptor| descriptor.canonical_id)
@@ -124,13 +131,15 @@ mod tests {
         assert_eq!(
             tts_ids,
             [
-                "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
-                "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
-                "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
-                "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
-                "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+                "alibaba/qwen3-tts-12hz-0.6b-base",
+                "alibaba/qwen3-tts-12hz-0.6b-customvoice",
+                "alibaba/qwen3-tts-12hz-1.7b-base",
+                "alibaba/qwen3-tts-12hz-1.7b-customvoice",
+                "alibaba/qwen3-tts-12hz-1.7b-voicedesign",
             ]
         );
+        assert!(model_descriptor("Qwen/Qwen3-ASR-0.6B").is_none());
+        assert!(model_descriptor("Qwen/Qwen3-TTS-12Hz-0.6B-Base").is_none());
     }
 
     #[test]
@@ -148,6 +157,11 @@ mod tests {
         let descriptor = KnownOcrModel::PaddleOcrVl16.descriptor();
 
         assert_eq!(descriptor.canonical_id, KnownOcrModel::PaddleOcrVl16.id());
+        assert_eq!(descriptor.display_name, "PaddleOCR-VL 1.6");
+        assert_eq!(
+            descriptor.source_locators.hugging_face,
+            "PaddlePaddle/PaddleOCR-VL-1.6"
+        );
         assert_eq!(descriptor.category, ModelCategory::OcrVl);
         assert_eq!(descriptor.runtime_provider, RuntimeProvider::OarOcr);
         assert!(

@@ -7,7 +7,7 @@ mock.module("@/shared/api/client", () => ({
 
 const baseInput: TtsRequestInput = {
   mode: "preset",
-  model: "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+  model: "alibaba/qwen3-tts-12hz-0.6b-customvoice",
   input: "hello",
   language: "",
   responseFormat: "wav",

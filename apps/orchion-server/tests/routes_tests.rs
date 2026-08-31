@@ -42,11 +42,11 @@ async fn models_endpoint_returns_configured_models() {
     assert_eq!(
         ids,
         vec![
-            "Qwen/Qwen3-ASR-0.6B",
-            "Qwen/Qwen3-ASR-1.7B",
-            "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
-            "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
-            "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+            "alibaba/qwen3-asr-0.6b",
+            "alibaba/qwen3-asr-1.7b",
+            "alibaba/qwen3-tts-12hz-0.6b-customvoice",
+            "alibaba/qwen3-tts-12hz-0.6b-base",
+            "alibaba/qwen3-tts-12hz-1.7b-voicedesign",
         ]
     );
     assert!(body["data"].as_array().unwrap().iter().all(|model| {
@@ -57,35 +57,35 @@ async fn models_endpoint_returns_configured_models() {
             && model.get("path").is_none()
             && model.get("digest").is_none()
     }));
-    assert_eq!(model_type(&body, "Qwen/Qwen3-ASR-0.6B"), "asr");
+    assert_eq!(model_type(&body, "alibaba/qwen3-asr-0.6b"), "asr");
     assert_eq!(
-        model_capabilities(&body, "Qwen/Qwen3-ASR-0.6B"),
+        model_capabilities(&body, "alibaba/qwen3-asr-0.6b"),
         vec!["asr_transcription", "asr_streaming"]
     );
-    assert_eq!(model_type(&body, "Qwen/Qwen3-ASR-1.7B"), "asr");
+    assert_eq!(model_type(&body, "alibaba/qwen3-asr-1.7b"), "asr");
     assert_eq!(
-        model_capabilities(&body, "Qwen/Qwen3-ASR-1.7B"),
+        model_capabilities(&body, "alibaba/qwen3-asr-1.7b"),
         vec!["asr_transcription", "asr_streaming"]
     );
     assert_eq!(
-        model_type(&body, "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"),
+        model_type(&body, "alibaba/qwen3-tts-12hz-0.6b-customvoice"),
         "tts"
     );
     assert_eq!(
-        model_capabilities(&body, "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"),
+        model_capabilities(&body, "alibaba/qwen3-tts-12hz-0.6b-customvoice"),
         vec!["tts_preset_speakers"]
     );
-    assert_eq!(model_type(&body, "Qwen/Qwen3-TTS-12Hz-0.6B-Base"), "tts");
+    assert_eq!(model_type(&body, "alibaba/qwen3-tts-12hz-0.6b-base"), "tts");
     assert_eq!(
-        model_capabilities(&body, "Qwen/Qwen3-TTS-12Hz-0.6B-Base"),
+        model_capabilities(&body, "alibaba/qwen3-tts-12hz-0.6b-base"),
         vec!["tts_voice_cloning"]
     );
     assert_eq!(
-        model_type(&body, "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"),
+        model_type(&body, "alibaba/qwen3-tts-12hz-1.7b-voicedesign"),
         "tts"
     );
     assert_eq!(
-        model_capabilities(&body, "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"),
+        model_capabilities(&body, "alibaba/qwen3-tts-12hz-1.7b-voicedesign"),
         vec!["tts_voice_design"]
     );
 }
@@ -109,7 +109,7 @@ async fn models_endpoint_returns_optional_deployment_display_name() {
     let body = json_body(response).await;
     let models = body["data"].as_array().unwrap();
     assert_eq!(models[0]["name"], "Fast transcription");
-    assert!(models[1].get("name").is_none());
+    assert_eq!(models[1]["name"], "Qwen3-ASR 1.7B");
 }
 
 #[tokio::test]
@@ -167,7 +167,7 @@ async fn model_status_endpoint_reports_runtime_residency_by_service() {
             .iter()
             .all(|model| { model["object"] == "model_status" && model["status"] == "unloaded" })
     );
-    assert_eq!(statuses[0]["id"], "Qwen/Qwen3-ASR-0.6B");
+    assert_eq!(statuses[0]["id"], "alibaba/qwen3-asr-0.6b");
     assert_eq!(statuses[0]["service"], "asr");
     assert_eq!(statuses[2]["service"], "tts");
 }
@@ -181,7 +181,7 @@ async fn model_unload_is_idempotent_for_configured_unloaded_model() {
                 .uri("/api/models/unload")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
-                    r#"{"model":"Qwen/Qwen3-ASR-0.6B","service":"asr"}"#,
+                    r#"{"model":"alibaba/qwen3-asr-0.6b","service":"asr"}"#,
                 ))
                 .unwrap(),
         )
@@ -190,7 +190,7 @@ async fn model_unload_is_idempotent_for_configured_unloaded_model() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = json_body(response).await;
-    assert_eq!(body["id"], "Qwen/Qwen3-ASR-0.6B");
+    assert_eq!(body["id"], "alibaba/qwen3-asr-0.6b");
     assert_eq!(body["service"], "asr");
     assert_eq!(body["status"], "unloaded");
 }
@@ -206,7 +206,7 @@ async fn model_control_rejects_wrong_service_and_invalid_json() {
                 .uri("/api/models/load")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
-                    r#"{"model":"Qwen/Qwen3-ASR-0.6B","service":"ocr"}"#,
+                    r#"{"model":"alibaba/qwen3-asr-0.6b","service":"ocr"}"#,
                 ))
                 .unwrap(),
         )
@@ -252,7 +252,7 @@ async fn legacy_model_control_routes_are_removed() {
                     .uri(route)
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
-                        r#"{"model":"Qwen/Qwen3-ASR-0.6B","service":"asr"}"#,
+                        r#"{"model":"alibaba/qwen3-asr-0.6b","service":"asr"}"#,
                     ))
                     .unwrap(),
             )
@@ -277,7 +277,10 @@ async fn models_endpoint_excludes_disabled_services() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = json_body(response).await;
     let ids = model_ids(&body);
-    assert_eq!(ids, vec!["Qwen/Qwen3-ASR-0.6B", "Qwen/Qwen3-ASR-1.7B"]);
+    assert_eq!(
+        ids,
+        vec!["alibaba/qwen3-asr-0.6b", "alibaba/qwen3-asr-1.7b"]
+    );
 }
 
 #[tokio::test]
@@ -318,16 +321,16 @@ async fn models_endpoint_includes_active_ocr_model_ids() {
         .iter()
         .map(|model| model["id"].as_str().unwrap().to_string())
         .collect::<Vec<_>>();
-    assert!(ids.contains(&"PaddlePaddle/PP-OCRv6_tiny".to_string()));
-    assert!(ids.contains(&"PaddlePaddle/PaddleOCR-VL-1.6".to_string()));
-    assert_eq!(model_type(&body, "PaddlePaddle/PP-OCRv6_tiny"), "ocr");
+    assert!(ids.contains(&"paddlepaddle/pp-ocrv6-tiny".to_string()));
+    assert!(ids.contains(&"paddlepaddle/paddleocr-vl-1.6".to_string()));
+    assert_eq!(model_type(&body, "paddlepaddle/pp-ocrv6-tiny"), "ocr");
     assert_eq!(
-        model_capabilities(&body, "PaddlePaddle/PP-OCRv6_tiny"),
+        model_capabilities(&body, "paddlepaddle/pp-ocrv6-tiny"),
         vec!["ocr_text"]
     );
-    assert_eq!(model_type(&body, "PaddlePaddle/PaddleOCR-VL-1.6"), "ocr");
+    assert_eq!(model_type(&body, "paddlepaddle/paddleocr-vl-1.6"), "ocr");
     assert_eq!(
-        model_capabilities(&body, "PaddlePaddle/PaddleOCR-VL-1.6"),
+        model_capabilities(&body, "paddlepaddle/paddleocr-vl-1.6"),
         vec!["ocr_text", "ocr_vision_language"]
     );
 }
@@ -359,11 +362,11 @@ async fn models_endpoint_exposes_layout_as_primary_deployment_capabilities() {
     assert_eq!(ids.len(), 2);
     assert!(!ids.contains(&"PaddlePaddle/PP-DocLayoutV3"));
     assert_eq!(
-        model_capabilities(&body, "PaddlePaddle/PP-OCRv6_tiny"),
+        model_capabilities(&body, "paddlepaddle/pp-ocrv6-tiny"),
         vec!["ocr_text", "ocr_layout", "ocr_markdown"]
     );
     assert_eq!(
-        model_capabilities(&body, "PaddlePaddle/PaddleOCR-VL-1.6"),
+        model_capabilities(&body, "paddlepaddle/paddleocr-vl-1.6"),
         vec![
             "ocr_text",
             "ocr_layout",
@@ -400,14 +403,14 @@ async fn models_endpoint_does_not_expose_unloaded_table_structure() {
     let body = json_body(response).await;
     assert_eq!(model_ids(&body).len(), 2);
     assert_eq!(
-        model_capabilities(&body, "PaddlePaddle/PP-OCRv6_tiny"),
+        model_capabilities(&body, "paddlepaddle/pp-ocrv6-tiny"),
         vec!["ocr_text", "ocr_layout", "ocr_markdown"]
     );
     let model = body["data"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|model| model["id"] == "PaddlePaddle/PP-OCRv6_tiny")
+        .find(|model| model["id"] == "paddlepaddle/pp-ocrv6-tiny")
         .unwrap();
     assert!(model.get("table_structure").is_none());
     assert!(model.get("artifacts").is_none());
@@ -423,7 +426,7 @@ async fn speech_route_is_absent_when_tts_is_disabled() {
                 .header("content-type", "application/json")
                 .body(Body::from(
                     r#"{
-                        "model":"Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+                        "model":"alibaba/qwen3-tts-12hz-0.6b-customvoice",
                         "input":"hello",
                         "voice":"alloy"
                     }"#,
@@ -857,7 +860,7 @@ async fn json_speech_rejects_voice_clone() {
                 .header("content-type", "application/json")
                 .body(Body::from(
                     r#"{
-                        "model":"Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+                        "model":"alibaba/qwen3-tts-12hz-0.6b-customvoice",
                         "input":"hello",
                         "voice":"clone",
                         "reference_audio":"/server/reference.wav",
@@ -889,7 +892,7 @@ async fn speech_rejects_max_length_above_service_limit_before_model_load() {
                 .header("content-type", "application/json")
                 .body(Body::from(
                     r#"{
-                        "model":"Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+                        "model":"alibaba/qwen3-tts-12hz-0.6b-customvoice",
                         "input":"hello",
                         "voice":"ryan",
                         "max_length":5
@@ -915,7 +918,7 @@ async fn ocr_vl_rejects_max_tokens_above_service_limit_before_model_load() {
     let body = multipart_body(
         boundary,
         &[
-            ("model", "PaddlePaddle/PaddleOCR-VL-1.6"),
+            ("model", "paddlepaddle/paddleocr-vl-1.6"),
             ("max_tokens", "5"),
         ],
         "file",
@@ -949,7 +952,7 @@ async fn traditional_ocr_rejects_html_before_model_load() {
     let body = multipart_body(
         boundary,
         &[
-            ("model", "PaddlePaddle/PP-OCRv6_tiny"),
+            ("model", "paddlepaddle/pp-ocrv6-tiny"),
             ("response_format", "html"),
         ],
         "file",
@@ -982,7 +985,7 @@ async fn ocr_rejects_invalid_image_before_model_load() {
     let boundary = "orchion-invalid-ocr-image";
     let body = multipart_body(
         boundary,
-        &[("model", "PaddlePaddle/PP-OCRv6_tiny")],
+        &[("model", "paddlepaddle/pp-ocrv6-tiny")],
         "file",
         "input.png",
         b"not an image",
@@ -1016,7 +1019,7 @@ async fn ocr_rejects_images_above_configured_pixel_limit_before_model_load() {
     let boundary = "orchion-ocr-pixel-limit";
     let body = multipart_body(
         boundary,
-        &[("model", "PaddlePaddle/PP-OCRv6_tiny")],
+        &[("model", "paddlepaddle/pp-ocrv6-tiny")],
         "file",
         "input.ppm",
         b"P6\n2 1\n255\n\0\0\0\0\0\0",
@@ -1079,7 +1082,7 @@ async fn traditional_ocr_markdown_uses_the_deployment_layout_model() {
     let body = multipart_body(
         boundary,
         &[
-            ("model", "PaddlePaddle/PP-OCRv6_tiny"),
+            ("model", "paddlepaddle/pp-ocrv6-tiny"),
             ("response_format", "markdown"),
         ],
         "file",
@@ -1118,7 +1121,7 @@ async fn traditional_ocr_html_is_rejected_even_with_a_deployment_layout_model() 
     let body = multipart_body(
         boundary,
         &[
-            ("model", "PaddlePaddle/PP-OCRv6_tiny"),
+            ("model", "paddlepaddle/pp-ocrv6-tiny"),
             ("response_format", "html"),
         ],
         "file",
@@ -1157,7 +1160,7 @@ async fn ocr_rejects_the_removed_layout_model_request_parameter() {
     let body = multipart_body(
         boundary,
         &[
-            ("model", "PaddlePaddle/PP-OCRv6_tiny"),
+            ("model", "paddlepaddle/pp-ocrv6-tiny"),
             ("layout_model", "PaddlePaddle/PP-DocLayoutV3"),
             ("response_format", "markdown"),
         ],
@@ -1196,7 +1199,7 @@ async fn ocr_vl_rejects_structured_format_without_layout_before_model_load() {
     let body = multipart_body(
         boundary,
         &[
-            ("model", "PaddlePaddle/PaddleOCR-VL-1.6"),
+            ("model", "paddlepaddle/paddleocr-vl-1.6"),
             ("response_format", "markdown"),
         ],
         "file",
@@ -1232,7 +1235,7 @@ async fn transcription_rejects_decoded_audio_above_duration_limit_before_model_l
     let boundary = "orchion-asr-duration-limit";
     let body = multipart_body(
         boundary,
-        &[("model", "Qwen/Qwen3-ASR-0.6B")],
+        &[("model", "alibaba/qwen3-asr-0.6b")],
         "file",
         "input.wav",
         &wav_bytes(),
@@ -1304,7 +1307,7 @@ async fn voice_clone_rejects_reference_audio_above_duration_limit_before_model_l
     let body = multipart_body(
         boundary,
         &[
-            ("model", "Qwen/Qwen3-TTS-12Hz-0.6B-Base"),
+            ("model", "alibaba/qwen3-tts-12hz-0.6b-base"),
             ("input", "hello"),
             ("voice", "clone"),
             ("reference_text", "hello"),
@@ -1419,7 +1422,7 @@ async fn multipart_speech_rejects_invalid_reference_audio_before_inference() {
     let body = multipart_body(
         boundary,
         &[
-            ("model", "Qwen/Qwen3-TTS-12Hz-0.6B-Base"),
+            ("model", "alibaba/qwen3-tts-12hz-0.6b-base"),
             ("input", "hello"),
             ("voice", "clone"),
             ("reference_text", "hello"),
@@ -1593,16 +1596,16 @@ fn test_state_with_ocr_services_config(
     test_state_with_services_config(api_key, false, false, |config| {
         config.services.ocr.enabled = true;
         config.services.ocr.default_model =
-            Some(ModelId::parse("PaddlePaddle/PP-OCRv6_tiny").unwrap());
+            Some(ModelId::parse("paddlepaddle/pp-ocrv6-tiny").unwrap());
         config.services.ocr.models = vec![OcrModelDeployment::from_runtime(OcrModel::new(
-            ModelId::parse("PaddlePaddle/PP-OCRv6_tiny").unwrap(),
+            ModelId::parse("paddlepaddle/pp-ocrv6-tiny").unwrap(),
             OcrModelKind::TraditionalOcr,
         ))];
         config.services.ocr_vl.enabled = true;
         config.services.ocr_vl.default_model =
-            Some(ModelId::parse("PaddlePaddle/PaddleOCR-VL-1.6").unwrap());
+            Some(ModelId::parse("paddlepaddle/paddleocr-vl-1.6").unwrap());
         config.services.ocr_vl.models = vec![OcrModelDeployment::from_runtime(OcrModel::new(
-            ModelId::parse("PaddlePaddle/PaddleOCR-VL-1.6").unwrap(),
+            ModelId::parse("paddlepaddle/paddleocr-vl-1.6").unwrap(),
             OcrModelKind::OcrVl,
         ))];
         configure(config);
@@ -1628,8 +1631,8 @@ fn test_state_with_services_config(
     config.services.asr.enabled = asr_enabled;
     config.services.tts.enabled = tts_enabled;
     config.services.asr.models = [
-        asr_model("Qwen/Qwen3-ASR-0.6B"),
-        asr_model("Qwen/Qwen3-ASR-1.7B"),
+        asr_model("alibaba/qwen3-asr-0.6b"),
+        asr_model("alibaba/qwen3-asr-1.7b"),
     ]
     .into_iter()
     .map(ModelDeployment::from_asr_runtime)
@@ -1637,9 +1640,9 @@ fn test_state_with_services_config(
     config.services.asr.idle_timeout = Duration::from_mins(10);
     config.services.asr.max_loaded = 2;
     config.services.tts.models = vec![
-        tts_model("Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"),
-        tts_model("Qwen/Qwen3-TTS-12Hz-0.6B-Base"),
-        tts_model("Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"),
+        tts_model("alibaba/qwen3-tts-12hz-0.6b-customvoice"),
+        tts_model("alibaba/qwen3-tts-12hz-0.6b-base"),
+        tts_model("alibaba/qwen3-tts-12hz-1.7b-voicedesign"),
     ]
     .into_iter()
     .map(ModelDeployment::from_tts_runtime)

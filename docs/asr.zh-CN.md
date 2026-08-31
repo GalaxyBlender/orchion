@@ -8,7 +8,7 @@ Orchion 通过文件上传和 WebSocket 流式接口提供 OpenAI 风格的语�
 
 ```sh
 curl http://127.0.0.1:9090/v1/audio/transcriptions \
-  -F model=Qwen/Qwen3-ASR-0.6B \
+  -F model=alibaba/qwen3-asr-0.6b \
   -F file=@audio.mp3 \
   -F response_format=verbose_json \
   -F "timestamp_granularities[]=segment"

@@ -11,7 +11,7 @@ Orchion 通过 `POST /v1/ocr` 和 `multipart/form-data` 提供传统 OCR 与 OCR
 ```sh
 curl -X POST http://127.0.0.1:9090/v1/ocr \
   -F file=@document.png \
-  -F model=PaddlePaddle/PP-OCRv6_tiny \
+  -F model=paddlepaddle/pp-ocrv6-tiny \
   -F response_format=json
 ```
 
@@ -22,7 +22,7 @@ curl -X POST http://127.0.0.1:9090/v1/ocr \
 ```sh
 curl -X POST http://127.0.0.1:9090/v1/ocr \
   -F file=@document.png \
-  -F model=PaddlePaddle/PaddleOCR-VL-1.6 \
+  -F model=paddlepaddle/paddleocr-vl-1.6 \
   -F response_format=markdown
 ```
 

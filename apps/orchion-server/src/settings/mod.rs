@@ -395,11 +395,14 @@ impl ModelDeployment<AsrModel> {
     #[must_use]
     pub fn from_asr_runtime(runtime: AsrModel) -> Self {
         let id = ModelId::parse(runtime.as_str()).expect("ASR runtime contains a valid model id");
-        let model = ModelUrl::parse(&format!("//{}", runtime.as_str()))
-            .expect("ASR runtime id forms a valid neutral model URL");
+        let name = runtime
+            .descriptor()
+            .map(|descriptor| descriptor.display_name.to_string());
+        let model = ModelUrl::parse(&format!("//{}", runtime.huggingface_repo()))
+            .expect("ASR runtime source forms a valid neutral model URL");
         Self {
             id,
-            name: None,
+            name,
             model,
             runtime,
         }
@@ -415,11 +418,14 @@ impl ModelDeployment<TtsModel> {
     #[must_use]
     pub fn from_tts_runtime(runtime: TtsModel) -> Self {
         let id = ModelId::parse(runtime.as_str()).expect("TTS runtime contains a valid model id");
-        let model = ModelUrl::parse(&format!("//{}", runtime.as_str()))
-            .expect("TTS runtime id forms a valid neutral model URL");
+        let name = runtime
+            .descriptor()
+            .map(|descriptor| descriptor.display_name.to_string());
+        let model = ModelUrl::parse(&format!("//{}", runtime.huggingface_repo()))
+            .expect("TTS runtime source forms a valid neutral model URL");
         Self {
             id,
-            name: None,
+            name,
             model,
             runtime,
         }
@@ -498,11 +504,14 @@ impl OcrModelDeployment {
     #[must_use]
     pub fn from_runtime(runtime: OcrModel) -> Self {
         let id = runtime.id().clone();
-        let model = ModelUrl::parse(&format!("//{id}"))
-            .expect("OCR runtime id forms a valid neutral model URL");
+        let name = runtime
+            .known()
+            .map(|model| model.descriptor().display_name.to_string());
+        let model = ModelUrl::parse(&format!("//{}", runtime.huggingface_repo()))
+            .expect("OCR runtime source forms a valid neutral model URL");
         Self {
             id,
-            name: None,
+            name,
             model,
             layout_model: None,
             table_structure: None,
@@ -1958,7 +1967,7 @@ where
     for deployment in models {
         validate_deployment_name(section, &deployment.id, deployment.name.as_deref())?;
         validate_runtime_category(section, &deployment.id, category, expected)?;
-        if deployment.runtime.huggingface_repo() != deployment.id.as_str() {
+        if deployment.runtime.model_id() != deployment.id.as_str() {
             return Err(ConfigError::UnsupportedRuntimeModel {
                 section,
                 id: deployment.id.to_string(),
@@ -2062,9 +2071,24 @@ fn validate_ocr_model_locator(
         }
         return Ok(());
     }
+    let descriptor = deployment
+        .runtime
+        .known()
+        .expect("validated OCR deployments use a registered runtime")
+        .descriptor();
+    let sources = descriptor.source_locators;
+    let expected = match url.source() {
+        orchion::ModelUrlSource::ModelScope => sources.model_scope,
+        orchion::ModelUrlSource::Neutral | orchion::ModelUrlSource::HuggingFace => {
+            sources.hugging_face
+        }
+        orchion::ModelUrlSource::File => unreachable!("file locators returned above"),
+    };
+    let expected_parts = expected.split_once('/');
     if url.path().is_some()
-        || url.owner() != Some(deployment.id.vendor())
-        || url.repository() != Some(deployment.id.name())
+        || expected_parts.is_none_or(|(owner, repository)| {
+            url.owner() != Some(owner) || url.repository() != Some(repository)
+        })
     {
         return Err(ConfigError::UnsupportedModelLocator {
             section,
@@ -2277,18 +2301,19 @@ pub fn parse_tts_model(value: &str) -> Result<TtsModel, ConfigError> {
 }
 
 fn default_asr_model() -> AsrModel {
-    AsrModel::parse("Qwen/Qwen3-ASR-0.6B").expect("default ASR model id is valid")
+    AsrModel::parse("alibaba/qwen3-asr-0.6b").expect("default ASR model id is valid")
 }
 
 fn default_tts_model() -> TtsModel {
-    TtsModel::parse("Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice").expect("default TTS model id is valid")
+    TtsModel::parse("alibaba/qwen3-tts-12hz-0.6b-customvoice")
+        .expect("default TTS model id is valid")
 }
 
 fn default_asr_deployment() -> ModelDeployment<AsrModel> {
     let runtime = default_asr_model();
     ModelDeployment {
         id: ModelId::parse(runtime.as_str()).expect("default ASR model id is valid"),
-        name: None,
+        name: Some("Qwen3-ASR 0.6B".to_string()),
         model: ModelUrl::parse("//Qwen/Qwen3-ASR-0.6B").expect("default ASR model URL is valid"),
         runtime,
     }
@@ -2298,7 +2323,7 @@ fn default_tts_deployment() -> ModelDeployment<TtsModel> {
     let runtime = default_tts_model();
     ModelDeployment {
         id: ModelId::parse(runtime.as_str()).expect("default TTS model id is valid"),
-        name: None,
+        name: Some("Qwen3-TTS 12Hz 0.6B CustomVoice".to_string()),
         model: ModelUrl::parse("//Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")
             .expect("default TTS model URL is valid"),
         runtime,

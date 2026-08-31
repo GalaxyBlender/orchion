@@ -14,7 +14,7 @@ async fn list_models_sends_auth_and_decodes_typed_models() {
             "object": "list",
             "data": [
                 {
-                    "id": "Qwen/Qwen3-ASR-Flash",
+                    "id": "alibaba/qwen3-asr-flash",
                     "object": "model",
                     "created": 0,
                     "owned_by": "orchion",
@@ -43,7 +43,7 @@ async fn list_models_sends_auth_and_decodes_typed_models() {
     let models = client.models().list().await.unwrap();
 
     assert_eq!(models.object, "list");
-    assert_eq!(models.data[0].id, "Qwen/Qwen3-ASR-Flash");
+    assert_eq!(models.data[0].id, "alibaba/qwen3-asr-flash");
     assert_eq!(models.data[0].model_type, ModelType::Asr);
     assert_eq!(models.data[0].name.as_deref(), Some("Fast ASR"));
     assert_eq!(
@@ -92,7 +92,7 @@ async fn transcribe_file_posts_multipart_and_decodes_json() {
     Mock::given(method("POST"))
         .and(path("/v1/audio/transcriptions"))
         .and(header("Authorization", "Bearer secret"))
-        .and(body_string_contains("Qwen/Qwen3-ASR-Flash"))
+        .and(body_string_contains("alibaba/qwen3-asr-flash"))
         .and(body_string_contains("response_format"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "text": "hello world"
@@ -104,7 +104,7 @@ async fn transcribe_file_posts_multipart_and_decodes_json() {
         .unwrap()
         .with_api_key("secret");
     let client = Client::from_config(config).unwrap();
-    let request = TranscriptionRequest::new("Qwen/Qwen3-ASR-Flash", "audio.wav")
+    let request = TranscriptionRequest::new("alibaba/qwen3-asr-flash", "audio.wav")
         .with_file_bytes(b"fake wav".to_vec())
         .with_response_format(TranscriptionFormat::Json);
 
@@ -135,7 +135,7 @@ async fn transcribe_text_format_returns_text_response() {
 
     let config = ClientConfig::new(server.uri()).unwrap();
     let client = Client::from_config(config).unwrap();
-    let request = TranscriptionRequest::new("Qwen/Qwen3-ASR-Flash", "audio.wav")
+    let request = TranscriptionRequest::new("alibaba/qwen3-asr-flash", "audio.wav")
         .with_file_bytes(b"fake wav".to_vec())
         .with_response_format(TranscriptionFormat::Text);
 
@@ -170,7 +170,7 @@ async fn streaming_handshake_preserves_the_server_error_body() {
         .await;
     let client = Client::new(server.uri()).unwrap();
     let request =
-        StreamingStartRequest::new("Qwen/Qwen3-ASR-Flash", StreamingInputAudioFormat::Mp3);
+        StreamingStartRequest::new("alibaba/qwen3-asr-flash", StreamingInputAudioFormat::Mp3);
 
     let Err(error) = client.asr().start_streaming(request).await else {
         panic!("streaming handshake unexpectedly succeeded");
@@ -202,7 +202,7 @@ async fn create_speech_posts_json_and_returns_audio_bytes() {
     Mock::given(method("POST"))
         .and(path("/v1/audio/speech"))
         .and(body_json(serde_json::json!({
-            "model": "Qwen/Qwen3-TTS-Flash",
+            "model": "alibaba/qwen3-tts-flash",
             "input": "hello",
             "voice": "Serena",
             "response_format": "wav",
@@ -218,7 +218,7 @@ async fn create_speech_posts_json_and_returns_audio_bytes() {
 
     let config = ClientConfig::new(server.uri()).unwrap();
     let client = Client::from_config(config).unwrap();
-    let request = SpeechRequest::new("Qwen/Qwen3-TTS-Flash", "hello", "Serena")
+    let request = SpeechRequest::new("alibaba/qwen3-tts-flash", "hello", "Serena")
         .with_response_format(SpeechFormat::Wav);
 
     let response = client.tts().create_speech(request).await.unwrap();
@@ -236,7 +236,7 @@ async fn create_speech_rejects_clone_locally_and_points_to_create_voice_clone() 
 
     let server = MockServer::start().await;
     let client = Client::new(server.uri()).unwrap();
-    let request = SpeechRequest::new("Qwen/Qwen3-TTS-Flash", "hello", " CLONE ");
+    let request = SpeechRequest::new("alibaba/qwen3-tts-flash", "hello", " CLONE ");
 
     let error = client.tts().create_speech(request).await.unwrap_err();
 
@@ -270,7 +270,7 @@ async fn create_voice_clone_posts_all_multipart_fields_and_audio_bytes() {
     let client = Client::new(server.uri()).unwrap();
     let audio = vec![0, 1, 2, 3, 255];
     let request = VoiceCloneRequest::new(
-        "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+        "alibaba/qwen3-tts-12hz-0.6b-base",
         "synthesized text",
         ReferenceAudio::bytes("reference.wav", audio.clone()),
         "reference transcript",
@@ -299,7 +299,7 @@ async fn create_voice_clone_posts_all_multipart_fields_and_audio_bytes() {
         .unwrap();
     let boundary = content_type.split("boundary=").nth(1).unwrap();
     for (name, value) in [
-        ("model", "Qwen/Qwen3-TTS-12Hz-0.6B-Base"),
+        ("model", "alibaba/qwen3-tts-12hz-0.6b-base"),
         ("input", "synthesized text"),
         ("voice", "clone"),
         ("reference_text", "reference transcript"),
@@ -350,7 +350,7 @@ async fn create_voice_clone_reads_reference_audio_from_a_path() {
     tokio::fs::write(&reference_path, &audio).await.unwrap();
     let client = Client::new(server.uri()).unwrap();
     let request = VoiceCloneRequest::new(
-        "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+        "alibaba/qwen3-tts-12hz-0.6b-base",
         "hello",
         ReferenceAudio::path(&reference_path),
         "reference",
@@ -401,7 +401,7 @@ async fn create_voice_clone_preserves_structured_server_errors() {
         .await;
     let client = Client::new(server.uri()).unwrap();
     let request = VoiceCloneRequest::new(
-        "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+        "alibaba/qwen3-tts-12hz-0.6b-base",
         "hello",
         ReferenceAudio::bytes("reference.wav", vec![1]),
         "reference",
@@ -445,7 +445,7 @@ async fn create_voice_clone_uses_the_configured_http_timeout() {
         .unwrap();
     let client = Client::from_config(config).unwrap();
     let request = VoiceCloneRequest::new(
-        "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+        "alibaba/qwen3-tts-12hz-0.6b-base",
         "hello",
         ReferenceAudio::bytes("reference.wav", vec![1]),
         "reference",
@@ -504,7 +504,7 @@ async fn create_ocr_posts_multipart_and_decodes_json() {
     Mock::given(method("POST"))
         .and(path("/v1/ocr"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "model": "PaddlePaddle/PP-OCRv6_tiny",
+            "model": "paddlepaddle/pp-ocrv6-tiny",
             "format": "json",
             "text": "invoice",
             "regions": [],
@@ -515,7 +515,7 @@ async fn create_ocr_posts_multipart_and_decodes_json() {
         .await;
 
     let client = Client::new(server.uri()).unwrap();
-    let request = OcrRequest::new("image.png", "PaddlePaddle/PP-OCRv6_tiny")
+    let request = OcrRequest::new("image.png", "paddlepaddle/pp-ocrv6-tiny")
         .with_file_bytes(vec![137, 80, 78, 71]);
 
     let response = client.ocr().recognize(request).await.unwrap();
@@ -531,8 +531,8 @@ async fn create_ocr_posts_multipart_and_decodes_json() {
     assert!(
         requests[0]
             .body
-            .windows(b"PaddlePaddle/PP-OCRv6_tiny".len())
-            .any(|window| window == b"PaddlePaddle/PP-OCRv6_tiny")
+            .windows(b"paddlepaddle/pp-ocrv6-tiny".len())
+            .any(|window| window == b"paddlepaddle/pp-ocrv6-tiny")
     );
     assert!(
         !requests[0]

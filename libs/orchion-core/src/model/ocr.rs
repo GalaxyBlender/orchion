@@ -55,12 +55,20 @@ impl ModelSpec for OcrModel {
         }
     }
 
-    fn huggingface_repo(&self) -> &str {
+    fn model_id(&self) -> &str {
         self.id.as_str()
     }
 
+    fn huggingface_repo(&self) -> &str {
+        self.known().map_or(self.id.as_str(), |model| {
+            model.descriptor().source_locators.hugging_face
+        })
+    }
+
     fn modelscope_repo(&self) -> &str {
-        self.id.as_str()
+        self.known().map_or(self.id.as_str(), |model| {
+            model.descriptor().source_locators.model_scope
+        })
     }
 
     fn required_files(&self) -> &'static [&'static str] {
@@ -245,14 +253,14 @@ impl KnownOcrModel {
 
     pub fn from_model_id(id: &ModelId) -> Result<Self> {
         match id.as_str() {
-            "PaddlePaddle/PP-OCRv5_mobile" => Ok(Self::PpOcrV5Mobile),
-            "PaddlePaddle/PP-OCRv5_server" => Ok(Self::PpOcrV5Server),
-            "PaddlePaddle/PP-OCRv6_tiny" => Ok(Self::PpOcrV6Tiny),
-            "PaddlePaddle/PP-OCRv6_small" => Ok(Self::PpOcrV6Small),
-            "PaddlePaddle/PP-OCRv6_medium" => Ok(Self::PpOcrV6Medium),
+            "paddlepaddle/pp-ocrv5-mobile" => Ok(Self::PpOcrV5Mobile),
+            "paddlepaddle/pp-ocrv5-server" => Ok(Self::PpOcrV5Server),
+            "paddlepaddle/pp-ocrv6-tiny" => Ok(Self::PpOcrV6Tiny),
+            "paddlepaddle/pp-ocrv6-small" => Ok(Self::PpOcrV6Small),
+            "paddlepaddle/pp-ocrv6-medium" => Ok(Self::PpOcrV6Medium),
             "PaddlePaddle/PP-DocLayoutV3" => Ok(Self::PpDocLayoutV3),
-            "PaddlePaddle/PaddleOCR-VL-1.5" => Ok(Self::PaddleOcrVl15),
-            "PaddlePaddle/PaddleOCR-VL-1.6" => Ok(Self::PaddleOcrVl16),
+            "paddlepaddle/paddleocr-vl-1.5" => Ok(Self::PaddleOcrVl15),
+            "paddlepaddle/paddleocr-vl-1.6" => Ok(Self::PaddleOcrVl16),
             other => Err(OrchionError::ModelLoad {
                 message: format!("unsupported OCR model `{other}`"),
             }),
@@ -288,14 +296,14 @@ impl KnownOcrModel {
 
     pub const fn id(self) -> &'static str {
         match self {
-            Self::PpOcrV5Mobile => "PaddlePaddle/PP-OCRv5_mobile",
-            Self::PpOcrV5Server => "PaddlePaddle/PP-OCRv5_server",
-            Self::PpOcrV6Tiny => "PaddlePaddle/PP-OCRv6_tiny",
-            Self::PpOcrV6Small => "PaddlePaddle/PP-OCRv6_small",
-            Self::PpOcrV6Medium => "PaddlePaddle/PP-OCRv6_medium",
+            Self::PpOcrV5Mobile => "paddlepaddle/pp-ocrv5-mobile",
+            Self::PpOcrV5Server => "paddlepaddle/pp-ocrv5-server",
+            Self::PpOcrV6Tiny => "paddlepaddle/pp-ocrv6-tiny",
+            Self::PpOcrV6Small => "paddlepaddle/pp-ocrv6-small",
+            Self::PpOcrV6Medium => "paddlepaddle/pp-ocrv6-medium",
             Self::PpDocLayoutV3 => "PaddlePaddle/PP-DocLayoutV3",
-            Self::PaddleOcrVl15 => "PaddlePaddle/PaddleOCR-VL-1.5",
-            Self::PaddleOcrVl16 => "PaddlePaddle/PaddleOCR-VL-1.6",
+            Self::PaddleOcrVl15 => "paddlepaddle/paddleocr-vl-1.5",
+            Self::PaddleOcrVl16 => "paddlepaddle/paddleocr-vl-1.6",
         }
     }
 
@@ -320,6 +328,19 @@ impl KnownOcrModel {
             | Self::PpOcrV6Medium => OcrModelKind::TraditionalOcr,
             Self::PpDocLayoutV3 => OcrModelKind::Layout,
             Self::PaddleOcrVl15 | Self::PaddleOcrVl16 => OcrModelKind::OcrVl,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::PpOcrV5Mobile => "PP-OCRv5 Mobile",
+            Self::PpOcrV5Server => "PP-OCRv5 Server",
+            Self::PpOcrV6Tiny => "PP-OCRv6 Tiny",
+            Self::PpOcrV6Small => "PP-OCRv6 Small",
+            Self::PpOcrV6Medium => "PP-OCRv6 Medium",
+            Self::PpDocLayoutV3 => "PP-DocLayoutV3",
+            Self::PaddleOcrVl15 => "PaddleOCR-VL 1.5",
+            Self::PaddleOcrVl16 => "PaddleOCR-VL 1.6",
         }
     }
 
@@ -353,6 +374,16 @@ impl KnownOcrModel {
 
     pub const fn descriptor(self) -> ModelDescriptor {
         let canonical_id = self.id();
+        let source_locator = match self {
+            Self::PpOcrV5Mobile => "PaddlePaddle/PP-OCRv5_mobile",
+            Self::PpOcrV5Server => "PaddlePaddle/PP-OCRv5_server",
+            Self::PpOcrV6Tiny => "PaddlePaddle/PP-OCRv6_tiny",
+            Self::PpOcrV6Small => "PaddlePaddle/PP-OCRv6_small",
+            Self::PpOcrV6Medium => "PaddlePaddle/PP-OCRv6_medium",
+            Self::PpDocLayoutV3 => "PaddlePaddle/PP-DocLayoutV3",
+            Self::PaddleOcrVl15 => "PaddlePaddle/PaddleOCR-VL-1.5",
+            Self::PaddleOcrVl16 => "PaddlePaddle/PaddleOCR-VL-1.6",
+        };
         let (capabilities, requirements): (_, &'static [_]) = match self.kind() {
             OcrModelKind::TraditionalOcr => {
                 (ModelCapabilities::OCR_TEXT, &Self::MARKDOWN_REQUIREMENTS)
@@ -365,9 +396,10 @@ impl KnownOcrModel {
         };
         ModelDescriptor {
             canonical_id,
+            display_name: self.name(),
             source_locators: ModelSourceLocators {
-                hugging_face: canonical_id,
-                model_scope: canonical_id,
+                hugging_face: source_locator,
+                model_scope: source_locator,
             },
             category: match self.kind() {
                 OcrModelKind::TraditionalOcr | OcrModelKind::Layout => ModelCategory::Ocr,
@@ -410,6 +442,10 @@ impl ModelSpec for KnownOcrModel {
         }
     }
 
+    fn model_id(&self) -> &str {
+        self.id()
+    }
+
     fn huggingface_repo(&self) -> &str {
         (*self).descriptor().source_locators.hugging_face
     }
@@ -442,25 +478,30 @@ mod tests {
 
     #[test]
     fn resolves_builtin_ocr_model_ids() {
-        let id = ModelId::parse("PaddlePaddle/PaddleOCR-VL-1.6").unwrap();
+        let id = ModelId::parse("paddlepaddle/paddleocr-vl-1.6").unwrap();
         let model = KnownOcrModel::from_model_id(&id).unwrap();
-        assert_eq!(model.id(), "PaddlePaddle/PaddleOCR-VL-1.6");
+        assert_eq!(model.id(), "paddlepaddle/paddleocr-vl-1.6");
+        assert_eq!(model.huggingface_repo(), "PaddlePaddle/PaddleOCR-VL-1.6");
         assert_eq!(model.kind(), OcrModelKind::OcrVl);
         assert!(model.supports_markdown());
+
+        let old_repository_id = ModelId::parse("PaddlePaddle/PaddleOCR-VL-1.6").unwrap();
+        assert!(KnownOcrModel::from_model_id(&old_repository_id).is_err());
     }
 
     #[test]
     fn traditional_ocr_does_not_support_markdown() {
-        let id = ModelId::parse("PaddlePaddle/PP-OCRv6_tiny").unwrap();
+        let id = ModelId::parse("paddlepaddle/pp-ocrv6-tiny").unwrap();
         let model = KnownOcrModel::from_model_id(&id).unwrap();
+        assert_eq!(model.huggingface_repo(), "PaddlePaddle/PP-OCRv6_tiny");
         assert_eq!(model.kind(), OcrModelKind::TraditionalOcr);
         assert!(!model.supports_markdown());
     }
 
     #[test]
     fn resolves_ocr_models_by_expected_capability() {
-        let traditional = ModelId::parse("PaddlePaddle/PP-OCRv6_tiny").unwrap();
-        let ocr_vl = ModelId::parse("PaddlePaddle/PaddleOCR-VL-1.6").unwrap();
+        let traditional = ModelId::parse("paddlepaddle/pp-ocrv6-tiny").unwrap();
+        let ocr_vl = ModelId::parse("paddlepaddle/paddleocr-vl-1.6").unwrap();
         let layout = ModelId::parse("PaddlePaddle/PP-DocLayoutV3").unwrap();
 
         assert_eq!(
