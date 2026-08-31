@@ -1,5 +1,5 @@
 [package]
-name = "orchion-example-download-model"
+name = "orchion-example-llm-streaming-cancel"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
@@ -9,12 +9,10 @@ publish = false
 [features]
 default = []
 cpu = ["orchion/cpu"]
-metal = ["orchion/metal"]
 cuda = ["orchion/cuda"]
-flash-attn = ["orchion/flash-attn"]
 
 [dependencies]
-orchion = { path = "../../libs/orchion", default-features = false, features = ["asr-qwen3", "download-all"] }
+orchion = { path = "../../../libs/orchion", default-features = false, features = ["llm", "download-all"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [lints.rust]

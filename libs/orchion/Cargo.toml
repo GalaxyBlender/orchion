@@ -14,6 +14,8 @@ tts = ["tts-qwen3"]
 asr-engine = []
 tts-engine = []
 llm = ["dep:orchion-llama-cpp", "dep:tokio"]
+server-support = ["llm"]
+llm-test-support = ["llm"]
 ocr = ["dep:orchion-ocr", "orchion-ocr/ocr"]
 ocr-vl = ["dep:orchion-ocr", "orchion-ocr/ocr-vl"]
 docs = ["dep:orchion-docs", "orchion-docs/serde", "orchion-docs/schema"]
@@ -39,7 +41,7 @@ orchion-ocr = { version = "0.3.0", path = "../orchion-ocr", default-features = f
 orchion-qwen3 = { version = "0.3.0", path = "../orchion-qwen3", default-features = false, optional = true }
 orchion-audio-vad = { version = "0.3.0", path = "../orchion-audio-vad", optional = true }
 orchion-llama-cpp = { version = "0.3.0", path = "../orchion-llama-cpp", optional = true }
-tokio = { version = "1", features = ["sync"], optional = true }
+tokio = { version = "1", features = ["rt", "sync"], optional = true }
 tracing = "0.1"
 
 [dev-dependencies]

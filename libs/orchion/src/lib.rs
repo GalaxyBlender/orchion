@@ -1,3 +1,25 @@
+//! In-process Rust facade for Orchion model inference.
+//!
+//! This crate keeps model selection, downloading, backend adapters, and runtime loading behind a
+//! single interface. Features are opt-in so applications only compile the inference domains and
+//! hardware backends they use.
+//!
+//! # Feature model
+//!
+//! - `asr-engine` and `tts-engine` expose adapter seams without selecting an implementation.
+//! - `asr-qwen3`, `tts-qwen3`, `ocr`, `ocr-vl`, and `llm` select built-in implementations.
+//! - `download-all` enables Hugging Face and `ModelScope` provisioning.
+//! - `cpu`, `metal`, and `cuda` select hardware support for enabled implementations.
+//! - `server-support` and `llm-test-support` are intended for Orchion Server integration, not
+//!   ordinary SDK callers.
+//!
+//! # Runtime behavior
+//!
+//! ASR, TTS, and OCR loading and inference use asynchronous interfaces. LLM provisioning and
+//! [`LlmEngine::load_deployment`] are asynchronous, while [`LlmEngine::load`] and
+//! [`LlmEngine::load_deployment_blocking`] explicitly block until the native runtime is ready.
+//! Dropping an asynchronous native-load future cannot cancel native work that has already started.
+
 #![allow(clippy::missing_errors_doc, clippy::must_use_candidate)]
 
 #[cfg(feature = "asr-engine")]
@@ -55,7 +77,7 @@ pub use orchion_docs as docs;
 pub use asr::{Asr, AsrEngine, AsrEngineFuture, AsrStream, AsrStreamSession};
 
 #[cfg(any(feature = "ocr", feature = "ocr-vl"))]
-pub use ocr::{Ocr, OcrAssets, OcrEngine, OcrEngineFuture};
+pub use ocr::{Ocr, OcrAssets, OcrDeployment, OcrEngine, OcrEngineFuture};
 #[cfg(any(feature = "ocr", feature = "ocr-vl"))]
 pub use orchion_ocr::TableStructureAssets;
 
@@ -64,13 +86,26 @@ pub use orchion_ocr::validate_image_file as validate_ocr_image_file;
 
 #[cfg(feature = "llm")]
 pub use llm::{
-    GenerationEvent, GenerationFinishReason, GenerationOptions, GenerationRequest, LlmBackendGuard,
-    LlmComplete, LlmEngine, LlmEngineConfig, LlmGeneration, LlmMessage, LlmReservation, LlmRole,
-    LlmScriptedControl, LlmTemplateEngine, LlmTimings, LlmUsage, initialize_llm_backend,
-    llm_build_metadata_json, scripted_context_limit_llm_engine, scripted_llm_engine,
-    scripted_panicking_llm_engine, scripted_preparation_panicking_llm_engine,
-    scripted_slow_preparation_llm_engine,
+    GenerationEvent, GenerationFinishReason, GenerationOptions, GenerationRequest, LlmComplete,
+    LlmDeployment, LlmEngine, LlmEngineConfig, LlmGeneration, LlmMessage, LlmRole,
+    LlmTemplateEngine, LlmTimings, LlmUsage,
 };
+
+#[cfg(feature = "server-support")]
+pub mod server_support {
+    pub use crate::llm::{
+        LlmBackendGuard, LlmReservation, initialize_llm_backend, llm_build_metadata_json,
+    };
+}
+
+#[cfg(feature = "llm-test-support")]
+pub mod llm_test_support {
+    pub use crate::llm::{
+        LlmScriptedControl, scripted_context_limit_llm_engine, scripted_llm_engine,
+        scripted_panicking_llm_engine, scripted_preparation_panicking_llm_engine,
+        scripted_slow_preparation_llm_engine,
+    };
+}
 
 #[cfg(feature = "tts-engine")]
 pub use tts::{Tts, TtsEngine, TtsEngineFuture};

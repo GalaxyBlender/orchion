@@ -4,9 +4,9 @@ use std::time::Duration;
 
 #[derive(Clone)]
 pub struct ClientConfig {
-    pub base_url: Url,
-    pub api_key: Option<String>,
-    pub timeout: Duration,
+    pub(crate) base_url: Url,
+    pub(crate) api_key: Option<String>,
+    pub(crate) timeout: Duration,
 }
 
 impl std::fmt::Debug for ClientConfig {
@@ -35,9 +35,34 @@ impl ClientConfig {
         })
     }
 
+    /// Returns the normalized server base URL.
+    #[must_use]
+    pub const fn base_url(&self) -> &Url {
+        &self.base_url
+    }
+
+    /// Returns the configured API key, if any.
+    #[must_use]
+    pub fn api_key(&self) -> Option<&str> {
+        self.api_key.as_deref()
+    }
+
+    /// Returns the request and streaming-operation timeout.
+    #[must_use]
+    pub const fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
     #[must_use]
     pub fn with_api_key(mut self, api_key: impl Into<String>) -> Self {
         self.api_key = Some(api_key.into());
+        self
+    }
+
+    /// Removes a previously configured API key.
+    #[must_use]
+    pub fn without_api_key(mut self) -> Self {
+        self.api_key = None;
         self
     }
 
@@ -89,7 +114,7 @@ mod tests {
     fn config_normalizes_base_url_with_trailing_slash() {
         let config = ClientConfig::new("http://localhost:8080").unwrap();
 
-        assert_eq!(config.base_url.as_str(), "http://localhost:8080/");
+        assert_eq!(config.base_url().as_str(), "http://localhost:8080/");
     }
 
     #[test]

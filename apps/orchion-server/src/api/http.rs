@@ -188,9 +188,10 @@ mod tests {
     use axum::response::Response;
     use futures_util::{SinkExt, StreamExt};
     use http_body_util::BodyExt;
+    use orchion::llm_test_support::scripted_context_limit_llm_engine;
     use orchion::{
         AsrModel, ModelCategory, ModelDownloader, ModelId, ModelSpec, ModelUrl, ModelUrlSource,
-        OcrModel, OcrModelKind, TtsModel, scripted_context_limit_llm_engine,
+        OcrModel, OcrModelKind, TtsModel,
     };
     use serde_json::Value;
     use std::net::SocketAddr;

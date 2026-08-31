@@ -1,0 +1,92 @@
+name: SDK CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  sdk:
+    name: Check SDK contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy,rustfmt
+
+      - name: Install native prerequisites
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake libclang-dev
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Test SDK contracts
+        run: |
+          cargo test -p orchion-client --all-features
+          cargo test -p orchion-protocol
+          cargo test -p orchion-download --lib
+          cargo test -p orchion-server --test routes_tests rust_client_matches_server_discovery_and_residency_contracts
+
+      - name: Check client feature isolation
+        run: |
+          cargo check -p orchion-client --no-default-features
+          cargo check -p orchion-client --no-default-features --features health
+          cargo check -p orchion-client --no-default-features --features models
+          cargo check -p orchion-client --no-default-features --features activity
+          cargo check -p orchion-client --no-default-features --features llm
+          cargo check -p orchion-client --no-default-features --features asr
+          cargo check -p orchion-client --no-default-features --features tts
+          cargo check -p orchion-client --no-default-features --features ocr
+          cargo check -p orchion-client --no-default-features --features pdf
+
+      - name: Check examples
+        run: |
+          cargo check \
+            -p orchion-example-client-asr-file \
+            -p orchion-example-client-asr-streaming \
+            -p orchion-example-client-discovery \
+            -p orchion-example-client-llm \
+            -p orchion-example-client-ocr \
+            -p orchion-example-client-operations \
+            -p orchion-example-client-pdf \
+            -p orchion-example-client-tts
+          cargo check \
+            -p orchion-example-asr-file \
+            -p orchion-example-asr-streaming \
+            -p orchion-example-download-model \
+            -p orchion-example-llm-complete \
+            -p orchion-example-llm-streaming-cancel \
+            -p orchion-example-ocr-basic \
+            -p orchion-example-tts-preset \
+            -p orchion-example-tts-voice-modes \
+            --features cpu
+
+      - name: Lint SDKs
+        run: |
+          cargo clippy -p orchion-client --all-features --all-targets -- -D warnings
+          cargo clippy -p orchion --no-default-features --features full,cpu --all-targets --no-deps -- -D warnings
+
+      - name: Document SDKs
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          cargo doc -p orchion-client --all-features --no-deps
+          cargo doc -p orchion --no-default-features --features full,cpu --no-deps

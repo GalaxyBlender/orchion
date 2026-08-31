@@ -36,7 +36,7 @@ async fn main() -> ExitCode {
 async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     if cli.build_metadata {
-        println!("{}", orchion::llm_build_metadata_json());
+        println!("{}", orchion::server_support::llm_build_metadata_json());
         return Ok(());
     }
     let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("orchion-server"));
@@ -49,7 +49,7 @@ async fn run() -> anyhow::Result<()> {
         "logging initialized"
     );
     tracing::debug!(
-        build_metadata = %orchion::llm_build_metadata_json(),
+        build_metadata = %orchion::server_support::llm_build_metadata_json(),
         "LLM native build metadata"
     );
 

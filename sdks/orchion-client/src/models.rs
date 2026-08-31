@@ -2,6 +2,10 @@ use crate::client::decode_json;
 use crate::{Client, ClientError};
 use serde::{Deserialize, Serialize};
 
+pub use orchion_protocol::{
+    ModelControlRequest, ModelResidency, ModelService, ModelStatus, ModelStatusList,
+};
+
 /// Client for the models API.
 pub struct ModelsClient<'a> {
     client: &'a Client,
@@ -20,6 +24,46 @@ impl<'a> ModelsClient<'a> {
     /// Returns [`ClientError`] when the request cannot be sent or the response cannot be decoded.
     pub async fn list(&self) -> Result<ListModelsResponse, ClientError> {
         let response = self.client.get("/v1/models")?.send().await?;
+        decode_json(response).await
+    }
+
+    /// Lists the runtime residency status of configured models.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the request cannot be sent or the response cannot be decoded.
+    pub async fn list_statuses(&self) -> Result<ModelStatusList, ClientError> {
+        let response = self.client.get("/api/models/status")?.send().await?;
+        decode_json(response).await
+    }
+
+    /// Loads a model into its service runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the request cannot be sent or the response cannot be decoded.
+    pub async fn load(&self, request: ModelControlRequest) -> Result<ModelStatus, ClientError> {
+        let response = self
+            .client
+            .post("/api/models/load")?
+            .json(&request)
+            .send()
+            .await?;
+        decode_json(response).await
+    }
+
+    /// Unloads a model from its service runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the request cannot be sent or the response cannot be decoded.
+    pub async fn unload(&self, request: ModelControlRequest) -> Result<ModelStatus, ClientError> {
+        let response = self
+            .client
+            .post("/api/models/unload")?
+            .json(&request)
+            .send()
+            .await?;
         decode_json(response).await
     }
 }

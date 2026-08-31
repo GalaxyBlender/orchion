@@ -8,8 +8,11 @@ license = "MIT"
 repository = "https://github.com/xuan/orchion"
 
 [features]
-default = ["models", "asr", "tts", "ocr", "pdf"]
+default = ["health", "models", "activity", "llm", "asr", "tts", "ocr", "pdf"]
+health = []
 models = []
+activity = ["dep:eventsource-stream", "dep:futures-util", "reqwest/query", "reqwest/stream"]
+llm = ["dep:eventsource-stream", "dep:futures-util", "reqwest/stream"]
 asr = ["dep:futures-util", "dep:tokio-tungstenite", "tokio/net"]
 tts = []
 ocr = []
@@ -26,6 +29,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["fs", "time"] }
 
 futures-util = { version = "0.3", optional = true }
+eventsource-stream = { version = "0.2.3", optional = true }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"], optional = true }
 
 [dev-dependencies]

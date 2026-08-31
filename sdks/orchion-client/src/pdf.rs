@@ -1,6 +1,7 @@
 use crate::client::decode_binary;
 use crate::{Client, ClientError};
 use bytes::Bytes;
+use reqwest::header::CONTENT_DISPOSITION;
 use reqwest::multipart::{Form, Part};
 use std::path::Path;
 
@@ -32,10 +33,16 @@ impl<'a> PdfClient<'a> {
             .send()
             .await?;
         let response = decode_binary(response).await?;
+        let content_disposition = optional_header(&response.headers, CONTENT_DISPOSITION.as_str())?;
+        let page_count = optional_count_header(&response.headers, "x-pdf-page-count")?;
+        let image_count = optional_count_header(&response.headers, "x-pdf-image-count")?;
 
         Ok(PdfImagesResponse {
             bytes: response.bytes,
             content_type: response.content_type,
+            content_disposition,
+            page_count,
+            image_count,
         })
     }
 }
@@ -151,7 +158,39 @@ impl PdfImageFormat {
 
 /// Binary PDF image rendering response.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PdfImagesResponse {
     pub bytes: Bytes,
     pub content_type: Option<String>,
+    pub content_disposition: Option<String>,
+    pub page_count: Option<usize>,
+    pub image_count: Option<usize>,
+}
+
+fn optional_header(
+    headers: &reqwest::header::HeaderMap,
+    name: &'static str,
+) -> Result<Option<String>, ClientError> {
+    headers
+        .get(name)
+        .map(|value| {
+            value
+                .to_str()
+                .map(str::to_owned)
+                .map_err(|error| ClientError::decode(format!("invalid {name} header: {error}")))
+        })
+        .transpose()
+}
+
+fn optional_count_header(
+    headers: &reqwest::header::HeaderMap,
+    name: &'static str,
+) -> Result<Option<usize>, ClientError> {
+    optional_header(headers, name)?
+        .map(|value| {
+            value.parse::<usize>().map_err(|error| {
+                ClientError::decode(format!("invalid {name} header value `{value}`: {error}"))
+            })
+        })
+        .transpose()
 }

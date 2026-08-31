@@ -1,19 +1,101 @@
 use orchion_llama_cpp as backend;
 use std::num::NonZeroU32;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+#[cfg(feature = "server-support")]
 use std::sync::Arc;
 
+use crate::{LlmModel, OrchionError, Result};
+
+/// A text-only LLM deployment backed by one exact local GGUF file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmDeployment {
+    model: LlmModel,
+    path: PathBuf,
+}
+
+impl LlmDeployment {
+    pub fn from_file(model: LlmModel, path: impl Into<PathBuf>) -> Result<Self> {
+        let path = path.into();
+        let metadata = std::fs::metadata(&path).map_err(|error| OrchionError::ModelLoad {
+            message: format!("cannot access LLM GGUF `{}`: {error}", path.display()),
+        })?;
+        if !metadata.is_file() {
+            return Err(OrchionError::ModelLoad {
+                message: format!("LLM GGUF path `{}` is not a file", path.display()),
+            });
+        }
+        if path
+            .extension()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_none_or(|extension| !extension.eq_ignore_ascii_case("gguf"))
+        {
+            return Err(OrchionError::ModelLoad {
+                message: format!("LLM model `{}` is not a GGUF file", path.display()),
+            });
+        }
+        Ok(Self { model, path })
+    }
+
+    #[must_use]
+    pub const fn model(&self) -> &LlmModel {
+        &self.model
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[cfg(feature = "download-all")]
+    pub async fn provision(
+        model: LlmModel,
+        source: crate::ModelUrl,
+        cache_dir: impl AsRef<Path>,
+    ) -> Result<Self> {
+        Self::provision_with_downloader(
+            model,
+            source,
+            cache_dir,
+            &crate::ModelDownloader::default(),
+        )
+        .await
+    }
+
+    #[cfg(feature = "download-all")]
+    pub async fn provision_with_downloader(
+        model: LlmModel,
+        source: crate::ModelUrl,
+        cache_dir: impl AsRef<Path>,
+        downloader: &crate::ModelDownloader,
+    ) -> Result<Self> {
+        let plan = llm_deployment_artifact_plan(&model, &source)?;
+        let publication = downloader
+            .provision_logical_deployment(model.id(), crate::ModelCategory::Llm, &plan, cache_dir)
+            .await?;
+        let path = publication
+            .artifact_file(crate::ArtifactRole::LlmModel)
+            .ok_or_else(|| OrchionError::ModelLoad {
+                message: format!("published LLM deployment `{model}` has no model artifact"),
+            })?
+            .to_path_buf();
+        Self::from_file(model, path)
+    }
+}
+
 #[doc(hidden)]
+#[cfg(feature = "server-support")]
 #[derive(Debug, Clone)]
 pub struct LlmBackendGuard {
     _inner: Arc<backend::BackendOwner>,
 }
 
 #[doc(hidden)]
+#[cfg(feature = "llm-test-support")]
 #[derive(Clone)]
 pub struct LlmScriptedControl(backend::ScriptedControl);
 
 #[doc(hidden)]
+#[cfg(feature = "llm-test-support")]
 impl LlmScriptedControl {
     pub fn wait_started(&self) {
         self.0.wait_started();
@@ -45,6 +127,7 @@ impl LlmScriptedControl {
 }
 
 #[doc(hidden)]
+#[cfg(feature = "server-support")]
 pub fn initialize_llm_backend() -> crate::Result<LlmBackendGuard> {
     backend::BackendOwner::acquire()
         .map(|inner| LlmBackendGuard { _inner: inner })
@@ -54,12 +137,14 @@ pub fn initialize_llm_backend() -> crate::Result<LlmBackendGuard> {
 }
 
 #[doc(hidden)]
+#[cfg(feature = "server-support")]
 #[must_use]
 pub fn llm_build_metadata_json() -> String {
     backend::build_metadata_json()
 }
 
 #[doc(hidden)]
+#[cfg(feature = "llm-test-support")]
 pub fn scripted_llm_engine(script: Vec<GenerationEvent>) -> (LlmEngine, LlmScriptedControl) {
     let script = script
         .into_iter()
@@ -94,12 +179,14 @@ pub fn scripted_llm_engine(script: Vec<GenerationEvent>) -> (LlmEngine, LlmScrip
         LlmEngine {
             inner,
             event_queue_capacity: 1,
+            model: None,
         },
         LlmScriptedControl(control),
     )
 }
 
 #[doc(hidden)]
+#[cfg(feature = "llm-test-support")]
 pub fn scripted_context_limit_llm_engine(
     prompt_tokens: usize,
     max_tokens: usize,
@@ -108,10 +195,12 @@ pub fn scripted_context_limit_llm_engine(
     LlmEngine {
         inner: backend::scripted_context_limit_engine(prompt_tokens, max_tokens, context_size),
         event_queue_capacity: 1,
+        model: None,
     }
 }
 
 #[doc(hidden)]
+#[cfg(feature = "llm-test-support")]
 pub fn scripted_panicking_llm_engine() -> (LlmEngine, LlmScriptedControl) {
     let (inner, control) = backend::scripted_engine(
         vec![backend::Event::Failed("__orchion_test_panic__".to_string())],
@@ -121,30 +210,35 @@ pub fn scripted_panicking_llm_engine() -> (LlmEngine, LlmScriptedControl) {
         LlmEngine {
             inner,
             event_queue_capacity: 1,
+            model: None,
         },
         LlmScriptedControl(control),
     )
 }
 
 #[doc(hidden)]
+#[cfg(feature = "llm-test-support")]
 pub fn scripted_preparation_panicking_llm_engine() -> (LlmEngine, LlmScriptedControl) {
     let (inner, control) = backend::scripted_preparation_panicking_engine(1);
     (
         LlmEngine {
             inner,
             event_queue_capacity: 1,
+            model: None,
         },
         LlmScriptedControl(control),
     )
 }
 
 #[doc(hidden)]
+#[cfg(feature = "llm-test-support")]
 pub fn scripted_slow_preparation_llm_engine() -> (LlmEngine, LlmScriptedControl) {
     let (inner, control) = backend::scripted_slow_preparation_engine(Vec::new(), 1);
     (
         LlmEngine {
             inner,
             event_queue_capacity: 1,
+            model: None,
         },
         LlmScriptedControl(control),
     )
@@ -289,6 +383,24 @@ pub struct LlmEngineConfig {
     pub enable_thinking: bool,
 }
 
+impl Default for LlmEngineConfig {
+    fn default() -> Self {
+        Self {
+            context_size: None,
+            batch_size: 512,
+            micro_batch_size: 512,
+            threads: 0,
+            gpu_layers: u32::MAX,
+            parallel_sequences: 1,
+            request_queue_capacity: 8,
+            event_queue_capacity: 16,
+            chat_template: None,
+            template_engine: LlmTemplateEngine::LlamaCpp,
+            enable_thinking: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LlmTemplateEngine {
     LlamaCpp,
@@ -299,6 +411,7 @@ pub enum LlmTemplateEngine {
 pub struct LlmEngine {
     inner: backend::Engine,
     event_queue_capacity: usize,
+    model: Option<LlmModel>,
 }
 
 pub struct LlmGeneration {
@@ -313,11 +426,16 @@ pub struct LlmReservation {
 
 impl LlmReservation {
     pub async fn commit(mut self) -> crate::Result<LlmGeneration> {
-        self.commit_reserved().await
+        self.commit_inner().await
     }
 
     #[doc(hidden)]
+    #[cfg(feature = "server-support")]
     pub async fn commit_reserved(&mut self) -> crate::Result<LlmGeneration> {
+        self.commit_inner().await
+    }
+
+    async fn commit_inner(&mut self) -> crate::Result<LlmGeneration> {
         self.inner
             .commit()
             .await
@@ -329,21 +447,29 @@ impl LlmReservation {
     }
 
     #[doc(hidden)]
+    #[cfg(feature = "server-support")]
     pub fn cancel(&self) {
         self.inner.cancel();
     }
 
     #[doc(hidden)]
+    #[cfg(feature = "server-support")]
     pub async fn wait_for_ack(&mut self) -> crate::Result<()> {
         self.inner.wait_for_ack().await.map_err(map_backend_error)
     }
 
+    #[cfg(feature = "server-support")]
     pub fn abort(self) {
         self.inner.abort();
     }
 }
 
 impl LlmEngine {
+    /// Loads a GGUF model synchronously.
+    ///
+    /// This method performs blocking model initialization. Async callers should use
+    /// [`Self::load_deployment`], which offloads initialization to Tokio's blocking pool.
+    /// Engines created through this compatibility API do not expose a typed model identity.
     pub fn load(model: PathBuf, config: LlmEngineConfig) -> crate::Result<Self> {
         let event_queue_capacity = config.event_queue_capacity;
         let inner = backend::Engine::load(
@@ -365,21 +491,59 @@ impl LlmEngine {
                 enable_thinking: config.enable_thinking,
             },
         )
-        .map_err(|error| crate::OrchionError::Inference {
+        .map_err(|error| crate::OrchionError::ModelLoad {
             message: error.to_string(),
         })?;
         Ok(Self {
             inner,
             event_queue_capacity,
+            model: None,
         })
     }
 
+    /// Loads a typed deployment synchronously on the current thread.
+    pub fn load_deployment_blocking(
+        deployment: LlmDeployment,
+        config: LlmEngineConfig,
+    ) -> crate::Result<Self> {
+        let LlmDeployment { model, path } = deployment;
+        let mut engine = Self::load(path, config)?;
+        engine.model = Some(model);
+        Ok(engine)
+    }
+
+    /// Loads a typed deployment on Tokio's blocking thread pool.
+    pub async fn load_deployment(
+        deployment: LlmDeployment,
+        config: LlmEngineConfig,
+    ) -> crate::Result<Self> {
+        tokio::task::spawn_blocking(move || Self::load_deployment_blocking(deployment, config))
+            .await
+            .map_err(|error| crate::OrchionError::BlockingTask {
+                message: error.to_string(),
+            })?
+    }
+
+    /// Returns the typed identity when the engine was loaded from an [`LlmDeployment`].
+    #[must_use]
+    pub const fn model(&self) -> Option<&LlmModel> {
+        self.model.as_ref()
+    }
+
     pub async fn stream(&self, request: GenerationRequest) -> crate::Result<LlmGeneration> {
-        self.reserve(request).await?.commit().await
+        self.reserve_generation(request).await?.commit().await
     }
 
     #[doc(hidden)]
+    #[cfg(feature = "server-support")]
     pub async fn reserve(&self, request: GenerationRequest) -> crate::Result<LlmReservation> {
+        self.reserve_generation(request).await
+    }
+
+    async fn reserve_generation(
+        &self,
+        request: GenerationRequest,
+    ) -> crate::Result<LlmReservation> {
         let request = backend::Request {
             messages: request
                 .messages
@@ -541,9 +705,108 @@ fn map_backend_error(error: backend::Error) -> crate::OrchionError {
     }
 }
 
+#[cfg(feature = "download-all")]
+fn llm_deployment_artifact_plan(
+    model: &LlmModel,
+    source: &crate::ModelUrl,
+) -> Result<crate::DeploymentArtifactPlan> {
+    use crate::{
+        ArtifactRole, DeploymentArtifactRequest, DeploymentArtifactSource, DownloadSource,
+        ModelUrlSource,
+    };
+
+    let artifact = match source.source() {
+        ModelUrlSource::File => {
+            let path = PathBuf::from(source.path().expect("validated file URL has a path"));
+            if path
+                .extension()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_none_or(|extension| !extension.eq_ignore_ascii_case("gguf"))
+            {
+                return Err(OrchionError::ModelLoad {
+                    message: format!("LLM source `{source}` is not a GGUF file"),
+                });
+            }
+            let file_name = path
+                .file_name()
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| OrchionError::ModelLoad {
+                    message: format!("LLM source `{source}` does not identify a file"),
+                })?
+                .to_string_lossy()
+                .to_string();
+            DeploymentArtifactRequest {
+                role: ArtifactRole::LlmModel,
+                source: DeploymentArtifactSource::File(path),
+                repository: None,
+                files: vec![file_name],
+                required_source: None,
+            }
+        }
+        ModelUrlSource::Neutral | ModelUrlSource::HuggingFace | ModelUrlSource::ModelScope => {
+            let path = source.path().ok_or_else(|| OrchionError::ModelLoad {
+                message: format!("LLM source `{source}` must identify an exact GGUF file"),
+            })?;
+            if !path.to_ascii_lowercase().ends_with(".gguf") {
+                return Err(OrchionError::ModelLoad {
+                    message: format!("LLM source `{source}` is not a GGUF file"),
+                });
+            }
+            DeploymentArtifactRequest {
+                role: ArtifactRole::LlmModel,
+                source: match source.source() {
+                    ModelUrlSource::Neutral => DeploymentArtifactSource::Neutral,
+                    ModelUrlSource::HuggingFace => DeploymentArtifactSource::HuggingFace,
+                    ModelUrlSource::ModelScope => DeploymentArtifactSource::ModelScope,
+                    ModelUrlSource::File => unreachable!("file source handled above"),
+                },
+                repository: Some(format!(
+                    "{}/{}",
+                    source.owner().expect("validated hub URL has an owner"),
+                    source
+                        .repository()
+                        .expect("validated hub URL has a repository")
+                )),
+                files: vec![path.to_string()],
+                required_source: None,
+            }
+        }
+    };
+    let neutral_candidates = vec![DownloadSource::HuggingFace, DownloadSource::ModelScope];
+    let neutral_suffix = if source.source() == ModelUrlSource::Neutral {
+        "|neutral-policy=huggingface,modelscope"
+    } else {
+        ""
+    };
+    Ok(crate::DeploymentArtifactPlan {
+        deployment_id: model.id().clone(),
+        category: crate::ModelCategory::Llm,
+        source_intent: format!("model={source}|mmproj=none{neutral_suffix}"),
+        artifacts: vec![artifact],
+        neutral_candidates,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_model() -> LlmModel {
+        LlmModel::new(crate::ModelId::parse("acme/test-llm").unwrap())
+    }
+
+    fn temporary_gguf(contents: &[u8]) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "orchion-llm-{}-{}.gguf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
 
     #[tokio::test]
     async fn complete_collects_the_same_deltas_and_terminal_as_stream() {
@@ -590,5 +853,114 @@ mod tests {
         };
         generation.cancel();
         generation.cancel();
+    }
+
+    #[test]
+    fn engine_config_default_matches_server_runtime_defaults() {
+        let config = LlmEngineConfig::default();
+        assert_eq!(config.context_size, None);
+        assert_eq!(config.batch_size, 512);
+        assert_eq!(config.micro_batch_size, 512);
+        assert_eq!(config.threads, 0);
+        assert_eq!(config.gpu_layers, u32::MAX);
+        assert_eq!(config.parallel_sequences, 1);
+        assert_eq!(config.request_queue_capacity, 8);
+        assert_eq!(config.event_queue_capacity, 16);
+        assert_eq!(config.chat_template, None);
+        assert_eq!(config.template_engine, LlmTemplateEngine::LlamaCpp);
+        assert!(!config.enable_thinking);
+    }
+
+    #[test]
+    fn deployment_checks_file_and_preserves_identity_and_path() {
+        let path = temporary_gguf(b"not a real model");
+        let model = test_model();
+        let deployment = LlmDeployment::from_file(model.clone(), path.clone()).unwrap();
+        assert_eq!(deployment.model(), &model);
+        assert_eq!(deployment.path(), path);
+        std::fs::remove_file(path).unwrap();
+
+        assert!(matches!(
+            LlmDeployment::from_file(test_model(), "/definitely/missing/model.gguf"),
+            Err(OrchionError::ModelLoad { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn typed_load_maps_invalid_gguf_to_model_load_without_nested_runtime() {
+        let path = temporary_gguf(b"not a real model");
+        let deployment = LlmDeployment::from_file(test_model(), path.clone()).unwrap();
+        let result = LlmEngine::load_deployment(deployment, LlmEngineConfig::default()).await;
+        assert!(matches!(result, Err(OrchionError::ModelLoad { .. })));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(feature = "download-all")]
+    #[test]
+    fn llm_plan_preserves_exact_sources_roles_and_identity() {
+        use crate::{
+            ArtifactRole, DeploymentArtifactSource, DownloadSource, ModelCategory, ModelUrl,
+        };
+
+        let cases = [
+            (
+                "hf://owner/repo/models/main.gguf",
+                DeploymentArtifactSource::HuggingFace,
+                Some("owner/repo"),
+                "models/main.gguf",
+            ),
+            (
+                "ms://owner/repo/main.gguf",
+                DeploymentArtifactSource::ModelScope,
+                Some("owner/repo"),
+                "main.gguf",
+            ),
+            (
+                "//owner/repo/main.gguf",
+                DeploymentArtifactSource::Neutral,
+                Some("owner/repo"),
+                "main.gguf",
+            ),
+            (
+                "file:///tmp/main.gguf",
+                DeploymentArtifactSource::File(PathBuf::from("/tmp/main.gguf")),
+                None,
+                "main.gguf",
+            ),
+        ];
+        for (url, expected_source, repository, file) in cases {
+            let model = test_model();
+            let source = ModelUrl::parse(url).unwrap();
+            let plan = llm_deployment_artifact_plan(&model, &source).unwrap();
+            assert_eq!(plan.deployment_id, *model.id());
+            assert_eq!(plan.category, ModelCategory::Llm);
+            assert!(plan.source_intent.contains("mmproj=none"));
+            assert_eq!(
+                plan.neutral_candidates,
+                vec![DownloadSource::HuggingFace, DownloadSource::ModelScope]
+            );
+            assert_eq!(plan.artifacts.len(), 1);
+            let artifact = &plan.artifacts[0];
+            assert_eq!(artifact.role, ArtifactRole::LlmModel);
+            assert_eq!(artifact.source, expected_source);
+            assert_eq!(artifact.repository.as_deref(), repository);
+            assert_eq!(artifact.files, [file]);
+        }
+    }
+
+    #[cfg(feature = "download-all")]
+    #[test]
+    fn llm_plan_rejects_repository_only_and_non_gguf_hub_sources() {
+        for source in [
+            "//owner/repo",
+            "hf://owner/repo/model.bin",
+            "file:///tmp/model.bin",
+        ] {
+            let source = crate::ModelUrl::parse(source).unwrap();
+            assert!(matches!(
+                llm_deployment_artifact_plan(&test_model(), &source),
+                Err(OrchionError::ModelLoad { .. })
+            ));
+        }
     }
 }

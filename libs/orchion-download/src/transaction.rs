@@ -51,6 +51,7 @@ pub(crate) async fn acquire_publication_lock(
     .await
 }
 
+#[cfg(test)]
 pub(crate) fn acquire_publication_lock_sync(
     cache_dir: &Path,
     model_key: &str,

@@ -4,13 +4,12 @@ use crate::device::{ProviderPolicy, try_provider_candidates};
 use image::{ImageReader, Limits};
 #[cfg(feature = "ocr")]
 use orchion_core::OcrPoint;
-#[cfg(feature = "ocr-vl")]
-use orchion_core::OcrTask;
 use orchion_core::{
-    DevicePreference, KnownOcrModel, OcrLimits, OcrOptions, OcrResult, OrchionError, Result,
+    DevicePreference, KnownOcrModel, OcrLimits, OcrOptions, OcrResponseFormat, OcrResult, OcrTask,
+    OrchionError, Result,
 };
 #[cfg(any(feature = "ocr", feature = "ocr-vl"))]
-use orchion_core::{ModelId, OcrLayoutBlock, OcrResponseFormat, OcrUsage};
+use orchion_core::{ModelId, OcrLayoutBlock, OcrUsage};
 use std::path::Path;
 #[cfg(feature = "ocr")]
 use std::path::PathBuf;
@@ -125,6 +124,9 @@ pub async fn run_ocr(
     options: OcrOptions,
     limits: OcrLimits,
 ) -> Result<OcrResult> {
+    if let Some(has_layout) = runtime_layout_availability(&runtime)? {
+        validate_builtin_request(model, &options, has_layout)?;
+    }
     let image_path = image_path.to_path_buf();
     #[cfg(all(feature = "ocr-vl", feature = "cuda"))]
     if let (
@@ -142,6 +144,144 @@ pub async fn run_ocr(
     .map_err(|error| OrchionError::BlockingTask {
         message: error.to_string(),
     })?
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OcrPipeline {
+    Traditional,
+    Layout,
+    VlTask,
+    VlLayout,
+}
+
+fn validate_builtin_request(
+    model: KnownOcrModel,
+    options: &OcrOptions,
+    has_layout: bool,
+) -> Result<OcrPipeline> {
+    match model {
+        KnownOcrModel::PpOcrV5Mobile
+        | KnownOcrModel::PpOcrV5Server
+        | KnownOcrModel::PpOcrV6Tiny
+        | KnownOcrModel::PpOcrV6Small
+        | KnownOcrModel::PpOcrV6Medium => {
+            validate_ocr_task(model, options.task)?;
+            reject_max_tokens(model, options)?;
+            if options.response_format == OcrResponseFormat::Html {
+                return unsupported(model, "HTML response format");
+            }
+
+            let wants_layout = options.layout_model.is_some()
+                || options.response_format == OcrResponseFormat::Markdown;
+            if wants_layout {
+                require_layout(model, has_layout)?;
+                Ok(OcrPipeline::Layout)
+            } else {
+                Ok(OcrPipeline::Traditional)
+            }
+        }
+        KnownOcrModel::PpDocLayoutV3 => {
+            validate_ocr_task(model, options.task)?;
+            reject_max_tokens(model, options)?;
+            if options.response_format == OcrResponseFormat::Html {
+                return unsupported(model, "HTML response format");
+            }
+            Ok(OcrPipeline::Layout)
+        }
+        KnownOcrModel::PaddleOcrVl15 | KnownOcrModel::PaddleOcrVl16 => {
+            let structured = matches!(
+                options.response_format,
+                OcrResponseFormat::Markdown | OcrResponseFormat::Html
+            );
+            if structured && options.task != OcrTask::Ocr {
+                return unsupported(model, structured_task_capability(options.response_format));
+            }
+            if options.layout_model.is_some() || structured {
+                require_layout(model, has_layout)?;
+            }
+            if should_use_vl_layout_pipeline(options) {
+                Ok(OcrPipeline::VlLayout)
+            } else {
+                Ok(OcrPipeline::VlTask)
+            }
+        }
+    }
+}
+
+fn validate_ocr_task(model: KnownOcrModel, task: OcrTask) -> Result<()> {
+    if task == OcrTask::Ocr {
+        Ok(())
+    } else {
+        unsupported(model, task_capability(task))
+    }
+}
+
+fn reject_max_tokens(model: KnownOcrModel, options: &OcrOptions) -> Result<()> {
+    if options.max_tokens.is_some() {
+        unsupported(model, "max_tokens")
+    } else {
+        Ok(())
+    }
+}
+
+fn require_layout(model: KnownOcrModel, has_layout: bool) -> Result<()> {
+    if has_layout {
+        Ok(())
+    } else {
+        Err(model_load_error(anyhow::anyhow!(
+            "OCR layout model is requested but not loaded for `{}`",
+            model.id()
+        )))
+    }
+}
+
+fn unsupported<T>(model: KnownOcrModel, capability: &'static str) -> Result<T> {
+    Err(OrchionError::UnsupportedCapability {
+        model: model.id().to_string(),
+        capability,
+    })
+}
+
+const fn task_capability(task: OcrTask) -> &'static str {
+    match task {
+        OcrTask::Ocr => "OCR task",
+        OcrTask::Table => "table task",
+        OcrTask::Formula => "formula task",
+        OcrTask::Chart => "chart task",
+        OcrTask::Spotting => "spotting task",
+        OcrTask::Seal => "seal task",
+    }
+}
+
+const fn structured_task_capability(format: OcrResponseFormat) -> &'static str {
+    match format {
+        OcrResponseFormat::Markdown => "Markdown response format for non-OCR tasks",
+        OcrResponseFormat::Html => "HTML response format for non-OCR tasks",
+        OcrResponseFormat::Json | OcrResponseFormat::Text => "structured response format",
+    }
+}
+
+fn runtime_layout_availability(runtime: &LoadedOcrRuntime) -> Result<Option<bool>> {
+    match runtime {
+        #[cfg(feature = "ocr")]
+        LoadedOcrRuntime::Traditional(runtime) => Ok(Some(runtime.structure.is_some())),
+        #[cfg(feature = "ocr")]
+        LoadedOcrRuntime::Layout(_) => Ok(Some(true)),
+        #[cfg(all(feature = "ocr-vl", not(feature = "cuda")))]
+        LoadedOcrRuntime::OcrVl(runtime) => Ok(Some(
+            runtime
+                .lock()
+                .map_err(|error| OrchionError::Inference {
+                    message: format!("OCR-VL runtime lock poisoned: {error}"),
+                })?
+                .layout_predictor
+                .is_some(),
+        )),
+        #[cfg(all(feature = "ocr-vl", feature = "cuda"))]
+        LoadedOcrRuntime::OcrVl(worker) => Ok(Some(worker.has_layout_predictor())),
+        #[cfg(any(not(feature = "ocr"), not(feature = "ocr-vl")))]
+        LoadedOcrRuntime::Unsupported { .. } => Ok(None),
+    }
 }
 
 /// Validates an OCR image header and decoder limits without decoding its pixels.
@@ -397,7 +537,7 @@ fn run_traditional_ocr(
     options: &OcrOptions,
     limits: OcrLimits,
 ) -> Result<OcrResult> {
-    if options.layout_model.is_some() {
+    if options.layout_model.is_some() || options.response_format == OcrResponseFormat::Markdown {
         let structure = runtime.structure.as_ref().ok_or_else(|| {
             model_load_error(anyhow::anyhow!(
                 "OCR layout model is configured but not loaded for `{}`",
@@ -621,13 +761,13 @@ fn run_vl_layout_ocr(
     ))
 }
 
-#[cfg(feature = "ocr-vl")]
 fn should_use_vl_layout_pipeline(options: &OcrOptions) -> bool {
-    options.layout_model.is_some()
-        || matches!(
-            options.response_format,
-            OcrResponseFormat::Markdown | OcrResponseFormat::Html
-        )
+    options.task == OcrTask::Ocr
+        && (options.layout_model.is_some()
+            || matches!(
+                options.response_format,
+                OcrResponseFormat::Markdown | OcrResponseFormat::Html
+            ))
 }
 
 #[cfg(any(feature = "ocr", feature = "ocr-vl"))]
@@ -1011,10 +1151,232 @@ fn base_result(
     }
 }
 
-#[cfg(any(feature = "ocr", feature = "ocr-vl"))]
 fn model_load_error(error: impl Into<anyhow::Error>) -> OrchionError {
     OrchionError::ModelLoad {
         message: error.into().to_string(),
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    const TRADITIONAL: KnownOcrModel = KnownOcrModel::PpOcrV6Tiny;
+    const LAYOUT: KnownOcrModel = KnownOcrModel::PpDocLayoutV3;
+    const VL: KnownOcrModel = KnownOcrModel::PaddleOcrVl16;
+
+    fn options(task: OcrTask, response_format: OcrResponseFormat) -> OcrOptions {
+        OcrOptions {
+            task,
+            response_format,
+            ..OcrOptions::default()
+        }
+    }
+
+    fn with_explicit_layout(mut options: OcrOptions) -> OcrOptions {
+        options.layout_model = Some(LAYOUT.id().parse().unwrap());
+        options
+    }
+
+    fn assert_unsupported(
+        result: Result<OcrPipeline>,
+        expected_model: KnownOcrModel,
+        expected_capability: &'static str,
+    ) {
+        match result.unwrap_err() {
+            OrchionError::UnsupportedCapability { model, capability } => {
+                assert_eq!(model, expected_model.id());
+                assert_eq!(capability, expected_capability);
+            }
+            error => panic!("expected UnsupportedCapability, got {error}"),
+        }
+    }
+
+    #[test]
+    fn traditional_supports_plain_json_and_text() {
+        for format in [OcrResponseFormat::Json, OcrResponseFormat::Text] {
+            assert_eq!(
+                validate_builtin_request(TRADITIONAL, &options(OcrTask::Ocr, format), false)
+                    .unwrap(),
+                OcrPipeline::Traditional
+            );
+        }
+    }
+
+    #[test]
+    fn traditional_layout_requests_require_and_use_loaded_structure() {
+        let markdown = options(OcrTask::Ocr, OcrResponseFormat::Markdown);
+        assert!(matches!(
+            validate_builtin_request(TRADITIONAL, &markdown, false),
+            Err(OrchionError::ModelLoad { .. })
+        ));
+        assert_eq!(
+            validate_builtin_request(TRADITIONAL, &markdown, true).unwrap(),
+            OcrPipeline::Layout
+        );
+
+        let explicit_layout = with_explicit_layout(options(OcrTask::Ocr, OcrResponseFormat::Json));
+        assert!(matches!(
+            validate_builtin_request(TRADITIONAL, &explicit_layout, false),
+            Err(OrchionError::ModelLoad { .. })
+        ));
+        assert_eq!(
+            validate_builtin_request(TRADITIONAL, &explicit_layout, true).unwrap(),
+            OcrPipeline::Layout
+        );
+    }
+
+    #[test]
+    fn traditional_rejects_html_non_ocr_tasks_and_max_tokens() {
+        assert_unsupported(
+            validate_builtin_request(
+                TRADITIONAL,
+                &options(OcrTask::Ocr, OcrResponseFormat::Html),
+                true,
+            ),
+            TRADITIONAL,
+            "HTML response format",
+        );
+        assert_unsupported(
+            validate_builtin_request(
+                TRADITIONAL,
+                &options(OcrTask::Table, OcrResponseFormat::Json),
+                false,
+            ),
+            TRADITIONAL,
+            "table task",
+        );
+        let max_tokens = OcrOptions {
+            max_tokens: Some(128),
+            ..OcrOptions::default()
+        };
+        assert_unsupported(
+            validate_builtin_request(TRADITIONAL, &max_tokens, false),
+            TRADITIONAL,
+            "max_tokens",
+        );
+    }
+
+    #[test]
+    fn standalone_layout_supports_only_ocr_json_text_and_markdown() {
+        for format in [
+            OcrResponseFormat::Json,
+            OcrResponseFormat::Text,
+            OcrResponseFormat::Markdown,
+        ] {
+            assert_eq!(
+                validate_builtin_request(LAYOUT, &options(OcrTask::Ocr, format), true).unwrap(),
+                OcrPipeline::Layout
+            );
+        }
+        assert_unsupported(
+            validate_builtin_request(
+                LAYOUT,
+                &options(OcrTask::Formula, OcrResponseFormat::Json),
+                true,
+            ),
+            LAYOUT,
+            "formula task",
+        );
+        assert_unsupported(
+            validate_builtin_request(
+                LAYOUT,
+                &options(OcrTask::Ocr, OcrResponseFormat::Html),
+                true,
+            ),
+            LAYOUT,
+            "HTML response format",
+        );
+        let max_tokens = OcrOptions {
+            max_tokens: Some(1),
+            ..OcrOptions::default()
+        };
+        assert_unsupported(
+            validate_builtin_request(LAYOUT, &max_tokens, true),
+            LAYOUT,
+            "max_tokens",
+        );
+    }
+
+    #[test]
+    fn vl_json_and_text_use_task_pipeline_for_all_tasks() {
+        let tasks = [
+            OcrTask::Ocr,
+            OcrTask::Table,
+            OcrTask::Formula,
+            OcrTask::Chart,
+            OcrTask::Spotting,
+            OcrTask::Seal,
+        ];
+        for task in tasks {
+            for format in [OcrResponseFormat::Json, OcrResponseFormat::Text] {
+                let mut request = options(task, format);
+                request.max_tokens = Some(256);
+                assert_eq!(
+                    validate_builtin_request(VL, &request, true).unwrap(),
+                    OcrPipeline::VlTask
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vl_non_ocr_tasks_ignore_loaded_or_explicit_layout_for_json_and_text() {
+        for task in [OcrTask::Table, OcrTask::Formula] {
+            for format in [OcrResponseFormat::Json, OcrResponseFormat::Text] {
+                let request = with_explicit_layout(options(task, format));
+                assert_eq!(
+                    validate_builtin_request(VL, &request, true).unwrap(),
+                    OcrPipeline::VlTask
+                );
+                assert!(!should_use_vl_layout_pipeline(&request));
+            }
+        }
+    }
+
+    #[test]
+    fn vl_structured_formats_require_ocr_task_and_loaded_layout() {
+        for (format, capability) in [
+            (
+                OcrResponseFormat::Markdown,
+                "Markdown response format for non-OCR tasks",
+            ),
+            (
+                OcrResponseFormat::Html,
+                "HTML response format for non-OCR tasks",
+            ),
+        ] {
+            assert_unsupported(
+                validate_builtin_request(VL, &options(OcrTask::Table, format), true),
+                VL,
+                capability,
+            );
+            assert!(matches!(
+                validate_builtin_request(VL, &options(OcrTask::Ocr, format), false),
+                Err(OrchionError::ModelLoad { .. })
+            ));
+            assert_eq!(
+                validate_builtin_request(VL, &options(OcrTask::Ocr, format), true).unwrap(),
+                OcrPipeline::VlLayout
+            );
+        }
+    }
+
+    #[test]
+    fn vl_explicit_layout_uses_layout_only_for_ocr_task() {
+        let ocr = with_explicit_layout(options(OcrTask::Ocr, OcrResponseFormat::Json));
+        assert_eq!(
+            validate_builtin_request(VL, &ocr, true).unwrap(),
+            OcrPipeline::VlLayout
+        );
+        assert!(should_use_vl_layout_pipeline(&ocr));
+
+        let table = with_explicit_layout(options(OcrTask::Table, OcrResponseFormat::Json));
+        assert_eq!(
+            validate_builtin_request(VL, &table, true).unwrap(),
+            OcrPipeline::VlTask
+        );
+        assert!(!should_use_vl_layout_pipeline(&table));
     }
 }
 

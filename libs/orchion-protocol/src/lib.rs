@@ -1,3 +1,14 @@
+mod activity;
+mod model_lifecycle;
+
+pub use activity::{
+    ActivityEntry, ActivityEventPayload, ActivityOperation, ActivityOutcome, ActivityPage,
+    ActivityState, ActivitySummary, ActivityTransport,
+};
+pub use model_lifecycle::{
+    ModelControlRequest, ModelResidency, ModelService, ModelStatus, ModelStatusList,
+};
+
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;

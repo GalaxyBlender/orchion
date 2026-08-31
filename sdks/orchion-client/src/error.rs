@@ -1,9 +1,17 @@
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "asr")]
 use std::time::Duration;
 
 pub use orchion_protocol::ErrorObject as ServerErrorObject;
+
+/// Error fields carried by a flat server-sent `event:error` frame.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StreamErrorObject {
+    pub code: Option<String>,
+    pub message: String,
+    pub param: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ServerErrorBody {
@@ -30,7 +38,14 @@ pub enum ClientError {
     #[cfg(feature = "asr")]
     #[error("websocket failed: {message}")]
     WebSocket { message: String },
-    #[cfg(feature = "asr")]
+    #[cfg(any(feature = "asr", feature = "llm"))]
+    #[error("streaming server error: {error:?}")]
+    StreamingServer { error: ServerErrorObject },
+    #[cfg(feature = "llm")]
+    #[error("streaming server error: {error:?}")]
+    StreamingServerEvent { error: StreamErrorObject },
+    #[error("{stream} stream ended before its terminal event")]
+    UnexpectedEof { stream: &'static str },
     #[error("{operation} timed out after {timeout:?}")]
     Timeout {
         operation: &'static str,

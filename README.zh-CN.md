@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-Orchion 提供统一的 Rust API 库和 OpenAI 兼容服务端，面向本地语音、文档与文本生成工作流。目前支持 Qwen3 ASR/TTS、PaddleOCR/OCR-VL 和 text-only llama.cpp tracer。
+Orchion 提供统一的 Rust API 库和 OpenAI 兼容服务端，面向本地语音、文档与文本生成工作流。目前支持 Qwen3 ASR/TTS、PaddleOCR/OCR-VL 和 text-only llama.cpp runtime。
 
 ## 亮点
 
@@ -62,6 +62,7 @@ API key 和表单偏好会存储在浏览器 `localStorage`；不要在共享或
 
 详细 API 文档：
 
+- [SDK 契约矩阵](docs/sdk-matrix.md)
 - [ASR](docs/asr.zh-CN.md)
 - [ASR 流式协议](docs/asr-streaming.zh-CN.md)
 - [TTS](docs/tts.zh-CN.md)
@@ -72,9 +73,9 @@ API key 和表单偏好会存储在浏览器 `localStorage`；不要在共享或
 
 Activity 页面只记录路由模板、模型 ID、状态、耗时和输入大小等白名单元数据。请求进行期间，Activity 客户端还可以看到 peer 地址和 User-Agent；这些仅限实时展示的字段会在写入历史前清除。Activity 接口遵循全局 API key 配置，因此未配置 API key 的部署会向所有能访问服务的客户端开放实时元数据。Activity 不存储请求正文、响应正文、凭据、文件名或生成结果。HTTP 耗时从请求进入匹配路由起，覆盖解析、排队、推理，直到响应 body 完成；WebSocket 耗时覆盖升级后的完整会话。历史数量有上限，并且仅在当前服务进程生命周期内存在。
 
-## Rust 库
+## 原生 Rust SDK
 
-公开 facade crate 位于 `libs/orchion`，提供用于加载、下载和运行 ASR/TTS/OCR 模型的异步 API。
+`orchion` facade 位于 `libs/orchion`，为 ASR、TTS、OCR/OCR-VL 和 text-only LLM 提供类型化的加载、下载、推理与流式接口。由于部分原生 adapter 尚不能从 registry 发布，该 facade 当前仅供 workspace 使用，尚未发布到 crates.io。重型领域和硬件后端均通过 feature 按需启用；以下示例显式选择 CPU。
 
 ```rust,no_run
 use orchion::{Asr, AsrModel, Result};
@@ -89,13 +90,51 @@ async fn main() -> Result<()> {
 }
 ```
 
-常用示例：
+原生 SDK 示例：
 
 ```sh
 cargo run -p orchion-example-download-model --features cpu -- models
 cargo run -p orchion-example-asr-file --features cpu -- audio.wav models
 cargo run -p orchion-example-tts-preset --features cpu -- "Hello from Orchion" output.wav models
+cargo run -p orchion-example-tts-voice-modes --features cpu -- preset "Hello" output.wav models
+cargo run -p orchion-example-ocr-basic --features cpu -- image.png models
+cargo run -p orchion-example-llm-complete --features cpu -- local/demo hf://org/repo/model.gguf "Hello" models
 ```
+
+`llm-complete` 和 `llm-streaming-cancel` 要求传入精确 GGUF URL。OCR provisioning 可能下载多个仓库，并在加载前组装类型化 assets。同步 `LlmEngine::load` 接口会阻塞；`LlmEngine::load_deployment` 会把加载移出 async runtime worker。
+
+## Server Rust SDK
+
+`sdks/orchion-client` 中的 `orchion-client` crate 是上述全部公开数据路由的类型化异步客户端。默认 feature 启用 health、models、Activity、LLM、ASR、TTS、OCR 和 PDF；应用也可以关闭默认 feature 后只选择需要的领域。
+
+```rust,no_run
+use orchion_client::{Client, ClientError};
+
+#[tokio::main]
+async fn main() -> Result<(), ClientError> {
+    let client = Client::new("http://127.0.0.1:8080")?;
+    client.health().check().await?;
+    for model in client.models().list().await?.data {
+        println!("{}: {:?}", model.id, model.capabilities);
+    }
+    Ok(())
+}
+```
+
+Server SDK 示例：
+
+```sh
+cargo run -p orchion-example-client-discovery -- http://127.0.0.1:8080
+cargo run -p orchion-example-client-asr-file -- http://127.0.0.1:8080 audio.wav alibaba/qwen3-asr-0.6b
+cargo run -p orchion-example-client-asr-streaming -- http://127.0.0.1:8080 audio.wav alibaba/qwen3-asr-0.6b
+cargo run -p orchion-example-client-tts -- http://127.0.0.1:8080 MODEL "Hello" VOICE output.wav
+cargo run -p orchion-example-client-ocr -- http://127.0.0.1:8080 image.png MODEL json
+cargo run -p orchion-example-client-pdf -- http://127.0.0.1:8080 document.pdf pages.zip
+cargo run -p orchion-example-client-llm -- http://127.0.0.1:8080 MODEL "Hello"
+cargo run -p orchion-example-client-operations -- http://127.0.0.1:8080 MODEL llm
+```
+
+服务启用认证时设置 `ORCHION_API_KEY`。`start_streaming` 会等待 ASR `Ready` 后再返回。LLM 流必须收到协议终态；Activity 流在服务断开时正常结束，且不会自动重连。推理 POST 请求不会自动重试。
 
 ## 配置
 
@@ -115,6 +154,8 @@ cargo run -p orchion-example-tts-preset --features cpu -- "Hello from Orchion" o
 cargo fmt --all -- --check
 cargo test --workspace --features full,cpu
 cargo check --workspace
+cargo clippy -p orchion-client --all-features --all-targets -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc -p orchion-client --all-features --no-deps
 ```
 
 Orchion 仍处于早期阶段。项目稳定前，公开 Rust API 和服务端请求扩展都可能调整。

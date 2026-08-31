@@ -15,7 +15,7 @@ flash-attn = ["orchion/flash-attn"]
 
 [dependencies]
 hound = "3"
-orchion = { path = "../../libs/orchion", default-features = false, features = ["asr-qwen3", "download-all"] }
+orchion = { path = "../../../libs/orchion", default-features = false, features = ["asr-qwen3", "download-all"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [lints.rust]

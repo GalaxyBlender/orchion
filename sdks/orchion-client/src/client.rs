@@ -1,8 +1,8 @@
 use crate::{ClientConfig, ClientError, ServerErrorBody};
 use bytes::Bytes;
-use reqwest::header::CONTENT_TYPE;
 #[cfg(feature = "asr")]
-use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+use reqwest::header::{AUTHORIZATION, HeaderValue};
+use reqwest::header::{CONTENT_TYPE, HeaderMap};
 use reqwest::{RequestBuilder, Response, Url};
 use std::fmt;
 
@@ -45,7 +45,10 @@ impl Client {
     ///
     /// Returns [`ClientError`] when the underlying HTTP client cannot be built.
     pub fn from_config(config: ClientConfig) -> Result<Self, ClientError> {
-        let http = reqwest::Client::builder().timeout(config.timeout).build()?;
+        let http = reqwest::Client::builder()
+            .connect_timeout(config.timeout)
+            .read_timeout(config.timeout)
+            .build()?;
         Ok(Self { config, http })
     }
 
@@ -60,6 +63,27 @@ impl Client {
     #[must_use]
     pub fn models(&self) -> crate::models::ModelsClient<'_> {
         crate::models::ModelsClient::new(self)
+    }
+
+    /// Returns the health API client.
+    #[cfg(feature = "health")]
+    #[must_use]
+    pub fn health(&self) -> crate::health::HealthClient<'_> {
+        crate::health::HealthClient::new(self)
+    }
+
+    /// Returns the activity API client.
+    #[cfg(feature = "activity")]
+    #[must_use]
+    pub fn activity(&self) -> crate::activity::ActivityClient<'_> {
+        crate::activity::ActivityClient::new(self)
+    }
+
+    /// Returns the LLM API client.
+    #[cfg(feature = "llm")]
+    #[must_use]
+    pub fn llm(&self) -> crate::llm::LlmClient<'_> {
+        crate::llm::LlmClient::new(self)
     }
 
     /// Returns the ASR API client.
@@ -100,11 +124,27 @@ impl Client {
 
     #[allow(dead_code)]
     pub(crate) fn get(&self, path: &str) -> Result<RequestBuilder, ClientError> {
-        Ok(self.authorize(self.http.get(self.url(path)?)))
+        Ok(self
+            .authorize(self.http.get(self.url(path)?))
+            .timeout(self.config.timeout))
     }
 
     #[allow(dead_code)]
     pub(crate) fn post(&self, path: &str) -> Result<RequestBuilder, ClientError> {
+        Ok(self
+            .authorize(self.http.post(self.url(path)?))
+            .timeout(self.config.timeout))
+    }
+
+    #[cfg(any(feature = "activity", feature = "llm"))]
+    #[allow(dead_code)]
+    pub(crate) fn stream_get(&self, path: &str) -> Result<RequestBuilder, ClientError> {
+        Ok(self.authorize(self.http.get(self.url(path)?)))
+    }
+
+    #[cfg(any(feature = "activity", feature = "llm"))]
+    #[allow(dead_code)]
+    pub(crate) fn stream_post(&self, path: &str) -> Result<RequestBuilder, ClientError> {
         Ok(self.authorize(self.http.post(self.url(path)?)))
     }
 
@@ -156,6 +196,7 @@ impl Client {
 pub(crate) struct BinaryResponse {
     pub(crate) bytes: Bytes,
     pub(crate) content_type: Option<String>,
+    pub(crate) headers: HeaderMap,
 }
 
 #[allow(dead_code)]
@@ -164,26 +205,25 @@ where
     T: serde::de::DeserializeOwned,
 {
     let response = ensure_success(response).await?;
-    response
-        .json::<T>()
-        .await
+    let bytes = response.bytes().await?;
+    serde_json::from_slice::<T>(&bytes)
         .map_err(|error| ClientError::decode(format!("invalid JSON response: {error}")))
 }
 
 #[allow(dead_code)]
 pub(crate) async fn decode_text(response: Response) -> Result<String, ClientError> {
     let response = ensure_success(response).await?;
-    response
-        .text()
-        .await
+    let bytes = response.bytes().await?;
+    String::from_utf8(bytes.to_vec())
         .map_err(|error| ClientError::decode(format!("invalid text response: {error}")))
 }
 
 #[allow(dead_code)]
 pub(crate) async fn decode_binary(response: Response) -> Result<BinaryResponse, ClientError> {
     let response = ensure_success(response).await?;
-    let content_type = response
-        .headers()
+    let headers = response.headers().clone();
+    let bytes = response.bytes().await?;
+    let content_type = headers
         .get(CONTENT_TYPE)
         .map(|value| {
             value.to_str().map(str::to_owned).map_err(|error| {
@@ -191,26 +231,21 @@ pub(crate) async fn decode_binary(response: Response) -> Result<BinaryResponse, 
             })
         })
         .transpose()?;
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|error| ClientError::decode(format!("invalid binary response: {error}")))?;
     Ok(BinaryResponse {
         bytes,
         content_type,
+        headers,
     })
 }
 
 #[allow(dead_code)]
-async fn ensure_success(response: Response) -> Result<Response, ClientError> {
+pub(crate) async fn ensure_success(response: Response) -> Result<Response, ClientError> {
     let status = response.status();
     if status.is_success() {
         return Ok(response);
     }
 
-    let body = response
-        .text()
-        .await
+    let body = String::from_utf8(response.bytes().await?.to_vec())
         .map_err(|error| ClientError::decode(format!("invalid error response: {error}")))?;
 
     if let Ok(server_error) = serde_json::from_str::<ServerErrorBody>(&body) {
@@ -236,4 +271,147 @@ async fn ensure_success(response: Response) -> Result<Response, ClientError> {
         message,
         error: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_binary, decode_json, decode_text, ensure_success};
+    use crate::ClientError;
+    use reqwest::Response;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    #[tokio::test]
+    async fn json_body_disconnect_is_a_transport_error() {
+        let response = truncated_response("200 OK").await;
+
+        let error = decode_json::<serde_json::Value>(response)
+            .await
+            .unwrap_err();
+
+        assert_body_transport(error);
+    }
+
+    #[tokio::test]
+    async fn text_body_disconnect_is_a_transport_error() {
+        let response = truncated_response("200 OK").await;
+
+        let error = decode_text(response).await.unwrap_err();
+
+        assert_body_transport(error);
+    }
+
+    #[tokio::test]
+    async fn binary_body_disconnect_is_a_transport_error() {
+        let response = truncated_response("200 OK").await;
+
+        let Err(error) = decode_binary(response).await else {
+            panic!("truncated binary body unexpectedly decoded");
+        };
+
+        assert_body_transport(error);
+    }
+
+    #[tokio::test]
+    async fn error_body_disconnect_is_a_transport_error() {
+        let response = truncated_response("500 Internal Server Error").await;
+
+        let error = ensure_success(response).await.unwrap_err();
+
+        assert_body_transport(error);
+    }
+
+    #[tokio::test]
+    async fn body_timeout_is_a_transport_error_with_the_reqwest_source() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\npartial",
+                )
+                .unwrap();
+            stream.flush().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        });
+        let response = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(20))
+            .build()
+            .unwrap()
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap();
+
+        let error = decode_text(response).await.unwrap_err();
+
+        match error {
+            ClientError::Transport { source } => assert!(source.is_timeout()),
+            unexpected => panic!("unexpected error variant: {unexpected:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fully_read_invalid_json_is_a_decode_error() {
+        let response = complete_response("200 OK", b"not json").await;
+
+        let error = decode_json::<serde_json::Value>(response)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ClientError::Decode { .. }));
+    }
+
+    #[tokio::test]
+    async fn fully_read_invalid_utf8_is_a_decode_error() {
+        let response = complete_response("200 OK", &[0xff]).await;
+
+        let error = decode_text(response).await.unwrap_err();
+
+        assert!(matches!(error, ClientError::Decode { .. }));
+    }
+
+    fn assert_body_transport(error: ClientError) {
+        match error {
+            ClientError::Transport { source } => assert!(!source.to_string().is_empty()),
+            unexpected => panic!("unexpected error variant: {unexpected:?}"),
+        }
+    }
+
+    async fn truncated_response(status: &'static str) -> Response {
+        raw_response(status, b"partial", 100).await
+    }
+
+    async fn complete_response(status: &'static str, body: &'static [u8]) -> Response {
+        raw_response(status, body, body.len()).await
+    }
+
+    async fn raw_response(
+        status: &'static str,
+        body: &'static [u8],
+        content_length: usize,
+    ) -> Response {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            stream.write_all(body).unwrap();
+        });
+
+        reqwest::Client::new()
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap()
+    }
 }

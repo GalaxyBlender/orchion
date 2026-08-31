@@ -72,9 +72,46 @@ jobs:
 
       - name: Check client feature gates
         run: |
+          cargo check -p orchion-client --no-default-features
+          cargo check -p orchion-client --no-default-features --features health
           cargo check -p orchion-client --no-default-features --features models
+          cargo check -p orchion-client --no-default-features --features activity
+          cargo check -p orchion-client --no-default-features --features llm
           cargo check -p orchion-client --no-default-features --features asr
-          cargo check -p orchion-client --no-default-features --features tts,ocr,pdf
+          cargo check -p orchion-client --no-default-features --features tts
+          cargo check -p orchion-client --no-default-features --features ocr
+          cargo check -p orchion-client --no-default-features --features pdf
+
+      - name: Check SDK examples
+        run: |
+          cargo check \
+            -p orchion-example-client-asr-file \
+            -p orchion-example-client-asr-streaming \
+            -p orchion-example-client-discovery \
+            -p orchion-example-client-llm \
+            -p orchion-example-client-ocr \
+            -p orchion-example-client-operations \
+            -p orchion-example-client-pdf \
+            -p orchion-example-client-tts
+          cargo check \
+            -p orchion-example-asr-file \
+            -p orchion-example-asr-streaming \
+            -p orchion-example-download-model \
+            -p orchion-example-llm-complete \
+            -p orchion-example-llm-streaming-cancel \
+            -p orchion-example-ocr-basic \
+            -p orchion-example-tts-preset \
+            -p orchion-example-tts-voice-modes \
+            --features cpu
+
+      - name: Lint and document SDKs
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          cargo clippy -p orchion-client --all-features --all-targets -- -D warnings
+          cargo clippy -p orchion --no-default-features --features full,cpu --all-targets --no-deps -- -D warnings
+          cargo doc -p orchion-client --all-features --no-deps
+          cargo doc -p orchion --no-default-features --features full,cpu --no-deps
 
       - name: Assemble publishable packages
         run: |
@@ -84,8 +121,20 @@ jobs:
             --exclude orchion-server \
             --exclude orchion-example-asr-file \
             --exclude orchion-example-asr-streaming \
+            --exclude orchion-example-client-asr-file \
+            --exclude orchion-example-client-asr-streaming \
+            --exclude orchion-example-client-discovery \
+            --exclude orchion-example-client-llm \
+            --exclude orchion-example-client-ocr \
+            --exclude orchion-example-client-operations \
+            --exclude orchion-example-client-pdf \
+            --exclude orchion-example-client-tts \
             --exclude orchion-example-download-model \
-            --exclude orchion-example-tts-preset
+            --exclude orchion-example-llm-complete \
+            --exclude orchion-example-llm-streaming-cancel \
+            --exclude orchion-example-ocr-basic \
+            --exclude orchion-example-tts-preset \
+            --exclude orchion-example-tts-voice-modes
 
   build-macos:
     name: Build macos packages

@@ -1,3 +1,31 @@
+#[cfg(feature = "health")]
+#[tokio::test]
+async fn health_check_accepts_only_trimmed_ok() {
+    use orchion_client::{Client, ClientError};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/healthz"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(" \nok\r\n"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = Client::new(server.uri()).unwrap();
+
+    client.health().check().await.unwrap();
+
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/healthz"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("OK"))
+        .mount(&server)
+        .await;
+    let error = client.health().check().await.unwrap_err();
+    assert!(matches!(error, ClientError::Decode { .. }));
+}
+
 #[cfg(feature = "models")]
 #[tokio::test]
 async fn list_models_sends_auth_and_decodes_typed_models() {
@@ -54,6 +82,73 @@ async fn list_models_sends_auth_and_decodes_typed_models() {
         ]
     );
     assert!(models.data[1].capabilities.is_empty());
+}
+
+#[cfg(feature = "models")]
+#[tokio::test]
+async fn model_lifecycle_sends_auth_and_typed_wire_requests() {
+    use orchion_client::models::{ModelControlRequest, ModelResidency, ModelService, ModelStatus};
+    use orchion_client::{Client, ClientConfig};
+    use wiremock::matchers::{body_json, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let status = serde_json::json!({
+        "object": "model_status",
+        "id": "acme/model",
+        "service": "llm",
+        "status": "loaded"
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/models/status"))
+        .and(header("Authorization", "Bearer secret"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "object": "list",
+            "data": [status.clone()]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    for (path_value, residency) in [
+        ("/api/models/load", ModelResidency::Loaded),
+        ("/api/models/unload", ModelResidency::Unloaded),
+    ] {
+        let mut response = status.clone();
+        response["status"] = serde_json::json!(match residency {
+            ModelResidency::Loaded => "loaded",
+            ModelResidency::Unloaded => "unloaded",
+            _ => unreachable!(),
+        });
+        Mock::given(method("POST"))
+            .and(path(path_value))
+            .and(header("Authorization", "Bearer secret"))
+            .and(body_json(serde_json::json!({
+                "model": "acme/model",
+                "service": "llm"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let client = Client::from_config(
+        ClientConfig::new(server.uri())
+            .unwrap()
+            .with_api_key("secret"),
+    )
+    .unwrap();
+    let request = || ModelControlRequest::new("acme/model", ModelService::Llm);
+
+    let statuses = client.models().list_statuses().await.unwrap();
+    let loaded = client.models().load(request()).await.unwrap();
+    let unloaded = client.models().unload(request()).await.unwrap();
+
+    assert_eq!(statuses.data.len(), 1);
+    assert_eq!(
+        loaded,
+        ModelStatus::new("acme/model", ModelService::Llm, ModelResidency::Loaded)
+    );
+    assert_eq!(unloaded.status, ModelResidency::Unloaded);
 }
 
 #[cfg(feature = "models")]
@@ -557,6 +652,9 @@ async fn render_pdf_images_posts_multipart_and_returns_zip_bytes() {
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "application/zip")
+                .insert_header("content-disposition", "attachment; filename=pdf-images.zip")
+                .insert_header("x-pdf-page-count", "7")
+                .insert_header("x-pdf-image-count", "4")
                 .set_body_bytes(vec![80, 75, 3, 4]),
         )
         .mount(&server)
@@ -572,6 +670,12 @@ async fn render_pdf_images_posts_multipart_and_returns_zip_bytes() {
     let response = client.pdf().render_images(request).await.unwrap();
 
     assert_eq!(response.content_type.as_deref(), Some("application/zip"));
+    assert_eq!(
+        response.content_disposition.as_deref(),
+        Some("attachment; filename=pdf-images.zip")
+    );
+    assert_eq!(response.page_count, Some(7));
+    assert_eq!(response.image_count, Some(4));
     assert_eq!(response.bytes.as_ref(), &[80, 75, 3, 4]);
 
     let requests = server.received_requests().await.unwrap();
@@ -587,6 +691,65 @@ async fn render_pdf_images_posts_multipart_and_returns_zip_bytes() {
             .windows(b"png".len())
             .any(|window| window == b"png")
     );
+}
+
+#[cfg(feature = "pdf")]
+#[tokio::test]
+async fn render_pdf_images_allows_missing_metadata_headers() {
+    use orchion_client::Client;
+    use orchion_client::pdf::PdfImagesRequest;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/pdf/images"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![1]))
+        .mount(&server)
+        .await;
+    let client = Client::new(server.uri()).unwrap();
+
+    let response = client
+        .pdf()
+        .render_images(PdfImagesRequest::new("doc.pdf").with_file_bytes(b"%PDF".to_vec()))
+        .await
+        .unwrap();
+
+    assert_eq!(response.content_disposition, None);
+    assert_eq!(response.page_count, None);
+    assert_eq!(response.image_count, None);
+}
+
+#[cfg(feature = "pdf")]
+#[tokio::test]
+async fn render_pdf_images_rejects_invalid_count_headers() {
+    use orchion_client::pdf::PdfImagesRequest;
+    use orchion_client::{Client, ClientError};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/pdf/images"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-pdf-page-count", "not-a-number")
+                .set_body_bytes(vec![1]),
+        )
+        .mount(&server)
+        .await;
+    let client = Client::new(server.uri()).unwrap();
+
+    let error = client
+        .pdf()
+        .render_images(PdfImagesRequest::new("doc.pdf").with_file_bytes(b"%PDF".to_vec()))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ClientError::Decode { message } if message.contains("x-pdf-page-count")
+    ));
 }
 
 #[cfg(feature = "models")]

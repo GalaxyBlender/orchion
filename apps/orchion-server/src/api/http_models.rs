@@ -6,7 +6,7 @@ use axum::Json;
 use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
 use axum::http::HeaderMap;
-use serde::{Deserialize, Serialize};
+pub use orchion_protocol::{ModelControlRequest, ModelStatusList};
 use std::sync::Arc;
 
 pub(super) async fn list_models<S>(
@@ -21,37 +21,26 @@ where
         .model_catalog()
         .await
         .into_iter()
-        .map(|model| {
+        .filter_map(|model| {
             let model_type = match model.service {
                 ModelService::Asr => ModelType::Asr,
                 ModelService::Tts => ModelType::Tts,
                 ModelService::Ocr | ModelService::OcrVl => ModelType::Ocr,
                 ModelService::Llm => ModelType::Llm,
+                _ => return None,
             };
-            ModelObject::new(
+            Some(ModelObject::new(
                 model.id.to_string(),
                 model.name,
                 model_type,
                 model.capabilities,
-            )
+            ))
         })
         .collect();
     Ok(Json(ModelList {
         object: "list",
         data,
     }))
-}
-
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct ModelStatusList {
-    pub object: &'static str,
-    pub data: Vec<ModelStatus>,
-}
-
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct ModelControlRequest {
-    pub model: String,
-    pub service: ModelService,
 }
 
 pub(super) async fn list_model_statuses<S>(
@@ -62,10 +51,7 @@ where
     S: ServerApplication,
 {
     authorize(state.as_ref(), &headers)?;
-    Ok(Json(ModelStatusList {
-        object: "list",
-        data: state.model_statuses().await,
-    }))
+    Ok(Json(ModelStatusList::new(state.model_statuses().await)))
 }
 
 pub(super) async fn load_model<S>(

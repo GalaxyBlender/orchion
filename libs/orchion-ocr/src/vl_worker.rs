@@ -15,6 +15,7 @@ pub(crate) struct OcrVlWorker {
     // Drop the last sender before joining so the owner thread can leave its receive loop.
     sender: mpsc::Sender<OcrVlRequest>,
     owner: Arc<OwnerThread>,
+    has_layout_predictor: bool,
 }
 
 struct OwnerThread {
@@ -36,6 +37,13 @@ impl OcrVlWorker {
         assets: OcrAssets,
         device: DevicePreference,
     ) -> Result<Self> {
+        let has_layout_predictor = matches!(
+            &assets,
+            OcrAssets::VisionLanguage {
+                layout: Some(_),
+                ..
+            }
+        );
         let (sender, mut receiver) = mpsc::channel::<OcrVlRequest>(REQUEST_QUEUE_CAPACITY);
         let (loaded_sender, loaded_receiver) = std::sync::mpsc::sync_channel(1);
         let join = thread::Builder::new()
@@ -71,6 +79,7 @@ impl OcrVlWorker {
             owner: Arc::new(OwnerThread {
                 join: Mutex::new(Some(join)),
             }),
+            has_layout_predictor,
         };
 
         loaded_receiver
@@ -79,6 +88,10 @@ impl OcrVlWorker {
                 message: format!("OCR-VL worker stopped during model loading: {error}"),
             })??;
         Ok(worker)
+    }
+
+    pub(crate) const fn has_layout_predictor(&self) -> bool {
+        self.has_layout_predictor
     }
 
     pub(crate) async fn run(
@@ -147,6 +160,7 @@ mod tests {
             owner: Arc::new(OwnerThread {
                 join: Mutex::new(Some(join)),
             }),
+            has_layout_predictor: false,
         };
         let (response, result) = oneshot::channel();
         worker

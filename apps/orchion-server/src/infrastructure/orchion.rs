@@ -26,14 +26,15 @@ use crate::settings::{
     LlmContextSize, LlmGpuLayers, LlmModelDeployment, ServerConfig, TableStructureConfig,
 };
 use anyhow::Context;
+use orchion::server_support::{LlmBackendGuard, initialize_llm_backend};
 use orchion::{
     ArtifactRequest, ArtifactRole, Asr, AsrModel, DeploymentArtifactPlan,
     DeploymentArtifactRequest, DeploymentArtifactSource, DeploymentPublication,
     DeploymentSourcePlan, DevicePreference, DownloadSource, GenerationOptions, GenerationRequest,
-    LlmBackendGuard, LlmEngine, LlmEngineConfig, LlmModel, LlmTemplateEngine, ModelCapabilities,
-    ModelCategory, ModelDownloader, ModelId, ModelSpec, ModelUrlSource, Ocr, OcrAssets, OcrModel,
+    LlmEngine, LlmEngineConfig, LlmModel, LlmTemplateEngine, ModelCapabilities, ModelCategory,
+    ModelDownloader, ModelId, ModelSpec, ModelUrlSource, Ocr, OcrAssets, OcrModel,
     OcrModelAssetKind, OcrModelAssetRole, OcrModelKind, RuntimeProvider, TableStructureAssets, Tts,
-    TtsModel, initialize_llm_backend, model_descriptor,
+    TtsModel, model_descriptor,
 };
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -522,12 +523,14 @@ mod tests {
         ChatTemplateConfig, LlmGenerationConfig, LlmModelDeployment, LlmRuntimeConfig,
         ModelDeployment, OcrModelDeployment,
     };
+    use orchion::llm_test_support::{
+        LlmScriptedControl, scripted_llm_engine, scripted_panicking_llm_engine,
+        scripted_preparation_panicking_llm_engine, scripted_slow_preparation_llm_engine,
+    };
     use orchion::{
         AsrEngine, AsrEngineFuture, AsrOptions, AsrStreamSession, AsrStreamingOptions,
         AsrTranscript, GenerationEvent, GenerationFinishReason, KnownOcrModel, LlmMessage, LlmRole,
-        LlmScriptedControl, LlmUsage, OcrEngine, OcrEngineFuture, OcrLimits, OcrOptions, OcrResult,
-        OcrUsage, scripted_llm_engine, scripted_panicking_llm_engine,
-        scripted_preparation_panicking_llm_engine, scripted_slow_preparation_llm_engine,
+        LlmUsage, OcrEngine, OcrEngineFuture, OcrLimits, OcrOptions, OcrResult, OcrUsage,
     };
 
     #[tokio::test]
@@ -2717,19 +2720,14 @@ impl AppState {
                                 .provision_llm_deployment(model.id().clone(), plan, models_dir)
                                 .await?
                         } else {
-                            let prepared_id = model.id().clone();
-                            tokio::task::spawn_blocking(move || {
-                                ModelDownloader::resolve_prepared_logical_deployment(
-                                    &prepared_id,
-                                    ModelCategory::Llm,
-                                    &plan,
-                                    &models_dir,
-                                )
-                            })
+                            ModelDownloader::resolve_or_recover_prepared_logical_deployment(
+                                model.id(),
+                                ModelCategory::Llm,
+                                &plan,
+                                &models_dir,
+                            )
                             .await
-                            .map_err(|error| {
-                                anyhow::anyhow!("prepared LLM resolver failed: {error}")
-                            })??
+                            .context("prepared LLM resolver failed")?
                         };
                         let path = publication
                             .artifact_file(ArtifactRole::LlmModel)
@@ -2952,12 +2950,8 @@ async fn load_ocr_runtime(
                 .provision_deployment(primary.clone(), plan, models_dir.clone())
                 .await?
         } else {
-            let prepared_primary = primary.clone();
-            tokio::task::spawn_blocking(move || {
-                ModelDownloader::resolve_prepared_deployment(&prepared_primary, &plan, &models_dir)
-            })
-            .await
-            .map_err(|error| anyhow::anyhow!("prepared deployment resolver failed: {error}"))??
+            ModelDownloader::resolve_or_recover_prepared_deployment(&primary, &plan, &models_dir)
+                .await?
         };
         return load_published_ocr_runtime(
             primary,
@@ -3673,6 +3667,7 @@ impl ModelLifecycleRuntime for AppState {
                     drop(lease);
                     self.llm_models.status(&model).await
                 }
+                _ => return Ok(None),
             };
             Ok(status.map(|status| model_status(&selector.model, selector.service, status)))
         })

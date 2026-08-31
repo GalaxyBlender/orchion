@@ -1,5 +1,5 @@
 [package]
-name = "orchion-example-tts-preset"
+name = "orchion-example-ocr-basic"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
@@ -11,10 +11,9 @@ default = []
 cpu = ["orchion/cpu"]
 metal = ["orchion/metal"]
 cuda = ["orchion/cuda"]
-flash-attn = ["orchion/flash-attn"]
 
 [dependencies]
-orchion = { path = "../../libs/orchion", default-features = false, features = ["tts-qwen3", "download-all"] }
+orchion = { path = "../../../libs/orchion", default-features = false, features = ["ocr", "download-all"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [lints.rust]

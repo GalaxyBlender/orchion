@@ -1,0 +1,23 @@
+[package]
+name = "orchion-example-llm-complete"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+publish = false
+
+[features]
+default = []
+cpu = ["orchion/cpu"]
+cuda = ["orchion/cuda"]
+
+[dependencies]
+orchion = { path = "../../../libs/orchion", default-features = false, features = ["llm", "download-all"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

@@ -4,8 +4,9 @@ mod transaction;
 
 pub use provider::{
     DownloadFuture, DownloadProvider, DownloadProviderRegistry, DownloadSource, HubProviderOptions,
-    HuggingFaceProvider, ModelScopeProvider, ProviderDownloadRequest, ProviderDownloadResult,
-    ProviderModel, ProviderPreflightRequest, ProviderPreflightResult, ResolvedDownloadFuture,
+    HuggingFaceProvider, ModelScopeProvider, PreflightFuture, ProviderDownloadRequest,
+    ProviderDownloadResult, ProviderModel, ProviderPreflightRequest, ProviderPreflightResult,
+    ResolvedDownloadFuture,
 };
 
 use assets::{ModelHubAsset, ModelHubAssetKind, uses_modelscope_file_assets};
@@ -334,6 +335,11 @@ impl Default for ModelDownloader {
     }
 }
 
+enum PreparedDeploymentInspection {
+    Ready(DeploymentPublication),
+    RecoverableError(OrchionError),
+}
+
 impl ModelDownloader {
     /// Provisions every artifact in one deployment and atomically publishes its manifest.
     ///
@@ -380,7 +386,13 @@ impl ModelDownloader {
         .await
     }
 
-    /// Resolves a previously atomically published deployment without network access.
+    /// Synchronously validates a previously atomically published deployment.
+    ///
+    /// This function performs blocking filesystem I/O and waits on an OS file lock. It does not
+    /// perform network I/O, repair cache state, recover from an LLM lock, or create an async
+    /// runtime. Async callers that cannot block should use
+    /// [`Self::resolve_or_recover_prepared_deployment`] when recovery is desired, or offload this
+    /// strict resolver to a blocking thread.
     ///
     /// # Errors
     ///
@@ -395,11 +407,17 @@ impl ModelDownloader {
         Self::resolve_prepared_deployment_core(plan, cache_dir.as_ref())
     }
 
-    /// Resolves or reconstructs a prepared logical deployment from its authoritative lock.
+    /// Synchronously validates a previously atomically published logical deployment.
+    ///
+    /// This function performs blocking filesystem I/O and waits on an OS file lock. It does not
+    /// perform network I/O, repair cache state, recover from an LLM lock, or create an async
+    /// runtime. Async callers that need LLM lock recovery should use
+    /// [`Self::resolve_or_recover_prepared_logical_deployment`].
     ///
     /// # Errors
     ///
-    /// Returns an error when lock identity, blob integrity, or recovery publication fails.
+    /// Returns an error when the expected deployment manifest is missing or invalid, lock identity
+    /// does not match, or a referenced artifact fails integrity validation.
     pub fn resolve_prepared_logical_deployment(
         deployment_id: &ModelId,
         category: ModelCategory,
@@ -410,10 +428,123 @@ impl ModelDownloader {
         Self::resolve_prepared_deployment_core(plan, cache_dir.as_ref())
     }
 
+    /// Asynchronously resolves a prepared deployment with local-only recovery.
+    ///
+    /// The initial strict validation and OS model-lock wait run on a blocking thread. If that
+    /// validation fails, the model lock is released before interrupted publication transactions
+    /// are recovered under the global publication lock. LLM deployments can additionally
+    /// reconstruct their publication from `orchion-models.lock` and existing verified artifacts.
+    /// Network downloads and provider calls are disabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the plan is invalid, blocking validation fails, transaction recovery
+    /// fails, or LLM lock recovery fails.
+    pub async fn resolve_or_recover_prepared_deployment<M: ModelSpec>(
+        primary: &M,
+        plan: &DeploymentArtifactPlan,
+        cache_dir: impl AsRef<Path>,
+    ) -> Result<DeploymentPublication> {
+        validate_deployment_plan(primary, plan)?;
+        Self::resolve_or_recover_prepared_deployment_core(plan, cache_dir.as_ref()).await
+    }
+
+    /// Asynchronously resolves a logical deployment with local-only recovery.
+    ///
+    /// The initial strict validation and OS model-lock wait run on a blocking thread. If that
+    /// validation fails, the model lock is released before interrupted publication transactions
+    /// are recovered under the global publication lock. LLM deployments can additionally
+    /// reconstruct their publication from `orchion-models.lock` and existing verified artifacts.
+    /// Network downloads and provider calls are disabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when deployment identity is invalid, blocking validation fails,
+    /// transaction recovery fails, or LLM lock recovery fails.
+    pub async fn resolve_or_recover_prepared_logical_deployment(
+        deployment_id: &ModelId,
+        category: ModelCategory,
+        plan: &DeploymentArtifactPlan,
+        cache_dir: impl AsRef<Path>,
+    ) -> Result<DeploymentPublication> {
+        validate_deployment_identity(deployment_id.as_str(), category, plan)?;
+        Self::resolve_or_recover_prepared_deployment_core(plan, cache_dir.as_ref()).await
+    }
+
+    async fn resolve_or_recover_prepared_deployment_core(
+        plan: &DeploymentArtifactPlan,
+        cache_dir: &Path,
+    ) -> Result<DeploymentPublication> {
+        let inspection = Self::inspect_prepared_deployment(plan, cache_dir).await?;
+        if let PreparedDeploymentInspection::Ready(publication) = inspection {
+            return Ok(publication);
+        }
+
+        let publication_lock = transaction::acquire_publication_lock(
+            cache_dir,
+            &deployment_artifact_fingerprint(plan),
+        )
+        .await?;
+        let recovered = recover_interrupted_publication(cache_dir)
+            .await
+            .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
+        drop(publication_lock);
+        if !recovered {
+            return Err(deployment_cache_error(
+                plan,
+                "a committed cache publication is awaiting cleanup",
+            ));
+        }
+
+        match Self::inspect_prepared_deployment(plan, cache_dir).await? {
+            PreparedDeploymentInspection::Ready(publication) => Ok(publication),
+            PreparedDeploymentInspection::RecoverableError(_)
+                if plan.category == ModelCategory::Llm =>
+            {
+                let downloader = Self::new(DownloadSource::Auto);
+                recover_llm_from_lock(
+                    &downloader,
+                    cache_dir,
+                    plan,
+                    &LibraryDownloadClient,
+                    &DownloadEnv::current(),
+                    false,
+                )
+                .await
+            }
+            PreparedDeploymentInspection::RecoverableError(error) => Err(error),
+        }
+    }
+
+    async fn inspect_prepared_deployment(
+        plan: &DeploymentArtifactPlan,
+        cache_dir: &Path,
+    ) -> Result<PreparedDeploymentInspection> {
+        let blocking_plan = plan.clone();
+        let blocking_cache_dir = cache_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            Self::inspect_prepared_deployment_core(&blocking_plan, &blocking_cache_dir)
+        })
+        .await
+        .map_err(|error| OrchionError::BlockingTask {
+            message: format!("prepared deployment validation task failed: {error}"),
+        })?
+    }
+
     fn resolve_prepared_deployment_core(
         plan: &DeploymentArtifactPlan,
         cache_dir: &Path,
     ) -> Result<DeploymentPublication> {
+        match Self::inspect_prepared_deployment_core(plan, cache_dir)? {
+            PreparedDeploymentInspection::Ready(publication) => Ok(publication),
+            PreparedDeploymentInspection::RecoverableError(error) => Err(error),
+        }
+    }
+
+    fn inspect_prepared_deployment_core(
+        plan: &DeploymentArtifactPlan,
+        cache_dir: &Path,
+    ) -> Result<PreparedDeploymentInspection> {
         let relative = deployment_publication_relative_path(plan);
         validate_cache_relative_ancestors_sync(cache_dir, Path::new(CACHE_STATE_DIR), true)
             .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
@@ -424,44 +555,17 @@ impl ModelDownloader {
         let _model_lock = transaction::acquire_model_lock_sync(cache_dir, &lock_key)?;
         validate_cache_relative_ancestors_sync(cache_dir, &lock_relative, true)
             .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
-        if publication_transaction_targets_path_sync(cache_dir, &relative)
-            .map_err(|error| deployment_cache_error(plan, error.to_string()))?
-        {
-            let _publication_lock =
-                transaction::acquire_publication_lock_sync(cache_dir, &lock_key)?;
-            if publication_transaction_targets_path_sync(cache_dir, &relative)
-                .map_err(|error| deployment_cache_error(plan, error.to_string()))?
-            {
-                recover_interrupted_publication_sync(cache_dir)
-                    .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
-            }
-        }
         validate_cache_relative_ancestors_sync(cache_dir, &relative, true)
             .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
-        match read_deployment_publication(&cache_dir.join(relative), cache_dir, plan, true) {
-            Ok(publication) => {
-                validate_llm_lock_sync(cache_dir, plan, &publication, true)?;
-                Ok(publication)
-            }
-            Err(_error) if plan.category == ModelCategory::Llm => {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|runtime_error| {
-                        deployment_cache_error(plan, runtime_error.to_string())
-                    })?;
-                let downloader = ModelDownloader::new(DownloadSource::Auto);
-                runtime.block_on(recover_llm_from_lock(
-                    &downloader,
-                    cache_dir,
-                    plan,
-                    &LibraryDownloadClient,
-                    &DownloadEnv::current(),
-                    false,
-                ))
-            }
-            Err(error) => Err(error),
+        let publication =
+            match read_deployment_publication(&cache_dir.join(relative), cache_dir, plan, true) {
+                Ok(publication) => publication,
+                Err(error) => return Ok(PreparedDeploymentInspection::RecoverableError(error)),
+            };
+        if let Err(error) = validate_llm_lock_sync(cache_dir, plan, &publication, true) {
+            return Ok(PreparedDeploymentInspection::RecoverableError(error));
         }
+        Ok(PreparedDeploymentInspection::Ready(publication))
     }
 
     async fn provision_deployment_with_client<M: ModelSpec, C: DownloadClient>(
@@ -1160,10 +1264,20 @@ impl ModelDownloader {
         let neutral = group_deployment_preflight_requests(plan, &neutral_artifacts)?;
         let mut resolved = Vec::with_capacity(plan.artifacts.len());
         if !neutral.is_empty() {
+            let candidates = self
+                .configured_providers(env, false, &plan.source_intent)?
+                .iter()
+                .filter_map(|provider| match provider.label() {
+                    "huggingface" => Some(DownloadSource::HuggingFace),
+                    "modelscope" => Some(DownloadSource::ModelScope),
+                    _ => None,
+                })
+                .filter(|source| plan.neutral_candidates.contains(source))
+                .collect();
             let neutral_plan = DeploymentSourcePlan {
                 key: plan.source_intent.clone(),
                 artifacts: neutral,
-                candidates: plan.neutral_candidates.clone(),
+                candidates,
             };
             let (source, artifacts) = self
                 .preflight_deployment_candidates(&neutral_plan, &[], client, env)
@@ -3253,7 +3367,7 @@ async fn recover_llm_from_lock<C: DownloadClient>(
         .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
     let lock_path = cache_dir.join(MODELS_LOCK_FILE);
     let lock: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&lock_path).map_err(|error| {
+        serde_json::from_slice(&tokio::fs::read(&lock_path).await.map_err(|error| {
             deployment_cache_error(plan, format!("{}: {error}", lock_path.display()))
         })?)
         .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
@@ -3307,7 +3421,8 @@ async fn recover_llm_from_lock<C: DownloadClient>(
                 .ok_or_else(|| deployment_cache_error(plan, "LLM lock digest is invalid"))?;
             let source = locked_deployment_source(locked_files, role, plan)?;
             if let DeploymentArtifactSource::File(path) = &source {
-                let (size, sha) = cache_file_integrity_sync(path)
+                let (size, sha) = cache_file_integrity(path.clone())
+                    .await
                     .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
                 if size != expected_size || sha != expected_sha {
                     return Err(deployment_cache_error(
@@ -3334,7 +3449,8 @@ async fn recover_llm_from_lock<C: DownloadClient>(
                 }
                 let live_file = cache_dir.join(&relative);
                 let staged_file = staging.path().join(&relative);
-                if cache_file_integrity_sync(&live_file)
+                if cache_file_integrity(live_file.clone())
+                    .await
                     .is_ok_and(|(size, sha)| size == expected_size && sha == expected_sha)
                 {
                     if let Some(parent) = staged_file.parent() {
@@ -3384,14 +3500,22 @@ async fn recover_llm_from_lock<C: DownloadClient>(
     publish_staged_relative_paths(staging.path(), cache_dir, &publication_paths)
         .await
         .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
-    let publication = read_deployment_publication(
-        &cache_dir.join(deployment_publication_relative_path(plan)),
-        cache_dir,
-        plan,
-        true,
-    )?;
-    validate_llm_lock_sync(cache_dir, plan, &publication, true)?;
-    Ok(publication)
+    let blocking_cache_dir = cache_dir.to_path_buf();
+    let blocking_plan = plan.clone();
+    tokio::task::spawn_blocking(move || -> Result<DeploymentPublication> {
+        let publication = read_deployment_publication(
+            &blocking_cache_dir.join(deployment_publication_relative_path(&blocking_plan)),
+            &blocking_cache_dir,
+            &blocking_plan,
+            true,
+        )?;
+        validate_llm_lock_sync(&blocking_cache_dir, &blocking_plan, &publication, true)?;
+        Ok(publication)
+    })
+    .await
+    .map_err(|error| OrchionError::BlockingTask {
+        message: format!("recovered LLM deployment validation task failed: {error}"),
+    })?
 }
 
 fn locked_deployment_source(
@@ -4513,152 +4637,6 @@ fn validate_cache_root_sync(cache_dir: &Path) -> std::io::Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
-}
-
-#[derive(Debug)]
-struct PublicationTransactionEntry {
-    relative: PathBuf,
-    had_target: bool,
-}
-
-fn publication_transaction_targets_path_sync(
-    cache_dir: &Path,
-    target: &Path,
-) -> std::io::Result<bool> {
-    Ok(read_publication_transaction_entries_sync(cache_dir)?
-        .is_some_and(|entries| entries.iter().any(|entry| entry.relative == target)))
-}
-
-fn read_publication_transaction_entries_sync(
-    cache_dir: &Path,
-) -> std::io::Result<Option<Vec<PublicationTransactionEntry>>> {
-    let transaction_relative = PathBuf::from(CACHE_STATE_DIR).join(PUBLISH_TRANSACTION_DIR);
-    validate_cache_relative_ancestors_sync(cache_dir, &transaction_relative, true)?;
-    let transaction_dir = cache_dir.join(&transaction_relative);
-    if !transaction_dir.exists() {
-        return Ok(None);
-    }
-    let manifest_path = transaction_dir.join(PUBLISH_TRANSACTION_MANIFEST);
-    let metadata = match std::fs::symlink_metadata(&manifest_path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Some(Vec::new())),
-        Err(error) => return Err(error),
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "publication transaction manifest is not a regular file",
-        ));
-    }
-    let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest_path)?)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    let entries = manifest["paths"]
-        .as_array()
-        .or_else(|| manifest["repos"].as_array())
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "publication transaction manifest has no paths",
-            )
-        })?;
-    entries
-        .iter()
-        .map(|entry| {
-            let relative = entry["path"]
-                .as_str()
-                .or_else(|| entry["repo"].as_str())
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "publication transaction path is invalid",
-                    )
-                })?;
-            let relative = PathBuf::from(relative);
-            validate_safe_cache_relative_path(&relative)?;
-            let had_target = entry["had_target"].as_bool().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "publication transaction target state is invalid",
-                )
-            })?;
-            Ok(PublicationTransactionEntry {
-                relative,
-                had_target,
-            })
-        })
-        .collect::<std::io::Result<Vec<_>>>()
-        .map(Some)
-}
-
-fn recover_interrupted_publication_sync(cache_dir: &Path) -> std::io::Result<bool> {
-    let transaction_relative = PathBuf::from(CACHE_STATE_DIR).join(PUBLISH_TRANSACTION_DIR);
-    validate_cache_relative_ancestors_sync(cache_dir, &transaction_relative, true)?;
-    let transaction_dir = cache_dir.join(&transaction_relative);
-    if !transaction_dir.exists() {
-        return Ok(true);
-    }
-    let committed_path = transaction_dir.join(PUBLISH_TRANSACTION_COMMITTED);
-    let committed = match std::fs::symlink_metadata(&committed_path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "publication commit marker is not a regular file",
-            ));
-        }
-        Ok(_) => std::fs::read(&committed_path).is_ok_and(|marker| marker == b"committed\n"),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(error) => return Err(error),
-    };
-    if committed {
-        validate_cache_relative_ancestors_sync(cache_dir, &transaction_relative, true)?;
-        std::fs::remove_dir_all(&transaction_dir)?;
-        sync_directory_sync(cache_dir.join(CACHE_STATE_DIR).as_path())?;
-        return Ok(true);
-    }
-    let entries = read_publication_transaction_entries_sync(cache_dir)?.unwrap_or_default();
-    for entry in entries {
-        validate_cache_relative_ancestors_sync(cache_dir, &entry.relative, true)?;
-        validate_cache_relative_ancestors_sync(&transaction_dir, &entry.relative, true)?;
-        let target = cache_dir.join(&entry.relative);
-        let backup = transaction_dir.join(&entry.relative);
-        if entry.had_target {
-            if backup.exists() {
-                remove_cache_entry_sync(&target)?;
-                let parent = target.parent().ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "cache publication target has no parent",
-                    )
-                })?;
-                std::fs::create_dir_all(parent)?;
-                validate_cache_relative_ancestors_sync(&transaction_dir, &entry.relative, true)?;
-                validate_cache_relative_ancestors_sync(cache_dir, &entry.relative, false)?;
-                std::fs::rename(backup, &target)?;
-                sync_directory_sync(parent)?;
-            }
-        } else {
-            remove_cache_entry_sync(&target)?;
-        }
-    }
-    validate_cache_relative_ancestors_sync(cache_dir, &transaction_relative, true)?;
-    std::fs::remove_dir_all(&transaction_dir)?;
-    sync_directory_sync(cache_dir.join(CACHE_STATE_DIR).as_path())?;
-    Ok(true)
-}
-
-fn remove_cache_entry_sync(path: &Path) -> std::io::Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
-            std::fs::remove_dir_all(path)
-        }
-        Ok(_) => std::fs::remove_file(path),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-fn sync_directory_sync(path: &Path) -> std::io::Result<()> {
-    std::fs::File::open(path)?.sync_all()
 }
 
 async fn remove_cache_entry(path: &Path) -> std::io::Result<()> {
@@ -9337,6 +9315,201 @@ mod downloader_tests {
     }
 
     #[tokio::test]
+    async fn strict_prepared_llm_resolver_does_not_recover_on_a_tokio_worker() {
+        let cache = tempfile::tempdir().unwrap();
+        let (model, plan) = remote_llm_plan();
+        let client = FakeDownloadClient {
+            echo_requested_revision: true,
+            ..FakeDownloadClient::default()
+        };
+        let downloader = ModelDownloader::new(DownloadSource::HuggingFace);
+        downloader
+            .provision_deployment_core(
+                &plan,
+                cache.path(),
+                &client,
+                &DownloadEnv {
+                    orchion_model_source: None,
+                    hf_endpoint: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let publication_path = deployment_publication_path(&plan, cache.path());
+        std::fs::remove_dir_all(&publication_path).unwrap();
+        let provider_calls = client.calls.lock().unwrap().len();
+
+        assert!(
+            ModelDownloader::resolve_prepared_logical_deployment(
+                &model,
+                ModelCategory::Llm,
+                &plan,
+                cache.path(),
+            )
+            .is_err()
+        );
+
+        assert!(!publication_path.exists());
+        assert_eq!(client.calls.lock().unwrap().len(), provider_calls);
+    }
+
+    #[tokio::test]
+    async fn async_prepared_llm_resolver_recovers_from_a_valid_lock_without_network() {
+        let cache = tempfile::tempdir().unwrap();
+        let (model, plan) = remote_llm_plan();
+        let client = FakeDownloadClient {
+            echo_requested_revision: true,
+            ..FakeDownloadClient::default()
+        };
+        ModelDownloader::new(DownloadSource::HuggingFace)
+            .provision_deployment_core(
+                &plan,
+                cache.path(),
+                &client,
+                &DownloadEnv {
+                    orchion_model_source: None,
+                    hf_endpoint: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(deployment_publication_path(&plan, cache.path())).unwrap();
+        let provider_calls = client.calls.lock().unwrap().len();
+
+        let recovered = ModelDownloader::resolve_or_recover_prepared_logical_deployment(
+            &model,
+            ModelCategory::Llm,
+            &plan,
+            cache.path(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            recovered
+                .artifact_file(ArtifactRole::LlmModel)
+                .unwrap()
+                .is_file()
+        );
+        assert_eq!(client.calls.lock().unwrap().len(), provider_calls);
+    }
+
+    #[tokio::test]
+    async fn async_prepared_ocr_resolver_recovers_an_interrupted_publication() {
+        let cache = tempfile::tempdir().unwrap();
+        let (primary, plan) = ocr_deployment_plan(
+            "ocr-prepared-recovery",
+            DeploymentArtifactSource::Neutral,
+            DeploymentArtifactSource::Neutral,
+        );
+        ModelDownloader::new(DownloadSource::Auto)
+            .provision_deployment_with_client(
+                primary.clone(),
+                &plan,
+                cache.path(),
+                &FakeDownloadClient::default(),
+                &DownloadEnv {
+                    orchion_model_source: None,
+                    hf_endpoint: None,
+                },
+            )
+            .await
+            .unwrap();
+        let relative = deployment_publication_relative_path(&plan);
+        let transaction = cache_state_path(cache.path(), PUBLISH_TRANSACTION_DIR);
+        let backup = transaction.join(&relative);
+        std::fs::create_dir_all(backup.parent().unwrap()).unwrap();
+        std::fs::rename(cache.path().join(&relative), &backup).unwrap();
+        std::fs::write(
+            transaction.join(PUBLISH_TRANSACTION_MANIFEST),
+            serde_json::to_vec(&serde_json::json!({
+                "paths": [{"path": relative.to_string_lossy(), "had_target": true}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let publication =
+            ModelDownloader::resolve_or_recover_prepared_deployment(&primary, &plan, cache.path())
+                .await
+                .unwrap();
+
+        assert!(publication.root().is_dir());
+        assert!(!transaction.exists());
+    }
+
+    #[tokio::test]
+    async fn configured_source_filters_neutral_deployment_candidates() {
+        let cache = tempfile::tempdir().unwrap();
+        let (model, mut plan) = remote_llm_plan();
+        plan.artifacts[0].source = DeploymentArtifactSource::Neutral;
+        plan.neutral_candidates = vec![DownloadSource::HuggingFace, DownloadSource::ModelScope];
+        let client = FakeDownloadClient {
+            echo_requested_revision: true,
+            ..FakeDownloadClient::default()
+        };
+
+        ModelDownloader::new(DownloadSource::ModelScope)
+            .provision_deployment_core(
+                &plan,
+                cache.path(),
+                &client,
+                &DownloadEnv {
+                    orchion_model_source: None,
+                    hf_endpoint: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(&*client.calls.lock().unwrap(), &["modelscope"]);
+        assert_eq!(model, plan.deployment_id);
+    }
+
+    #[tokio::test]
+    async fn concurrent_async_prepared_llm_recovery_is_serialized() {
+        let cache = tempfile::tempdir().unwrap();
+        let (model, plan) = remote_llm_plan();
+        ModelDownloader::new(DownloadSource::HuggingFace)
+            .provision_deployment_core(
+                &plan,
+                cache.path(),
+                &FakeDownloadClient {
+                    echo_requested_revision: true,
+                    ..FakeDownloadClient::default()
+                },
+                &DownloadEnv {
+                    orchion_model_source: None,
+                    hf_endpoint: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(deployment_publication_path(&plan, cache.path())).unwrap();
+
+        let (first, second) = tokio::join!(
+            ModelDownloader::resolve_or_recover_prepared_logical_deployment(
+                &model,
+                ModelCategory::Llm,
+                &plan,
+                cache.path(),
+            ),
+            ModelDownloader::resolve_or_recover_prepared_logical_deployment(
+                &model,
+                ModelCategory::Llm,
+                &plan,
+                cache.path(),
+            ),
+        );
+
+        assert_eq!(first.unwrap(), second.unwrap());
+    }
+
+    #[tokio::test]
     async fn llm_prepared_readers_reject_corrupt_direct_artifact_concurrently() {
         let cache = tempfile::tempdir().unwrap();
         let (model, plan) = remote_llm_plan();
@@ -9434,12 +9607,13 @@ mod downloader_tests {
         )
         .unwrap();
 
-        let publication = ModelDownloader::resolve_prepared_logical_deployment(
+        let publication = ModelDownloader::resolve_or_recover_prepared_logical_deployment(
             &model,
             ModelCategory::Llm,
             &plan,
             cache.path(),
         )
+        .await
         .unwrap();
         assert!(
             publication

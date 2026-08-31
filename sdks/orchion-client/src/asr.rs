@@ -139,9 +139,10 @@ impl<'a> AsrClient<'a> {
         })
         .await?;
 
-        Ok(StreamingSession {
-            io: StreamingSessionIo::new(stream, timeout),
-        })
+        let mut io = StreamingSessionIo::new(stream, timeout);
+        io.expect_ready().await?;
+
+        Ok(StreamingSession { io })
     }
 }
 
@@ -665,7 +666,35 @@ where
             return Ok(None);
         }
         self.ensure_readable()?;
-        let result = websocket_with_timeout(self.timeout, "websocket next_event", async {
+        let Some(event) = self.receive_event("websocket next_event").await? else {
+            self.state = StreamingSessionState::Terminal {
+                failed_operation: "next_event",
+            };
+            return Err(ClientError::UnexpectedEof {
+                stream: "asr_streaming",
+            });
+        };
+        Ok(Some(event))
+    }
+
+    async fn expect_ready(&mut self) -> Result<(), ClientError> {
+        match self.receive_event("websocket ready event").await? {
+            Some(StreamingEvent::Ready) => Ok(()),
+            Some(StreamingEvent::Error { error }) => Err(ClientError::StreamingServer { error }),
+            Some(event) => Err(ClientError::decode(format!(
+                "expected ready as the first streaming event, received {event:?}"
+            ))),
+            None => Err(ClientError::WebSocket {
+                message: "streaming WebSocket closed before the ready event".to_string(),
+            }),
+        }
+    }
+
+    async fn receive_event(
+        &mut self,
+        timeout_operation: &'static str,
+    ) -> Result<Option<StreamingEvent>, ClientError> {
+        let result = websocket_with_timeout(self.timeout, timeout_operation, async {
             while let Some(message) = self.stream.next().await {
                 match message.map_err(websocket_error)? {
                     Message::Text(text) => return StreamingEvent::from_text(&text).map(Some),
@@ -684,7 +713,11 @@ where
         .await;
         if matches!(
             result,
-            Ok(None | Some(StreamingEvent::Final { .. } | StreamingEvent::Completed))
+            Ok(Some(
+                StreamingEvent::Final { .. }
+                    | StreamingEvent::Completed
+                    | StreamingEvent::Error { .. }
+            ))
         ) {
             self.state = StreamingSessionState::Completed;
         }

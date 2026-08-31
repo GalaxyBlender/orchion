@@ -129,6 +129,8 @@ fn parse_operation(value: &str) -> Result<crate::api::activity::ActivityOperatio
         "tts" => Ok(ActivityOperation::Tts),
         "ocr" => Ok(ActivityOperation::Ocr),
         "pdf" => Ok(ActivityOperation::Pdf),
+        "chat" => Ok(ActivityOperation::Chat),
+        "responses" => Ok(ActivityOperation::Responses),
         _ => Err(invalid_query("operation")),
     }
 }
@@ -160,4 +162,19 @@ fn sse_event(event_type: &'static str, payload: &ActivityEventPayload) -> Event 
         .event(event_type)
         .id(payload.cursor.clone())
         .data(serde_json::to_string(payload).expect("activity event payload must serialize"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::activity::ActivityOperation;
+
+    #[test]
+    fn operation_query_accepts_llm_operations() {
+        assert_eq!(parse_operation("chat").unwrap(), ActivityOperation::Chat);
+        assert_eq!(
+            parse_operation("responses").unwrap(),
+            ActivityOperation::Responses
+        );
+    }
 }

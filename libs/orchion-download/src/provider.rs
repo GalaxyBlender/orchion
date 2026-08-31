@@ -18,14 +18,18 @@ pub struct ProviderPreflightResult {
 }
 
 impl ProviderPreflightResult {
-    pub(crate) fn new(files: Vec<String>) -> Self {
+    /// Creates a preflight result without a resolved immutable revision.
+    #[must_use]
+    pub fn new(files: Vec<String>) -> Self {
         Self {
             files,
             resolved_revision: None,
         }
     }
 
-    pub(crate) fn with_resolved_revision(
+    /// Creates a preflight result with the provider's resolved immutable revision.
+    #[must_use]
+    pub fn with_resolved_revision(
         files: Vec<String>,
         resolved_revision: impl Into<String>,
     ) -> Self {
@@ -209,6 +213,9 @@ impl<'a> ProviderDownloadRequest<'a> {
 }
 
 pub trait DownloadProvider: Send + Sync + 'static {
+    /// Returns the provider label used for registry lookup and diagnostics.
+    ///
+    /// Provider-neutral deployment plans currently support `huggingface` and `modelscope` labels.
     fn label(&self) -> &'static str;
     fn default_revision(&self) -> &str;
     fn repository(&self, model: ProviderModel<'_>) -> String;

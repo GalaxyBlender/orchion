@@ -3,6 +3,7 @@ use axum::http::{Request, StatusCode, header, header::AUTHORIZATION};
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use orchion::{AsrModel, ModelId, ModelUrl, OcrModel, OcrModelKind, TtsModel};
+use orchion_client::{Client as OrchionClient, ClientConfig as OrchionClientConfig};
 use orchion_protocol::{AsrStreamEvent, AsrStreamInputAudioFormat, AsrStreamStartMessage};
 use orchion_server::api::ui;
 use orchion_server::config::{
@@ -88,6 +89,36 @@ async fn models_endpoint_returns_configured_models() {
         model_capabilities(&body, "alibaba/qwen3-tts-12hz-1.7b-voicedesign"),
         vec!["tts_voice_design"]
     );
+}
+
+#[tokio::test]
+async fn rust_client_matches_server_discovery_and_residency_contracts() {
+    let (address, server) = start_websocket_test_server().await;
+    let config = OrchionClientConfig::new(format!("http://{address}"))
+        .unwrap()
+        .with_api_key("secret");
+    let client = OrchionClient::from_config(config).unwrap();
+
+    client.health().check().await.unwrap();
+    let models = client.models().list().await.unwrap();
+    assert_eq!(models.object, "list");
+    assert!(
+        models
+            .data
+            .iter()
+            .any(|model| model.id == "alibaba/qwen3-asr-0.6b")
+    );
+
+    let statuses = client.models().list_statuses().await.unwrap();
+    assert_eq!(statuses.object, "list");
+    assert!(
+        statuses
+            .data
+            .iter()
+            .any(|status| status.id == "alibaba/qwen3-asr-0.6b")
+    );
+
+    server.abort();
 }
 
 #[tokio::test]

@@ -19,8 +19,8 @@ clap = { version = "4", features = ["derive"] }
 http = "1"
 http-body = "1"
 include_dir = "0.7"
-orchion = { path = "../../libs/orchion", default-features = false, features = ["asr-qwen3", "tts-qwen3", "ocr", "ocr-vl", "llm", "docs", "audio-ffmpeg", "download-all", "audio-vad", "serde", "schema"] }
-orchion-protocol = { path = "../../libs/orchion-protocol" }
+orchion = { path = "../../libs/orchion", default-features = false, features = ["asr-qwen3", "tts-qwen3", "ocr", "ocr-vl", "llm", "server-support", "docs", "audio-ffmpeg", "download-all", "audio-vad", "serde", "schema"] }
+orchion-protocol = { path = "../../libs/orchion-protocol", features = ["schema"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
@@ -44,6 +44,8 @@ sha2 = "0.11"
 [dev-dependencies]
 futures-util = "0.3"
 http-body-util = "0.1"
+orchion = { path = "../../libs/orchion", default-features = false, features = ["llm-test-support"] }
+orchion-client = { path = "../../sdks/orchion-client", default-features = false, features = ["health", "models"] }
 tokio-tungstenite = "0.30"
 tower = "0.5"
 

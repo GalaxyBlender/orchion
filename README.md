@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-Orchion provides a unified Rust API library and an OpenAI-compatible server for local speech, document, and text-generation workflows. It supports Qwen3 ASR/TTS, PaddleOCR/OCR-VL, and a text-only llama.cpp tracer.
+Orchion provides a unified Rust API library and an OpenAI-compatible server for local speech, document, and text-generation workflows. It supports Qwen3 ASR/TTS, PaddleOCR/OCR-VL, and a text-only llama.cpp runtime.
 
 ## Highlights
 
@@ -62,6 +62,7 @@ API keys and form preferences are stored in browser `localStorage`; do not save 
 
 Detailed API docs:
 
+- [SDK contract matrix](docs/sdk-matrix.md)
 - [ASR](docs/asr.md)
 - [ASR streaming protocol](docs/asr-streaming.md)
 - [TTS](docs/tts.md)
@@ -72,9 +73,9 @@ If `[auth] api_key` is configured, pass `Authorization: Bearer <api_key>` for ev
 
 The Activity view records only allowlisted metadata such as route templates, model IDs, status, timing, and input size. While a request is in flight, Activity clients can also see its peer address and User-Agent; these live-only fields are removed before history is retained. Activity endpoints follow the global API key configuration, so deployments without an API key expose live metadata to clients that can reach the server. Activity never stores request bodies, response bodies, credentials, filenames, or generated output. HTTP timing covers the matched request through response-body completion, including parsing, queueing, and inference; WebSocket timing covers the upgraded session. History is bounded and exists only for the lifetime of the server process.
 
-## Rust Library
+## In-Process Rust SDK
 
-The facade crate lives at `libs/orchion` and exposes async APIs for loading, downloading, and running ASR/TTS/OCR models.
+The `orchion` facade lives at `libs/orchion`. It provides typed loading, downloading, inference, and streaming interfaces for ASR, TTS, OCR/OCR-VL, and text-only LLMs. It is currently workspace-only rather than published to crates.io because not all native adapters are registry-publishable. Heavy domains and hardware backends are opt-in features; examples below select CPU explicitly.
 
 ```rust,no_run
 use orchion::{Asr, AsrModel, Result};
@@ -89,13 +90,51 @@ async fn main() -> Result<()> {
 }
 ```
 
-Useful examples:
+Native SDK examples:
 
 ```sh
 cargo run -p orchion-example-download-model --features cpu -- models
 cargo run -p orchion-example-asr-file --features cpu -- audio.wav models
 cargo run -p orchion-example-tts-preset --features cpu -- "Hello from Orchion" output.wav models
+cargo run -p orchion-example-tts-voice-modes --features cpu -- preset "Hello" output.wav models
+cargo run -p orchion-example-ocr-basic --features cpu -- image.png models
+cargo run -p orchion-example-llm-complete --features cpu -- local/demo hf://org/repo/model.gguf "Hello" models
 ```
+
+`llm-complete` and `llm-streaming-cancel` require an exact GGUF URL. OCR provisioning may download multiple repositories and assembles typed assets before loading. The synchronous `LlmEngine::load` interface is blocking; `LlmEngine::load_deployment` offloads that load from the async runtime.
+
+## Server Rust SDK
+
+The `orchion-client` crate in `sdks/orchion-client` is a typed async client for every public data route listed above. Its default features enable health, models, Activity, LLM, ASR, TTS, OCR, and PDF; applications can disable defaults and select individual domains.
+
+```rust,no_run
+use orchion_client::{Client, ClientError};
+
+#[tokio::main]
+async fn main() -> Result<(), ClientError> {
+    let client = Client::new("http://127.0.0.1:8080")?;
+    client.health().check().await?;
+    for model in client.models().list().await?.data {
+        println!("{}: {:?}", model.id, model.capabilities);
+    }
+    Ok(())
+}
+```
+
+Server SDK examples:
+
+```sh
+cargo run -p orchion-example-client-discovery -- http://127.0.0.1:8080
+cargo run -p orchion-example-client-asr-file -- http://127.0.0.1:8080 audio.wav alibaba/qwen3-asr-0.6b
+cargo run -p orchion-example-client-asr-streaming -- http://127.0.0.1:8080 audio.wav alibaba/qwen3-asr-0.6b
+cargo run -p orchion-example-client-tts -- http://127.0.0.1:8080 MODEL "Hello" VOICE output.wav
+cargo run -p orchion-example-client-ocr -- http://127.0.0.1:8080 image.png MODEL json
+cargo run -p orchion-example-client-pdf -- http://127.0.0.1:8080 document.pdf pages.zip
+cargo run -p orchion-example-client-llm -- http://127.0.0.1:8080 MODEL "Hello"
+cargo run -p orchion-example-client-operations -- http://127.0.0.1:8080 MODEL llm
+```
+
+Set `ORCHION_API_KEY` when the server has authentication enabled. `start_streaming` waits for ASR `Ready` before returning. LLM streams require their protocol terminal event; Activity streams end normally on server disconnect and do not reconnect automatically. Inference POST requests are never retried automatically.
 
 ## Configuration
 
@@ -115,6 +154,8 @@ cargo run -p orchion-example-tts-preset --features cpu -- "Hello from Orchion" o
 cargo fmt --all -- --check
 cargo test --workspace --features full,cpu
 cargo check --workspace
+cargo clippy -p orchion-client --all-features --all-targets -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc -p orchion-client --all-features --no-deps
 ```
 
 Orchion is early-stage software. The public Rust API and server request extensions may change while the project is still stabilizing.

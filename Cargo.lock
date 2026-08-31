@@ -1475,6 +1475,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "eventsource-stream"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74fef4569247a5f429d9156b9d0a2599914385dd189c539334c625d8099d90ab"
+dependencies = [
+ "futures-core",
+ "nom 7.1.3",
+ "pin-project-lite",
+]
+
+[[package]]
 name = "exr"
 version = "1.74.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3529,6 +3540,7 @@ name = "orchion-client"
 version = "0.3.0"
 dependencies = [
  "bytes",
+ "eventsource-stream",
  "futures-util",
  "orchion-core",
  "orchion-protocol",
@@ -3597,6 +3609,70 @@ dependencies = [
 ]
 
 [[package]]
+name = "orchion-example-client-asr-file"
+version = "0.1.0"
+dependencies = [
+ "orchion-client",
+ "tokio",
+]
+
+[[package]]
+name = "orchion-example-client-asr-streaming"
+version = "0.1.0"
+dependencies = [
+ "orchion-client",
+ "tokio",
+]
+
+[[package]]
+name = "orchion-example-client-discovery"
+version = "0.1.0"
+dependencies = [
+ "orchion-client",
+ "tokio",
+]
+
+[[package]]
+name = "orchion-example-client-llm"
+version = "0.1.0"
+dependencies = [
+ "orchion-client",
+ "tokio",
+]
+
+[[package]]
+name = "orchion-example-client-ocr"
+version = "0.1.0"
+dependencies = [
+ "orchion-client",
+ "tokio",
+]
+
+[[package]]
+name = "orchion-example-client-operations"
+version = "0.1.0"
+dependencies = [
+ "orchion-client",
+ "tokio",
+]
+
+[[package]]
+name = "orchion-example-client-pdf"
+version = "0.1.0"
+dependencies = [
+ "orchion-client",
+ "tokio",
+]
+
+[[package]]
+name = "orchion-example-client-tts"
+version = "0.1.0"
+dependencies = [
+ "orchion-client",
+ "tokio",
+]
+
+[[package]]
 name = "orchion-example-download-model"
 version = "0.1.0"
 dependencies = [
@@ -3605,7 +3681,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "orchion-example-llm-complete"
+version = "0.1.0"
+dependencies = [
+ "orchion",
+ "tokio",
+]
+
+[[package]]
+name = "orchion-example-llm-streaming-cancel"
+version = "0.1.0"
+dependencies = [
+ "orchion",
+ "tokio",
+]
+
+[[package]]
+name = "orchion-example-ocr-basic"
+version = "0.1.0"
+dependencies = [
+ "orchion",
+ "tokio",
+]
+
+[[package]]
 name = "orchion-example-tts-preset"
+version = "0.1.0"
+dependencies = [
+ "orchion",
+ "tokio",
+]
+
+[[package]]
+name = "orchion-example-tts-voice-modes"
 version = "0.1.0"
 dependencies = [
  "orchion",
@@ -3652,6 +3760,7 @@ version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
+ "utoipa",
 ]
 
 [[package]]
@@ -3683,6 +3792,7 @@ dependencies = [
  "http-body-util",
  "include_dir",
  "orchion",
+ "orchion-client",
  "orchion-protocol",
  "serde",
  "serde_json",
@@ -4427,6 +4537,7 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
