@@ -1,4 +1,5 @@
 pub mod llm;
+pub mod metrics;
 pub mod model_cache;
 pub mod model_lifecycle;
 pub mod ocr;
@@ -15,6 +16,7 @@ use crate::application::speech::SpeechRuntime;
 use crate::application::streaming_transcription::StreamingTranscriptionRuntime;
 use crate::application::transcription::TranscriptionRuntime;
 use orchion::{AsrModel, ModelCapabilities, ModelId, TtsModel};
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -95,6 +97,8 @@ pub(crate) fn finish_owned_file_operation() -> bool {
 
 pub type InferenceGuardFuture<'a> = Pin<Box<dyn Future<Output = InferenceGuard> + Send + 'a>>;
 pub type ModelCatalogFuture<'a> = Pin<Box<dyn Future<Output = Vec<ApiModel>> + Send + 'a>>;
+pub type ObservabilitySnapshotFuture<'a> =
+    Pin<Box<dyn Future<Output = metrics::ObservabilitySnapshot> + Send + 'a>>;
 
 #[derive(Debug, Clone)]
 pub struct AsrApiPolicy {
@@ -112,6 +116,7 @@ pub struct ApiModel {
     pub name: Option<String>,
     pub service: ModelService,
     pub capabilities: ModelCapabilities,
+    pub llm_max_choices: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -119,6 +124,22 @@ pub struct ActivityPolicy {
     pub enabled: bool,
     pub history_capacity: usize,
 }
+
+#[derive(Debug, Clone, Copy)]
+pub struct StreamingPolicy {
+    pub max_active: usize,
+    pub max_retained: usize,
+    pub max_events_per_session: usize,
+    pub max_bytes_per_session: usize,
+    pub max_total_bytes: usize,
+    pub max_followers_per_session: usize,
+    pub ttl: Duration,
+    pub lookup_max: usize,
+    pub keepalive_interval: Duration,
+}
+
+pub const MIN_STREAMING_EVENTS_PER_SESSION: usize = 1;
+pub const MIN_STREAMING_ERROR_FRAME_BYTES: usize = 512;
 
 #[derive(Debug, Clone)]
 pub struct ApiPolicy {
@@ -130,11 +151,23 @@ pub struct ApiPolicy {
     pub max_pdf_output_size: usize,
     pub max_websocket_message_size: usize,
     pub activity: ActivityPolicy,
+    pub streaming: StreamingPolicy,
     pub models: Vec<ApiModel>,
+    pub llm_vision_limits: HashMap<ModelId, LlmVisionPolicy>,
     pub asr: Option<AsrApiPolicy>,
     pub tts_models: Option<Vec<TtsModel>>,
     pub ocr_enabled: bool,
     pub llm_enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LlmVisionPolicy {
+    pub max_images: usize,
+    pub max_bytes_per_image: usize,
+    pub max_total_bytes: usize,
+    pub max_side: u32,
+    pub max_pixels_per_image: u64,
+    pub max_total_pixels: u64,
 }
 
 pub trait ServerApplication:
@@ -147,6 +180,8 @@ pub trait ServerApplication:
     + 'static
 {
     fn api_policy(&self) -> &ApiPolicy;
+    fn metrics(&self) -> &metrics::Metrics;
+    fn observability_snapshot(&self) -> ObservabilitySnapshotFuture<'_>;
     fn model_catalog(&self) -> ModelCatalogFuture<'_> {
         Box::pin(async move { self.api_policy().models.clone() })
     }

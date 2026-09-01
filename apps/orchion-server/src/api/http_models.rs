@@ -3,8 +3,8 @@ use crate::api::openai::{ApiError, ModelList, ModelObject, ModelType};
 use crate::application::model_lifecycle::{ModelSelector, ModelService, ModelStatus};
 use crate::application::{ServerApplication, UseCaseError};
 use axum::Json;
-use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
+use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 pub use orchion_protocol::{ModelControlRequest, ModelStatusList};
 use std::sync::Arc;
@@ -21,26 +21,48 @@ where
         .model_catalog()
         .await
         .into_iter()
-        .filter_map(|model| {
-            let model_type = match model.service {
-                ModelService::Asr => ModelType::Asr,
-                ModelService::Tts => ModelType::Tts,
-                ModelService::Ocr | ModelService::OcrVl => ModelType::Ocr,
-                ModelService::Llm => ModelType::Llm,
-                _ => return None,
-            };
-            Some(ModelObject::new(
-                model.id.to_string(),
-                model.name,
-                model_type,
-                model.capabilities,
-            ))
-        })
+        .filter_map(model_object)
         .collect();
     Ok(Json(ModelList {
         object: "list",
         data,
     }))
+}
+
+pub(super) async fn retrieve_model<S>(
+    State(state): State<Arc<S>>,
+    headers: HeaderMap,
+    Path(model): Path<String>,
+) -> Result<Json<ModelObject>, ApiError>
+where
+    S: ServerApplication,
+{
+    authorize(state.as_ref(), &headers)?;
+    state
+        .model_catalog()
+        .await
+        .into_iter()
+        .find(|candidate| candidate.id.as_str() == model)
+        .and_then(model_object)
+        .map(Json)
+        .ok_or_else(ApiError::model_not_found)
+}
+
+fn model_object(model: crate::application::ApiModel) -> Option<ModelObject> {
+    let model_type = match model.service {
+        ModelService::Asr => ModelType::Asr,
+        ModelService::Tts => ModelType::Tts,
+        ModelService::Ocr | ModelService::OcrVl => ModelType::Ocr,
+        ModelService::Llm => ModelType::Llm,
+        _ => return None,
+    };
+    Some(ModelObject::new(
+        model.id.to_string(),
+        model.name,
+        model_type,
+        model.capabilities,
+        model.llm_max_choices,
+    ))
 }
 
 pub(super) async fn list_model_statuses<S>(

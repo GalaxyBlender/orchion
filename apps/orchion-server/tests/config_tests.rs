@@ -2,8 +2,8 @@ use orchion::{
     DevicePreference, KnownOcrModel, ModelId, ModelUrl, ModelUrlSource, OcrResponseFormat,
 };
 use orchion_server::config::{
-    ConfigError, ModelSource, OcrModelDeployment, ServerConfig, TableStructureConfig,
-    TableStructureType,
+    ConfigError, LlmDeploymentKind, LlmEmbeddingPooling, ModelSource, OcrModelDeployment,
+    ServerConfig, TableStructureConfig, TableStructureType,
 };
 use orchion_server::state::AppState;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -617,6 +617,135 @@ model = "https://huggingface.co/Qwen/Qwen3-ASR-0.6B"
 }
 
 #[test]
+fn llm_embedding_deployment_parses_and_generation_remains_the_default() {
+    let config = ServerConfig::from_toml_str(
+        r#"
+[[services.llm.models]]
+id = "qwen/generator"
+model = "//Qwen/generator/model.gguf"
+
+[[services.llm.models]]
+id = "qwen/qwen3-embedding-0.6b"
+kind = "embedding"
+model = "//Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf"
+runtime = { batch_size = 8192, micro_batch_size = 8192 }
+embeddings = { pooling = "last", min_dimensions = 32, max_input_tokens = 8192 }
+"#,
+        exe(),
+    )
+    .unwrap();
+    assert_eq!(
+        config.services.llm.models[0].kind,
+        LlmDeploymentKind::Generation
+    );
+    let LlmDeploymentKind::Embeddings(embedding) = config.services.llm.models[1].kind else {
+        panic!("expected embedding deployment");
+    };
+    assert_eq!(embedding.pooling, LlmEmbeddingPooling::Last);
+    assert_eq!(embedding.min_dimensions, 32);
+    assert_eq!(embedding.max_input_tokens, 8192);
+}
+
+#[test]
+fn generation_deployment_accepts_multiple_execution_slots() {
+    let config = ServerConfig::from_toml_str(
+        r#"
+        [[services.llm.models]]
+        id = "qwen/generator"
+        model = "//Qwen/generator/model.gguf"
+        runtime = { parallel_sequences = 3, batch_size = 8 }
+        "#,
+        exe(),
+    )
+    .unwrap();
+
+    assert_eq!(config.services.llm.models[0].runtime.parallel_sequences, 3);
+}
+
+#[test]
+fn generation_prompt_cache_parses_defaults_and_strict_limits() {
+    let config = ServerConfig::from_toml_str(
+        r#"
+[[services.llm.models]]
+id = "qwen/generator"
+model = "//Qwen/generator/model.gguf"
+runtime = { context_size = 512 }
+prompt_cache = { enabled = true, max_entries = 8, max_bytes = 1048576, min_prefix_tokens = 16 }
+"#,
+        exe(),
+    )
+    .unwrap();
+    let cache = &config.services.llm.models[0].prompt_cache;
+    assert!(cache.enabled);
+    assert_eq!(cache.max_entries, 8);
+    assert_eq!(cache.max_bytes, 1_048_576);
+    assert_eq!(cache.min_prefix_tokens, 16);
+
+    for field in [
+        "max_entries = 0",
+        "max_entries = 65",
+        "max_bytes = 0",
+        "max_bytes = 4294967297",
+        "min_prefix_tokens = 0",
+        "min_prefix_tokens = 512",
+    ] {
+        let document = format!(
+            r#"
+[[services.llm.models]]
+id = "qwen/generator"
+model = "//Qwen/generator/model.gguf"
+runtime = {{ context_size = 512 }}
+prompt_cache = {{ enabled = true, {field} }}
+"#
+        );
+        assert!(
+            ServerConfig::from_toml_str(&document, exe()).is_err(),
+            "{field}"
+        );
+    }
+}
+
+#[test]
+fn embedding_deployment_rejects_prompt_cache_as_generation_only() {
+    let error = ServerConfig::from_toml_str(
+        r#"
+[[services.llm.models]]
+id = "qwen/embedder"
+kind = "embedding"
+model = "//Qwen/embedder/model.gguf"
+runtime = { batch_size = 512, micro_batch_size = 512 }
+embeddings = { max_input_tokens = 512 }
+prompt_cache = { enabled = false }
+"#,
+        exe(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("prompt_cache"));
+}
+
+#[test]
+fn embedding_settings_require_embedding_kind_and_reject_mmproj() {
+    for document in [
+        r#"
+[[services.llm.models]]
+id = "qwen/test"
+model = "//Qwen/test/model.gguf"
+embeddings = { pooling = "last" }
+"#,
+        r#"
+[[services.llm.models]]
+id = "qwen/test"
+kind = "embedding"
+model = "//Qwen/test/model.gguf"
+mmproj_model = "//Qwen/test/mmproj.gguf"
+runtime = { batch_size = 8192, micro_batch_size = 8192 }
+"#,
+    ] {
+        assert!(ServerConfig::from_toml_str(document, exe()).is_err());
+    }
+}
+
+#[test]
 fn general_server_and_service_overrides_still_parse() {
     let config = ServerConfig::from_toml_str(
         r#"
@@ -650,6 +779,44 @@ max_length = 1024
     assert_eq!(config.services.asr.idle_timeout, Duration::from_mins(5));
     assert_eq!(config.services.tts.format, "mp3");
     assert_eq!(config.services.tts.max_length, 1024);
+}
+
+#[test]
+fn max_upload_size_rejects_values_above_the_hard_body_limit() {
+    let error = ServerConfig::from_toml_str(
+        r#"
+[server]
+max_upload_size = "129M"
+"#,
+        exe(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("must not exceed"));
+}
+
+#[test]
+fn vision_base64_upper_bound_must_fit_global_body_limit() {
+    let error = ServerConfig::from_toml_str(
+        r#"
+[server]
+max_upload_size = "1M"
+
+[services.llm]
+enabled = true
+default_model = "qwen/vision"
+
+[[services.llm.models]]
+id = "qwen/vision"
+model = "//Qwen/test/model.gguf"
+mmproj_model = "//Qwen/test/mmproj.gguf"
+vision = { max_bytes_per_image = 786432, max_total_bytes = 786432 }
+"#,
+        exe(),
+    )
+    .unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("vision.max_total_bytes"));
+    assert!(message.contains("server.max_upload_size"));
 }
 
 #[test]
@@ -736,6 +903,7 @@ fn shipped_config_uses_canonical_public_identity_and_preserves_artifact_locators
             ("paddlepaddle/paddleocr-vl-1.6", "PaddleOCR-VL 1.6"),
         ]
     );
+    assert_eq!(config.services.llm.models.len(), 2);
     let llm = &config.services.llm.models[0];
     assert_eq!(llm.id.as_str(), "alibaba/qwen3.5-0.8b");
     assert_eq!(llm.name.as_deref(), Some("Qwen3.5 0.8B"));

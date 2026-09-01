@@ -2,7 +2,6 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::SystemTime;
 
 const CMAKE_INPUT_ENV: &[&str] = &[
     "GGML_METAL",
@@ -60,70 +59,75 @@ fn main() {
         &["show", "active-toolchain"],
     );
 
-    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"));
-    let build_root = out_dir
-        .parent()
-        .and_then(Path::parent)
-        .expect("crate OUT_DIR is under the Cargo profile build root");
-    let cache = select_cmake_cache(build_root, &features).unwrap_or_else(|error| {
-        panic!("failed to locate resolved llama-cpp-sys-2 CMake cache: {error}")
+    println!("cargo:rerun-if-env-changed=DEP_LLAMA_GGML_CMAKE_DIR");
+    let sys_out_dir = sys_out_dir().unwrap_or_else(|error| {
+        panic!("failed to derive llama-cpp-sys-2 OUT_DIR from DEP_LLAMA_GGML_CMAKE_DIR: {error}")
+    });
+    let cache_path = sys_out_dir.join("build/CMakeCache.txt");
+    let cache = load_cmake_cache(cache_path, &features).unwrap_or_else(|error| {
+        panic!("failed to load resolved llama-cpp-sys-2 CMake cache: {error}")
     });
     println!("cargo:rerun-if-changed={}", cache.path.display());
-    emit_resolved_cache(build_root, &cache);
+    emit_resolved_cache(&sys_out_dir, &cache);
+    compile_common_chat_bridge(&cache);
 }
 
 struct CacheCandidate {
     path: PathBuf,
     values: BTreeMap<String, String>,
-    modified: SystemTime,
     contents: Vec<u8>,
 }
 
-fn select_cmake_cache(build_root: &Path, features: &[String]) -> Result<CacheCandidate, String> {
-    let entries = std::fs::read_dir(build_root)
-        .map_err(|error| format!("read {}: {error}", build_root.display()))?;
-    let mut candidates = Vec::new();
-    for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        if !file_name.to_string_lossy().starts_with("llama-cpp-sys-2-") {
-            continue;
-        }
-        let path = entry.path().join("out/build/CMakeCache.txt");
-        let Ok(contents) = std::fs::read(&path) else {
-            continue;
-        };
-        let values = parse_cmake_cache(&contents);
-        let target_is_apple = std::env::var("TARGET").is_ok_and(|target| target.contains("apple"));
-        if !RESOLVED_KEYS
-            .iter()
-            .filter(|key| target_is_apple || **key != "CMAKE_OSX_DEPLOYMENT_TARGET")
-            .all(|key| values.contains_key(*key))
-            || !cache_matches_features(&values, features)
-        {
-            continue;
-        }
-        let modified = std::fs::metadata(&path)
-            .and_then(|metadata| metadata.modified())
-            .unwrap_or(SystemTime::UNIX_EPOCH);
-        candidates.push(CacheCandidate {
-            path,
-            values,
-            modified,
-            contents,
-        });
+fn sys_out_dir() -> Result<PathBuf, String> {
+    let cmake_dir = PathBuf::from(
+        std::env::var_os("DEP_LLAMA_GGML_CMAKE_DIR")
+            .ok_or_else(|| "environment variable is missing".to_string())?,
+    );
+    if cmake_dir.file_name().and_then(|name| name.to_str()) != Some("cmake") {
+        return Err(format!(
+            "unexpected CMake package directory {}",
+            cmake_dir.display()
+        ));
     }
-    candidates.sort_by(|left, right| {
-        right
-            .modified
-            .cmp(&left.modified)
-            .then_with(|| left.path.cmp(&right.path))
-    });
-    candidates.into_iter().next().ok_or_else(|| {
-        format!(
-            "no valid cache in {} matching features {}",
-            build_root.display(),
+    let lib_dir = cmake_dir
+        .parent()
+        .ok_or_else(|| format!("{} has no parent", cmake_dir.display()))?;
+    if !matches!(
+        lib_dir.file_name().and_then(|name| name.to_str()),
+        Some("lib" | "lib64")
+    ) {
+        return Err(format!(
+            "expected lib or lib64 parent, got {}",
+            lib_dir.display()
+        ));
+    }
+    Ok(lib_dir
+        .parent()
+        .ok_or_else(|| format!("{} has no OUT_DIR parent", lib_dir.display()))?
+        .to_path_buf())
+}
+
+fn load_cmake_cache(path: PathBuf, features: &[String]) -> Result<CacheCandidate, String> {
+    let contents =
+        std::fs::read(&path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    let values = parse_cmake_cache(&contents);
+    let target_is_apple = std::env::var("TARGET").is_ok_and(|target| target.contains("apple"));
+    if !RESOLVED_KEYS
+        .iter()
+        .filter(|key| target_is_apple || **key != "CMAKE_OSX_DEPLOYMENT_TARGET")
+        .all(|key| values.contains_key(*key))
+        || !cache_matches_features(&values, features)
+    {
+        return Err(format!(
+            "{} is incomplete or does not match Cargo features {}",
+            path.display(),
             features.join(",")
-        )
+        ));
+    }
+    Ok(CacheCandidate {
+        path,
+        values,
+        contents,
     })
 }
 
@@ -162,7 +166,7 @@ fn cache_matches_features(values: &BTreeMap<String, String>, features: &[String]
     true
 }
 
-fn emit_resolved_cache(build_root: &Path, cache: &CacheCandidate) {
+fn emit_resolved_cache(sys_out_dir: &Path, cache: &CacheCandidate) {
     for key in RESOLVED_KEYS {
         emit_env(
             &format!("ORCHION_BUILD_RESOLVED_{key}"),
@@ -174,7 +178,7 @@ fn emit_resolved_cache(build_root: &Path, cache: &CacheCandidate) {
     }
     let relative = cache
         .path
-        .strip_prefix(build_root.parent().unwrap_or(build_root))
+        .strip_prefix(sys_out_dir.parent().unwrap_or(sys_out_dir))
         .unwrap_or(&cache.path)
         .to_string_lossy();
     emit_env("ORCHION_BUILD_CMAKE_CACHE_RELATIVE_PATH", &relative);
@@ -209,6 +213,40 @@ fn emit_resolved_cache(build_root: &Path, cache: &CacheCandidate) {
                 .map_or("unavailable", String::as_str),
         );
     }
+}
+
+fn compile_common_chat_bridge(cache: &CacheCandidate) {
+    let source = cache
+        .values
+        .get("CMAKE_HOME_DIRECTORY")
+        .map(PathBuf::from)
+        .filter(|path| path.join("common/chat.h").is_file())
+        .unwrap_or_else(|| {
+            panic!("CMAKE_HOME_DIRECTORY does not identify a llama.cpp source tree")
+        });
+    for path in [
+        "native/common_chat_bridge.h",
+        "native/common_chat_bridge.cpp",
+    ] {
+        println!("cargo:rerun-if-changed={path}");
+    }
+    let mut build = cc::Build::new();
+    build
+        .cpp(true)
+        .file("native/common_chat_bridge.cpp")
+        .include("native")
+        .include(&source)
+        .include(source.join("common"))
+        .include(source.join("include"))
+        .include(source.join("ggml/include"))
+        .include(source.join("vendor"))
+        .flag_if_supported("-std=c++17")
+        .flag_if_supported("-Wno-unused-function")
+        .pic(true);
+    if std::env::var("TARGET").is_ok_and(|target| target.ends_with("-windows-msvc")) {
+        build.flag("/std:c++17");
+    }
+    build.compile("orchion_common_chat_bridge");
 }
 
 fn find_compiler_metadata(root: &Path, language: &str) -> Option<BTreeMap<String, String>> {

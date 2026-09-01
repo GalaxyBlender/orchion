@@ -68,7 +68,7 @@ jobs:
         run: |
           cargo run -p orchion-llama-cpp --bin native-link-probe
           cargo run -p orchion-llama-cpp --bin native-link-probe -- --metadata-json > target/llama-build-metadata.json
-          python3 -c 'import json, pathlib; data=json.load(open("target/llama-build-metadata.json")); resolved=data["cmake_resolved"]; assert data["binding_revision"] == "3d5f424f7cfb7cd3d1f9039440bd0286e29ca050"; assert data["llama_cpp_revision"] == "e79e4bf660e19f2ad851e06c6913f7a8c5852621"; assert data["binding_features"] == "common,mtmd"; assert data["rustc_version"].startswith("rustc 1.95.0"); assert all(resolved[key] not in ("", "unset", "unavailable") for key in ("build_type", "generator", "build_shared_libs", "ggml_metal", "ggml_openmp", "ggml_cuda", "ggml_vulkan", "ggml_native")); assert len(resolved["cache_sha256"]) == 64; assert not pathlib.Path(resolved["cache_path_relative"]).is_absolute()'
+          python3 -c 'import json, pathlib; data=json.load(open("target/llama-build-metadata.json")); resolved=data["cmake_resolved"]; assert data["binding_revision"] == "0ad1788017e39de25c431d9323f90a4b4b538d9e"; assert data["llama_cpp_revision"] == "e79e4bf660e19f2ad851e06c6913f7a8c5852621"; assert data["binding_features"] == "common,mtmd"; assert data.get("common_chat_bridge") is True; assert data["rustc_version"].startswith("rustc 1.95.0"); assert all(resolved[key] not in ("", "unset", "unavailable") for key in ("build_type", "generator", "build_shared_libs", "ggml_metal", "ggml_openmp", "ggml_cuda", "ggml_vulkan", "ggml_native")); assert len(resolved["cache_sha256"]) == 64; assert not pathlib.Path(resolved["cache_path_relative"]).is_absolute()'
 
       - name: Check client feature gates
         run: |

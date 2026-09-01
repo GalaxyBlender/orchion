@@ -75,6 +75,12 @@ pub enum OrchionError {
     #[error("LLM worker failed: {message}")]
     LlmWorkerFailed { message: String },
 
+    #[error("unsupported LLM field `{field}`: {detail}")]
+    LlmUnsupported { field: &'static str, detail: String },
+
+    #[error("invalid LLM field `{field}`: {detail}")]
+    LlmInvalidRequest { field: &'static str, detail: String },
+
     #[error("invalid audio input: {reason}")]
     InvalidAudio { reason: String },
 

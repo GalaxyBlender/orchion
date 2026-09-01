@@ -2,16 +2,16 @@ use crate::api::activity::{ActivityEventPayload, ActivityFilter, ActivityHub};
 use crate::api::http::ServerShutdown;
 use crate::api::http_shared::authorize;
 use crate::api::openai::ApiError;
+use crate::api::sse;
 use crate::application::ServerApplication;
 use async_stream::stream;
 use axum::Json;
 use axum::extract::{Extension, RawQuery, State};
-use axum::http::{HeaderMap, HeaderValue};
+use axum::http::HeaderMap;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::Duration;
 
 const DEFAULT_LIMIT: usize = 50;
 const MAX_LIMIT: usize = 200;
@@ -72,13 +72,11 @@ where
     let mut response = Sse::new(event_stream)
         .keep_alive(
             KeepAlive::new()
-                .interval(Duration::from_secs(15))
+                .interval(state.api_policy().streaming.keepalive_interval)
                 .text("keep-alive"),
         )
         .into_response();
-    response
-        .headers_mut()
-        .insert("x-accel-buffering", HeaderValue::from_static("no"));
+    sse::set_headers(&mut response);
     Ok(response)
 }
 
@@ -130,7 +128,10 @@ fn parse_operation(value: &str) -> Result<crate::api::activity::ActivityOperatio
         "ocr" => Ok(ActivityOperation::Ocr),
         "pdf" => Ok(ActivityOperation::Pdf),
         "chat" => Ok(ActivityOperation::Chat),
+        "completions" => Ok(ActivityOperation::Completions),
         "responses" => Ok(ActivityOperation::Responses),
+        "input_tokens" => Ok(ActivityOperation::InputTokens),
+        "embeddings" => Ok(ActivityOperation::Embeddings),
         _ => Err(invalid_query("operation")),
     }
 }
@@ -175,6 +176,18 @@ mod tests {
         assert_eq!(
             parse_operation("responses").unwrap(),
             ActivityOperation::Responses
+        );
+        assert_eq!(
+            parse_operation("completions").unwrap(),
+            ActivityOperation::Completions
+        );
+        assert_eq!(
+            parse_operation("input_tokens").unwrap(),
+            ActivityOperation::InputTokens
+        );
+        assert_eq!(
+            parse_operation("embeddings").unwrap(),
+            ActivityOperation::Embeddings
         );
     }
 }

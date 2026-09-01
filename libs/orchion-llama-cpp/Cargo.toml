@@ -32,7 +32,11 @@ all = "warn"
 pedantic = "warn"
 
 [build-dependencies]
+cc = "1"
 sha2 = "0.10"
+
+[dev-dependencies]
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
 
 [[bin]]
 name = "native-link-probe"

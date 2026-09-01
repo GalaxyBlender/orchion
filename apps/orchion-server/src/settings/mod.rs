@@ -9,6 +9,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::application::{MIN_STREAMING_ERROR_FRAME_BYTES, MIN_STREAMING_EVENTS_PER_SESSION};
+
 pub const DEFAULT_ASR_STREAM_TARGET_SEGMENT: Duration = Duration::from_secs(12);
 pub const DEFAULT_ASR_STREAM_MAX_SEGMENT: Duration = Duration::from_mins(2);
 pub const DEFAULT_ASR_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -23,6 +25,7 @@ pub const DEFAULT_MAX_WEBSOCKET_CONNECTIONS: usize = 64;
 pub const DEFAULT_MAX_PENDING_WEBSOCKET_CONNECTIONS: usize = 16;
 pub const DEFAULT_MAX_WEBSOCKET_MESSAGE_SIZE: usize = 2 * 1024 * 1024;
 pub const MAX_ACTIVITY_HISTORY_CAPACITY: usize = 10_000;
+pub const MAX_UPLOAD_SIZE: usize = 128 * 1024 * 1024;
 pub const CORS_ALLOWED_ORIGINS_ENV: &str = "CORS_ALLOWED_ORIGINS";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,9 +50,39 @@ pub struct ServerConfig {
     pub config_path: PathBuf,
     pub server: ServerSection,
     pub activity: ActivitySection,
+    pub streaming: StreamingSection,
     pub models: ModelsSection,
     pub services: ServicesSection,
     pub auth: AuthSection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamingSection {
+    pub max_active_sessions: usize,
+    pub max_retained_sessions: usize,
+    pub max_events_per_session: usize,
+    pub max_bytes_per_session: usize,
+    pub max_total_bytes: usize,
+    pub max_followers_per_session: usize,
+    pub session_ttl: Duration,
+    pub lookup_max_ids: usize,
+    pub keepalive_interval: Duration,
+}
+
+impl Default for StreamingSection {
+    fn default() -> Self {
+        Self {
+            max_active_sessions: 16,
+            max_retained_sessions: 128,
+            max_events_per_session: 4096,
+            max_bytes_per_session: 4 * 1024 * 1024,
+            max_total_bytes: 64 * 1024 * 1024,
+            max_followers_per_session: 8,
+            session_ttl: Duration::from_mins(5),
+            lookup_max_ids: 100,
+            keepalive_interval: Duration::from_secs(15),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -307,6 +340,26 @@ pub struct ChatTemplateConfig {
     pub engine: ChatTemplateEngine,
     pub template: Option<String>,
     pub enable_thinking: bool,
+    pub guarantees_reasoning: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PromptCacheConfig {
+    pub enabled: bool,
+    pub max_entries: usize,
+    pub max_bytes: usize,
+    pub min_prefix_tokens: usize,
+}
+
+impl Default for PromptCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_entries: 4,
+            max_bytes: 268_435_456,
+            min_prefix_tokens: 32,
+        }
+    }
 }
 
 impl Default for ChatTemplateConfig {
@@ -315,6 +368,7 @@ impl Default for ChatTemplateConfig {
             engine: ChatTemplateEngine::LlamaCpp,
             template: None,
             enable_thinking: false,
+            guarantees_reasoning: false,
         }
     }
 }
@@ -368,7 +422,51 @@ pub struct LlmModelDeployment {
     pub mmproj_model: Option<ModelUrl>,
     pub runtime: LlmRuntimeConfig,
     pub chat_template: ChatTemplateConfig,
+    pub prompt_cache: PromptCacheConfig,
     pub generation: LlmGenerationConfig,
+    pub kind: LlmDeploymentKind,
+    pub vision: LlmVisionLimits,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LlmVisionLimits {
+    pub max_images: usize,
+    pub max_bytes_per_image: usize,
+    pub max_total_bytes: usize,
+    pub max_side: u32,
+    pub max_pixels_per_image: u64,
+    pub max_total_pixels: u64,
+}
+
+impl Default for LlmVisionLimits {
+    fn default() -> Self {
+        Self {
+            max_images: 4,
+            max_bytes_per_image: 10 * 1024 * 1024,
+            max_total_bytes: 20 * 1024 * 1024,
+            max_side: 8192,
+            max_pixels_per_image: 16_777_216,
+            max_total_pixels: 33_554_432,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LlmDeploymentKind {
+    Generation,
+    Embeddings(LlmEmbeddingConfig),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LlmEmbeddingConfig {
+    pub pooling: LlmEmbeddingPooling,
+    pub min_dimensions: usize,
+    pub max_input_tokens: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LlmEmbeddingPooling {
+    Last,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -740,6 +838,12 @@ pub enum ConfigError {
         value: String,
         message: &'static str,
     },
+    #[error("invalid streaming.{field} `{value}`: {message}")]
+    InvalidStreamingSetting {
+        field: &'static str,
+        value: String,
+        message: &'static str,
+    },
 }
 
 impl ServerConfig {
@@ -764,6 +868,7 @@ impl ServerConfig {
                 enabled: true,
                 history_capacity: 500,
             },
+            streaming: StreamingSection::default(),
             models: ModelsSection {
                 dir: exe_dir.join("models"),
                 source: ModelSource::Auto,
@@ -835,7 +940,39 @@ impl ServerConfig {
     ///
     /// Returns [`ConfigError`] when a service deployment is inconsistent or unsupported.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        validate_model_deployments(self)
+        validate_max_upload_size(self.server.max_upload_size)?;
+        validate_streaming(&self.streaming)?;
+        validate_model_deployments(self)?;
+        Self::validate_vision_upload_bounds(self)
+    }
+
+    fn validate_vision_upload_bounds(config: &Self) -> Result<(), ConfigError> {
+        for deployment in &config.services.llm.models {
+            if deployment.mmproj_model.is_none() {
+                continue;
+            }
+            let encoded_images = deployment
+                .vision
+                .max_total_bytes
+                .checked_add(2)
+                .and_then(|bytes| bytes.checked_div(3))
+                .and_then(|groups| groups.checked_mul(4));
+            let json_overhead = deployment
+                .vision
+                .max_images
+                .checked_mul(256)
+                .and_then(|bytes| bytes.checked_add(4096));
+            let required = encoded_images
+                .and_then(|bytes| json_overhead.and_then(|overhead| bytes.checked_add(overhead)));
+            if required.is_none_or(|required| required > config.server.max_upload_size) {
+                return Err(invalid_llm(
+                    "vision.max_total_bytes",
+                    deployment.vision.max_total_bytes.to_string(),
+                    "base64-encoded vision.max_total_bytes plus JSON overhead must fit server.max_upload_size",
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// # Errors
@@ -888,7 +1025,8 @@ impl ServerConfig {
                     parse_cors_allowed_origins(cors_allowed_origins)?;
             }
             if let Some(max_upload_size) = server.max_upload_size {
-                config.server.max_upload_size = parse_upload_size(&max_upload_size)?;
+                config.server.max_upload_size =
+                    validate_max_upload_size(parse_upload_size(&max_upload_size)?)?;
             }
             if let Some(max_pdf_pages) = server.max_pdf_pages {
                 if max_pdf_pages == 0 {
@@ -957,6 +1095,10 @@ impl ServerConfig {
                 }
                 config.activity.history_capacity = history_capacity;
             }
+        }
+
+        if let Some(streaming) = raw.streaming {
+            config.streaming = parse_streaming(streaming, config.streaming)?;
         }
 
         if let Some(models) = raw.models {
@@ -1315,15 +1457,151 @@ fn parse_llm_service(
 
 fn parse_llm_deployment(raw: RawLlmModelDeployment) -> Result<LlmModelDeployment, ConfigError> {
     let id = parse_model_id("services.llm", &raw.id)?;
+    let kind = parse_llm_deployment_kind(raw.kind.as_deref(), raw.embeddings)?;
+    if let LlmDeploymentKind::Embeddings(embedding) = kind {
+        for (field, configured) in [
+            ("mmproj_model", raw.mmproj_model.is_some()),
+            ("vision", raw.vision.is_some()),
+            ("chat_template", raw.chat_template.is_some()),
+            ("prompt_cache", raw.prompt_cache.is_some()),
+            ("generation", raw.generation.is_some()),
+        ] {
+            if configured {
+                return Err(invalid_llm(
+                    field,
+                    "configured".to_string(),
+                    "embedding deployments do not support generation-only settings",
+                ));
+            }
+        }
+        let (batch_size, micro_batch_size) = raw.runtime.as_ref().map_or((512, 512), |runtime| {
+            (
+                runtime.batch_size.unwrap_or(512),
+                runtime.micro_batch_size.unwrap_or(512),
+            )
+        });
+        if batch_size != micro_batch_size {
+            return Err(invalid_llm(
+                "runtime.micro_batch_size",
+                micro_batch_size.to_string(),
+                "embedding deployments require batch_size == micro_batch_size",
+            ));
+        }
+        if usize::try_from(batch_size).unwrap_or(usize::MAX) < embedding.max_input_tokens {
+            return Err(invalid_llm(
+                "runtime.batch_size",
+                batch_size.to_string(),
+                "embedding batch_size must cover embeddings.max_input_tokens",
+            ));
+        }
+    }
+    let runtime = parse_llm_runtime(raw.runtime.unwrap_or_default())?;
+    let prompt_cache = parse_prompt_cache(raw.prompt_cache.unwrap_or_default(), &runtime)?;
     Ok(LlmModelDeployment {
         name: parse_deployment_name("services.llm", &id, raw.name)?,
         id,
         model: raw.model,
         mmproj_model: raw.mmproj_model,
-        runtime: parse_llm_runtime(raw.runtime.unwrap_or_default())?,
+        runtime,
         chat_template: parse_chat_template(raw.chat_template.unwrap_or_default())?,
+        prompt_cache,
         generation: parse_llm_generation(&raw.generation.unwrap_or_default())?,
+        kind,
+        vision: parse_llm_vision(&raw.vision.unwrap_or_default())?,
     })
+}
+
+fn parse_llm_vision(raw: &RawLlmVision) -> Result<LlmVisionLimits, ConfigError> {
+    let defaults = LlmVisionLimits::default();
+    let limits = LlmVisionLimits {
+        max_images: raw.max_images.unwrap_or(defaults.max_images),
+        max_bytes_per_image: raw
+            .max_bytes_per_image
+            .unwrap_or(defaults.max_bytes_per_image),
+        max_total_bytes: raw.max_total_bytes.unwrap_or(defaults.max_total_bytes),
+        max_side: raw.max_side.unwrap_or(defaults.max_side),
+        max_pixels_per_image: raw
+            .max_pixels_per_image
+            .unwrap_or(defaults.max_pixels_per_image),
+        max_total_pixels: raw.max_total_pixels.unwrap_or(defaults.max_total_pixels),
+    };
+    if limits.max_images == 0
+        || limits.max_images > 32
+        || limits.max_bytes_per_image == 0
+        || limits.max_bytes_per_image > 64 * 1024 * 1024
+        || limits.max_total_bytes < limits.max_bytes_per_image
+        || limits.max_total_bytes > 128 * 1024 * 1024
+        || limits.max_side == 0
+        || limits.max_side > 16_384
+        || limits.max_pixels_per_image == 0
+        || limits.max_pixels_per_image > 67_108_864
+        || limits.max_total_pixels < limits.max_pixels_per_image
+        || limits.max_total_pixels > 134_217_728
+    {
+        return Err(invalid_llm(
+            "vision",
+            format!("{limits:?}"),
+            "vision limits are inconsistent or exceed hard safety bounds",
+        ));
+    }
+    Ok(limits)
+}
+
+fn parse_llm_deployment_kind(
+    kind: Option<&str>,
+    embeddings: Option<RawLlmEmbeddings>,
+) -> Result<LlmDeploymentKind, ConfigError> {
+    match kind.unwrap_or("generation") {
+        "generation" => {
+            if embeddings.is_some() {
+                return Err(invalid_llm(
+                    "embeddings",
+                    "configured".to_string(),
+                    "embeddings settings require kind = `embedding`",
+                ));
+            }
+            Ok(LlmDeploymentKind::Generation)
+        }
+        "embedding" => {
+            let embeddings = embeddings.unwrap_or_default();
+            let pooling = match embeddings.pooling.as_deref().unwrap_or("last") {
+                "last" => LlmEmbeddingPooling::Last,
+                value => {
+                    return Err(invalid_llm(
+                        "embeddings.pooling",
+                        value.to_string(),
+                        "expected `last`",
+                    ));
+                }
+            };
+            let min_dimensions = embeddings.min_dimensions.unwrap_or(32);
+            let max_input_tokens = embeddings.max_input_tokens.unwrap_or(8192);
+            if min_dimensions == 0 {
+                return Err(invalid_llm(
+                    "embeddings.min_dimensions",
+                    min_dimensions.to_string(),
+                    "value must be greater than zero",
+                ));
+            }
+            if max_input_tokens == 0 {
+                return Err(invalid_llm(
+                    "embeddings.max_input_tokens",
+                    max_input_tokens.to_string(),
+                    "value must be greater than zero",
+                ));
+            }
+            Ok(LlmDeploymentKind::Embeddings(LlmEmbeddingConfig {
+                pooling,
+                min_dimensions,
+                max_input_tokens,
+            }))
+        }
+        value => Err(invalid_llm(
+            "kind",
+            value.to_string(),
+            "expected `generation` or `embedding`",
+        )),
+    }
 }
 
 fn parse_llm_runtime(raw: RawLlmRuntime) -> Result<LlmRuntimeConfig, ConfigError> {
@@ -1355,14 +1633,7 @@ fn parse_llm_runtime(raw: RawLlmRuntime) -> Result<LlmRuntimeConfig, ConfigError
         };
     }
     if let Some(value) = raw.parallel_sequences {
-        runtime.parallel_sequences = value;
-    }
-    if runtime.parallel_sequences != 1 {
-        return Err(invalid_llm(
-            "runtime.parallel_sequences",
-            runtime.parallel_sequences.to_string(),
-            "the text tracer supports exactly one parallel sequence",
-        ));
+        runtime.parallel_sequences = nonzero_u32("runtime.parallel_sequences", value)?;
     }
     if let Some(value) = raw.batch_size {
         runtime.batch_size = nonzero_u32("runtime.batch_size", value)?;
@@ -1443,7 +1714,54 @@ fn parse_chat_template(raw: RawChatTemplate) -> Result<ChatTemplateConfig, Confi
         engine,
         template,
         enable_thinking: raw.enable_thinking.unwrap_or(false),
+        guarantees_reasoning: raw.guarantees_reasoning.unwrap_or(false),
     })
+}
+
+fn parse_prompt_cache(
+    raw: RawPromptCache,
+    runtime: &LlmRuntimeConfig,
+) -> Result<PromptCacheConfig, ConfigError> {
+    let value = PromptCacheConfig {
+        enabled: raw.enabled.unwrap_or(false),
+        max_entries: raw.max_entries.unwrap_or(4),
+        max_bytes: raw.max_bytes.unwrap_or(268_435_456),
+        min_prefix_tokens: raw.min_prefix_tokens.unwrap_or(32),
+    };
+    if !(1..=64).contains(&value.max_entries) {
+        return Err(invalid_llm(
+            "prompt_cache.max_entries",
+            value.max_entries.to_string(),
+            "expected a value in 1..=64",
+        ));
+    }
+    if value.max_bytes == 0
+        || u64::try_from(value.max_bytes).unwrap_or(u64::MAX) > 4 * 1024 * 1024 * 1024
+    {
+        return Err(invalid_llm(
+            "prompt_cache.max_bytes",
+            value.max_bytes.to_string(),
+            "expected a nonzero byte limit no greater than 4 GiB",
+        ));
+    }
+    if value.min_prefix_tokens == 0 {
+        return Err(invalid_llm(
+            "prompt_cache.min_prefix_tokens",
+            value.min_prefix_tokens.to_string(),
+            "value must be greater than zero",
+        ));
+    }
+    if value.enabled
+        && let LlmContextSize::Tokens(context_size) = runtime.context_size
+        && value.min_prefix_tokens >= context_size as usize
+    {
+        return Err(invalid_llm(
+            "prompt_cache.min_prefix_tokens",
+            value.min_prefix_tokens.to_string(),
+            "value must be below the per-slot context size",
+        ));
+    }
+    Ok(value)
 }
 
 fn parse_llm_generation(raw: &RawLlmGeneration) -> Result<LlmGenerationConfig, ConfigError> {
@@ -1925,11 +2243,34 @@ fn validate_llm_deployments(service: &LlmServiceSection) -> Result<(), ConfigErr
             validate_exact_gguf(mmproj, "LLM mmproj GGUF must use an exact-file locator")?;
         }
         validate_llm_generation(&deployment.generation)?;
-        if deployment.runtime.parallel_sequences != 1 {
+        let runtime = &deployment.runtime;
+        if matches!(deployment.kind, LlmDeploymentKind::Embeddings(_))
+            && runtime.parallel_sequences != 1
+        {
             return Err(invalid_llm(
                 "runtime.parallel_sequences",
-                deployment.runtime.parallel_sequences.to_string(),
-                "the text tracer supports exactly one parallel sequence",
+                runtime.parallel_sequences.to_string(),
+                "embedding deployments require exactly one parallel sequence",
+            ));
+        }
+        if matches!(deployment.kind, LlmDeploymentKind::Generation)
+            && runtime.batch_size < runtime.parallel_sequences
+        {
+            return Err(invalid_llm(
+                "runtime.batch_size",
+                runtime.batch_size.to_string(),
+                "generation batch_size must be at least parallel_sequences",
+            ));
+        }
+        if let LlmContextSize::Tokens(context_size) = runtime.context_size
+            && context_size
+                .checked_mul(runtime.parallel_sequences)
+                .is_none()
+        {
+            return Err(invalid_llm(
+                "runtime.parallel_sequences",
+                runtime.parallel_sequences.to_string(),
+                "context_size * parallel_sequences exceeds the native context limit",
             ));
         }
     }
@@ -2244,6 +2585,146 @@ fn parse_duration(value: &str) -> Result<Duration, ConfigError> {
         })
 }
 
+fn parse_streaming(
+    raw: RawStreaming,
+    mut value: StreamingSection,
+) -> Result<StreamingSection, ConfigError> {
+    for (field, raw_value, target) in [
+        (
+            "max_active_sessions",
+            raw.max_active_sessions,
+            &mut value.max_active_sessions,
+        ),
+        (
+            "max_retained_sessions",
+            raw.max_retained_sessions,
+            &mut value.max_retained_sessions,
+        ),
+        (
+            "max_events_per_session",
+            raw.max_events_per_session,
+            &mut value.max_events_per_session,
+        ),
+        (
+            "max_bytes_per_session",
+            raw.max_bytes_per_session,
+            &mut value.max_bytes_per_session,
+        ),
+        (
+            "max_total_bytes",
+            raw.max_total_bytes,
+            &mut value.max_total_bytes,
+        ),
+        (
+            "max_followers_per_session",
+            raw.max_followers_per_session,
+            &mut value.max_followers_per_session,
+        ),
+        (
+            "lookup_max_ids",
+            raw.lookup_max_ids,
+            &mut value.lookup_max_ids,
+        ),
+    ] {
+        if let Some(raw_value) = raw_value {
+            *target =
+                usize::try_from(raw_value).map_err(|_| ConfigError::InvalidStreamingSetting {
+                    field,
+                    value: raw_value.to_string(),
+                    message: "value does not fit this platform's usize",
+                })?;
+        }
+    }
+    if let Some(ttl) = raw.session_ttl {
+        value.session_ttl =
+            parse_duration(&ttl).map_err(|_| ConfigError::InvalidStreamingSetting {
+                field: "session_ttl",
+                value: ttl,
+                message: "expected a nonzero duration from 1s through 24h",
+            })?;
+    }
+    if let Some(keepalive) = raw.keepalive_interval {
+        value.keepalive_interval =
+            parse_duration(&keepalive).map_err(|_| ConfigError::InvalidStreamingSetting {
+                field: "keepalive_interval",
+                value: keepalive,
+                message: "expected a nonzero duration from 1s through 5m",
+            })?;
+    }
+    validate_streaming(&value)?;
+    Ok(value)
+}
+
+fn validate_streaming(value: &StreamingSection) -> Result<(), ConfigError> {
+    for (field, setting) in [
+        ("max_active_sessions", value.max_active_sessions),
+        ("max_retained_sessions", value.max_retained_sessions),
+        ("max_events_per_session", value.max_events_per_session),
+        ("max_bytes_per_session", value.max_bytes_per_session),
+        ("max_total_bytes", value.max_total_bytes),
+        ("max_followers_per_session", value.max_followers_per_session),
+        ("lookup_max_ids", value.lookup_max_ids),
+    ] {
+        if setting == 0 {
+            return Err(ConfigError::InvalidStreamingSetting {
+                field,
+                value: setting.to_string(),
+                message: "value must be greater than zero",
+            });
+        }
+    }
+    if value.max_events_per_session < MIN_STREAMING_EVENTS_PER_SESSION {
+        return Err(ConfigError::InvalidStreamingSetting {
+            field: "max_events_per_session",
+            value: value.max_events_per_session.to_string(),
+            message: "value must retain at least one terminal protocol error event",
+        });
+    }
+    if value.max_bytes_per_session < MIN_STREAMING_ERROR_FRAME_BYTES {
+        return Err(ConfigError::InvalidStreamingSetting {
+            field: "max_bytes_per_session",
+            value: value.max_bytes_per_session.to_string(),
+            message: "value must be at least 512 bytes to retain a terminal protocol error frame",
+        });
+    }
+    if value.max_total_bytes < MIN_STREAMING_ERROR_FRAME_BYTES {
+        return Err(ConfigError::InvalidStreamingSetting {
+            field: "max_total_bytes",
+            value: value.max_total_bytes.to_string(),
+            message: "value must be at least 512 bytes to retain a terminal protocol error frame",
+        });
+    }
+    if !(Duration::from_secs(1)..=Duration::from_hours(24)).contains(&value.session_ttl) {
+        return Err(ConfigError::InvalidStreamingSetting {
+            field: "session_ttl",
+            value: format_duration_for_error(value.session_ttl),
+            message: "expected a duration from 1s through 24h",
+        });
+    }
+    if !(Duration::from_secs(1)..=Duration::from_mins(5)).contains(&value.keepalive_interval) {
+        return Err(ConfigError::InvalidStreamingSetting {
+            field: "keepalive_interval",
+            value: format_duration_for_error(value.keepalive_interval),
+            message: "expected a duration from 1s through 5m",
+        });
+    }
+    if value.max_total_bytes < value.max_bytes_per_session {
+        return Err(ConfigError::InvalidStreamingSetting {
+            field: "max_total_bytes",
+            value: value.max_total_bytes.to_string(),
+            message: "value must be at least max_bytes_per_session",
+        });
+    }
+    if value.max_total_bytes > 1024 * 1024 * 1024 {
+        return Err(ConfigError::InvalidStreamingSetting {
+            field: "max_total_bytes",
+            value: value.max_total_bytes.to_string(),
+            message: "value must not exceed 1 GiB",
+        });
+    }
+    Ok(())
+}
+
 fn parse_upload_size(value: &str) -> Result<usize, ConfigError> {
     let value = value.trim();
     if value.is_empty() {
@@ -2280,6 +2761,16 @@ fn parse_upload_size(value: &str) -> Result<usize, ConfigError> {
             value: value.to_string(),
             message: "value is too large".to_string(),
         })
+}
+
+fn validate_max_upload_size(value: usize) -> Result<usize, ConfigError> {
+    if value > MAX_UPLOAD_SIZE {
+        return Err(ConfigError::InvalidUploadSize {
+            value: value.to_string(),
+            message: format!("value must not exceed {MAX_UPLOAD_SIZE} bytes"),
+        });
+    }
+    Ok(value)
 }
 
 /// # Errors
@@ -2389,9 +2880,24 @@ fn normalize_identifier(value: &str) -> String {
 struct RawConfig {
     server: Option<RawServer>,
     activity: Option<RawActivity>,
+    streaming: Option<RawStreaming>,
     models: Option<RawModels>,
     services: Option<RawServices>,
     auth: Option<RawAuth>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawStreaming {
+    max_active_sessions: Option<u64>,
+    max_retained_sessions: Option<u64>,
+    max_events_per_session: Option<u64>,
+    max_bytes_per_session: Option<u64>,
+    max_total_bytes: Option<u64>,
+    max_followers_per_session: Option<u64>,
+    session_ttl: Option<String>,
+    lookup_max_ids: Option<u64>,
+    keepalive_interval: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2455,7 +2961,34 @@ struct RawLlmModelDeployment {
     mmproj_model: Option<ModelUrl>,
     runtime: Option<RawLlmRuntime>,
     chat_template: Option<RawChatTemplate>,
+    prompt_cache: Option<RawPromptCache>,
     generation: Option<RawLlmGeneration>,
+    kind: Option<String>,
+    embeddings: Option<RawLlmEmbeddings>,
+    vision: Option<RawLlmVision>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "configuration keys intentionally share the max_ safety-limit prefix"
+)]
+struct RawLlmVision {
+    max_images: Option<usize>,
+    max_bytes_per_image: Option<usize>,
+    max_total_bytes: Option<usize>,
+    max_side: Option<u32>,
+    max_pixels_per_image: Option<u64>,
+    max_total_pixels: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawLlmEmbeddings {
+    pooling: Option<String>,
+    min_dimensions: Option<usize>,
+    max_input_tokens: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -2493,6 +3026,16 @@ struct RawChatTemplate {
     engine: Option<String>,
     template: Option<String>,
     enable_thinking: Option<bool>,
+    guarantees_reasoning: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawPromptCache {
+    enabled: Option<bool>,
+    max_entries: Option<usize>,
+    max_bytes: Option<usize>,
+    min_prefix_tokens: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Default)]
@@ -2603,6 +3146,88 @@ struct RawAuth {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streaming_defaults_and_bounds_are_validated() {
+        let config = ServerConfig::default_for_exe(Path::new("/tmp/orchion-server"));
+        assert_eq!(config.streaming, StreamingSection::default());
+        assert!(config.validate().is_ok());
+
+        let mut minimum = config.clone();
+        minimum.streaming.max_events_per_session = MIN_STREAMING_EVENTS_PER_SESSION;
+        minimum.streaming.max_bytes_per_session = MIN_STREAMING_ERROR_FRAME_BYTES;
+        minimum.streaming.max_total_bytes = MIN_STREAMING_ERROR_FRAME_BYTES;
+        assert!(minimum.validate().is_ok());
+
+        let mut invalid = config.clone();
+        invalid.streaming.max_events_per_session = 0;
+        assert!(matches!(
+            invalid.validate(),
+            Err(ConfigError::InvalidStreamingSetting {
+                field: "max_events_per_session",
+                ..
+            })
+        ));
+        invalid.streaming = StreamingSection::default();
+        invalid.streaming.max_bytes_per_session = MIN_STREAMING_ERROR_FRAME_BYTES - 1;
+        assert!(matches!(
+            invalid.validate(),
+            Err(ConfigError::InvalidStreamingSetting {
+                field: "max_bytes_per_session",
+                ..
+            })
+        ));
+        invalid.streaming = StreamingSection::default();
+        invalid.streaming.max_bytes_per_session = MIN_STREAMING_ERROR_FRAME_BYTES;
+        invalid.streaming.max_total_bytes = MIN_STREAMING_ERROR_FRAME_BYTES - 1;
+        assert!(matches!(
+            invalid.validate(),
+            Err(ConfigError::InvalidStreamingSetting {
+                field: "max_total_bytes",
+                ..
+            })
+        ));
+        invalid.streaming = StreamingSection::default();
+        invalid.streaming.max_total_bytes = invalid.streaming.max_bytes_per_session - 1;
+        assert!(matches!(
+            invalid.validate(),
+            Err(ConfigError::InvalidStreamingSetting {
+                field: "max_total_bytes",
+                ..
+            })
+        ));
+        invalid.streaming = StreamingSection::default();
+        invalid.streaming.keepalive_interval = Duration::from_secs(301);
+        assert!(matches!(
+            invalid.validate(),
+            Err(ConfigError::InvalidStreamingSetting {
+                field: "keepalive_interval",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn streaming_section_parses_all_public_settings() {
+        let config = ServerConfig::from_toml_str(
+            r#"[streaming]
+max_active_sessions = 3
+max_retained_sessions = 9
+max_events_per_session = 12
+max_bytes_per_session = 1024
+max_total_bytes = 4096
+max_followers_per_session = 2
+session_ttl = "1h"
+lookup_max_ids = 7
+keepalive_interval = "2s"
+"#,
+            Path::new("/tmp/orchion-server"),
+        )
+        .unwrap();
+        assert_eq!(config.streaming.max_active_sessions, 3);
+        assert_eq!(config.streaming.session_ttl, Duration::from_hours(1));
+        assert_eq!(config.streaming.keepalive_interval, Duration::from_secs(2));
+    }
 
     fn assert_f32_close(actual: f32, expected: f32) {
         assert!(
@@ -2837,7 +3462,7 @@ mod tests {
             name = "Test Q4"
             model = "//owner/repo/main-Q4.gguf"
             mmproj_model = "//owner/repo/mmproj.gguf"
-            runtime = { context_size = 4096, gpu_layers = 0, parallel_sequences = 1, batch_size = 128, micro_batch_size = 64, threads = 4, request_queue_capacity = 2, event_queue_capacity = 3, queue_timeout = "7s", generation_timeout = "2m" }
+            runtime = { context_size = 4096, gpu_layers = 0, parallel_sequences = 2, batch_size = 128, micro_batch_size = 64, threads = 4, request_queue_capacity = 2, event_queue_capacity = 3, queue_timeout = "7s", generation_timeout = "2m" }
             chat_template = { engine = "llama_cpp", template = "chatml" }
             generation = { max_tokens = 32768, temperature = 0.7, top_p = 0.9, top_k = 40, min_p = 0.05, presence_penalty = 0.1, frequency_penalty = -0.1, repeat_penalty = 1.1 }
         "#, Path::new("/tmp/orchion-server")).unwrap();
@@ -2850,15 +3475,31 @@ mod tests {
         ));
         assert!(matches!(model.runtime.gpu_layers, LlmGpuLayers::Count(0)));
         assert_eq!(model.generation.max_tokens, 32768);
-        assert_eq!(model.runtime.parallel_sequences, 1);
+        assert_eq!(model.runtime.parallel_sequences, 2);
         assert_eq!(model.runtime.queue_timeout, Duration::from_secs(7));
         assert_eq!(model.runtime.generation_timeout, Duration::from_mins(2));
         assert!(model.mmproj_model.is_some());
     }
 
     #[test]
-    fn llm_rejects_repository_wide_download_and_parallel_sequences() {
-        for (model, parallel) in [("//owner/repo", 1), ("//owner/repo/main.gguf", 2)] {
+    fn llm_rejects_repository_wide_download() {
+        let document = r#"
+            [services.llm]
+            enabled = true
+            default_model = "qwen/test"
+            [[services.llm.models]]
+            id = "qwen/test"
+            model = "//owner/repo"
+        "#;
+        assert!(ServerConfig::from_toml_str(document, Path::new("/tmp/orchion-server")).is_err());
+    }
+
+    #[test]
+    fn llm_rejects_invalid_deployment_slot_capacity() {
+        for runtime in [
+            "parallel_sequences = 0",
+            "parallel_sequences = 2, batch_size = 1",
+        ] {
             let document = format!(
                 r#"
                 [services.llm]
@@ -2866,14 +3507,27 @@ mod tests {
                 default_model = "qwen/test"
                 [[services.llm.models]]
                 id = "qwen/test"
-                model = "{model}"
-                runtime = {{ parallel_sequences = {parallel} }}
-            "#
+                model = "//owner/repo/main.gguf"
+                runtime = {{ {runtime} }}
+                "#
             );
             assert!(
                 ServerConfig::from_toml_str(&document, Path::new("/tmp/orchion-server")).is_err()
             );
         }
+
+        let embedding = r#"
+            [services.llm]
+            enabled = true
+            default_model = "qwen/test"
+            [[services.llm.models]]
+            id = "qwen/test"
+            kind = "embedding"
+            model = "//owner/repo/main.gguf"
+            runtime = { parallel_sequences = 2, batch_size = 8192, micro_batch_size = 8192 }
+            embeddings = { max_input_tokens = 8192 }
+        "#;
+        assert!(ServerConfig::from_toml_str(embedding, Path::new("/tmp/orchion-server")).is_err());
     }
 
     #[test]
@@ -2915,5 +3569,32 @@ mod tests {
             ChatTemplateEngine::Jinja
         );
         assert!(config.services.llm.models[0].chat_template.enable_thinking);
+        assert!(
+            !config.services.llm.models[0]
+                .chat_template
+                .guarantees_reasoning
+        );
+    }
+
+    #[test]
+    fn llm_accepts_explicit_reasoning_capability_guarantee() {
+        let config = ServerConfig::from_toml_str(
+            r#"
+            [services.llm]
+            enabled = true
+            default_model = "qwen/test"
+            [[services.llm.models]]
+            id = "qwen/test"
+            model = "//owner/repo/main.gguf"
+            chat_template = { engine = "jinja", guarantees_reasoning = true }
+            "#,
+            Path::new("/tmp/orchion-server"),
+        )
+        .unwrap();
+        assert!(
+            config.services.llm.models[0]
+                .chat_template
+                .guarantees_reasoning
+        );
     }
 }

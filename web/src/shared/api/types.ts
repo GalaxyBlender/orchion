@@ -14,7 +14,21 @@ export type ModelCapability =
   | "ocr_html"
   | "llm_chat"
   | "llm_responses"
-  | "llm_streaming";
+  | "llm_completions"
+  | "llm_input_tokens"
+  | "llm_tools"
+  | "llm_parallel_tools"
+  | "llm_json_object"
+  | "llm_json_schema"
+  | "llm_logprobs"
+  | "llm_logit_bias"
+  | "llm_multiple_choices"
+  | "llm_reasoning"
+  | "llm_reasoning_control"
+  | "llm_vision"
+  | "llm_streaming"
+  | "llm_embeddings"
+  | "llm_resumable_streaming";
 
 export interface ApiSettings {
   serverBaseUrl: string;
@@ -26,6 +40,13 @@ export interface ModelObject {
   type?: ModelType;
   name?: string;
   capabilities: ModelCapability[];
+  capability_details?: {
+    max_choices: number;
+    max_top_logprobs: number;
+    legacy_max_logprobs: number;
+    strict_json_schema: boolean;
+    runtime_template_validation: boolean;
+  };
   object?: string;
   created?: number;
   owned_by?: string;

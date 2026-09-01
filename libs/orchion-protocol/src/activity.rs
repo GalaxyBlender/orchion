@@ -30,6 +30,9 @@ pub enum ActivityOperation {
     Pdf,
     Chat,
     Responses,
+    Embeddings,
+    Completions,
+    InputTokens,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -74,6 +77,8 @@ pub struct ActivityEntry {
     pub prompt_tokens: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completion_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queue_time_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -143,6 +148,7 @@ mod tests {
             input_bytes: Some(128),
             prompt_tokens: Some(10),
             completion_tokens: Some(20),
+            reasoning_tokens: Some(5),
             queue_time_ms: Some(2),
             eval_time_ms: Some(18),
             prefill_tokens_per_second: Some(5.0),
@@ -176,6 +182,9 @@ mod tests {
             ActivityOperation::Pdf,
             ActivityOperation::Chat,
             ActivityOperation::Responses,
+            ActivityOperation::Embeddings,
+            ActivityOperation::Completions,
+            ActivityOperation::InputTokens,
         ] {
             round_trip(&operation);
         }

@@ -1,6 +1,6 @@
 export type ActivityState = "in_flight" | "completed";
 export type ActivityTransport = "http" | "websocket";
-export type ActivityOperation = "asr" | "asr_stream" | "tts" | "ocr" | "pdf" | "chat" | "responses";
+export type ActivityOperation = "asr" | "asr_stream" | "tts" | "ocr" | "pdf" | "chat" | "completions" | "responses" | "input_tokens" | "embeddings";
 export type ActivityOutcome =
   | "success"
   | "client_error"
@@ -28,6 +28,7 @@ export interface ActivityEntry {
   input_bytes?: number;
   prompt_tokens?: number;
   completion_tokens?: number;
+  reasoning_tokens?: number;
   queue_time_ms?: number;
   eval_time_ms?: number;
   prefill_tokens_per_second?: number;

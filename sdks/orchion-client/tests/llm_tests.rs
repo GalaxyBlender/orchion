@@ -1,8 +1,12 @@
 #![cfg(feature = "llm")]
 
 use orchion_client::llm::{
-    ChatCompletionEvent, ChatCompletionRequest, ChatMessage, FinishReason, MessageRole,
-    ResponseInputMessage, ResponseStatus, ResponsesEvent, ResponsesInput, ResponsesRequest,
+    ChatCompletionEvent, ChatCompletionRequest, ChatContentPart, ChatImageUrl, ChatMessage,
+    ChatReasoningControlRequest, CompletionRequest, EmbeddingEncodingFormat, EmbeddingValue,
+    EmbeddingsInput, EmbeddingsRequest, FinishReason, FunctionTool, ImageDetail, MessageRole,
+    ReasoningEffort, ResponseInputContentPart, ResponseInputItem, ResponseInputMessage,
+    ResponseStatus, ResponsesEvent, ResponsesInput, ResponsesInputTokensRequest, ResponsesRequest,
+    ResponsesTextFormat, ToolChoice,
 };
 use orchion_client::{Client, ClientConfig, ClientError};
 use serde_json::{Value, json};
@@ -10,8 +14,343 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::thread;
 use std::time::Duration;
-use wiremock::matchers::{body_json, header, method, path};
+use wiremock::matchers::{body_json, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+#[tokio::test]
+async fn resumable_chat_start_and_resume_expose_transport_identity() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("x-orchion-resumable", "true"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .insert_header("x-orchion-stream-id", "strm_fixture")
+                .insert_header(
+                    "x-orchion-completion-id",
+                    "chatcmpl_0123456789abcdefghijklmnopqrstuv",
+                )
+                .set_body_raw("id: 1\ndata: [DONE]\n\n", "text/event-stream"),
+        )
+        .mount(&server)
+        .await;
+    let client = Client::new(server.uri()).unwrap();
+    let mut stream = client
+        .llm()
+        .start_resumable_chat_completion(ChatCompletionRequest::new(
+            "qwen/test",
+            vec![ChatMessage::user("hello")],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(stream.stream_id(), Some("strm_fixture"));
+    assert_eq!(
+        stream.completion_id(),
+        Some("chatcmpl_0123456789abcdefghijklmnopqrstuv")
+    );
+    assert!(stream.next_event().await.unwrap().is_none());
+    assert_eq!(stream.last_event_id(), Some(1));
+
+    Mock::given(method("GET"))
+        .and(path("/v1/stream"))
+        .and(query_param("stream_id", "strm_fixture"))
+        .and(header("last-event-id", "1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw("id: 2\ndata: [DONE]\n\n", "text/event-stream"),
+        )
+        .mount(&server)
+        .await;
+    let mut resumed = client
+        .llm()
+        .resume_chat_completion("strm_fixture", Some(1))
+        .await
+        .unwrap();
+    assert!(resumed.next_event().await.unwrap().is_none());
+    assert_eq!(resumed.last_event_id(), Some(2));
+}
+
+#[tokio::test]
+async fn resumable_sse_requires_nonzero_contiguous_decimal_ids() {
+    for body in [
+        "data: [DONE]\n\n",
+        "id: 0\ndata: [DONE]\n\n",
+        "id: nope\ndata: [DONE]\n\n",
+        "id: 2\ndata: [DONE]\n\n",
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .insert_header("x-orchion-stream-id", "strm_fixture")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+        let client = Client::new(server.uri()).unwrap();
+        let mut stream = client
+            .llm()
+            .start_resumable_completion(CompletionRequest::new("qwen/test", "hello"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            stream.next_event().await,
+            Err(ClientError::Decode { .. })
+        ));
+        assert_eq!(stream.last_event_id(), None);
+    }
+
+    for second_id in [1, 0, 3] {
+        let server = MockServer::start().await;
+        let chunk = json!({
+            "id":"cmpl-1","object":"text_completion","created":1,"model":"qwen/test",
+            "choices":[{"text":"x","index":0,"logprobs":null,"finish_reason":null}],
+            "usage":null,"timings":null
+        });
+        let body = format!("id: 1\ndata: {chunk}\n\nid: {second_id}\ndata: [DONE]\n\n");
+        Mock::given(method("POST"))
+            .and(path("/v1/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .insert_header("x-orchion-stream-id", "strm_fixture")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+        let client = Client::new(server.uri()).unwrap();
+        let mut stream = client
+            .llm()
+            .start_resumable_completion(CompletionRequest::new("qwen/test", "hello"))
+            .await
+            .unwrap();
+        assert!(stream.next_event().await.unwrap().is_some());
+        assert!(matches!(
+            stream.next_event().await,
+            Err(ClientError::Decode { .. })
+        ));
+        assert_eq!(stream.last_event_id(), Some(1));
+    }
+}
+
+#[tokio::test]
+async fn chat_reasoning_control_builder_and_typed_result_use_fixed_action() {
+    let server = MockServer::start().await;
+    let id = "chatcmpl_0123456789abcdefghijklmnopqrstuv";
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions/control"))
+        .and(body_json(json!({
+            "id":id,
+            "action":"reasoning_end",
+            "model":"qwen/test"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id":id,
+            "action":"reasoning_end",
+            "success":true,
+            "message":null
+        })))
+        .mount(&server)
+        .await;
+    let client = Client::new(server.uri()).unwrap();
+    let result = client
+        .llm()
+        .control_chat_reasoning(ChatReasoningControlRequest::new(id).with_model("qwen/test"))
+        .await
+        .unwrap();
+    assert!(result.success);
+    assert_eq!(result.action, "reasoning_end");
+
+    let request = ChatCompletionRequest::new("qwen/test", vec![ChatMessage::user("hi")])
+        .with_reasoning_control();
+    assert!(matches!(
+        client.llm().create_chat_completion(request).await,
+        Err(ClientError::BuildRequest { .. })
+    ));
+}
+
+#[tokio::test]
+async fn resumed_responses_accepts_a_nonzero_first_payload_sequence() {
+    let server = MockServer::start().await;
+    let terminal = json!({
+        "type":"response.completed",
+        "response":response_object("completed"),
+        "timings":timings(),
+        "sequence_number":8
+    });
+    Mock::given(method("GET"))
+        .and(path("/v1/stream"))
+        .and(query_param("stream_id", "strm_fixture"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(
+                    format!("id: 9\n{}", response_frame("response.completed", &terminal)),
+                    "text/event-stream",
+                ),
+        )
+        .mount(&server)
+        .await;
+    let client = Client::new(server.uri()).unwrap();
+    let mut stream = client
+        .llm()
+        .resume_response("strm_fixture", Some(8))
+        .await
+        .unwrap();
+    assert!(matches!(
+        stream.next_event().await.unwrap(),
+        Some(ResponsesEvent::Completed {
+            sequence_number: 8,
+            ..
+        })
+    ));
+    assert_eq!(stream.last_event_id(), Some(9));
+}
+
+#[tokio::test]
+async fn resumed_responses_validate_full_replay_and_inferred_lifecycle() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/stream"))
+        .and(query_param("stream_id", "strm_full"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(
+                    format!(
+                        "id: 1\n{}",
+                        response_frame(
+                            "response.created",
+                            &snapshot_payload("response.created", 1)
+                        )
+                    ),
+                    "text/event-stream",
+                ),
+        )
+        .mount(&server)
+        .await;
+    let client = Client::new(server.uri()).unwrap();
+    for cursor in [None, Some(0)] {
+        let mut stream = client
+            .llm()
+            .resume_response("strm_full", cursor)
+            .await
+            .unwrap();
+        assert!(matches!(
+            stream.next_event().await.unwrap_err(),
+            ClientError::Decode { .. }
+        ));
+    }
+
+    Mock::given(method("GET"))
+        .and(path("/v1/stream"))
+        .and(query_param("stream_id", "strm_partial"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(
+                    format!(
+                        "id: 4\n{}id: 5\n{}",
+                        response_frame(
+                            "response.created",
+                            &snapshot_payload("response.created", 4),
+                        ),
+                        response_frame(
+                            "response.created",
+                            &snapshot_payload("response.created", 5),
+                        ),
+                    ),
+                    "text/event-stream",
+                ),
+        )
+        .mount(&server)
+        .await;
+    let mut stream = client
+        .llm()
+        .resume_response("strm_partial", Some(3))
+        .await
+        .unwrap();
+    assert!(matches!(
+        stream.next_event().await.unwrap(),
+        Some(ResponsesEvent::Created { .. })
+    ));
+    assert!(matches!(
+        stream.next_event().await.unwrap_err(),
+        ClientError::Decode { .. }
+    ));
+}
+
+#[tokio::test]
+async fn resumable_lookup_and_delete_use_explicit_routes() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/streams/lookup"))
+        .and(body_json(json!({"stream_ids":["strm_fixture"]})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"streams":[{
+            "stream_id":"strm_fixture","protocol":"chat","status":"active",
+            "last_event_id":3,"expires_in_seconds":300
+        }]})))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v1/stream"))
+        .and(query_param("stream_id", "strm_fixture"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    let client = Client::new(server.uri()).unwrap();
+    let lookup = client
+        .llm()
+        .lookup_streams(vec!["strm_fixture".into()])
+        .await
+        .unwrap();
+    assert_eq!(lookup.streams[0].last_event_id, 3);
+    client.llm().delete_stream("strm_fixture").await.unwrap();
+}
+
+#[test]
+fn typed_image_parts_serialize_to_chat_and_responses_wire_shapes() {
+    let data_url = "data:image/png;base64,AAAA".to_string();
+    let chat = ChatCompletionRequest::new(
+        "qwen/vision",
+        vec![ChatMessage::user("").with_content_parts(vec![
+            ChatContentPart::Text {
+                text: "before".to_string(),
+            },
+            ChatContentPart::ImageUrl {
+                image_url: ChatImageUrl {
+                    url: data_url.clone(),
+                    detail: Some(ImageDetail::Auto),
+                },
+            },
+        ])],
+    );
+    let chat = serde_json::to_value(chat).unwrap();
+    assert_eq!(chat["messages"][0]["content"][1]["type"], "image_url");
+    assert_eq!(
+        chat["messages"][0]["content"][1]["image_url"]["detail"],
+        "auto"
+    );
+
+    let responses = ResponsesRequest::new(
+        "qwen/vision",
+        ResponsesInput::items(vec![ResponseInputItem::MessageParts {
+            role: MessageRole::User,
+            content: vec![ResponseInputContentPart::InputImage {
+                image_url: data_url,
+                detail: Some(ImageDetail::Auto),
+            }],
+        }]),
+    );
+    let responses = serde_json::to_value(responses).unwrap();
+    assert_eq!(responses["input"][0]["type"], "message");
+    assert_eq!(responses["input"][0]["content"][0]["type"], "input_image");
+    assert_eq!(responses["input"][0]["content"][0]["detail"], "auto");
+}
 
 #[tokio::test]
 async fn chat_json_sends_typed_request_auth_and_decodes_complete_response() {
@@ -69,6 +408,118 @@ async fn chat_json_sends_typed_request_auth_and_decodes_complete_response() {
 }
 
 #[tokio::test]
+async fn chat_request_serializes_tools_reasoning_and_multiple_choice_options() {
+    let server = MockServer::start().await;
+    let request = ChatCompletionRequest::new("qwen/test", vec![ChatMessage::user("weather")])
+        .with_tools(vec![FunctionTool::new(
+            "weather",
+            json!({"type":"object","properties":{},"required":[],"additionalProperties":false}),
+        )])
+        .with_tool_choice(ToolChoice::named("weather"))
+        .with_parallel_tool_calls(true)
+        .with_reasoning_effort(ReasoningEffort::Low)
+        .with_logprobs(2)
+        .with_choices(2);
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_json(json!({
+            "model":"qwen/test","messages":[{"role":"user","content":"weather"}],
+            "tools":[{"type":"function","function":{"name":"weather","parameters":{"type":"object","properties":{},"required":[],"additionalProperties":false},"strict":true}}],
+            "tool_choice":{"type":"function","function":{"name":"weather"}},
+            "parallel_tool_calls":true,"reasoning_effort":"low","logprobs":true,
+            "top_logprobs":2,"n":2,"stream":false
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_response()))
+        .mount(&server)
+        .await;
+
+    Client::new(server.uri())
+        .unwrap()
+        .llm()
+        .create_chat_completion(request)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn completion_json_stream_and_input_tokens_use_typed_contracts() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/completions"))
+        .and(body_json(json!({
+            "model":"qwen/test","prompt":"hello","max_tokens":8,"stream":false
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id":"cmpl-1","object":"text_completion","created":1,"model":"qwen/test",
+            "choices":[{"text":"world","index":0,"logprobs":null,"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let response = Client::new(server.uri())
+        .unwrap()
+        .llm()
+        .create_completion(CompletionRequest::new("qwen/test", "hello").with_max_tokens(8))
+        .await
+        .unwrap();
+    assert_eq!(response.choices[0].text, "world");
+
+    Mock::given(method("POST"))
+        .and(path("/v1/completions"))
+        .and(body_json(json!({"model":"qwen/test","prompt":"hello","stream":true})))
+        .respond_with(sse_response(
+            "data: {\"id\":\"cmpl-1\",\"object\":\"text_completion\",\"created\":1,\"model\":\"qwen/test\",\"choices\":[{\"text\":\"world\",\"index\":0,\"logprobs\":null,\"finish_reason\":null}],\"usage\":null}\n\ndata: [DONE]\n\n",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut stream = Client::new(server.uri())
+        .unwrap()
+        .llm()
+        .stream_completion(CompletionRequest::new("qwen/test", "hello"))
+        .await
+        .unwrap();
+    assert_eq!(
+        stream.next_event().await.unwrap().unwrap().choices[0].text,
+        "world"
+    );
+    assert!(stream.next_event().await.unwrap().is_none());
+
+    Mock::given(method("POST"))
+        .and(path("/v1/responses/input_tokens"))
+        .and(body_json(json!({
+            "model":"qwen/test","input":"hello","instructions":"concise",
+            "tools":[{"type":"function","function":{"name":"weather","parameters":{"type":"object"},"strict":true}}],
+            "tool_choice":{"type":"function","function":{"name":"weather"}},
+            "parallel_tool_calls":false,
+            "reasoning":{"effort":"low"},
+            "text":{"format":{"type":"json_object"}}
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object":"response.input_tokens","input_tokens":7
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let count = Client::new(server.uri())
+        .unwrap()
+        .llm()
+        .count_response_input_tokens(
+            ResponsesInputTokensRequest::new("qwen/test", ResponsesInput::text("hello"))
+                .with_instructions("concise")
+                .with_tools(vec![FunctionTool::new("weather", json!({"type":"object"}))])
+                .with_tool_choice(ToolChoice::named("weather"))
+                .with_parallel_tool_calls(false)
+                .with_reasoning(ReasoningEffort::Low)
+                .with_text_format(ResponsesTextFormat::JsonObject),
+        )
+        .await
+        .unwrap();
+    assert_eq!(count.input_tokens, 7);
+}
+
+#[tokio::test]
 async fn responses_json_always_disables_store_and_decodes_typed_fields() {
     let server = MockServer::start().await;
     let request = ResponsesRequest::new(
@@ -111,6 +562,69 @@ async fn responses_json_always_disables_store_and_decodes_typed_fields() {
         0
     );
     assert_eq!(response.timings.unwrap().prompt_n, 2);
+}
+
+#[tokio::test]
+async fn embeddings_send_all_options_and_decode_float_and_base64_values() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/embeddings"))
+        .and(body_json(json!({
+            "model":"qwen/embed",
+            "input":["first","second"],
+            "dimensions":2,
+            "encoding_format":"base64",
+            "user":"ignored-user"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object":"list",
+            "data":[
+                {"object":"embedding","embedding":[0.6,0.8],"index":0},
+                {"object":"embedding","embedding":"AACAPwAAAD8=","index":1}
+            ],
+            "model":"qwen/embed",
+            "usage":{"prompt_tokens":4,"total_tokens":4}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let response = Client::new(server.uri())
+        .unwrap()
+        .llm()
+        .create_embeddings(
+            EmbeddingsRequest::new(
+                "qwen/embed",
+                EmbeddingsInput::Texts(vec!["first".to_string(), "second".to_string()]),
+            )
+            .with_dimensions(2)
+            .with_encoding_format(EmbeddingEncodingFormat::Base64)
+            .with_user("ignored-user"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.usage.total_tokens, 4);
+    assert!(matches!(
+        response.data[0].embedding,
+        EmbeddingValue::Float(_)
+    ));
+    assert!(matches!(
+        response.data[1].embedding,
+        EmbeddingValue::Base64(_)
+    ));
+}
+
+#[tokio::test]
+async fn embeddings_reject_empty_inputs_before_network_io() {
+    let client = Client::new("http://127.0.0.1:9").unwrap();
+    let error = client
+        .llm()
+        .create_embeddings(EmbeddingsRequest::new(
+            "qwen/embed",
+            EmbeddingsInput::TokenBatches(Vec::new()),
+        ))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ClientError::BuildRequest { .. }));
 }
 
 #[tokio::test]
@@ -272,6 +786,98 @@ async fn responses_stream_exposes_complete_lifecycle_and_terminal() {
         ]
     );
     assert!(stream.next_event().await.unwrap().is_none());
+    drop(server);
+}
+
+#[tokio::test]
+async fn responses_known_and_forward_compatible_terminal_events_close_the_stream() {
+    for (kind, status) in [
+        ("response.failed", "failed"),
+        ("response.cancelled", "cancelled"),
+        ("response.future_terminal", "failed"),
+    ] {
+        let body = [
+            response_frame("response.created", &snapshot_payload("response.created", 0)),
+            response_frame(
+                "response.in_progress",
+                &snapshot_payload("response.in_progress", 1),
+            ),
+            response_frame(
+                kind,
+                &json!({"type":kind,"response":response_object(status),"sequence_number":2}),
+            ),
+        ]
+        .concat();
+        let (client, server) = responses_stream_mock(&body).await;
+        let mut stream = client
+            .llm()
+            .stream_response(ResponsesRequest::new(
+                "qwen/test",
+                ResponsesInput::text("hello"),
+            ))
+            .await
+            .unwrap();
+        assert!(stream.next_event().await.unwrap().is_some());
+        assert!(stream.next_event().await.unwrap().is_some());
+        let terminal = stream.next_event().await.unwrap().unwrap();
+        match kind {
+            "response.failed" => assert!(matches!(terminal, ResponsesEvent::Failed { .. })),
+            "response.cancelled" => assert!(matches!(terminal, ResponsesEvent::Cancelled { .. })),
+            _ => assert!(matches!(terminal, ResponsesEvent::Unknown { .. })),
+        }
+        assert!(stream.next_event().await.unwrap().is_none());
+        drop(server);
+    }
+}
+
+#[tokio::test]
+async fn responses_stream_decodes_dynamic_reasoning_and_function_events() {
+    let events = [
+        ("response.created", snapshot_payload("response.created", 0)),
+        (
+            "response.in_progress",
+            snapshot_payload("response.in_progress", 1),
+        ),
+        (
+            "response.reasoning_summary_text.delta",
+            json!({"type":"response.reasoning_summary_text.delta","item_id":"rs-1","output_index":0,"summary_index":0,"delta":"think","sequence_number":2}),
+        ),
+        (
+            "response.function_call_arguments.delta",
+            json!({"type":"response.function_call_arguments.delta","item_id":"call-1","output_index":1,"delta":"{\"city\":","sequence_number":3}),
+        ),
+        (
+            "response.function_call_arguments.done",
+            json!({"type":"response.function_call_arguments.done","item_id":"call-1","output_index":1,"arguments":"{\"city\":\"Paris\"}","sequence_number":4}),
+        ),
+        (
+            "response.completed",
+            json!({"type":"response.completed","response":response_object("completed"),"timings":timings(),"sequence_number":5}),
+        ),
+    ];
+    let body = events
+        .iter()
+        .map(|(name, payload)| response_frame(name, payload))
+        .collect::<String>();
+    let (client, server) = responses_stream_mock(&body).await;
+    let mut stream = client
+        .llm()
+        .stream_response(ResponsesRequest::new(
+            "qwen/test",
+            ResponsesInput::text("hello"),
+        ))
+        .await
+        .unwrap();
+    let mut dynamic = Vec::new();
+    while let Some(event) = stream.next_event().await.unwrap() {
+        match event {
+            ResponsesEvent::ReasoningSummaryTextDelta { delta, .. }
+            | ResponsesEvent::FunctionCallArgumentsDelta { delta, .. } => dynamic.push(delta),
+            ResponsesEvent::FunctionCallArgumentsDone { arguments, .. } => dynamic.push(arguments),
+            _ => {}
+        }
+    }
+    assert_eq!(dynamic, ["think", "{\"city\":", "{\"city\":\"Paris\"}"]);
     drop(server);
 }
 

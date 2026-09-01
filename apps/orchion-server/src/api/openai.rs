@@ -107,6 +107,50 @@ impl ApiError {
     }
 
     #[must_use]
+    pub(crate) fn stream_not_found() -> Self {
+        Self::status_error(
+            StatusCode::NOT_FOUND,
+            "stream not found",
+            "stream_not_found",
+        )
+    }
+
+    #[must_use]
+    pub(crate) fn replay_lost() -> Self {
+        Self::status_error(
+            StatusCode::CONFLICT,
+            "requested events are no longer retained",
+            "replay_lost",
+        )
+    }
+
+    #[must_use]
+    pub(crate) fn stream_capacity(resource: &'static str) -> Self {
+        Self::status_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("{resource} capacity is currently exhausted"),
+            "stream_capacity_exhausted",
+        )
+    }
+
+    fn status_error(status: StatusCode, message: impl Into<String>, code: &'static str) -> Self {
+        Self {
+            status,
+            error: ErrorObject {
+                message: message.into(),
+                error_type: if status == StatusCode::TOO_MANY_REQUESTS {
+                    "rate_limit_error"
+                } else {
+                    "invalid_request_error"
+                },
+                param: None,
+                code: Some(code.to_string()),
+            },
+            log_message: None,
+        }
+    }
+
+    #[must_use]
     pub fn timeout(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::REQUEST_TIMEOUT,
@@ -135,6 +179,20 @@ impl ApiError {
     }
 
     #[must_use]
+    pub fn control_unavailable() -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            error: ErrorObject {
+                message: "reasoning control is temporarily unavailable".to_string(),
+                error_type: "server_error",
+                param: None,
+                code: Some("control_unavailable".to_string()),
+            },
+            log_message: None,
+        }
+    }
+
+    #[must_use]
     pub fn model_not_loaded(model: &str) -> Self {
         Self::invalid_request(
             format!("model `{model}` is not loaded by this server"),
@@ -150,6 +208,20 @@ impl ApiError {
             Some("model"),
             Some("model_not_available"),
         )
+    }
+
+    #[must_use]
+    pub fn model_not_found() -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            error: ErrorObject {
+                message: "model not found".to_string(),
+                error_type: "invalid_request_error",
+                param: Some("model".to_string()),
+                code: Some("model_not_found".to_string()),
+            },
+            log_message: None,
+        }
     }
 
     #[must_use]
@@ -205,6 +277,20 @@ pub enum ModelCapability {
     LlmChat,
     LlmResponses,
     LlmStreaming,
+    LlmEmbeddings,
+    LlmCompletions,
+    LlmInputTokens,
+    LlmTools,
+    LlmParallelTools,
+    LlmJsonObject,
+    LlmJsonSchema,
+    LlmLogprobs,
+    LlmLogitBias,
+    LlmMultipleChoices,
+    LlmReasoning,
+    LlmVision,
+    LlmResumableStreaming,
+    LlmReasoningControl,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -218,6 +304,17 @@ pub struct ModelObject {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub capabilities: Vec<ModelCapability>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capability_details: Option<LlmCapabilityDetails>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct LlmCapabilityDetails {
+    pub max_choices: usize,
+    pub max_top_logprobs: usize,
+    pub legacy_max_logprobs: usize,
+    pub strict_json_schema: bool,
+    pub runtime_template_validation: bool,
 }
 
 impl ModelObject {
@@ -226,6 +323,7 @@ impl ModelObject {
         name: Option<String>,
         model_type: ModelType,
         capabilities: ModelCapabilities,
+        llm_max_choices: Option<usize>,
     ) -> Self {
         Self {
             id: id.into(),
@@ -235,6 +333,13 @@ impl ModelObject {
             model_type,
             name,
             capabilities: ModelCapability::from_core(capabilities),
+            capability_details: llm_max_choices.map(|max_choices| LlmCapabilityDetails {
+                max_choices,
+                max_top_logprobs: 20,
+                legacy_max_logprobs: 5,
+                strict_json_schema: true,
+                runtime_template_validation: true,
+            }),
         }
     }
 }
@@ -265,6 +370,32 @@ impl ModelCapability {
             (ModelCapabilities::LLM_CHAT, Self::LlmChat),
             (ModelCapabilities::LLM_RESPONSES, Self::LlmResponses),
             (ModelCapabilities::LLM_STREAMING, Self::LlmStreaming),
+            (ModelCapabilities::LLM_EMBEDDINGS, Self::LlmEmbeddings),
+            (ModelCapabilities::LLM_COMPLETIONS, Self::LlmCompletions),
+            (ModelCapabilities::LLM_INPUT_TOKENS, Self::LlmInputTokens),
+            (ModelCapabilities::LLM_TOOLS, Self::LlmTools),
+            (
+                ModelCapabilities::LLM_PARALLEL_TOOLS,
+                Self::LlmParallelTools,
+            ),
+            (ModelCapabilities::LLM_JSON_OBJECT, Self::LlmJsonObject),
+            (ModelCapabilities::LLM_JSON_SCHEMA, Self::LlmJsonSchema),
+            (ModelCapabilities::LLM_LOGPROBS, Self::LlmLogprobs),
+            (ModelCapabilities::LLM_LOGIT_BIAS, Self::LlmLogitBias),
+            (
+                ModelCapabilities::LLM_MULTIPLE_CHOICES,
+                Self::LlmMultipleChoices,
+            ),
+            (ModelCapabilities::LLM_REASONING, Self::LlmReasoning),
+            (ModelCapabilities::LLM_VISION, Self::LlmVision),
+            (
+                ModelCapabilities::LLM_RESUMABLE_STREAMING,
+                Self::LlmResumableStreaming,
+            ),
+            (
+                ModelCapabilities::LLM_REASONING_CONTROL,
+                Self::LlmReasoningControl,
+            ),
         ]
         .into_iter()
         .filter_map(|(capability, value)| capabilities.contains(capability).then_some(value))
@@ -325,6 +456,12 @@ impl From<orchion::OrchionError> for ApiError {
                 Some("input"),
                 Some("context_length_exceeded"),
             ),
+            orchion::OrchionError::LlmUnsupported { field, detail } => {
+                Self::invalid_request(detail, Some(field), Some("unsupported_parameter"))
+            }
+            orchion::OrchionError::LlmInvalidRequest { field, detail } => {
+                Self::invalid_request(detail, Some(field), Some("invalid_parameter"))
+            }
             other => Self::internal(other.to_string()),
         }
     }

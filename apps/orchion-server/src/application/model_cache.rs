@@ -1,5 +1,5 @@
 use super::mark_owned_operation_dispatched;
-use super::resource_policy::InferenceLimiter;
+use super::resource_policy::{InferenceEpoch, InferenceLimiter};
 use orchion::{
     Asr, AsrModel, DeploymentSourcePlan, ModelDownloader, ModelSpec, ModelUrl, Ocr, OcrModel, Tts,
     TtsModel,
@@ -7,11 +7,12 @@ use orchion::{
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify, Semaphore, watch};
 
@@ -38,6 +39,10 @@ pub trait ModelProvisioner<M>: Send + Sync {
 
 pub trait ModelCacheKey: Clone + std::fmt::Debug + Eq + Send + Sync + 'static {
     fn cache_path(&self, cache_dir: &std::path::Path) -> PathBuf;
+
+    fn execution_slots(&self) -> NonZeroUsize {
+        NonZeroUsize::MIN
+    }
 
     fn resolve_without_provisioner(
         &self,
@@ -116,11 +121,26 @@ pub(crate) struct ResidencyDomain {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ModelResidencyStatus {
+pub enum ModelResidencyStatus {
     Unloaded,
     Loading,
     Loaded,
     Unloading,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelLoadFailurePhase {
+    Provision,
+    Load,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ModelCacheSnapshot {
+    pub residency: ModelResidencyStatus,
+    pub load_epoch: u64,
+    pub worker_healthy: bool,
+    pub active_leases: usize,
+    pub last_load_failure: Option<ModelLoadFailurePhase>,
 }
 
 impl ResidencyDomain {
@@ -166,14 +186,21 @@ struct ModelCacheState<M, E> {
     draining: HashSet<M>,
     retiring: HashSet<M>,
     provisioned: HashMap<M, PathBuf>,
+    load_epochs: HashMap<M, u64>,
+    load_failures: HashMap<M, ModelLoadFailurePhase>,
 }
 
 struct LoadedModel<E> {
     engine: E,
     last_used: Arc<StdMutex<Instant>>,
     active_leases: Arc<AtomicUsize>,
-    run_permits: Arc<Semaphore>,
+    execution: Arc<ExecutionController>,
     residency: ResidencyDomain,
+}
+
+struct ExecutionController {
+    slots: Arc<Semaphore>,
+    epoch: Mutex<Weak<InferenceEpoch>>,
 }
 
 #[must_use = "the model lease must be held while the model is in use"]
@@ -181,8 +208,15 @@ pub struct ModelLease<E> {
     engine: E,
     last_used: Arc<StdMutex<Instant>>,
     active_leases: Arc<AtomicUsize>,
-    run_permits: Arc<Semaphore>,
+    execution: Arc<ExecutionController>,
     residency: ResidencyDomain,
+}
+
+#[must_use = "the active model must be held until native cleanup is acknowledged"]
+pub(crate) struct ActiveModel<E> {
+    lease: ModelLease<E>,
+    _slot: tokio::sync::OwnedSemaphorePermit,
+    _epoch: Arc<InferenceEpoch>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -198,7 +232,7 @@ impl<E> ModelLease<E> {
         engine: E,
         last_used: Arc<StdMutex<Instant>>,
         active_leases: Arc<AtomicUsize>,
-        run_permits: Arc<Semaphore>,
+        execution: Arc<ExecutionController>,
         residency: ResidencyDomain,
     ) -> Self {
         active_leases.fetch_add(1, Ordering::SeqCst);
@@ -206,7 +240,7 @@ impl<E> ModelLease<E> {
             engine,
             last_used,
             active_leases,
-            run_permits,
+            execution,
             residency,
         }
     }
@@ -230,7 +264,7 @@ where
         F: FnOnce(ModelLease<E>) -> Fut + Send + 'static,
         Fut: Future<Output = T> + Send + 'static,
     {
-        let permit = Arc::clone(&self.run_permits)
+        let permit = Arc::clone(&self.execution.slots)
             .acquire_owned()
             .await
             .expect("model inference semaphore must remain open");
@@ -255,21 +289,39 @@ where
         F: FnOnce(ModelLease<E>) -> Fut + Send + 'static,
         Fut: Future<Output = T> + Send + 'static,
     {
-        let model_permit = Arc::clone(&self.run_permits)
-            .acquire_owned()
-            .await
-            .expect("model inference semaphore must remain open");
-        let inference_permit = inference.acquire().await;
-        let lease = self.clone();
+        let active = self.clone().activate(inference).await;
         if !mark_owned_operation_dispatched() {
             return Err(ModelOperationError::Cancelled);
         }
         Ok(tokio::spawn(async move {
-            let _model_permit = model_permit;
-            let _inference_permit = inference_permit;
-            operation(lease).await
+            let lease = active.lease.clone();
+            let result = operation(lease).await;
+            drop(active);
+            result
         })
         .await?)
+    }
+
+    pub(crate) async fn activate(self, inference: InferenceLimiter) -> ActiveModel<E> {
+        let slot = Arc::clone(&self.execution.slots)
+            .acquire_owned()
+            .await
+            .expect("model inference semaphore must remain open");
+        let epoch = {
+            let mut current = self.execution.epoch.lock().await;
+            if let Some(epoch) = current.upgrade() {
+                epoch
+            } else {
+                let epoch = Arc::new(inference.acquire_epoch().await);
+                *current = Arc::downgrade(&epoch);
+                epoch
+            }
+        };
+        ActiveModel {
+            lease: self,
+            _slot: slot,
+            _epoch: epoch,
+        }
     }
 }
 
@@ -279,7 +331,7 @@ impl<E: Clone> Clone for ModelLease<E> {
             self.engine.clone(),
             Arc::clone(&self.last_used),
             Arc::clone(&self.active_leases),
-            Arc::clone(&self.run_permits),
+            Arc::clone(&self.execution),
             self.residency.clone(),
         )
     }
@@ -290,6 +342,14 @@ impl<E> Deref for ModelLease<E> {
 
     fn deref(&self) -> &Self::Target {
         &self.engine
+    }
+}
+
+impl<E> Deref for ActiveModel<E> {
+    type Target = E;
+
+    fn deref(&self) -> &Self::Target {
+        &self.lease
     }
 }
 
@@ -319,7 +379,7 @@ impl<E: Clone> LoadedModel<E> {
             self.engine.clone(),
             Arc::clone(&self.last_used),
             Arc::clone(&self.active_leases),
-            Arc::clone(&self.run_permits),
+            Arc::clone(&self.execution),
             self.residency.clone(),
         )
     }
@@ -774,6 +834,8 @@ where
                 draining: HashSet::new(),
                 retiring: HashSet::new(),
                 provisioned: HashMap::new(),
+                load_epochs: HashMap::new(),
+                load_failures: HashMap::new(),
             })),
             capacity_lock: Arc::new(Mutex::new(())),
             pending_loads: Arc::new(StdMutex::new(HashSet::new())),
@@ -816,6 +878,10 @@ where
             .await
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "owns one cache load admission and publication transaction"
+    )]
     async fn get_or_load_after<F, Fut, A, AFut, Admission>(
         &self,
         model: M,
@@ -924,8 +990,22 @@ where
                 .await
                 .expect("reserved model must remain available");
             let load_guard = loading.lock_owned().await;
-            let path = self.provision_locked(model.clone()).await?;
-            let engine = load(model.clone(), path).await?;
+            let path = match self.provision_locked(model.clone()).await {
+                Ok(path) => path,
+                Err(error) => {
+                    self.latch_load_failure(model.clone(), ModelLoadFailurePhase::Provision)
+                        .await;
+                    return Err(error);
+                }
+            };
+            let engine = match load(model.clone(), path).await {
+                Ok(engine) => engine,
+                Err(error) => {
+                    self.latch_load_failure(model.clone(), ModelLoadFailurePhase::Load)
+                        .await;
+                    return Err(error);
+                }
+            };
             let lease = self.insert_loaded(model, engine).await;
             drop(load_guard);
             return Ok(Some(lease));
@@ -936,6 +1016,10 @@ where
         let _capacity_guard = self.capacity_lock.lock().await;
         let mut state = self.inner.lock().await;
         debug_assert!(state.resident_len() < self.max_loaded);
+        let execution_slots = model.execution_slots();
+        let epoch = state.load_epochs.entry(model.clone()).or_default();
+        *epoch = epoch.saturating_add(1);
+        state.load_failures.remove(&model);
         let std::collections::hash_map::Entry::Vacant(entry) = state.loaded.entry(model) else {
             unreachable!("per-model load reservation prevents duplicate cache insertion");
         };
@@ -944,7 +1028,10 @@ where
                 engine,
                 last_used: Arc::new(StdMutex::new(Instant::now())),
                 active_leases: Arc::new(AtomicUsize::new(0)),
-                run_permits: Arc::new(Semaphore::new(1)),
+                execution: Arc::new(ExecutionController {
+                    slots: Arc::new(Semaphore::new(execution_slots.get())),
+                    epoch: Mutex::new(Weak::new()),
+                }),
                 residency: self.residency.clone(),
             })
             .lease();
@@ -976,6 +1063,11 @@ where
             .insert(model.clone(), path.clone());
         tracing::debug!(cache = self.cache_id, model = ?model, path = %path.display(), "model cache ready");
         Ok(path)
+    }
+
+    async fn latch_load_failure(&self, model: M, phase: ModelLoadFailurePhase) {
+        self.inner.lock().await.load_failures.insert(model, phase);
+        self.residency.notify();
     }
 
     pub async fn cleanup_idle(&self)
@@ -1057,6 +1149,43 @@ where
                 ModelResidencyStatus::Unloaded
             },
         )
+    }
+
+    pub(crate) async fn snapshot_with_health(
+        &self,
+        model: &M,
+        healthy: impl FnOnce(&E) -> bool,
+    ) -> Option<ModelCacheSnapshot> {
+        let state = self.inner.lock().await;
+        if !state.available.contains(model) {
+            return None;
+        }
+        let loaded = state.loaded.get(model);
+        let residency = if state.draining.contains(model) || state.retiring.contains(model) {
+            ModelResidencyStatus::Unloading
+        } else if loaded.is_some() {
+            ModelResidencyStatus::Loaded
+        } else if self
+            .pending_loads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(model)
+            || state
+                .loading
+                .get(model)
+                .is_some_and(|loading| loading.try_lock().is_err())
+        {
+            ModelResidencyStatus::Loading
+        } else {
+            ModelResidencyStatus::Unloaded
+        };
+        Some(ModelCacheSnapshot {
+            residency,
+            load_epoch: state.load_epochs.get(model).copied().unwrap_or(0),
+            worker_healthy: loaded.is_none_or(|loaded| healthy(&loaded.engine)),
+            active_leases: loaded.map_or(0, |loaded| loaded.active_leases.load(Ordering::SeqCst)),
+            last_load_failure: state.load_failures.get(model).copied(),
+        })
     }
 
     pub(crate) async fn next_idle_deadline(&self) -> Option<Instant> {
@@ -1524,6 +1653,32 @@ mod tests {
     struct CompositeModel {
         primary: AsrModel,
         variant: u8,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    struct SlotModel {
+        id: &'static str,
+        slots: usize,
+    }
+
+    impl ModelCacheKey for SlotModel {
+        fn cache_path(&self, cache_dir: &std::path::Path) -> PathBuf {
+            cache_dir.join(self.id)
+        }
+
+        fn execution_slots(&self) -> NonZeroUsize {
+            NonZeroUsize::new(self.slots).expect("test slot count must be nonzero")
+        }
+    }
+
+    fn slot_cache(models: Vec<SlotModel>) -> ModelCache<SlotModel, usize> {
+        ModelCache::new(
+            "slots",
+            models,
+            Duration::from_mins(1),
+            2,
+            PathBuf::from("models"),
+        )
     }
 
     impl ModelSpec for CompositeModel {
@@ -2247,6 +2402,32 @@ mod tests {
         assert_eq!(loads.load(Ordering::SeqCst), 2);
     }
 
+    #[tokio::test]
+    async fn load_failure_latch_is_structured_and_success_clears_it() {
+        let cache = asr_cache(1, Duration::from_secs(60));
+        let model = qwen_asr_06b();
+        let failure = cache
+            .get_or_load(model.clone(), |_, _| async {
+                anyhow::bail!("/private/model-path-sentinel: runtime-secret-sentinel")
+            })
+            .await;
+        assert!(failure.is_err());
+        let failed = cache.snapshot_with_health(&model, |_| true).await.unwrap();
+        assert_eq!(failed.last_load_failure, Some(ModelLoadFailurePhase::Load));
+        assert_eq!(failed.load_epoch, 0);
+
+        let lease = cache
+            .get_or_load(model.clone(), |_, _| async { Ok(7_usize) })
+            .await
+            .unwrap()
+            .unwrap();
+        drop(lease);
+        let loaded = cache.snapshot_with_health(&model, |_| true).await.unwrap();
+        assert_eq!(loaded.last_load_failure, None);
+        assert_eq!(loaded.load_epoch, 1);
+        assert_eq!(loaded.residency, ModelResidencyStatus::Loaded);
+    }
+
     #[test]
     fn retire_idle_returns_unloaded_models() {
         let model = qwen_asr_06b();
@@ -2263,7 +2444,10 @@ mod tests {
                             .expect("test duration fits before the current instant"),
                     )),
                     active_leases: Arc::new(AtomicUsize::new(0)),
-                    run_permits: Arc::new(Semaphore::new(1)),
+                    execution: Arc::new(ExecutionController {
+                        slots: Arc::new(Semaphore::new(1)),
+                        epoch: Mutex::new(Weak::new()),
+                    }),
                     residency: ResidencyDomain::new(),
                 },
             )]),
@@ -2271,6 +2455,8 @@ mod tests {
             draining: HashSet::new(),
             retiring: HashSet::new(),
             provisioned: HashMap::new(),
+            load_epochs: HashMap::new(),
+            load_failures: HashMap::new(),
         };
 
         let retired = state.retire_idle(Duration::from_secs(1));
@@ -2626,6 +2812,192 @@ mod tests {
         release.notify_one();
         first.await.unwrap();
         second.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn execution_slots_admit_capacity_and_queue_the_next_operation() {
+        let key = SlotModel {
+            id: "first",
+            slots: 2,
+        };
+        let cache = slot_cache(vec![key.clone()]);
+        let lease = cache
+            .get_or_load(key, |_, _| async { Ok(1) })
+            .await
+            .unwrap()
+            .unwrap();
+        let inference = ResourcePolicy::new(1, 1, 1).inference_limiter();
+        let first = lease.clone().activate(inference.clone()).await;
+        let second = lease.clone().activate(inference.clone()).await;
+        let third = lease.clone().activate(inference);
+        tokio::pin!(third);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut third)
+                .await
+                .is_err()
+        );
+        drop(first);
+        let third = tokio::time::timeout(Duration::from_secs(1), third)
+            .await
+            .unwrap();
+
+        drop(second);
+        drop(third);
+    }
+
+    #[tokio::test]
+    async fn same_loaded_model_shares_global_epoch_until_the_last_slot_drops() {
+        let first_key = SlotModel {
+            id: "first",
+            slots: 2,
+        };
+        let other_key = SlotModel {
+            id: "other",
+            slots: 1,
+        };
+        let cache = slot_cache(vec![first_key.clone(), other_key.clone()]);
+        let first_model = cache
+            .get_or_load(first_key, |_, _| async { Ok(1) })
+            .await
+            .unwrap()
+            .unwrap();
+        let other_model = cache
+            .get_or_load(other_key, |_, _| async { Ok(2) })
+            .await
+            .unwrap()
+            .unwrap();
+        let inference = ResourcePolicy::new(1, 1, 1).inference_limiter();
+        let first = first_model.clone().activate(inference.clone()).await;
+        let sibling = first_model.activate(inference.clone()).await;
+        let other = other_model.activate(inference);
+        tokio::pin!(other);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut other)
+                .await
+                .is_err()
+        );
+        drop(first);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut other)
+                .await
+                .is_err()
+        );
+        drop(sibling);
+        let _other = tokio::time::timeout(Duration::from_secs(1), other)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_first_epoch_acquirer_releases_its_slot_and_creation_lock() {
+        let key = SlotModel {
+            id: "first",
+            slots: 2,
+        };
+        let cache = slot_cache(vec![key.clone()]);
+        let lease = cache
+            .get_or_load(key, |_, _| async { Ok(1) })
+            .await
+            .unwrap()
+            .unwrap();
+        let policy = ResourcePolicy::new(1, 1, 1);
+        let occupied = policy.acquire_inference().await;
+        let waiter = tokio::spawn({
+            let lease = lease.clone();
+            let inference = policy.inference_limiter();
+            async move { lease.activate(inference).await }
+        });
+        tokio::task::yield_now().await;
+        waiter.abort();
+        let Err(error) = waiter.await else {
+            panic!("aborted epoch acquirer must be cancelled");
+        };
+        assert!(error.is_cancelled());
+        drop(occupied);
+
+        let first = tokio::time::timeout(
+            Duration::from_secs(1),
+            lease.clone().activate(policy.inference_limiter()),
+        )
+        .await
+        .unwrap();
+        let second = tokio::time::timeout(
+            Duration::from_secs(1),
+            lease.activate(policy.inference_limiter()),
+        )
+        .await
+        .unwrap();
+        drop(first);
+        drop(second);
+    }
+
+    #[tokio::test]
+    async fn last_epoch_drop_racing_a_joiner_neither_leaks_nor_splits_global_capacity() {
+        let key = SlotModel {
+            id: "first",
+            slots: 2,
+        };
+        let cache = slot_cache(vec![key.clone()]);
+        let lease = cache
+            .get_or_load(key, |_, _| async { Ok(1) })
+            .await
+            .unwrap()
+            .unwrap();
+        let policy = ResourcePolicy::new(1, 1, 1);
+        let active = lease.clone().activate(policy.inference_limiter()).await;
+        let joiner = tokio::spawn({
+            let lease = lease.clone();
+            let inference = policy.inference_limiter();
+            async move { lease.activate(inference).await }
+        });
+        tokio::task::yield_now().await;
+        drop(active);
+        let joined = tokio::time::timeout(Duration::from_secs(1), joiner)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), policy.acquire_inference())
+                .await
+                .is_err()
+        );
+        drop(joined);
+        tokio::time::timeout(Duration::from_secs(1), policy.acquire_inference())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn unload_waits_for_every_active_execution_slot() {
+        let key = SlotModel {
+            id: "first",
+            slots: 2,
+        };
+        let cache = slot_cache(vec![key.clone()]);
+        let lease = cache
+            .get_or_load(key.clone(), |_, _| async { Ok(1) })
+            .await
+            .unwrap()
+            .unwrap();
+        let inference = ResourcePolicy::new(1, 1, 1).inference_limiter();
+        let first = lease.clone().activate(inference.clone()).await;
+        let second = lease.clone().activate(inference).await;
+        drop(lease);
+        let unload = tokio::spawn({
+            let cache = cache.clone();
+            let key = key.clone();
+            async move { cache.unload(key).await.unwrap() }
+        });
+        wait_for_status(&cache, &key, ModelResidencyStatus::Unloading).await;
+
+        drop(first);
+        tokio::task::yield_now().await;
+        assert!(!unload.is_finished());
+        drop(second);
+        assert_eq!(unload.await.unwrap(), Some(true));
     }
 
     #[tokio::test]

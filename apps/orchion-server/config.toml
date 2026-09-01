@@ -15,6 +15,18 @@ enabled = true
 # Retained in memory for this process only; maximum 10000.
 history_capacity = 500
 
+[streaming]
+# Retention must allow at least 1 event and 512 bytes for a terminal error frame.
+max_active_sessions = 16
+max_retained_sessions = 128
+max_events_per_session = 4096
+max_bytes_per_session = 4194304
+max_total_bytes = 67108864
+max_followers_per_session = 8
+session_ttl = "5m"
+lookup_max_ids = 100
+keepalive_interval = "15s"
+
 [models]
 dir = "models"
 source = "auto"
@@ -145,9 +157,27 @@ id = "alibaba/qwen3.5-0.8b"
 name = "Qwen3.5 0.8B"
 model = "//unsloth/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf"
 mmproj_model = "//unsloth/Qwen3.5-0.8B-GGUF/mmproj-BF16.gguf"
+# Generation may use more than one parallel sequence when batch_size is at least the slot count.
 runtime = { context_size = "model", gpu_layers = "all", parallel_sequences = 1, batch_size = 512, micro_batch_size = 512, threads = 0, request_queue_capacity = 8, event_queue_capacity = 16, queue_timeout = "30s", generation_timeout = "5m" }
-chat_template = { engine = "jinja", enable_thinking = false }
+# `guarantees_reasoning` may be enabled only when this exact template is known to expose separate
+# reasoning output and controllable start/end tags. `enable_thinking` alone is only a default.
+chat_template = { engine = "jinja", enable_thinking = false, guarantees_reasoning = false }
+# Worker-local host snapshots are disabled by default. Enable for repeated prompt prefixes.
+prompt_cache = { enabled = false, max_entries = 4, max_bytes = 268435456, min_prefix_tokens = 32 }
+# Vision accepts local PNG/JPEG data URLs only; remote URLs and files are never fetched.
+vision = { max_images = 4, max_bytes_per_image = 10485760, max_total_bytes = 20971520, max_side = 8192, max_pixels_per_image = 16777216, max_total_pixels = 33554432 }
 generation = { max_tokens = 32768, temperature = 1.0, top_p = 0.95, top_k = 20, min_p = 0.0, presence_penalty = 0.0, frequency_penalty = 0.0, repeat_penalty = 1.0 }
+
+# Qwen3-Embedding-0.6B-Q8_0.gguf: 639150592 bytes
+# SHA256: 06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439
+[[services.llm.models]]
+id = "qwen/qwen3-embedding-0.6b"
+name = "Qwen3 Embedding 0.6B"
+kind = "embedding"
+model = "//Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf"
+# Embedding deployments require exactly one parallel sequence.
+runtime = { context_size = 8192, gpu_layers = "all", parallel_sequences = 1, batch_size = 8192, micro_batch_size = 8192, threads = 0, request_queue_capacity = 8, event_queue_capacity = 16, queue_timeout = "30s", generation_timeout = "5m" }
+embeddings = { pooling = "last", min_dimensions = 32, max_input_tokens = 8192 }
 
 [[services.ocr-vl.models]]
 id = "paddlepaddle/paddleocr-vl-1.6"

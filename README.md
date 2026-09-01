@@ -44,7 +44,10 @@ API keys and form preferences are stored in browser `localStorage`; do not save 
 ## API Routes
 
 - `GET /healthz`: health check.
+- `GET /readyz`: public readiness JSON; returns `503` after shutdown starts, for unhealthy resident workers, or after a required default deployment load failure.
+- `GET /metrics`: OpenMetrics 1.0 metrics; uses the configured bearer API key when authentication is enabled.
 - `GET /v1/models`: configured primary deployment IDs, optional display names, and derived capabilities.
+- `GET /v1/models/{model}`: retrieve one configured public model without exposing residency.
 - `GET /api/models/status`: configured model runtime residency.
 - `POST /api/models/load`: load a configured model runtime.
 - `POST /api/models/unload`: unload a configured model runtime.
@@ -52,8 +55,14 @@ API keys and form preferences are stored in browser `localStorage`; do not save 
 - `GET /v1/audio/transcriptions/stream`: ASR WebSocket streaming.
 - `POST /v1/audio/speech`: TTS.
 - `POST /v1/ocr`: OCR and OCR-VL.
-- `POST /v1/chat/completions`: text-only, single-choice JSON or SSE.
-- `POST /v1/responses`: stateless text-only JSON or lifecycle SSE; requires `store=false`.
+- `POST /v1/chat/completions`: indexed JSON/SSE choices with function tools, rich tool/reasoning messages, strict JSON formats, logprobs, logit bias, deployment-bounded `n`, and opt-in `reasoning_control`.
+- `POST /v1/chat/completions/control`: authenticated process-local `reasoning_end` control for an armed Chat stream.
+- `POST /v1/completions`: legacy raw-prompt JSON/SSE with indexed `n`, logprobs, and logit bias.
+- `POST /v1/responses`: stateless JSON or lifecycle SSE with function-call/output items, tools, strict text formats, reasoning items/events, and truthful logprobs where the semantic parser can attribute them; omitted or false `store` is accepted.
+- `POST /v1/responses/input_tokens`: count tokens after Responses instructions/input prompt preparation.
+- `POST /v1/embeddings`: OpenAI-compatible float or base64 embeddings for text and token inputs.
+- `GET|DELETE /v1/stream`: resume/follow or idempotently cancel an owned resumable LLM stream.
+- `POST /v1/streams/lookup`: look up explicitly named owned resumable streams.
 - `POST /v1/pdf/images`: PDF page rendering.
 - `GET /api/activity`: in-flight requests, retained history, and summary statistics.
 - `GET /api/activity/events`: authenticated server-sent Activity events.
@@ -63,6 +72,7 @@ API keys and form preferences are stored in browser `localStorage`; do not save 
 Detailed API docs:
 
 - [SDK contract matrix](docs/sdk-matrix.md)
+- [Resumable LLM streaming contract](docs/llm-resumable-streaming.md)
 - [ASR](docs/asr.md)
 - [ASR streaming protocol](docs/asr-streaming.md)
 - [TTS](docs/tts.md)
@@ -71,11 +81,15 @@ Detailed API docs:
 
 If `[auth] api_key` is configured, pass `Authorization: Bearer <api_key>` for every `/v1/*`, `/api/models/*`, and `/api/activity*` request.
 
+OpenAI chat and Responses request parsing ignores unknown fields and recognized unsupported fields set to `null`. Recognized unsupported non-null values still return parameter-specific errors, and malformed values for known supported fields remain invalid.
+
+Generation deployments advertise bridge-backed tools, parallel tools, JSON formats, logprobs, logit bias, and choice limits from configuration. `chat_template.enable_thinking` controls the omitted-request default but does not advertise reasoning. Set `chat_template.guarantees_reasoning = true` only when the exact deployed template is known to expose separate reasoning output and controllable start/end tags; otherwise reasoning remains conservatively absent from the catalog and requests can still receive a typed runtime rejection.
+
 The Activity view records only allowlisted metadata such as route templates, model IDs, status, timing, and input size. While a request is in flight, Activity clients can also see its peer address and User-Agent; these live-only fields are removed before history is retained. Activity endpoints follow the global API key configuration, so deployments without an API key expose live metadata to clients that can reach the server. Activity never stores request bodies, response bodies, credentials, filenames, or generated output. HTTP timing covers the matched request through response-body completion, including parsing, queueing, and inference; WebSocket timing covers the upgraded session. History is bounded and exists only for the lifetime of the server process.
 
 ## In-Process Rust SDK
 
-The `orchion` facade lives at `libs/orchion`. It provides typed loading, downloading, inference, and streaming interfaces for ASR, TTS, OCR/OCR-VL, and text-only LLMs. It is currently workspace-only rather than published to crates.io because not all native adapters are registry-publishable. Heavy domains and hardware backends are opt-in features; examples below select CPU explicitly.
+The `orchion` facade lives at `libs/orchion`. It provides typed loading, downloading, inference, and streaming interfaces for ASR, TTS, OCR/OCR-VL, and text or image LLMs. It is currently workspace-only rather than published to crates.io because not all native adapters are registry-publishable. Heavy domains and hardware backends are opt-in features; examples below select CPU explicitly.
 
 ```rust,no_run
 use orchion::{Asr, AsrModel, Result};
@@ -134,7 +148,7 @@ cargo run -p orchion-example-client-llm -- http://127.0.0.1:8080 MODEL "Hello"
 cargo run -p orchion-example-client-operations -- http://127.0.0.1:8080 MODEL llm
 ```
 
-Set `ORCHION_API_KEY` when the server has authentication enabled. `start_streaming` waits for ASR `Ready` before returning. LLM streams require their protocol terminal event; Activity streams end normally on server disconnect and do not reconnect automatically. Inference POST requests are never retried automatically.
+Set `ORCHION_API_KEY` when the server has authentication enabled. `start_streaming` waits for ASR `Ready` before returning. LLM streams require their protocol terminal event; opt-in resumable LLM methods expose the stream ID and last SSE event ID but never retry automatically. Activity streams end normally on server disconnect and do not reconnect automatically. Inference POST requests are never retried automatically.
 
 ## Configuration
 
@@ -143,7 +157,7 @@ Set `ORCHION_API_KEY` when the server has authentication enabled. `start_streami
 - `[server]`: bind address, CORS allowed origins, upload limit, and PDF page/pixel/output limits. CORS defaults to all origins (`["*"]`).
 - `[activity]`: enable request activity and set the in-memory completed-history capacity (default `500`).
 - `[models]`: model directory, source, global residency limit, and file integrity verification. `verify_file_integrity` defaults to `false`; set it to `true` to verify reused model files against the SHA-256 values recorded in their manifest.
-- `[services.asr]`, `[services.tts]`, `[services.ocr]`, `[services.ocr-vl]`, `[services.llm]`: service deployments and residency. LLM deployments require exact main GGUF locators, optionally lock an exact mmproj artifact, and currently run text only with `parallel_sequences=1`.
+- `[services.asr]`, `[services.tts]`, `[services.ocr]`, `[services.ocr-vl]`, `[services.llm]`: service deployments and residency. LLM deployments require exact main GGUF locators and optionally lock an exact mmproj artifact. A configured mmproj publishes static `llm_vision` capability for Chat `image_url` and Responses `input_image`; projector vision support and model compatibility are validated when the worker loads, and load errors are returned if validation fails. Images must be strict `data:image/png;base64,...` or `data:image/jpeg;base64,...` URLs; HTTP(S), files, paths, media parameters, and non-auto detail modes are rejected. Vision limits are configurable with bounded `vision` settings; defaults are 4 images, 10 MiB each, 20 MiB total, 8192 pixels per side, 16,777,216 pixels each, and 33,554,432 pixels total. Generation deployments may set positive `parallel_sequences` when `batch_size` is at least that value; embedding deployments require `parallel_sequences=1` and reject mmproj/vision settings. Multimodal requests require `n=1`, bypass prompt-prefix snapshots, and use exclusive projector prefill before returning to shared continuous decode. Concurrent slots on one loaded model share one global inference permit until the last slot finishes. Generation deployments can opt into worker-local prompt prefix snapshots with `prompt_cache = { enabled = true, max_entries = 4, max_bytes = 268435456, min_prefix_tokens = 32 }`; entries remain text-only, memory-only, and scoped to one loaded worker epoch.
 - `[auth]`: optional API key.
 
 `CORS_ALLOWED_ORIGINS` overrides `server.cors_allowed_origins` with a comma-separated origin list, for example `https://app.example.com,https://admin.example.com`; use `*` to allow all origins. `ORCHION_MODEL_SOURCE` and `models.source` accept `auto`, `huggingface`, or `modelscope`. `RUST_LOG` controls runtime logging.

@@ -53,7 +53,7 @@ export function formatActivityTokensPerSecond(
   value?: number,
 ): string {
   if (
-    (operation !== "chat" && operation !== "responses")
+    (operation !== "chat" && operation !== "completions" && operation !== "responses")
     || typeof value !== "number"
     || !Number.isFinite(value)
     || value < 0

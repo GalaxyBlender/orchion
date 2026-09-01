@@ -1,4 +1,5 @@
 pub mod activity;
+mod chat_controls;
 pub mod docs;
 pub mod http;
 mod http_activity;
@@ -8,7 +9,10 @@ mod http_models;
 mod http_ocr;
 mod http_pdf_images;
 mod http_shared;
+mod http_streams;
+mod llm_streams;
 pub mod openai;
 pub mod pdf;
 pub mod srt;
+mod sse;
 pub mod ui;

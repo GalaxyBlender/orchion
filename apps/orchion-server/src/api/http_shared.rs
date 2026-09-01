@@ -1,3 +1,4 @@
+use crate::api::llm_streams::PrincipalId;
 use crate::api::openai::ApiError;
 use crate::application::ServerApplication;
 use crate::application::resource_policy::InferenceGuard;
@@ -61,9 +62,9 @@ where
 pub(super) fn authorize(
     state: &impl ServerApplication,
     headers: &HeaderMap,
-) -> Result<(), ApiError> {
+) -> Result<PrincipalId, ApiError> {
     let Some(api_key) = state.api_policy().api_key.as_deref() else {
-        return Ok(());
+        return Ok(PrincipalId::Anonymous);
     };
     let Some(header) = headers
         .get(AUTHORIZATION)
@@ -75,7 +76,7 @@ pub(super) fn authorize(
         return Err(ApiError::invalid_api_key());
     };
     if token == api_key {
-        Ok(())
+        Ok(PrincipalId::Authenticated)
     } else {
         Err(ApiError::invalid_api_key())
     }

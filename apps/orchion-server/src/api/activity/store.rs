@@ -184,6 +184,7 @@ impl ActivityHub {
             input_bytes,
             prompt_tokens: None,
             completion_tokens: None,
+            reasoning_tokens: None,
             queue_time_ms: None,
             eval_time_ms: None,
             prefill_tokens_per_second: None,
@@ -466,6 +467,12 @@ impl ActivityContext {
         });
     }
 
+    pub fn set_llm_reasoning_tokens(&self, reasoning_tokens: usize) {
+        self.hub.update(self.id, |entry| {
+            entry.reasoning_tokens = Some(reasoning_tokens);
+        });
+    }
+
     pub fn set_llm_timing(
         &self,
         queue_time_ms: Option<u64>,
@@ -487,6 +494,11 @@ impl ActivityContext {
 
     pub(crate) fn complete_stream_failure(&self, outcome: ActivityOutcome, error: ActivityError) {
         self.hub.complete(self.id, Some(200), outcome, Some(error));
+    }
+
+    pub(crate) fn complete_stream_cancelled(&self) {
+        self.hub
+            .complete(self.id, Some(200), ActivityOutcome::Cancelled, None);
     }
 
     pub(crate) fn complete_http(&self, status: u16, activity_error: Option<ActivityError>) {
@@ -523,6 +535,10 @@ impl ActivityContext {
             context: self.clone(),
             completed: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn handoff_to_owner(&self) {
+        self.handed_off.store(true, Ordering::Release);
     }
 
     #[must_use]

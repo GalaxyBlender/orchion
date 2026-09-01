@@ -1,5 +1,6 @@
 mod activity;
 mod model_lifecycle;
+mod streaming;
 
 pub use activity::{
     ActivityEntry, ActivityEventPayload, ActivityOperation, ActivityOutcome, ActivityPage,
@@ -7,6 +8,10 @@ pub use activity::{
 };
 pub use model_lifecycle::{
     ModelControlRequest, ModelResidency, ModelService, ModelStatus, ModelStatusList,
+};
+pub use streaming::{
+    LlmStreamLookupRequest, LlmStreamLookupResponse, LlmStreamMetadata, LlmStreamProtocol,
+    LlmStreamStatus,
 };
 
 use serde::{Deserialize, Serialize};

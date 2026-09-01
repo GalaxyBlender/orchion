@@ -10,6 +10,8 @@ const llmKeys = [
   "llm.incomplete.stopped",
   "models.llmModels",
   "models.capabilities.llm_chat",
+  "models.capabilities.llm_embeddings",
+  "models.capabilities.llm_resumable_streaming",
   "activity.operations.chat",
   "activity.operations.responses",
   "activity.columns.prefill",

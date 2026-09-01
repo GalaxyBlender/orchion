@@ -1,7 +1,7 @@
 //! Typed asynchronous client for Orchion Server.
 //!
 //! [`Client`] owns shared HTTP transport and exposes domain clients for health, model discovery and
-//! residency, Activity, LLM generation, ASR, TTS, OCR, and PDF rendering. Each domain is controlled
+//! residency, Activity, LLM generation and embeddings, ASR, TTS, OCR, and PDF rendering. Each domain is controlled
 //! by a same-named Cargo feature; default features enable the complete client.
 //!
 //! Streaming interfaces expose `next_event` methods instead of a raw wire stream. ASR streaming

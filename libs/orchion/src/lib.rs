@@ -86,23 +86,33 @@ pub use orchion_ocr::validate_image_file as validate_ocr_image_file;
 
 #[cfg(feature = "llm")]
 pub use llm::{
-    GenerationEvent, GenerationFinishReason, GenerationOptions, GenerationRequest, LlmComplete,
-    LlmDeployment, LlmEngine, LlmEngineConfig, LlmGeneration, LlmMessage, LlmRole,
-    LlmTemplateEngine, LlmTimings, LlmUsage,
+    GenerationEvent, GenerationFinishReason, GenerationOptions, GenerationRequest,
+    LlmAdvancedInput, LlmAdvancedRequest, LlmChoiceEvent, LlmChoiceFinishReason,
+    LlmChoiceGeneration, LlmChoiceReservation, LlmComplete, LlmContentPart, LlmDeployment,
+    LlmDeploymentKind, LlmEmbeddingConfig, LlmEmbeddingInput, LlmEmbeddingPooling,
+    LlmEmbeddingRequest, LlmEmbeddingResult, LlmEngine, LlmEngineConfig, LlmGeneration,
+    LlmImageFormat, LlmImageInput, LlmLogitBias, LlmLogprobsOptions, LlmMessage,
+    LlmOutputConstraint, LlmPromptCacheConfig, LlmReasoningControl, LlmReasoningControlResult,
+    LlmReasoningEffort, LlmReasoningOptions, LlmRichMessage, LlmRole, LlmSamplingExtensions,
+    LlmSemanticDelta, LlmSemanticRole, LlmSemanticTokenCountRequest, LlmTemplateEngine, LlmTimings,
+    LlmTokenAlternative, LlmTokenLogprobs, LlmToolCall, LlmToolChoice, LlmToolDefinition,
+    LlmToolResult, LlmUsage, LlmVisionConfig, LlmVisionLimits, validate_llm_json_schema,
 };
 
 #[cfg(feature = "server-support")]
 pub mod server_support {
     pub use crate::llm::{
-        LlmBackendGuard, LlmReservation, initialize_llm_backend, llm_build_metadata_json,
+        LlmBackendGuard, LlmEmbeddingOperation, LlmEmbeddingReservation, LlmReservation,
+        initialize_llm_backend, llm_build_metadata_json,
     };
 }
 
 #[cfg(feature = "llm-test-support")]
 pub mod llm_test_support {
     pub use crate::llm::{
-        LlmScriptedControl, scripted_context_limit_llm_engine, scripted_llm_engine,
-        scripted_panicking_llm_engine, scripted_preparation_panicking_llm_engine,
+        LlmScriptedControl, scripted_context_limit_llm_engine, scripted_embedding_llm_engine,
+        scripted_failing_llm_engine, scripted_llm_engine, scripted_panicking_llm_engine,
+        scripted_preparation_panicking_llm_engine, scripted_reasoning_llm_engine,
         scripted_slow_preparation_llm_engine,
     };
 }

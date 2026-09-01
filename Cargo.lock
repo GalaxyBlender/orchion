@@ -1349,6 +1349,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "dtoa"
+version = "1.0.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c3cf4824e2d5f025c7b531afcb2325364084a16806f6d47fbc1f5fbd9960590"
+
+[[package]]
 name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2769,7 +2775,7 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 [[package]]
 name = "llama-cpp-2"
 version = "0.1.155"
-source = "git+https://github.com/utilityai/llama-cpp-rs?branch=main#3d5f424f7cfb7cd3d1f9039440bd0286e29ca050"
+source = "git+https://github.com/utilityai/llama-cpp-rs?branch=main#0ad1788017e39de25c431d9323f90a4b4b538d9e"
 dependencies = [
  "encoding_rs",
  "enumflags2",
@@ -2782,7 +2788,7 @@ dependencies = [
 [[package]]
 name = "llama-cpp-sys-2"
 version = "0.1.155"
-source = "git+https://github.com/utilityai/llama-cpp-rs?branch=main#3d5f424f7cfb7cd3d1f9039440bd0286e29ca050"
+source = "git+https://github.com/utilityai/llama-cpp-rs?branch=main#0ad1788017e39de25c431d9323f90a4b4b538d9e"
 dependencies = [
  "bindgen",
  "cc",
@@ -3724,8 +3730,10 @@ dependencies = [
 name = "orchion-llama-cpp"
 version = "0.3.0"
 dependencies = [
+ "cc",
  "chrono",
  "encoding_rs",
+ "image",
  "llama-cpp-2",
  "llama-cpp-sys-2",
  "minijinja",
@@ -3784,16 +3792,20 @@ dependencies = [
  "anyhow",
  "async-stream",
  "axum",
+ "base64 0.22.1",
  "clap",
  "flate2",
  "futures-util",
+ "getrandom 0.3.4",
  "http",
  "http-body",
  "http-body-util",
+ "image",
  "include_dir",
  "orchion",
  "orchion-client",
  "orchion-protocol",
+ "prometheus-client",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -4096,6 +4108,29 @@ version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4488a4a36b9a4ba6b9334a32a39971f77c1436ec82c38707bce707699cc3bbcb"
 dependencies = [
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "prometheus-client"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba70bf887030e45213b4a95c9b08d5a450b157f87c1d63661ed0847a12fa2aad"
+dependencies = [
+ "dtoa",
+ "itoa",
+ "parking_lot",
+ "prometheus-client-derive-encode",
+]
+
+[[package]]
+name = "prometheus-client-derive-encode"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9adf1691c04c0a5ff46ff8f262b58beb07b0dbb61f96f9f54f6cbd82106ed87f"
+dependencies = [
+ "proc-macro2",
  "quote",
  "syn 2.0.119",
 ]

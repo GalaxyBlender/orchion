@@ -26,6 +26,33 @@ async fn health_check_accepts_only_trimmed_ok() {
     assert!(matches!(error, ClientError::Decode { .. }));
 }
 
+#[cfg(feature = "health")]
+#[tokio::test]
+async fn readiness_decodes_ready_and_not_ready_statuses() {
+    use orchion_client::Client;
+    use orchion_client::health::ReadinessStatus;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/readyz"))
+        .respond_with(ResponseTemplate::new(503).set_body_json(serde_json::json!({
+            "status": "not_ready",
+            "reasons": [{"code":"shutdown"}]
+        })))
+        .mount(&server)
+        .await;
+    let readiness = Client::new(server.uri())
+        .unwrap()
+        .health()
+        .ready()
+        .await
+        .unwrap();
+    assert_eq!(readiness.status, ReadinessStatus::NotReady);
+    assert_eq!(readiness.reasons[0].code, "shutdown");
+}
+
 #[cfg(feature = "models")]
 #[tokio::test]
 async fn list_models_sends_auth_and_decodes_typed_models() {
@@ -56,6 +83,14 @@ async fn list_models_sends_auth_and_decodes_typed_models() {
                     "created": 0,
                     "owned_by": "orchion",
                     "type": "tts",
+                    "capabilities": ["future_capability"]
+                },
+                {
+                    "id": "Acme/Future",
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "orchion",
+                    "type": "future_model_type",
                     "capabilities": []
                 }
             ]
@@ -81,7 +116,40 @@ async fn list_models_sends_auth_and_decodes_typed_models() {
             ModelCapability::AsrStreaming
         ]
     );
-    assert!(models.data[1].capabilities.is_empty());
+    assert_eq!(
+        models.data[1].capabilities,
+        vec![ModelCapability::Unknown("future_capability".to_string())]
+    );
+    assert_eq!(
+        models.data[2].model_type,
+        ModelType::Unknown("future_model_type".to_string())
+    );
+}
+
+#[cfg(feature = "models")]
+#[tokio::test]
+async fn retrieve_model_uses_the_model_path_and_decodes_object() {
+    use orchion_client::Client;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models/qwen%2Ftest"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id":"qwen/test","object":"model","created":0,"owned_by":"orchion",
+            "type":"llm","capabilities":["llm_completions","llm_input_tokens"]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let model = Client::new(server.uri())
+        .unwrap()
+        .models()
+        .retrieve("qwen/test")
+        .await
+        .unwrap();
+    assert_eq!(model.id, "qwen/test");
 }
 
 #[cfg(feature = "models")]

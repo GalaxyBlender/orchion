@@ -5,6 +5,10 @@ pub struct InferenceGuard {
     _permit: OwnedSemaphorePermit,
 }
 
+pub(crate) struct InferenceEpoch {
+    _guard: InferenceGuard,
+}
+
 #[derive(Clone)]
 pub(crate) struct InferenceLimiter {
     permits: Arc<Semaphore>,
@@ -17,6 +21,12 @@ impl InferenceLimiter {
             .await
             .expect("inference semaphore must remain open");
         InferenceGuard { _permit: permit }
+    }
+
+    pub(crate) async fn acquire_epoch(&self) -> InferenceEpoch {
+        InferenceEpoch {
+            _guard: self.acquire().await,
+        }
     }
 }
 

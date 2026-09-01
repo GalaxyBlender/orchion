@@ -1,8 +1,16 @@
-use crate::application::llm::{LlmCommand, LlmGenerationFuture, LlmRuntime, ManagedGeneration};
+use crate::application::llm::{
+    ChoiceCancellationCause, LlmChoiceGenerationFuture, LlmCommand, LlmEmbeddingCommand,
+    LlmEmbeddingFuture, LlmGenerationFuture, LlmGenerationOverrides, LlmInput, LlmRuntime,
+    LlmTokenCountFuture, ManagedChoiceGeneration, ManagedGeneration,
+};
+use crate::application::metrics::{
+    InferenceLifecycle, InferenceOperation, Outcome, TerminationReason,
+};
+use crate::application::metrics::{ModelObservation, ObservabilitySnapshot};
 use crate::application::model_cache::{
-    AsrModelCache, CacheTracker, GlobalModelCacheLimiter, ModelCache, ModelCacheKey, ModelLease,
-    ModelProvisionFuture, ModelProvisioner, ModelProvisioning, ModelResidencyStatus,
-    ResidencyDomain, TtsModelCache,
+    AsrModelCache, CacheTracker, GlobalModelCacheLimiter, ModelCache, ModelCacheKey,
+    ModelCacheSnapshot, ModelLease, ModelLoadFailurePhase, ModelProvisionFuture, ModelProvisioner,
+    ModelProvisioning, ModelResidencyStatus, ResidencyDomain, TtsModelCache,
 };
 use crate::application::model_lifecycle::{
     ModelControlFuture, ModelLifecycleRuntime, ModelResidency, ModelSelector, ModelService,
@@ -23,7 +31,8 @@ use crate::application::{
     ActivityPolicy, ApiModel, ApiPolicy, AsrApiPolicy, RuntimeError, ServerApplication,
 };
 use crate::settings::{
-    LlmContextSize, LlmGpuLayers, LlmModelDeployment, ServerConfig, TableStructureConfig,
+    LlmContextSize, LlmDeploymentKind, LlmGpuLayers, LlmModelDeployment, ServerConfig,
+    TableStructureConfig,
 };
 use anyhow::Context;
 use orchion::server_support::{LlmBackendGuard, initialize_llm_backend};
@@ -31,13 +40,14 @@ use orchion::{
     ArtifactRequest, ArtifactRole, Asr, AsrModel, DeploymentArtifactPlan,
     DeploymentArtifactRequest, DeploymentArtifactSource, DeploymentPublication,
     DeploymentSourcePlan, DevicePreference, DownloadSource, GenerationOptions, GenerationRequest,
-    LlmEngine, LlmEngineConfig, LlmModel, LlmTemplateEngine, ModelCapabilities, ModelCategory,
-    ModelDownloader, ModelId, ModelSpec, ModelUrlSource, Ocr, OcrAssets, OcrModel,
-    OcrModelAssetKind, OcrModelAssetRole, OcrModelKind, RuntimeProvider, TableStructureAssets, Tts,
-    TtsModel, model_descriptor,
+    LlmAdvancedRequest, LlmChoiceEvent, LlmEngine, LlmEngineConfig, LlmMessage, LlmModel,
+    LlmTemplateEngine, ModelCapabilities, ModelCategory, ModelDownloader, ModelId, ModelSpec,
+    ModelUrlSource, Ocr, OcrAssets, OcrModel, OcrModelAssetKind, OcrModelAssetRole, OcrModelKind,
+    RuntimeProvider, TableStructureAssets, Tts, TtsModel, model_descriptor,
 };
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -59,19 +69,40 @@ pub type LlmRuntimeFuture<'a> =
     Pin<Box<dyn Future<Output = anyhow::Result<LlmEngine>> + Send + 'a>>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct LlmRuntimeKey(LlmModel);
+struct LlmRuntimeKey {
+    model: LlmModel,
+    execution_slots: NonZeroUsize,
+}
 
 impl LlmRuntimeKey {
+    #[cfg(test)]
     fn new(id: ModelId) -> Self {
-        Self(LlmModel::new(id))
+        Self {
+            model: LlmModel::new(id),
+            execution_slots: NonZeroUsize::MIN,
+        }
+    }
+
+    fn for_deployment(deployment: &LlmModelDeployment) -> Self {
+        Self {
+            model: LlmModel::new(deployment.id.clone()),
+            execution_slots: NonZeroUsize::new(match deployment.kind {
+                LlmDeploymentKind::Generation => {
+                    usize::try_from(deployment.runtime.parallel_sequences)
+                        .expect("validated LLM slot count must fit usize")
+                }
+                LlmDeploymentKind::Embeddings(_) => 1,
+            })
+            .expect("validated LLM slot count must be nonzero"),
+        }
     }
 
     fn id(&self) -> &ModelId {
-        self.0.id()
+        self.model.id()
     }
 
     fn public_model(&self) -> LlmModel {
-        self.0.clone()
+        self.model.clone()
     }
 }
 
@@ -84,6 +115,10 @@ impl std::fmt::Display for LlmRuntimeKey {
 impl ModelCacheKey for LlmRuntimeKey {
     fn cache_path(&self, cache_dir: &std::path::Path) -> PathBuf {
         cache_dir.to_path_buf()
+    }
+
+    fn execution_slots(&self) -> NonZeroUsize {
+        self.execution_slots
     }
 }
 
@@ -234,6 +269,7 @@ pub trait ModelRuntimeFactory: Send + Sync + 'static {
         &self,
         _model: LlmModel,
         _path: PathBuf,
+        _mmproj: Option<PathBuf>,
         _deployment: LlmModelDeployment,
     ) -> LlmRuntimeFuture<'_> {
         Box::pin(async { anyhow::bail!("LLM is not supported by this runtime factory") })
@@ -292,6 +328,7 @@ impl ModelRuntimeFactory for TestLlmRuntimeFactory {
         &self,
         _model: LlmModel,
         _path: PathBuf,
+        _mmproj: Option<PathBuf>,
         _deployment: LlmModelDeployment,
     ) -> LlmRuntimeFuture<'_> {
         let llm = self.llm.clone();
@@ -390,6 +427,7 @@ impl ModelRuntimeFactory for BuiltinModelRuntimeFactory {
         &self,
         _model: LlmModel,
         path: PathBuf,
+        mmproj: Option<PathBuf>,
         deployment: LlmModelDeployment,
     ) -> LlmRuntimeFuture<'_> {
         Box::pin(async move {
@@ -420,6 +458,39 @@ impl ModelRuntimeFactory for BuiltinModelRuntimeFactory {
                             crate::settings::ChatTemplateEngine::Jinja => LlmTemplateEngine::Jinja,
                         },
                         enable_thinking: deployment.chat_template.enable_thinking,
+                        prompt_cache: orchion::LlmPromptCacheConfig {
+                            enabled: deployment.prompt_cache.enabled,
+                            max_entries: deployment.prompt_cache.max_entries,
+                            max_bytes: deployment.prompt_cache.max_bytes,
+                            min_prefix_tokens: deployment.prompt_cache.min_prefix_tokens,
+                        },
+                        deployment_kind: match deployment.kind {
+                            LlmDeploymentKind::Generation => orchion::LlmDeploymentKind::Generation,
+                            LlmDeploymentKind::Embeddings(embedding) => {
+                                orchion::LlmDeploymentKind::Embeddings(
+                                    orchion::LlmEmbeddingConfig {
+                                        pooling: match embedding.pooling {
+                                            crate::settings::LlmEmbeddingPooling::Last => {
+                                                orchion::LlmEmbeddingPooling::Last
+                                            }
+                                        },
+                                        min_dimensions: embedding.min_dimensions,
+                                        max_input_tokens: embedding.max_input_tokens,
+                                    },
+                                )
+                            }
+                        },
+                        vision: mmproj.map(|mmproj| orchion::LlmVisionConfig {
+                            mmproj,
+                            limits: orchion::LlmVisionLimits {
+                                max_images: deployment.vision.max_images,
+                                max_bytes_per_image: deployment.vision.max_bytes_per_image,
+                                max_total_bytes: deployment.vision.max_total_bytes,
+                                max_side: deployment.vision.max_side,
+                                max_pixels_per_image: deployment.vision.max_pixels_per_image,
+                                max_total_pixels: deployment.vision.max_total_pixels,
+                            },
+                        }),
                     },
                 )
                 .map_err(anyhow::Error::from)
@@ -496,6 +567,7 @@ pub struct AppState {
     config: ServerConfig,
     source_candidates: Vec<DownloadSource>,
     api_policy: ApiPolicy,
+    metrics: crate::application::metrics::Metrics,
     asr_models: AsrModelCache,
     tts_models: TtsModelCache,
     ocr_models: OcrRuntimeCache,
@@ -524,7 +596,8 @@ mod tests {
         ModelDeployment, OcrModelDeployment,
     };
     use orchion::llm_test_support::{
-        LlmScriptedControl, scripted_llm_engine, scripted_panicking_llm_engine,
+        LlmScriptedControl, scripted_embedding_llm_engine, scripted_failing_llm_engine,
+        scripted_llm_engine, scripted_panicking_llm_engine,
         scripted_preparation_panicking_llm_engine, scripted_slow_preparation_llm_engine,
     };
     use orchion::{
@@ -680,6 +753,7 @@ mod tests {
             &self,
             _model: LlmModel,
             _path: PathBuf,
+            _mmproj: Option<PathBuf>,
             _deployment: LlmModelDeployment,
         ) -> LlmRuntimeFuture<'_> {
             let index = self
@@ -1485,6 +1559,7 @@ layout_model = "ms://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
                     usage: LlmUsage {
                         prompt_tokens: 2,
                         completion_tokens: 1,
+                        reasoning_tokens: 0,
                         total_tokens: 3,
                         queue_time_ms: None,
                         eval_time_ms: None,
@@ -1764,6 +1839,7 @@ layout_model = "ms://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
                 usage: LlmUsage {
                     prompt_tokens: 1,
                     completion_tokens: 1,
+                    reasoning_tokens: 0,
                     total_tokens: 2,
                     queue_time_ms: None,
                     eval_time_ms: None,
@@ -1830,20 +1906,20 @@ layout_model = "ms://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
         )
         .await;
         let defaults = &state.config.services.llm.models[0].generation;
-        let request = GenerationRequest {
-            messages: test_llm_command().messages,
-            options: GenerationOptions {
-                max_tokens: defaults.max_tokens,
-                temperature: defaults.temperature,
-                top_p: defaults.top_p,
-                top_k: defaults.top_k,
-                min_p: defaults.min_p,
-                presence_penalty: defaults.presence_penalty,
-                frequency_penalty: defaults.frequency_penalty,
-                repeat_penalty: defaults.repeat_penalty,
-                seed: u32::MAX,
-                stop: Vec::new(),
-            },
+        let LlmInput::Messages(messages) = test_llm_command().input else {
+            panic!("test command must contain messages");
+        };
+        let options = GenerationOptions {
+            max_tokens: defaults.max_tokens,
+            temperature: defaults.temperature,
+            top_p: defaults.top_p,
+            top_k: defaults.top_k,
+            min_p: defaults.min_p,
+            presence_penalty: defaults.presence_penalty,
+            frequency_penalty: defaults.frequency_penalty,
+            repeat_penalty: defaults.repeat_penalty,
+            seed: u32::MAX,
+            stop: Vec::new(),
         };
         let (ready, readiness) = tokio::sync::oneshot::channel();
         drop(readiness);
@@ -1856,7 +1932,8 @@ layout_model = "ms://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
         let owner = tokio::spawn(own_llm_generation(
             state.as_ref().clone(),
             LlmRuntimeKey::new(ModelId::parse("qwen/test").unwrap()),
-            request,
+            LlmInput::Messages(messages),
+            options,
             std::time::Duration::from_secs(1),
             std::time::Duration::from_secs(1),
             ready,
@@ -1864,6 +1941,10 @@ layout_model = "ms://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
             terminal,
             cancelled,
             cancellation,
+            state.metrics.start_inference(
+                InferenceOperation::Chat,
+                ModelId::parse("qwen/test").unwrap(),
+            ),
         ));
         let started = control.clone();
         tokio::task::spawn_blocking(move || started.wait_started())
@@ -1890,6 +1971,603 @@ layout_model = "ms://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
     }
 
     #[tokio::test]
+    async fn dropped_choice_readiness_keeps_resources_until_every_native_ack() {
+        let (_root, state, control) = scripted_llm_state(
+            Vec::new(),
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        let request = LlmAdvancedRequest {
+            input: orchion::LlmAdvancedInput::Messages(vec![orchion::LlmRichMessage {
+                role: orchion::LlmSemanticRole::User,
+                content: vec![orchion::LlmContentPart::Text {
+                    text: "hello".to_string(),
+                }],
+                tool_calls: Vec::new(),
+            }]),
+            options: GenerationOptions::default(),
+            tools: Vec::new(),
+            tool_choice: orchion::LlmToolChoice::None,
+            parallel_tool_calls: false,
+            reasoning: orchion::LlmReasoningOptions::default(),
+            output: orchion::LlmOutputConstraint::Text,
+            logprobs: None,
+            logit_bias: Vec::new(),
+            sampling: orchion::LlmSamplingExtensions::default(),
+            choices: 1,
+            reasoning_control_id: None,
+        };
+        let (ready, readiness) = tokio::sync::oneshot::channel();
+        drop(readiness);
+        let (events, event_receiver) = tokio::sync::mpsc::channel(1);
+        drop(event_receiver);
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancellation = Arc::new(tokio::sync::Notify::new());
+        let owner = tokio::spawn(own_llm_choice_generation(
+            state.as_ref().clone(),
+            LlmRuntimeKey::new(ModelId::parse("qwen/test").unwrap()),
+            request,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+            ready,
+            events,
+            cancelled,
+            cancellation,
+            Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            state.metrics.start_inference(
+                InferenceOperation::Chat,
+                ModelId::parse("qwen/test").unwrap(),
+            ),
+            InferenceOperation::Chat,
+        ));
+        let started = control.clone();
+        tokio::task::spawn_blocking(move || started.wait_started())
+            .await
+            .unwrap();
+        control.release_ready();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !control.has_executed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!owner.is_finished());
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                state.resources.acquire_inference(),
+            )
+            .await
+            .is_err()
+        );
+        control.release_cleanup();
+        tokio::time::timeout(std::time::Duration::from_secs(1), owner)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            state.resources.acquire_inference(),
+        )
+        .await
+        .unwrap();
+        state.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn server_capacity_cancellation_reaches_inference_metrics_once_and_releases_lease() {
+        let (_root, state, control) = scripted_llm_state(
+            vec![
+                GenerationEvent::ContentDelta("one".to_string()),
+                GenerationEvent::ContentDelta("two".to_string()),
+                GenerationEvent::ContentDelta("three".to_string()),
+            ],
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+        let start = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move {
+                state
+                    .start_choice_generation(
+                        InferenceOperation::Chat,
+                        "qwen/test".to_string(),
+                        test_advanced_request(1),
+                        crate::application::llm::LlmGenerationOverrides::default(),
+                        "max_completion_tokens",
+                        None,
+                        None,
+                    )
+                    .await
+            }
+        });
+        let started = control.clone();
+        tokio::task::spawn_blocking(move || started.wait_started())
+            .await
+            .unwrap();
+        control.release_ready();
+        let generation = start.await.unwrap().unwrap().unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        generation
+            .cancellation_handle()
+            .cancel_with(ChoiceCancellationCause::ResourceExhausted);
+        let unload = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move {
+                state
+                    .unload_model(ModelSelector {
+                        model: "qwen/test".to_string(),
+                        service: ModelService::Llm,
+                    })
+                    .await
+            }
+        });
+        control.release_cleanup();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), unload)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .is_some()
+        );
+        let encoded = state.metrics.encode().unwrap();
+        assert_eq!(
+            metric_samples(
+                &encoded,
+                "orchion_inference_terminations_total",
+                &["operation=\"chat\"", "reason=\"resource_exhausted\""]
+            ),
+            1
+        );
+        assert_eq!(
+            metric_samples(
+                &encoded,
+                "orchion_inference_requests_total",
+                &["operation=\"chat\"", "outcome=\"resource_exhausted\""]
+            ),
+            1
+        );
+        assert_eq!(
+            metric_samples(
+                &encoded,
+                "orchion_inference_terminations_total",
+                &["operation=\"chat\"", "reason=\"client_disconnect\""]
+            ),
+            0
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), state.shutdown())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn full_choice_queue_delivers_aggregate_terminal_after_consumer_resumes() {
+        let (_root, state, control) = scripted_llm_state(
+            vec![GenerationEvent::Finished {
+                reason: GenerationFinishReason::Stop,
+                usage: LlmUsage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    reasoning_tokens: 0,
+                    total_tokens: 2,
+                    queue_time_ms: None,
+                    eval_time_ms: None,
+                    timings: orchion::LlmTimings::default(),
+                },
+            }],
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        let start = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move {
+                state
+                    .start_choice_generation(
+                        InferenceOperation::Chat,
+                        "qwen/test".to_string(),
+                        test_advanced_request(1),
+                        crate::application::llm::LlmGenerationOverrides::default(),
+                        "max_completion_tokens",
+                        None,
+                        None,
+                    )
+                    .await
+            }
+        });
+        let started = control.clone();
+        tokio::task::spawn_blocking(move || started.wait_started())
+            .await
+            .unwrap();
+        control.release_ready();
+        let mut generation = start.await.unwrap().unwrap().unwrap();
+        control.release_cleanup();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), generation.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            LlmChoiceEvent::Finished { .. }
+        ));
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), generation.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            LlmChoiceEvent::FinishedAll { .. }
+        ));
+        state.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn unread_aggregate_terminal_deadline_releases_inference_capacity() {
+        let (_root, state, control) = scripted_llm_state(
+            vec![GenerationEvent::Finished {
+                reason: GenerationFinishReason::Stop,
+                usage: LlmUsage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    reasoning_tokens: 0,
+                    total_tokens: 2,
+                    queue_time_ms: None,
+                    eval_time_ms: None,
+                    timings: orchion::LlmTimings::default(),
+                },
+            }],
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(30),
+        )
+        .await;
+        let start = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move {
+                state
+                    .start_choice_generation(
+                        InferenceOperation::Chat,
+                        "qwen/test".to_string(),
+                        test_advanced_request(1),
+                        crate::application::llm::LlmGenerationOverrides::default(),
+                        "max_completion_tokens",
+                        None,
+                        None,
+                    )
+                    .await
+            }
+        });
+        let started = control.clone();
+        tokio::task::spawn_blocking(move || started.wait_started())
+            .await
+            .unwrap();
+        control.release_ready();
+        let _generation = start.await.unwrap().unwrap().unwrap();
+        control.release_cleanup();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            state.resources.acquire_inference(),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), state.shutdown())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn aggregate_choice_failure_records_one_error_terminal_and_no_success() {
+        let (engine, control) = scripted_failing_llm_engine("choice failed");
+        let (_root, state, control) = scripted_llm_state_with_engine(
+            engine,
+            control,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        let start = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move {
+                state
+                    .start_choice_generation(
+                        InferenceOperation::Chat,
+                        "qwen/test".to_string(),
+                        test_advanced_request(1),
+                        crate::application::llm::LlmGenerationOverrides::default(),
+                        "max_completion_tokens",
+                        None,
+                        None,
+                    )
+                    .await
+            }
+        });
+        let started = control.clone();
+        tokio::task::spawn_blocking(move || started.wait_started())
+            .await
+            .unwrap();
+        control.release_ready();
+        let mut generation = start.await.unwrap().unwrap().unwrap();
+        control.release_cleanup();
+        let mut failures = 0;
+        while let Some(event) = generation.next().await {
+            if matches!(event.unwrap(), LlmChoiceEvent::Failed { index: None, .. }) {
+                failures += 1;
+            }
+        }
+        assert_eq!(failures, 1);
+        let metrics = state.metrics.encode().unwrap();
+        assert_eq!(
+            metric_samples(
+                &metrics,
+                "orchion_inference_terminations_total",
+                &["operation=\"chat\"", "reason=\"error\""]
+            ),
+            1
+        );
+        assert_eq!(
+            metric_samples(
+                &metrics,
+                "orchion_inference_requests_total",
+                &["operation=\"chat\"", "outcome=\"server_error\""]
+            ),
+            1
+        );
+        assert_eq!(
+            metric_samples(
+                &metrics,
+                "orchion_inference_requests_total",
+                &["operation=\"chat\"", "outcome=\"success\""]
+            ),
+            0
+        );
+        state.shutdown().await;
+    }
+
+    #[test]
+    fn one_failed_choice_records_one_aggregate_termination_and_outcome() {
+        let metrics = crate::application::metrics::Metrics::new();
+        let operation = InferenceOperation::Chat;
+        let model = ModelId::parse("qwen/test").unwrap();
+        let lifecycle = metrics.start_inference(operation.clone(), model);
+        let usage = LlmUsage {
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            reasoning_tokens: 0,
+            total_tokens: 2,
+            queue_time_ms: None,
+            eval_time_ms: None,
+            timings: orchion::LlmTimings::default(),
+        };
+        let events = [
+            LlmChoiceEvent::Failed {
+                index: Some(0),
+                message: "choice failed".to_string(),
+            },
+            LlmChoiceEvent::Finished {
+                index: 1,
+                reason: orchion::LlmChoiceFinishReason::Stop,
+                usage,
+            },
+            LlmChoiceEvent::Failed {
+                index: None,
+                message: "aggregate failed".to_string(),
+            },
+        ];
+        let mut aggregate = ChoiceAggregateTerminal::default();
+        for event in &events {
+            aggregate.observe(event);
+        }
+        metrics.observe_termination(
+            operation.clone(),
+            aggregate
+                .termination_reason
+                .clone()
+                .unwrap_or(TerminationReason::Error),
+        );
+        lifecycle.finish(if aggregate.succeeded(false) {
+            Outcome::Success
+        } else {
+            Outcome::ServerError
+        });
+
+        let encoded = metrics.encode().unwrap();
+        assert_eq!(
+            metric_samples(
+                &encoded,
+                "orchion_inference_terminations_total",
+                &["operation=\"chat\"", "reason=\"error\""]
+            ),
+            1
+        );
+        assert_eq!(
+            metric_samples(
+                &encoded,
+                "orchion_inference_requests_total",
+                &["operation=\"chat\"", "outcome=\"server_error\""]
+            ),
+            1
+        );
+        assert_eq!(
+            metric_samples(
+                &encoded,
+                "orchion_inference_requests_total",
+                &["operation=\"chat\"", "outcome=\"success\""]
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn choice_error_metrics_keep_terminal_causes_typed() {
+        let cases = [
+            (
+                RuntimeError::Timeout("request was cancelled".to_string()),
+                TerminationReason::Cancelled,
+                Outcome::Cancelled,
+            ),
+            (
+                RuntimeError::Timeout("deadline".to_string()),
+                TerminationReason::Timeout,
+                Outcome::Timeout,
+            ),
+            (
+                RuntimeError::ShuttingDown,
+                TerminationReason::ServerShutdown,
+                Outcome::Cancelled,
+            ),
+            (
+                RuntimeError::ResourceExhausted("inference"),
+                TerminationReason::Error,
+                Outcome::ResourceExhausted,
+            ),
+            (
+                RuntimeError::Internal("failed".to_string()),
+                TerminationReason::Error,
+                Outcome::ServerError,
+            ),
+        ];
+        for (error, termination, outcome) in cases {
+            assert_eq!(choice_error_metrics(&error), (termination, outcome));
+        }
+    }
+
+    #[test]
+    fn buffer_capacity_cancellation_records_typed_inference_labels_once() {
+        for (cause, reason) in [
+            (
+                ChoiceCancellationCause::ResourceExhausted,
+                TerminationReason::ResourceExhausted,
+            ),
+            (
+                ChoiceCancellationCause::StreamBufferExceeded,
+                TerminationReason::StreamBufferExceeded,
+            ),
+        ] {
+            let metrics = crate::application::metrics::Metrics::new();
+            let operation = InferenceOperation::Responses;
+            let model = ModelId::parse("qwen/test").unwrap();
+            let lifecycle = metrics.start_inference(operation.clone(), model);
+            let (termination, outcome) = choice_cancellation_metrics(cause);
+            assert_eq!(termination, reason);
+            assert_eq!(outcome, Outcome::ResourceExhausted);
+            metrics.observe_termination(operation.clone(), termination);
+            lifecycle.finish(outcome);
+
+            let encoded = metrics.encode().unwrap();
+            let reason_label = match cause {
+                ChoiceCancellationCause::ResourceExhausted => "resource_exhausted",
+                ChoiceCancellationCause::StreamBufferExceeded => "stream_buffer_exceeded",
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                metric_samples(
+                    &encoded,
+                    "orchion_inference_terminations_total",
+                    &[
+                        "operation=\"responses\"",
+                        &format!("reason=\"{reason_label}\"")
+                    ]
+                ),
+                1
+            );
+            assert_eq!(
+                metric_samples(
+                    &encoded,
+                    "orchion_inference_requests_total",
+                    &["operation=\"responses\"", "outcome=\"resource_exhausted\""]
+                ),
+                1
+            );
+            assert_eq!(
+                metric_samples(
+                    &encoded,
+                    "orchion_inference_terminations_total",
+                    &["operation=\"responses\"", "reason=\"client_disconnect\""]
+                ),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn cancelled_choice_aggregate_is_not_successful() {
+        let usage = LlmUsage {
+            prompt_tokens: 1,
+            completion_tokens: 0,
+            reasoning_tokens: 0,
+            total_tokens: 1,
+            queue_time_ms: None,
+            eval_time_ms: None,
+            timings: orchion::LlmTimings::default(),
+        };
+        let mut aggregate = ChoiceAggregateTerminal::default();
+        aggregate.observe(&LlmChoiceEvent::Finished {
+            index: 0,
+            reason: orchion::LlmChoiceFinishReason::Cancelled,
+            usage,
+        });
+        aggregate.observe(&LlmChoiceEvent::FinishedAll { usage });
+        assert!(!aggregate.succeeded(false));
+        assert_eq!(
+            aggregate.termination_reason,
+            Some(TerminationReason::Cancelled)
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_token_count_uses_loaded_runtime_without_global_generation_permit() {
+        let (generation_engine, control) = scripted_llm_engine(Vec::new());
+        let (count_engine, _count_control) = scripted_llm_engine(Vec::new());
+        let (_root, state, control) = scripted_llm_state_with_engines(
+            vec![generation_engine, count_engine],
+            control,
+            std::time::Duration::from_millis(25),
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        let generation = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move { state.start_generation(test_llm_command()).await }
+        });
+        let started = control.clone();
+        tokio::task::spawn_blocking(move || started.wait_started())
+            .await
+            .unwrap();
+        control.release_ready();
+        let generation = generation.await.unwrap().unwrap().unwrap();
+        let result = state
+            .count_semantic_input_tokens(
+                "qwen/count".to_string(),
+                orchion::LlmSemanticTokenCountRequest {
+                    messages: vec![orchion::LlmRichMessage {
+                        role: orchion::LlmSemanticRole::User,
+                        content: vec![orchion::LlmContentPart::Text {
+                            text: "hello".to_string(),
+                        }],
+                        tool_calls: Vec::new(),
+                    }],
+                    tools: Vec::new(),
+                    tool_choice: orchion::LlmToolChoice::None,
+                    parallel_tool_calls: false,
+                    reasoning: orchion::LlmReasoningOptions::default(),
+                    output: orchion::LlmOutputConstraint::Text,
+                },
+            )
+            .await;
+        assert_eq!(result.unwrap(), Some(2));
+        generation.cancel();
+        control.release_cleanup();
+        drop(generation);
+        state.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn preparation_panic_is_retired_before_error_and_cold_reloads() {
         let (panicking, control) = scripted_preparation_panicking_llm_engine();
         let (healthy, healthy_control) = scripted_llm_engine(vec![GenerationEvent::Finished {
@@ -1897,6 +2575,7 @@ layout_model = "ms://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
             usage: LlmUsage {
                 prompt_tokens: 1,
                 completion_tokens: 1,
+                reasoning_tokens: 0,
                 total_tokens: 2,
                 queue_time_ms: None,
                 eval_time_ms: None,
@@ -1997,6 +2676,143 @@ layout_model = "ms://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
         scripted_llm_state_with_engine(engine, control, queue_timeout, generation_timeout).await
     }
 
+    #[tokio::test]
+    async fn embedding_queue_deadline_cancels_waiter_and_unload_drains_active_decode() {
+        let (_root, state, control) = scripted_embedding_state(
+            std::time::Duration::from_millis(30),
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+        let first = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move {
+                let mut command = test_embedding_command();
+                command.queue_timeout = Some(std::time::Duration::from_secs(2));
+                state.create_embeddings(command).await
+            }
+        });
+        let started = control.clone();
+        tokio::task::spawn_blocking(move || started.wait_started())
+            .await
+            .unwrap();
+
+        let second = state.create_embeddings(test_embedding_command()).await;
+        assert!(matches!(
+            second,
+            Err(RuntimeError::Timeout(message)) if message == "LLM embedding admission timed out"
+        ));
+
+        control.release_ready();
+        let preparation = control.clone();
+        tokio::task::spawn_blocking(move || preparation.wait_preparation_started())
+            .await
+            .unwrap();
+        let unload = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move {
+                state
+                    .unload_model(ModelSelector {
+                        model: "qwen/embed".to_string(),
+                        service: ModelService::Llm,
+                    })
+                    .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!unload.is_finished());
+        control.release_cleanup();
+        let result = first.await.unwrap().unwrap().unwrap();
+        assert_eq!(result.embeddings, vec![vec![1.0, 0.0]]);
+        assert!(unload.await.unwrap().unwrap().is_some());
+        state.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn dropping_embedding_request_cancels_admission_without_blocking_shutdown() {
+        let (_root, state, control) = scripted_embedding_state(
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+        let request = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move { state.create_embeddings(test_embedding_command()).await }
+        });
+        let started = control.clone();
+        tokio::task::spawn_blocking(move || started.wait_started())
+            .await
+            .unwrap();
+        request.abort();
+        control.release_ready();
+        tokio::time::timeout(std::time::Duration::from_secs(1), state.shutdown())
+            .await
+            .unwrap();
+        assert!(!control.has_executed());
+    }
+
+    async fn scripted_embedding_state(
+        queue_timeout: std::time::Duration,
+        generation_timeout: std::time::Duration,
+    ) -> (tempfile::TempDir, Arc<AppState>, LlmScriptedControl) {
+        let (engine, control) = scripted_embedding_llm_engine(vec![vec![2.0, 0.0]], 3);
+        let root = tempfile::tempdir().unwrap();
+        let model_file = root.path().join("embedding.gguf");
+        std::fs::write(&model_file, b"scripted embedding model").unwrap();
+        let mut config = ServerConfig::default_for_exe(&root.path().join("orchion-server"));
+        config.models.dir = root.path().join("models");
+        config.server.max_concurrent_inference = 1;
+        config.services.asr.enabled = false;
+        config.services.tts.enabled = false;
+        config.services.ocr.enabled = false;
+        config.services.ocr_vl.enabled = false;
+        let id = ModelId::parse("qwen/embed").unwrap();
+        config.services.llm.enabled = true;
+        config.services.llm.default_model = Some(id.clone());
+        config.services.llm.models = vec![LlmModelDeployment {
+            id,
+            name: None,
+            model: orchion::ModelUrl::parse(&format!("file://{}", model_file.display())).unwrap(),
+            mmproj_model: None,
+            runtime: LlmRuntimeConfig {
+                event_queue_capacity: 1,
+                request_queue_capacity: 1,
+                queue_timeout,
+                generation_timeout,
+                ..LlmRuntimeConfig::default()
+            },
+            chat_template: ChatTemplateConfig::default(),
+            prompt_cache: crate::settings::PromptCacheConfig::default(),
+            generation: LlmGenerationConfig::default(),
+            kind: LlmDeploymentKind::Embeddings(crate::settings::LlmEmbeddingConfig {
+                pooling: crate::settings::LlmEmbeddingPooling::Last,
+                min_dimensions: 1,
+                max_input_tokens: 8192,
+            }),
+            vision: crate::settings::LlmVisionLimits::default(),
+        }];
+        let state = AppState::load_with_components(
+            config,
+            Arc::new(ModelDownloader::new(DownloadSource::Auto)),
+            Arc::new(ScriptedLlmRuntimeFactory {
+                engines: vec![engine],
+                loads: std::sync::atomic::AtomicUsize::new(0),
+            }),
+        )
+        .await
+        .unwrap();
+        (root, state, control)
+    }
+
+    fn test_embedding_command() -> LlmEmbeddingCommand {
+        LlmEmbeddingCommand {
+            model: "qwen/embed".to_string(),
+            inputs: vec![orchion::LlmEmbeddingInput::Text("hello".to_string())],
+            dimensions: None,
+            queue_timeout: None,
+            embedding_timeout: None,
+        }
+    }
+
     async fn scripted_llm_state_with_engine(
         engine: LlmEngine,
         control: LlmScriptedControl,
@@ -2018,6 +2834,7 @@ layout_model = "ms://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
         std::fs::write(&model_file, b"scripted model").unwrap();
         let mut config = ServerConfig::default_for_exe(&root.path().join("orchion-server"));
         config.models.dir = root.path().join("models");
+        config.models.max_loaded = 2;
         config.server.max_concurrent_inference = 1;
         config.services.asr.enabled = false;
         config.services.tts.enabled = false;
@@ -2032,15 +2849,22 @@ layout_model = "ms://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
         };
         config.services.llm.enabled = true;
         config.services.llm.default_model = Some(id.clone());
-        config.services.llm.models = vec![LlmModelDeployment {
+        config.services.llm.max_loaded = 2;
+        let deployment = LlmModelDeployment {
             id,
             name: None,
             model: orchion::ModelUrl::parse(&format!("file://{}", model_file.display())).unwrap(),
             mmproj_model: None,
             runtime,
             chat_template: ChatTemplateConfig::default(),
+            prompt_cache: crate::settings::PromptCacheConfig::default(),
             generation: LlmGenerationConfig::default(),
-        }];
+            kind: LlmDeploymentKind::Generation,
+            vision: crate::settings::LlmVisionLimits::default(),
+        };
+        let mut count_deployment = deployment.clone();
+        count_deployment.id = ModelId::parse("qwen/count").unwrap();
+        config.services.llm.models = vec![deployment, count_deployment];
         let state = AppState::load_with_components(
             config,
             Arc::new(ModelDownloader::new(DownloadSource::Auto)),
@@ -2057,15 +2881,114 @@ layout_model = "ms://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
     fn test_llm_command() -> LlmCommand {
         LlmCommand {
             model: "qwen/test".to_string(),
-            messages: vec![LlmMessage {
+            input: LlmInput::Messages(vec![LlmMessage {
                 role: LlmRole::User,
                 content: "hello".to_string(),
-            }],
+            }]),
             options: crate::application::llm::LlmGenerationOverrides::default(),
             max_tokens_param: "max_completion_tokens",
             queue_timeout: None,
             generation_timeout: None,
         }
+    }
+
+    fn test_advanced_request(choices: usize) -> LlmAdvancedRequest {
+        LlmAdvancedRequest {
+            input: orchion::LlmAdvancedInput::Messages(vec![orchion::LlmRichMessage {
+                role: orchion::LlmSemanticRole::User,
+                content: vec![orchion::LlmContentPart::Text {
+                    text: "hello".to_string(),
+                }],
+                tool_calls: Vec::new(),
+            }]),
+            options: GenerationOptions::default(),
+            tools: Vec::new(),
+            tool_choice: orchion::LlmToolChoice::None,
+            parallel_tool_calls: false,
+            reasoning: orchion::LlmReasoningOptions::default(),
+            output: orchion::LlmOutputConstraint::Text,
+            logprobs: None,
+            logit_bias: Vec::new(),
+            sampling: orchion::LlmSamplingExtensions::default(),
+            choices,
+            reasoning_control_id: None,
+        }
+    }
+
+    #[test]
+    fn effective_reasoning_honors_explicit_disable_and_rejects_hidden_logprobs() {
+        let mut template = crate::settings::ChatTemplateConfig::default();
+        template.enable_thinking = true;
+
+        let mut inherited = test_advanced_request(1);
+        inherited.logprobs = Some(orchion::LlmLogprobsOptions { top_logprobs: 1 });
+        assert!(matches!(
+            apply_effective_reasoning(&mut inherited, &template),
+            Err(RuntimeError::InvalidRequest {
+                param: "logprobs",
+                ..
+            })
+        ));
+
+        let mut disabled = test_advanced_request(1);
+        disabled.reasoning.enabled = Some(false);
+        disabled.logprobs = Some(orchion::LlmLogprobsOptions { top_logprobs: 1 });
+        apply_effective_reasoning(&mut disabled, &template).unwrap();
+        assert_eq!(disabled.reasoning.enabled, Some(false));
+
+        let mut omitted = test_advanced_request(1);
+        apply_effective_reasoning(&mut omitted, &template).unwrap();
+        assert_eq!(omitted.reasoning.enabled, Some(true));
+    }
+
+    #[test]
+    fn reasoning_capabilities_require_an_explicit_template_guarantee() {
+        let mut config = ServerConfig::from_toml_str(
+            r#"
+            [services.llm]
+            enabled = true
+            default_model = "qwen/test"
+            [[services.llm.models]]
+            id = "qwen/test"
+            model = "//owner/repo/model.gguf"
+            chat_template = { engine = "jinja", enable_thinking = true }
+            "#,
+            std::path::Path::new("/tmp/orchion-server"),
+        )
+        .unwrap();
+        let policy = api_policy(&config);
+        let capabilities = policy
+            .models
+            .iter()
+            .find(|model| model.id.as_str() == "qwen/test")
+            .unwrap()
+            .capabilities;
+        assert!(!capabilities.contains(ModelCapabilities::LLM_REASONING));
+        assert!(!capabilities.contains(ModelCapabilities::LLM_REASONING_CONTROL));
+
+        config.services.llm.models[0]
+            .chat_template
+            .guarantees_reasoning = true;
+        let policy = api_policy(&config);
+        let capabilities = policy
+            .models
+            .iter()
+            .find(|model| model.id.as_str() == "qwen/test")
+            .unwrap()
+            .capabilities;
+        assert!(capabilities.contains(ModelCapabilities::LLM_REASONING));
+        assert!(capabilities.contains(ModelCapabilities::LLM_REASONING_CONTROL));
+    }
+
+    fn metric_samples(metrics: &str, name: &str, labels: &[&str]) -> usize {
+        metrics
+            .lines()
+            .filter(|line| {
+                line.starts_with(name) && labels.iter().all(|label| line.contains(label))
+            })
+            .filter_map(|line| line.rsplit_once(' '))
+            .filter(|(_, value)| *value == "1")
+            .count()
     }
 
     fn test_config() -> ServerConfig {
@@ -2250,7 +3173,7 @@ impl AppState {
             .filter(|_| config.services.llm.active())
             .map(|deployment| {
                 (
-                    LlmRuntimeKey::new(deployment.id.clone()),
+                    LlmRuntimeKey::for_deployment(deployment),
                     llm_deployment_artifact_plan(deployment, source_candidates),
                 )
             })
@@ -2340,7 +3263,7 @@ impl AppState {
                 .models
                 .iter()
                 .filter(|_| config.services.llm.active())
-                .map(|deployment| LlmRuntimeKey::new(deployment.id.clone()))
+                .map(LlmRuntimeKey::for_deployment)
                 .collect(),
             HashMap::new(),
             config.services.llm.idle_timeout,
@@ -2363,6 +3286,7 @@ impl AppState {
             config,
             source_candidates: source_candidates.to_vec(),
             api_policy,
+            metrics: crate::application::metrics::Metrics::new(),
             asr_models,
             tts_models,
             ocr_models,
@@ -2536,12 +3460,15 @@ impl AppState {
         }
         let device = self.config.services.asr.device;
         let runtime_factory = Arc::clone(&self.runtime_factory);
+        let metric_model = ModelId::parse(model.as_str()).map_err(anyhow::Error::from)?;
+        let before = self.asr_models.snapshot_with_health(&model, |_| true).await;
         let all_caches = self.active_model_caches();
-        self.global_models
+        let result = self
+            .global_models
             .get_or_load(
                 &self.asr_models,
                 all_caches.as_slice(),
-                model,
+                model.clone(),
                 move |model, path| async move {
                     tracing::info!(model = ?model, device = %device, "loading ASR model");
                     runtime_factory
@@ -2550,7 +3477,17 @@ impl AppState {
                         .context("load ASR model")
                 },
             )
-            .await
+            .await;
+        let after = self.asr_models.snapshot_with_health(&model, |_| true).await;
+        observe_cache_attempt(
+            &self.metrics,
+            ModelService::Asr,
+            &metric_model,
+            before,
+            after,
+            result.is_err(),
+        );
+        result
     }
 
     /// # Errors
@@ -2562,12 +3499,15 @@ impl AppState {
         }
         let device = self.config.services.tts.device;
         let runtime_factory = Arc::clone(&self.runtime_factory);
+        let metric_model = ModelId::parse(model.as_str()).map_err(anyhow::Error::from)?;
+        let before = self.tts_models.snapshot_with_health(&model, |_| true).await;
         let all_caches = self.active_model_caches();
-        self.global_models
+        let result = self
+            .global_models
             .get_or_load(
                 &self.tts_models,
                 all_caches.as_slice(),
-                model,
+                model.clone(),
                 move |model, path| async move {
                     tracing::info!(model = ?model, device = %device, "loading TTS model");
                     runtime_factory
@@ -2576,7 +3516,17 @@ impl AppState {
                         .context("load TTS model")
                 },
             )
-            .await
+            .await;
+        let after = self.tts_models.snapshot_with_health(&model, |_| true).await;
+        observe_cache_attempt(
+            &self.metrics,
+            ModelService::Tts,
+            &metric_model,
+            before,
+            after,
+            result.is_err(),
+        );
+        result
     }
 
     /// # Errors
@@ -2608,6 +3558,8 @@ impl AppState {
         let key = OcrRuntimeKey::new(model, layout)
             .with_table_structure(table_structure)
             .with_table_source_intent(table_source_intent);
+        let metric_model = key.primary.id().clone();
+        let before = self.ocr_models.snapshot_with_health(&key, |_| true).await;
         let device = self.config.services.ocr.device;
         let models_dir = self.config.models.dir.clone();
         let runtime_factory = Arc::clone(&self.runtime_factory);
@@ -2616,11 +3568,12 @@ impl AppState {
         let deployment_plan = self.ocr_deployment_plans.get(&key).cloned();
         let deployment_provisioner = self.ocr_deployment_provisioner.clone();
         let all_caches = self.active_model_caches();
-        self.global_models
+        let result = self
+            .global_models
             .get_or_load(
                 &self.ocr_models,
                 all_caches.as_slice(),
-                key,
+                key.clone(),
                 move |key, _| async move {
                     load_ocr_runtime(
                         key,
@@ -2636,7 +3589,17 @@ impl AppState {
                     .context("load OCR model")
                 },
             )
-            .await
+            .await;
+        let after = self.ocr_models.snapshot_with_health(&key, |_| true).await;
+        observe_cache_attempt(
+            &self.metrics,
+            ModelService::Ocr,
+            &metric_model,
+            before,
+            after,
+            result.is_err(),
+        );
+        result
     }
 
     /// # Errors
@@ -2652,17 +3615,23 @@ impl AppState {
         }
         let layout = layout.map(|layout| DeploymentLayoutModel::new(model.id().clone(), layout));
         let key = OcrRuntimeKey::new(model, layout);
+        let metric_model = key.primary.id().clone();
+        let before = self
+            .ocr_vl_models
+            .snapshot_with_health(&key, |_| true)
+            .await;
         let device = self.config.services.ocr_vl.device;
         let models_dir = self.config.models.dir.clone();
         let runtime_factory = Arc::clone(&self.runtime_factory);
         let ocr_assets = self.ocr_assets.clone();
         let layout_models = self.layout_models.clone();
         let all_caches = self.active_model_caches();
-        self.global_models
+        let result = self
+            .global_models
             .get_or_load(
                 &self.ocr_vl_models,
                 all_caches.as_slice(),
-                key,
+                key.clone(),
                 move |key, _| async move {
                     load_ocr_runtime(
                         key,
@@ -2678,7 +3647,20 @@ impl AppState {
                     .context("load OCR-VL model")
                 },
             )
-            .await
+            .await;
+        let after = self
+            .ocr_vl_models
+            .snapshot_with_health(&key, |_| true)
+            .await;
+        observe_cache_attempt(
+            &self.metrics,
+            ModelService::OcrVl,
+            &metric_model,
+            before,
+            after,
+            result.is_err(),
+        );
+        result
     }
 
     async fn llm(&self, model: LlmRuntimeKey) -> anyhow::Result<Option<ModelLease<LlmEngine>>> {
@@ -2708,6 +3690,8 @@ impl AppState {
             let all_caches = self.active_model_caches();
             let deployment = deployment.clone();
             let plan = plan.clone();
+            let metrics = self.metrics.clone();
+            let metric_model = model.id().clone();
             let lease = self
                 .global_models
                 .get_or_load(
@@ -2718,7 +3702,7 @@ impl AppState {
                         let publication = if let Some(provisioner) = provisioner {
                             provisioner
                                 .provision_llm_deployment(model.id().clone(), plan, models_dir)
-                                .await?
+                                .await
                         } else {
                             ModelDownloader::resolve_or_recover_prepared_logical_deployment(
                                 model.id(),
@@ -2727,15 +3711,38 @@ impl AppState {
                                 &models_dir,
                             )
                             .await
-                            .context("prepared LLM resolver failed")?
+                            .context("prepared LLM resolver failed")
+                        };
+                        let publication = match publication {
+                            Ok(publication) => publication,
+                            Err(error) => {
+                                metrics.observe_model_load(
+                                    ModelService::Llm,
+                                    &metric_model,
+                                    Err(ModelLoadFailurePhase::Provision),
+                                );
+                                return Err(error);
+                            }
                         };
                         let path = publication
                             .artifact_file(ArtifactRole::LlmModel)
                             .context("published LLM deployment is missing its main GGUF")?
                             .to_path_buf();
-                        runtime_factory
-                            .load_llm(model.public_model(), path, deployment)
-                            .await
+                        let mmproj = publication
+                            .artifact_file(ArtifactRole::LlmMmproj)
+                            .map(std::path::Path::to_path_buf);
+                        let result = runtime_factory
+                            .load_llm(model.public_model(), path, mmproj, deployment)
+                            .await;
+                        metrics.observe_model_load(
+                            ModelService::Llm,
+                            &metric_model,
+                            result
+                                .as_ref()
+                                .map(|_| ())
+                                .map_err(|_| ModelLoadFailurePhase::Load),
+                        );
+                        result
                     },
                 )
                 .await?;
@@ -2921,7 +3928,7 @@ impl AppState {
             }
         }
         for deployment in &self.config.services.llm.models {
-            let model = LlmRuntimeKey::new(deployment.id.clone());
+            let model = LlmRuntimeKey::for_deployment(deployment);
             if let Err(error) = self.llm_models.unload(model).await {
                 tracing::error!(model = %deployment.id, %error, "failed to unload LLM during shutdown");
             }
@@ -3098,6 +4105,120 @@ impl ServerApplication for AppState {
         &self.api_policy
     }
 
+    fn metrics(&self) -> &crate::application::metrics::Metrics {
+        &self.metrics
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "maps each configured deployment to one public observation"
+    )]
+    fn observability_snapshot(&self) -> crate::application::ObservabilitySnapshotFuture<'_> {
+        Box::pin(async move {
+            let mut models = Vec::new();
+            if self.config.services.asr.enabled {
+                for deployment in &self.config.services.asr.models {
+                    if let Some(snapshot) = self
+                        .asr_models
+                        .snapshot_with_health(&deployment.runtime, |_| true)
+                        .await
+                    {
+                        models.push(model_observation(
+                            ModelService::Asr,
+                            ModelId::parse(deployment.runtime.as_str())
+                                .expect("configured ASR model ID is valid"),
+                            snapshot,
+                            self.config.services.asr.default_model == deployment.runtime,
+                        ));
+                    }
+                }
+            }
+            if self.config.services.tts.enabled {
+                for deployment in &self.config.services.tts.models {
+                    if let Some(snapshot) = self
+                        .tts_models
+                        .snapshot_with_health(&deployment.runtime, |_| true)
+                        .await
+                    {
+                        models.push(model_observation(
+                            ModelService::Tts,
+                            ModelId::parse(deployment.runtime.as_str())
+                                .expect("configured TTS model ID is valid"),
+                            snapshot,
+                            self.config.services.tts.default_model == deployment.runtime,
+                        ));
+                    }
+                }
+            }
+            if self.config.services.ocr.active() {
+                for deployment in &self.config.services.ocr.models {
+                    let mut snapshot = None;
+                    for key in ocr_runtime_keys_for_deployment(deployment, &self.source_candidates)
+                    {
+                        if let Some(next) =
+                            self.ocr_models.snapshot_with_health(&key, |_| true).await
+                        {
+                            merge_model_snapshot(&mut snapshot, next);
+                        }
+                    }
+                    if let Some(snapshot) = snapshot {
+                        models.push(model_observation(
+                            ModelService::Ocr,
+                            deployment.id.clone(),
+                            snapshot,
+                            self.config.services.ocr.default_model.as_ref() == Some(&deployment.id),
+                        ));
+                    }
+                }
+            }
+            if self.config.services.ocr_vl.active() {
+                for deployment in &self.config.services.ocr_vl.models {
+                    let mut snapshot = None;
+                    for key in ocr_runtime_keys_for_deployment(deployment, &self.source_candidates)
+                    {
+                        if let Some(next) = self
+                            .ocr_vl_models
+                            .snapshot_with_health(&key, |_| true)
+                            .await
+                        {
+                            merge_model_snapshot(&mut snapshot, next);
+                        }
+                    }
+                    if let Some(snapshot) = snapshot {
+                        models.push(model_observation(
+                            ModelService::OcrVl,
+                            deployment.id.clone(),
+                            snapshot,
+                            self.config.services.ocr_vl.default_model.as_ref()
+                                == Some(&deployment.id),
+                        ));
+                    }
+                }
+            }
+            if self.config.services.llm.active() {
+                for deployment in &self.config.services.llm.models {
+                    let key = LlmRuntimeKey::for_deployment(deployment);
+                    if let Some(snapshot) = self
+                        .llm_models
+                        .snapshot_with_health(&key, LlmEngine::is_healthy)
+                        .await
+                    {
+                        models.push(model_observation(
+                            ModelService::Llm,
+                            deployment.id.clone(),
+                            snapshot,
+                            self.config.services.llm.default_model.as_ref() == Some(&deployment.id),
+                        ));
+                    }
+                }
+            }
+            ObservabilitySnapshot {
+                shutdown: *self.cleanup_shutdown.borrow(),
+                models,
+            }
+        })
+    }
+
     fn model_catalog(&self) -> crate::application::ModelCatalogFuture<'_> {
         Box::pin(async move {
             let mut models = self.api_policy.models.clone();
@@ -3145,6 +4266,58 @@ impl ServerApplication for AppState {
     }
 }
 
+fn model_observation(
+    service: ModelService,
+    model: ModelId,
+    snapshot: ModelCacheSnapshot,
+    required: bool,
+) -> ModelObservation {
+    ModelObservation {
+        service,
+        model,
+        residency: snapshot.residency,
+        load_epoch: snapshot.load_epoch,
+        worker_healthy: snapshot.worker_healthy,
+        active_leases: snapshot.active_leases,
+        last_load_failure: snapshot.last_load_failure,
+        required,
+    }
+}
+
+fn merge_model_snapshot(current: &mut Option<ModelCacheSnapshot>, next: ModelCacheSnapshot) {
+    let Some(current) = current else {
+        *current = Some(next);
+        return;
+    };
+    if residency_status_rank(next.residency) > residency_status_rank(current.residency) {
+        current.residency = next.residency;
+    }
+    current.load_epoch = current.load_epoch.max(next.load_epoch);
+    current.worker_healthy &= next.worker_healthy;
+    current.active_leases = current.active_leases.saturating_add(next.active_leases);
+    current.last_load_failure = current.last_load_failure.or(next.last_load_failure);
+}
+
+fn observe_cache_attempt(
+    metrics: &crate::application::metrics::Metrics,
+    service: ModelService,
+    model: &ModelId,
+    before: Option<ModelCacheSnapshot>,
+    after: Option<ModelCacheSnapshot>,
+    failed: bool,
+) {
+    let before_epoch = before.map_or(0, |snapshot| snapshot.load_epoch);
+    let after_epoch = after.map_or(0, |snapshot| snapshot.load_epoch);
+    if after_epoch > before_epoch {
+        metrics.observe_model_load(service, model, Ok(()));
+    } else if failed {
+        let phase = after
+            .and_then(|snapshot| snapshot.last_load_failure)
+            .unwrap_or(ModelLoadFailurePhase::Load);
+        metrics.observe_model_load(service, model, Err(phase));
+    }
+}
+
 impl LlmRuntime for AppState {
     #[allow(
         clippy::too_many_lines,
@@ -3169,7 +4342,17 @@ impl LlmRuntime for AppState {
             if !self.config.services.llm.active() {
                 return Ok(None);
             }
-            let model = LlmRuntimeKey::new(deployment.id.clone());
+            if !matches!(deployment.kind, LlmDeploymentKind::Generation) {
+                return Err(RuntimeError::InvalidRequest {
+                    message: "selected model is not a generation deployment".to_string(),
+                    param: "model",
+                    code: "unsupported_capability",
+                });
+            }
+            let model = LlmRuntimeKey::for_deployment(deployment);
+            let lifecycle = self
+                .metrics
+                .start_inference(InferenceOperation::Chat, deployment.id.clone());
             let capacity = deployment.runtime.event_queue_capacity;
             let queue_timeout = command
                 .queue_timeout
@@ -3222,10 +4405,8 @@ impl LlmRuntime for AppState {
                 own_llm_generation(
                     state,
                     model,
-                    GenerationRequest {
-                        messages: command.messages,
-                        options,
-                    },
+                    command.input,
+                    options,
                     queue_timeout,
                     generation_timeout,
                     ready,
@@ -3233,6 +4414,7 @@ impl LlmRuntime for AppState {
                     terminal,
                     task_cancelled,
                     task_cancellation,
+                    lifecycle,
                 )
                 .await;
             });
@@ -3253,12 +4435,568 @@ impl LlmRuntime for AppState {
             )))
         })
     }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "owns validated multi-choice admission and owner startup"
+    )]
+    fn start_choice_generation(
+        &self,
+        operation: InferenceOperation,
+        model_name: String,
+        mut request: LlmAdvancedRequest,
+        overrides: LlmGenerationOverrides,
+        max_tokens_param: &'static str,
+        queue_timeout: Option<std::time::Duration>,
+        generation_timeout: Option<std::time::Duration>,
+    ) -> LlmChoiceGenerationFuture<'_> {
+        Box::pin(async move {
+            if *self.cleanup_shutdown.borrow() {
+                return Err(RuntimeError::ShuttingDown);
+            }
+            let id = ModelId::parse(&model_name).ok();
+            let Some(deployment) = id.as_ref().and_then(|id| {
+                self.config
+                    .services
+                    .llm
+                    .models
+                    .iter()
+                    .find(|deployment| deployment.id == *id)
+            }) else {
+                return Ok(None);
+            };
+            if !self.config.services.llm.active() {
+                return Ok(None);
+            }
+            if !matches!(deployment.kind, LlmDeploymentKind::Generation) {
+                return Err(RuntimeError::InvalidRequest {
+                    message: "selected model is not a generation deployment".to_string(),
+                    param: "model",
+                    code: "unsupported_capability",
+                });
+            }
+            let slots = usize::try_from(deployment.runtime.parallel_sequences)
+                .expect("validated LLM slot count must fit usize");
+            if request.choices == 0 || request.choices > slots {
+                return Err(RuntimeError::InvalidRequest {
+                    message: format!("n must be in 1..={slots} for the selected deployment"),
+                    param: "n",
+                    code: "invalid_parameter",
+                });
+            }
+            if overrides
+                .max_tokens
+                .is_some_and(|value| value == 0 || value > deployment.generation.max_tokens)
+            {
+                return Err(RuntimeError::InvalidRequest {
+                    message: format!(
+                        "max output tokens must be in 1..={}",
+                        deployment.generation.max_tokens
+                    ),
+                    param: max_tokens_param,
+                    code: "invalid_parameter",
+                });
+            }
+            let defaults = &deployment.generation;
+            if matches!(request.input, orchion::LlmAdvancedInput::Messages(_)) {
+                apply_effective_reasoning(&mut request, &deployment.chat_template)?;
+            }
+            request.options = GenerationOptions {
+                max_tokens: overrides.max_tokens.unwrap_or(defaults.max_tokens),
+                temperature: overrides.temperature.unwrap_or(defaults.temperature),
+                top_p: overrides.top_p.unwrap_or(defaults.top_p),
+                top_k: defaults.top_k,
+                min_p: defaults.min_p,
+                presence_penalty: overrides
+                    .presence_penalty
+                    .unwrap_or(defaults.presence_penalty),
+                frequency_penalty: overrides
+                    .frequency_penalty
+                    .unwrap_or(defaults.frequency_penalty),
+                repeat_penalty: defaults.repeat_penalty,
+                seed: overrides.seed.unwrap_or(u32::MAX),
+                stop: overrides.stop,
+            };
+            let capacity = deployment
+                .runtime
+                .event_queue_capacity
+                .saturating_mul(request.choices)
+                .clamp(1, 4096);
+            let queue_timeout = queue_timeout.unwrap_or(deployment.runtime.queue_timeout);
+            let generation_timeout =
+                generation_timeout.unwrap_or(deployment.runtime.generation_timeout);
+            let key = LlmRuntimeKey::for_deployment(deployment);
+            let lifecycle = self
+                .metrics
+                .start_inference(operation.clone(), deployment.id.clone());
+            let (events, receiver) = tokio::sync::mpsc::channel(capacity);
+            let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let cancellation = Arc::new(tokio::sync::Notify::new());
+            let cancellation_cause = Arc::new(std::sync::atomic::AtomicU8::new(0));
+            let (ready, readiness) = tokio::sync::oneshot::channel();
+            let state = self.clone();
+            let task_cancelled = Arc::clone(&cancelled);
+            let task_cancellation = Arc::clone(&cancellation);
+            let task_cancellation_cause = Arc::clone(&cancellation_cause);
+            tokio::spawn(async move {
+                own_llm_choice_generation(
+                    state,
+                    key,
+                    request,
+                    queue_timeout,
+                    generation_timeout,
+                    ready,
+                    events,
+                    task_cancelled,
+                    task_cancellation,
+                    task_cancellation_cause,
+                    lifecycle,
+                    operation,
+                )
+                .await;
+            });
+            let mut pending = PendingManagedReadiness {
+                cancelled: Arc::clone(&cancelled),
+                cancellation: Arc::clone(&cancellation),
+                committed: false,
+            };
+            let reasoning_control = readiness.await.unwrap_or(Err(RuntimeError::Internal(
+                "LLM choice admission task stopped before readiness".to_string(),
+            )))?;
+            pending.committed = true;
+            Ok(Some(ManagedChoiceGeneration::new_with_control(
+                receiver,
+                cancelled,
+                cancellation,
+                cancellation_cause,
+                reasoning_control,
+            )))
+        })
+    }
+
+    fn create_embeddings(&self, command: LlmEmbeddingCommand) -> LlmEmbeddingFuture<'_> {
+        Box::pin(async move {
+            if *self.cleanup_shutdown.borrow() {
+                return Err(RuntimeError::ShuttingDown);
+            }
+            let id = ModelId::parse(&command.model).ok();
+            let Some(deployment) = id.as_ref().and_then(|id| {
+                self.config
+                    .services
+                    .llm
+                    .models
+                    .iter()
+                    .find(|deployment| deployment.id == *id)
+            }) else {
+                return Ok(None);
+            };
+            let lifecycle = self
+                .metrics
+                .start_inference(InferenceOperation::Embeddings, deployment.id.clone());
+            let LlmDeploymentKind::Embeddings(embedding_config) = deployment.kind else {
+                lifecycle.finish(Outcome::ClientError);
+                return Err(RuntimeError::InvalidRequest {
+                    message: "selected model is not an embedding deployment".to_string(),
+                    param: "model",
+                    code: "unsupported_capability",
+                });
+            };
+            if command
+                .dimensions
+                .is_some_and(|dimensions| dimensions < embedding_config.min_dimensions)
+            {
+                lifecycle.finish(Outcome::ClientError);
+                return Err(RuntimeError::InvalidRequest {
+                    message: format!(
+                        "dimensions must be at least {}",
+                        embedding_config.min_dimensions
+                    ),
+                    param: "dimensions",
+                    code: "invalid_parameter",
+                });
+            }
+            let queue_timeout = command
+                .queue_timeout
+                .unwrap_or(deployment.runtime.queue_timeout);
+            let embedding_timeout = command
+                .embedding_timeout
+                .unwrap_or(deployment.runtime.generation_timeout);
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let cancellation = Arc::new(tokio::sync::Notify::new());
+            let state = self.clone();
+            let task_cancelled = Arc::clone(&cancelled);
+            let task_cancellation = Arc::clone(&cancellation);
+            let model = LlmRuntimeKey::for_deployment(deployment);
+            tokio::spawn(async move {
+                let result = own_llm_embedding(
+                    state,
+                    model,
+                    orchion::LlmEmbeddingRequest {
+                        inputs: command.inputs,
+                        dimensions: command.dimensions,
+                    },
+                    queue_timeout,
+                    embedding_timeout,
+                    task_cancelled,
+                    task_cancellation,
+                )
+                .await;
+                lifecycle.finish(runtime_result_outcome(&result));
+                let _ = sender.send(result);
+            });
+            let mut pending = PendingEmbeddingRequest {
+                cancelled,
+                cancellation,
+                completed: false,
+            };
+            let result = receiver.await.unwrap_or(Err(RuntimeError::Internal(
+                "LLM embedding owner stopped without a result".to_string(),
+            )));
+            pending.completed = true;
+            result.map(Some)
+        })
+    }
+
+    fn count_input_tokens(
+        &self,
+        model: String,
+        messages: Vec<LlmMessage>,
+    ) -> LlmTokenCountFuture<'_> {
+        Box::pin(async move {
+            if *self.cleanup_shutdown.borrow() {
+                return Err(RuntimeError::ShuttingDown);
+            }
+            let id = ModelId::parse(&model).ok();
+            let Some(deployment) = id.as_ref().and_then(|id| {
+                self.config
+                    .services
+                    .llm
+                    .models
+                    .iter()
+                    .find(|deployment| deployment.id == *id)
+            }) else {
+                return Ok(None);
+            };
+            if !self.config.services.llm.active() {
+                return Ok(None);
+            }
+            let lifecycle = self
+                .metrics
+                .start_inference(InferenceOperation::InputTokens, deployment.id.clone());
+            if !matches!(deployment.kind, LlmDeploymentKind::Generation) {
+                lifecycle.finish(Outcome::ClientError);
+                return Err(RuntimeError::InvalidRequest {
+                    message: "selected model is not a generation deployment".to_string(),
+                    param: "model",
+                    code: "unsupported_capability",
+                });
+            }
+            let mut shutdown = self.cleanup_shutdown.subscribe();
+            let deadline = tokio::time::Instant::now() + deployment.runtime.queue_timeout;
+            let key = LlmRuntimeKey::for_deployment(deployment);
+            let count = async {
+                let lease = self
+                    .llm(key)
+                    .await
+                    .map_err(|error| RuntimeError::Internal(format!("{error:#}")))?
+                    .ok_or_else(|| {
+                        RuntimeError::Internal("configured LLM disappeared".to_string())
+                    })?;
+                lease
+                    .run(move |lease| async move {
+                        lease
+                            .count_input_tokens(messages)
+                            .await
+                            .map_err(RuntimeError::Core)
+                    })
+                    .await
+                    .map_err(|error| RuntimeError::Internal(error.to_string()))?
+            };
+            tokio::pin!(count);
+            let result = tokio::select! {
+                result = &mut count => result,
+                () = tokio::time::sleep_until(deadline) => Err(RuntimeError::Timeout("LLM input token counting timed out".to_string())),
+                _ = shutdown.changed() => Err(RuntimeError::ShuttingDown),
+            };
+            lifecycle.finish(runtime_result_outcome(&result));
+            let count = result?;
+            Ok(Some(count))
+        })
+    }
+
+    fn count_semantic_input_tokens(
+        &self,
+        model: String,
+        request: orchion::LlmSemanticTokenCountRequest,
+    ) -> LlmTokenCountFuture<'_> {
+        Box::pin(async move {
+            if *self.cleanup_shutdown.borrow() {
+                return Err(RuntimeError::ShuttingDown);
+            }
+            let id = ModelId::parse(&model).ok();
+            let Some(deployment) = id.as_ref().and_then(|id| {
+                self.config
+                    .services
+                    .llm
+                    .models
+                    .iter()
+                    .find(|deployment| deployment.id == *id)
+            }) else {
+                return Ok(None);
+            };
+            let lifecycle = self
+                .metrics
+                .start_inference(InferenceOperation::InputTokens, deployment.id.clone());
+            if !matches!(deployment.kind, LlmDeploymentKind::Generation) {
+                lifecycle.finish(Outcome::ClientError);
+                return Err(RuntimeError::InvalidRequest {
+                    message: "selected model is not a generation deployment".to_string(),
+                    param: "model",
+                    code: "unsupported_capability",
+                });
+            }
+            let mut shutdown = self.cleanup_shutdown.subscribe();
+            let deadline = tokio::time::Instant::now() + deployment.runtime.queue_timeout;
+            let key = LlmRuntimeKey::for_deployment(deployment);
+            let count = async {
+                let lease = self
+                    .llm(key)
+                    .await
+                    .map_err(|error| RuntimeError::Internal(format!("{error:#}")))?
+                    .ok_or_else(|| {
+                        RuntimeError::Internal("configured LLM disappeared".to_string())
+                    })?;
+                lease
+                    .run(move |lease| async move {
+                        lease
+                            .count_semantic_input_tokens(request)
+                            .await
+                            .map_err(RuntimeError::Core)
+                    })
+                    .await
+                    .map_err(|error| RuntimeError::Internal(error.to_string()))?
+            };
+            tokio::pin!(count);
+            let result = tokio::select! {
+                result = &mut count => result,
+                () = tokio::time::sleep_until(deadline) => Err(RuntimeError::Timeout("LLM input token counting timed out".to_string())),
+                _ = shutdown.changed() => Err(RuntimeError::ShuttingDown),
+            };
+            lifecycle.finish(runtime_result_outcome(&result));
+            let count = result?;
+            Ok(Some(count))
+        })
+    }
+}
+
+fn apply_effective_reasoning(
+    request: &mut LlmAdvancedRequest,
+    template: &crate::settings::ChatTemplateConfig,
+) -> Result<(), RuntimeError> {
+    let reasoning_enabled = request
+        .reasoning
+        .enabled
+        .unwrap_or(template.enable_thinking)
+        || request.reasoning.effort.is_some();
+    request.reasoning.enabled = Some(reasoning_enabled);
+    if reasoning_enabled && request.logprobs.is_some() {
+        return Err(RuntimeError::InvalidRequest {
+            message: "token logprobs cannot be truthfully mapped through parsed reasoning"
+                .to_string(),
+            param: "logprobs",
+            code: "unsupported_parameter",
+        });
+    }
+    if request.reasoning_control_id.is_some() && !reasoning_enabled {
+        return Err(RuntimeError::InvalidRequest {
+            message: "reasoning_control requires reasoning to be enabled".to_string(),
+            param: "reasoning_control",
+            code: "invalid_parameter",
+        });
+    }
+    Ok(())
+}
+
+fn runtime_result_outcome<T>(result: &Result<T, RuntimeError>) -> Outcome {
+    match result {
+        Ok(_) => Outcome::Success,
+        Err(
+            RuntimeError::InvalidRequest { .. }
+            | RuntimeError::Core(
+                orchion::OrchionError::LlmContextLimit { .. }
+                | orchion::OrchionError::LlmUnsupported { .. },
+            ),
+        ) => Outcome::ClientError,
+        Err(RuntimeError::Core(orchion::OrchionError::Inference { message }))
+            if message.starts_with("embedding dimensions")
+                || message.contains("token id ")
+                || message.contains("embedding request exceeds ")
+                || message.contains("each embedding input ") =>
+        {
+            Outcome::ClientError
+        }
+        Err(RuntimeError::ResourceExhausted(_)) => Outcome::ResourceExhausted,
+        Err(RuntimeError::Timeout(message)) if message.contains("cancelled") => Outcome::Cancelled,
+        Err(RuntimeError::Timeout(_)) => Outcome::Timeout,
+        Err(RuntimeError::ShuttingDown) => Outcome::Cancelled,
+        Err(RuntimeError::Internal(_) | RuntimeError::Core(_)) => Outcome::ServerError,
+    }
+}
+
+struct PendingEmbeddingRequest {
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    cancellation: Arc<tokio::sync::Notify>,
+    completed: bool,
+}
+
+impl Drop for PendingEmbeddingRequest {
+    fn drop(&mut self) {
+        if !self.completed
+            && !self
+                .cancelled
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.cancellation.notify_one();
+        }
+    }
+}
+
+async fn own_llm_embedding(
+    state: AppState,
+    model: LlmRuntimeKey,
+    request: orchion::LlmEmbeddingRequest,
+    queue_timeout: std::time::Duration,
+    embedding_timeout: std::time::Duration,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    cancellation: Arc<tokio::sync::Notify>,
+) -> Result<orchion::LlmEmbeddingResult, RuntimeError> {
+    let mut shutdown = state.cleanup_shutdown.subscribe();
+    if *shutdown.borrow() {
+        return Err(RuntimeError::ShuttingDown);
+    }
+    let admission_deadline = tokio::time::Instant::now() + queue_timeout;
+    let load_state = state.clone();
+    let load_model = model.clone();
+    let reservation = async move {
+        let lease = load_state
+            .llm(load_model)
+            .await
+            .map_err(|error| RuntimeError::Internal(format!("{error:#}")))?
+            .ok_or_else(|| RuntimeError::Internal("configured LLM disappeared".to_string()))?;
+        let reservation = lease
+            .reserve_embedding(request)
+            .await
+            .map_err(RuntimeError::Core)?;
+        Ok::<_, RuntimeError>((lease, reservation))
+    };
+    tokio::pin!(reservation);
+    let (lease, mut reservation) = tokio::select! {
+        result = &mut reservation => result?,
+        () = tokio::time::sleep_until(admission_deadline) => return Err(RuntimeError::Timeout("LLM embedding admission timed out".to_string())),
+        () = cancellation.notified() => return Err(RuntimeError::Timeout("LLM embedding request was cancelled while waiting for admission".to_string())),
+        _ = shutdown.changed() => return Err(RuntimeError::ShuttingDown),
+    };
+    let active = tokio::select! {
+        active = lease.activate(state.resources.inference_limiter()) => active,
+        () = tokio::time::sleep_until(admission_deadline) => {
+            reservation.abort();
+            return Err(RuntimeError::Timeout("LLM embedding admission timed out waiting for global inference capacity".to_string()));
+        },
+        () = cancellation.notified() => {
+            reservation.abort();
+            return Err(RuntimeError::Timeout("LLM embedding request was cancelled before commit".to_string()));
+        },
+        _ = shutdown.changed() => {
+            reservation.abort();
+            return Err(RuntimeError::ShuttingDown);
+        },
+    };
+    if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+        reservation.abort();
+        return Err(RuntimeError::Timeout(
+            "LLM embedding request was cancelled before commit".to_string(),
+        ));
+    }
+    let deadline = tokio::time::Instant::now() + embedding_timeout;
+    let committed = {
+        let commit = reservation.commit_reserved();
+        tokio::pin!(commit);
+        tokio::select! {
+            result = &mut commit => result.map_err(RuntimeError::Core),
+            () = tokio::time::sleep_until(deadline) => Err(RuntimeError::Timeout("LLM embedding preparation timed out".to_string())),
+            () = cancellation.notified() => Err(RuntimeError::Timeout("LLM embedding request was cancelled during preparation".to_string())),
+            _ = shutdown.changed() => Err(RuntimeError::ShuttingDown),
+        }
+    };
+    let mut operation = match committed {
+        Ok(operation) => operation,
+        Err(error) => {
+            reservation.cancel();
+            let _ = reservation.wait_for_ack().await;
+            let healthy = active.is_healthy();
+            drop(active);
+            retire_unhealthy_llm(&state, model, healthy).await;
+            return Err(error);
+        }
+    };
+    let result = tokio::select! {
+        result = operation.result() => result.map_err(RuntimeError::Core),
+        () = tokio::time::sleep_until(deadline) => Err(RuntimeError::Timeout("LLM embedding generation timed out".to_string())),
+        () = cancellation.notified() => Err(RuntimeError::Timeout("LLM embedding request was cancelled".to_string())),
+        _ = shutdown.changed() => Err(RuntimeError::ShuttingDown),
+    };
+    if result.is_err() {
+        operation.cancel();
+    }
+    let _ = operation.wait_for_ack().await;
+    let healthy = active.is_healthy();
+    drop(active);
+    retire_unhealthy_llm(&state, model, healthy).await;
+    result
 }
 
 struct PendingManagedReadiness {
     cancelled: Arc<std::sync::atomic::AtomicBool>,
     cancellation: Arc<tokio::sync::Notify>,
     committed: bool,
+}
+
+#[derive(Default)]
+struct ChoiceAggregateTerminal {
+    termination_reason: Option<TerminationReason>,
+    terminal: bool,
+    failed: bool,
+}
+
+impl ChoiceAggregateTerminal {
+    fn observe(&mut self, event: &LlmChoiceEvent) {
+        match event {
+            LlmChoiceEvent::Finished { reason, .. } => {
+                self.termination_reason
+                    .get_or_insert(choice_termination_reason(*reason));
+            }
+            LlmChoiceEvent::FinishedAll { .. } => {
+                self.terminal = true;
+                self.termination_reason
+                    .get_or_insert(TerminationReason::Error);
+            }
+            LlmChoiceEvent::Failed { index: None, .. } => {
+                self.terminal = true;
+                self.failed = true;
+                self.termination_reason = Some(TerminationReason::Error);
+            }
+            _ => {}
+        }
+    }
+
+    const fn succeeded(&self, transport_failed: bool) -> bool {
+        self.terminal
+            && !self.failed
+            && !transport_failed
+            && !matches!(self.termination_reason, Some(TerminationReason::Cancelled))
+    }
 }
 
 impl Drop for PendingManagedReadiness {
@@ -3276,19 +5014,21 @@ impl Drop for PendingManagedReadiness {
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
-    reason = "owns the complete admitted generation and its readiness/cleanup protocol"
+    reason = "owns one multi-choice admission, lease, cancellation, and aggregate terminal"
 )]
-async fn own_llm_generation(
+async fn own_llm_choice_generation(
     state: AppState,
     model: LlmRuntimeKey,
-    request: GenerationRequest,
+    request: LlmAdvancedRequest,
     queue_timeout: std::time::Duration,
     generation_timeout: std::time::Duration,
-    ready: tokio::sync::oneshot::Sender<Result<(), RuntimeError>>,
-    events: tokio::sync::mpsc::Sender<Result<orchion::GenerationEvent, RuntimeError>>,
-    terminal_sender: tokio::sync::oneshot::Sender<Result<orchion::GenerationEvent, RuntimeError>>,
+    ready: tokio::sync::oneshot::Sender<Result<Option<orchion::LlmReasoningControl>, RuntimeError>>,
+    events: tokio::sync::mpsc::Sender<Result<LlmChoiceEvent, RuntimeError>>,
     cancelled: Arc<std::sync::atomic::AtomicBool>,
     cancellation: Arc<tokio::sync::Notify>,
+    cancellation_cause: Arc<std::sync::atomic::AtomicU8>,
+    lifecycle: InferenceLifecycle,
+    operation: InferenceOperation,
 ) {
     let admission_started = std::time::Instant::now();
     let mut shutdown = state.cleanup_shutdown.subscribe();
@@ -3304,7 +5044,321 @@ async fn own_llm_generation(
                 .await
                 .map_err(|error| RuntimeError::Internal(format!("{error:#}")))?
                 .ok_or_else(|| RuntimeError::Internal("configured LLM disappeared".to_string()))?;
-            let reservation = lease.reserve(request).await.map_err(RuntimeError::Core)?;
+            let reservation = lease
+                .reserve_advanced(request)
+                .await
+                .map_err(RuntimeError::Core)?;
+            Ok::<_, RuntimeError>((lease, reservation))
+        };
+        tokio::pin!(reservation);
+        tokio::select! {
+            result = &mut reservation => result,
+            () = tokio::time::sleep_until(admission_deadline) => Err(RuntimeError::Timeout("LLM admission timed out".to_string())),
+            () = cancellation.notified() => Err(RuntimeError::Timeout("LLM request was cancelled while waiting for admission".to_string())),
+            _ = shutdown.changed() => Err(RuntimeError::ShuttingDown),
+        }
+    };
+    let (lease, mut reservation) = match reserved {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = ready.send(Err(error));
+            return;
+        }
+    };
+    let active = tokio::select! {
+        active = lease.activate(state.resources.inference_limiter()) => Ok(active),
+        () = tokio::time::sleep_until(admission_deadline) => Err(RuntimeError::Timeout("LLM admission timed out waiting for global inference capacity".to_string())),
+        () = cancellation.notified() => Err(RuntimeError::Timeout("LLM request was cancelled before commit".to_string())),
+        _ = shutdown.changed() => Err(RuntimeError::ShuttingDown),
+    };
+    let active = match active {
+        Ok(active) => active,
+        Err(error) => {
+            let _ = reservation.cancel_and_wait().await;
+            let _ = ready.send(Err(error));
+            return;
+        }
+    };
+    if cancelled.load(std::sync::atomic::Ordering::Acquire) || *shutdown.borrow() {
+        let _ = reservation.cancel_and_wait().await;
+        drop(active);
+        let error = if *shutdown.borrow() {
+            RuntimeError::ShuttingDown
+        } else {
+            RuntimeError::Timeout("LLM request was cancelled before commit".to_string())
+        };
+        let _ = ready.send(Err(error));
+        return;
+    }
+    let generation_deadline = tokio::time::Instant::now() + generation_timeout;
+    let committed = {
+        let commit = reservation.commit_reserved();
+        tokio::pin!(commit);
+        tokio::select! {
+            result = &mut commit => result.map_err(RuntimeError::Core),
+            () = tokio::time::sleep_until(generation_deadline) => Err(RuntimeError::Timeout("LLM preparation timed out".to_string())),
+            () = cancellation.notified() => Err(RuntimeError::Timeout("LLM request was cancelled during preparation".to_string())),
+            _ = shutdown.changed() => Err(RuntimeError::ShuttingDown),
+        }
+    };
+    let mut generation = match committed {
+        Ok(generation) => generation,
+        Err(error) => {
+            let _ = reservation.cancel_and_wait().await;
+            let healthy = active.is_healthy();
+            drop(active);
+            retire_unhealthy_llm(&state, model, healthy).await;
+            let _ = ready.send(Err(error));
+            return;
+        }
+    };
+    let reasoning_control = generation.reasoning_control();
+    if ready.send(Ok(reasoning_control)).is_err() {
+        generation.cancel();
+        let _ = generation.wait_for_ack().await;
+        let healthy = active.is_healthy();
+        drop(active);
+        retire_unhealthy_llm(&state, model, healthy).await;
+        return;
+    }
+    let queue_time_ms = u64::try_from(admission_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let evaluation_started = std::time::Instant::now();
+    let mut observed_ttft = false;
+    let deadline = tokio::time::sleep_until(generation_deadline);
+    tokio::pin!(deadline);
+    let mut connected = true;
+    let mut terminal_error = None;
+    let mut aggregate = ChoiceAggregateTerminal::default();
+    loop {
+        if cancelled.load(std::sync::atomic::Ordering::Acquire) && connected {
+            generation.cancel();
+            connected = false;
+        }
+        let event = tokio::select! {
+            event = generation.next() => event,
+            () = cancellation.notified(), if connected => {
+                generation.cancel();
+                connected = false;
+                continue;
+            }
+            () = &mut deadline, if terminal_error.is_none() => {
+                generation.cancel();
+                terminal_error = Some(RuntimeError::Timeout("LLM generation timed out".to_string()));
+                continue;
+            }
+            _ = shutdown.changed(), if terminal_error.is_none() => {
+                generation.cancel();
+                terminal_error = Some(RuntimeError::ShuttingDown);
+                continue;
+            }
+        };
+        let event = match event {
+            Ok(Some(event)) => event,
+            Ok(None) => {
+                if !aggregate.terminal {
+                    terminal_error = Some(RuntimeError::Internal(
+                        "LLM generation ended without an aggregate terminal".to_string(),
+                    ));
+                }
+                break;
+            }
+            Err(error) => {
+                terminal_error.get_or_insert(RuntimeError::Core(error));
+                break;
+            }
+        };
+        let terminal = matches!(
+            event,
+            LlmChoiceEvent::FinishedAll { .. } | LlmChoiceEvent::Failed { index: None, .. }
+        );
+        if !observed_ttft
+            && matches!(
+                event,
+                LlmChoiceEvent::Delta { .. } | LlmChoiceEvent::SemanticDelta { .. }
+            )
+        {
+            state
+                .metrics
+                .observe_ttft(operation.clone(), evaluation_started.elapsed());
+            observed_ttft = true;
+        }
+        aggregate.observe(&event);
+        if matches!(event, LlmChoiceEvent::Failed { index: Some(_), .. }) {
+            continue;
+        }
+        let event = match event {
+            LlmChoiceEvent::FinishedAll { mut usage } => {
+                usage.queue_time_ms = Some(queue_time_ms);
+                usage.eval_time_ms = Some(
+                    u64::try_from(evaluation_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                );
+                state.metrics.observe_llm_usage(operation.clone(), usage);
+                LlmChoiceEvent::FinishedAll { usage }
+            }
+            other => other,
+        };
+        if connected {
+            tokio::select! {
+                result = events.send(Ok(event)) => {
+                    if result.is_err() {
+                        generation.cancel();
+                        connected = false;
+                    }
+                }
+                () = cancellation.notified() => {
+                    generation.cancel();
+                    connected = false;
+                }
+                () = &mut deadline, if terminal_error.is_none() => {
+                    generation.cancel();
+                    connected = false;
+                    terminal_error = Some(RuntimeError::Timeout("LLM generation timed out".to_string()));
+                }
+                _ = shutdown.changed(), if terminal_error.is_none() => {
+                    generation.cancel();
+                    connected = false;
+                    terminal_error = Some(RuntimeError::ShuttingDown);
+                }
+            }
+        }
+        if terminal {
+            break;
+        }
+    }
+    if let Err(error) = generation.wait_for_ack().await
+        && terminal_error.is_none()
+    {
+        terminal_error = Some(RuntimeError::Core(error));
+    }
+    let healthy = active.is_healthy();
+    drop(active);
+    retire_unhealthy_llm(&state, model, healthy).await;
+    let succeeded = aggregate.succeeded(terminal_error.is_some() || !connected);
+    let cancellation_cause = ChoiceCancellationCause::decode(
+        cancellation_cause.load(std::sync::atomic::Ordering::Acquire),
+    );
+    let server_resource_cause = cancellation_cause.filter(|cause| {
+        matches!(
+            cause,
+            ChoiceCancellationCause::ResourceExhausted
+                | ChoiceCancellationCause::StreamBufferExceeded
+        )
+    });
+    let (termination, outcome) = if succeeded {
+        (
+            aggregate
+                .termination_reason
+                .clone()
+                .unwrap_or(TerminationReason::Error),
+            Outcome::Success,
+        )
+    } else if let Some(cause) = server_resource_cause {
+        choice_cancellation_metrics(cause)
+    } else if let Some(error) = terminal_error.as_ref() {
+        choice_error_metrics(error)
+    } else if let Some(cause) = cancellation_cause {
+        choice_cancellation_metrics(cause)
+    } else {
+        (
+            aggregate
+                .termination_reason
+                .clone()
+                .unwrap_or(TerminationReason::Error),
+            if aggregate.termination_reason == Some(TerminationReason::Cancelled) {
+                Outcome::Cancelled
+            } else {
+                Outcome::ServerError
+            },
+        )
+    };
+    state
+        .metrics
+        .observe_termination(operation.clone(), termination);
+    if connected && let Some(error) = terminal_error {
+        let _ = events.try_send(Err(error));
+    }
+    lifecycle.finish(outcome);
+}
+
+const fn choice_cancellation_metrics(
+    cause: ChoiceCancellationCause,
+) -> (TerminationReason, Outcome) {
+    match cause {
+        ChoiceCancellationCause::ClientDisconnect => {
+            (TerminationReason::ClientDisconnect, Outcome::Cancelled)
+        }
+        ChoiceCancellationCause::UserDeleted => (TerminationReason::Cancelled, Outcome::Cancelled),
+        ChoiceCancellationCause::ServerShutdown => {
+            (TerminationReason::ServerShutdown, Outcome::Cancelled)
+        }
+        ChoiceCancellationCause::ResourceExhausted => (
+            TerminationReason::ResourceExhausted,
+            Outcome::ResourceExhausted,
+        ),
+        ChoiceCancellationCause::StreamBufferExceeded => (
+            TerminationReason::StreamBufferExceeded,
+            Outcome::ResourceExhausted,
+        ),
+    }
+}
+
+fn choice_error_metrics(error: &RuntimeError) -> (TerminationReason, Outcome) {
+    match error {
+        RuntimeError::Timeout(message) if message.contains("cancelled") => {
+            (TerminationReason::Cancelled, Outcome::Cancelled)
+        }
+        RuntimeError::Timeout(_) => (TerminationReason::Timeout, Outcome::Timeout),
+        RuntimeError::ShuttingDown => (TerminationReason::ServerShutdown, Outcome::Cancelled),
+        RuntimeError::ResourceExhausted(_) => {
+            (TerminationReason::Error, Outcome::ResourceExhausted)
+        }
+        RuntimeError::InvalidRequest { .. } => (TerminationReason::Error, Outcome::ClientError),
+        RuntimeError::Internal(_) | RuntimeError::Core(_) => {
+            (TerminationReason::Error, Outcome::ServerError)
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "owns the complete admitted generation and its readiness/cleanup protocol"
+)]
+async fn own_llm_generation(
+    state: AppState,
+    model: LlmRuntimeKey,
+    input: LlmInput,
+    options: GenerationOptions,
+    queue_timeout: std::time::Duration,
+    generation_timeout: std::time::Duration,
+    ready: tokio::sync::oneshot::Sender<Result<(), RuntimeError>>,
+    events: tokio::sync::mpsc::Sender<Result<orchion::GenerationEvent, RuntimeError>>,
+    terminal_sender: tokio::sync::oneshot::Sender<Result<orchion::GenerationEvent, RuntimeError>>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    cancellation: Arc<tokio::sync::Notify>,
+    lifecycle: InferenceLifecycle,
+) {
+    let admission_started = std::time::Instant::now();
+    let mut shutdown = state.cleanup_shutdown.subscribe();
+    if *shutdown.borrow() {
+        let _ = ready.send(Err(RuntimeError::ShuttingDown));
+        return;
+    }
+    let admission_deadline = tokio::time::Instant::now() + queue_timeout;
+    let reserved = {
+        let reservation = async {
+            let lease = state
+                .llm(model.clone())
+                .await
+                .map_err(|error| RuntimeError::Internal(format!("{error:#}")))?
+                .ok_or_else(|| RuntimeError::Internal("configured LLM disappeared".to_string()))?;
+            let reservation = match input {
+                LlmInput::Messages(messages) => {
+                    lease.reserve(GenerationRequest { messages, options }).await
+                }
+                LlmInput::Prompt(prompt) => lease.reserve_prompt(prompt, options).await,
+            }
+            .map_err(RuntimeError::Core)?;
             Ok::<_, RuntimeError>((lease, reservation))
         };
         tokio::pin!(reservation);
@@ -3322,25 +5376,23 @@ async fn own_llm_generation(
             return;
         }
     };
-    let inference = tokio::select! {
-        inference = state.resources.acquire_inference() => Ok(inference),
+    let active = tokio::select! {
+        active = lease.activate(state.resources.inference_limiter()) => Ok(active),
         () = tokio::time::sleep_until(admission_deadline) => Err(RuntimeError::Timeout("LLM admission timed out waiting for global inference capacity".to_string())),
         () = cancellation.notified() => Err(RuntimeError::Timeout("LLM request was cancelled before commit".to_string())),
         _ = shutdown.changed() => Err(RuntimeError::ShuttingDown),
     };
-    let inference = match inference {
-        Ok(inference) => inference,
+    let active = match active {
+        Ok(active) => active,
         Err(error) => {
             reservation.abort();
-            drop(lease);
             let _ = ready.send(Err(error));
             return;
         }
     };
     if cancelled.load(std::sync::atomic::Ordering::Acquire) || *shutdown.borrow() {
         reservation.abort();
-        drop(inference);
-        drop(lease);
+        drop(active);
         let error = if *shutdown.borrow() {
             RuntimeError::ShuttingDown
         } else {
@@ -3366,9 +5418,8 @@ async fn own_llm_generation(
         Err(first_error) => {
             reservation.cancel();
             let _ = reservation.wait_for_ack().await;
-            let worker_healthy = lease.is_healthy();
-            drop(inference);
-            drop(lease);
+            let worker_healthy = active.is_healthy();
+            drop(active);
             retire_unhealthy_llm(&state, model, worker_healthy).await;
             let _ = ready.send(Err(first_error));
             return;
@@ -3377,14 +5428,14 @@ async fn own_llm_generation(
     if ready.send(Ok(())).is_err() {
         generation.cancel();
         let _ = generation.wait_for_ack().await;
-        let worker_healthy = lease.is_healthy();
-        drop(inference);
-        drop(lease);
+        let worker_healthy = active.is_healthy();
+        drop(active);
         retire_unhealthy_llm(&state, model, worker_healthy).await;
         return;
     }
     let queue_time_ms = u64::try_from(admission_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let evaluation_started = std::time::Instant::now();
+    let mut observed_ttft = false;
 
     let deadline = tokio::time::sleep_until(generation_deadline);
     tokio::pin!(deadline);
@@ -3421,10 +5472,23 @@ async fn own_llm_generation(
                 usage.eval_time_ms = Some(
                     u64::try_from(evaluation_started.elapsed().as_millis()).unwrap_or(u64::MAX),
                 );
+                state
+                    .metrics
+                    .observe_llm_usage(InferenceOperation::Chat, usage);
+                state.metrics.observe_termination(
+                    InferenceOperation::Chat,
+                    generation_termination_reason(reason),
+                );
                 terminal = Some(orchion::GenerationEvent::Finished { reason, usage });
                 break;
             }
             Ok(Some(event @ orchion::GenerationEvent::ContentDelta(_))) if forward_content => {
+                if !observed_ttft {
+                    state
+                        .metrics
+                        .observe_ttft(InferenceOperation::Chat, evaluation_started.elapsed());
+                    observed_ttft = true;
+                }
                 tokio::select! {
                     result = events.send(Ok(event)) => {
                         if result.is_err() {
@@ -3465,16 +5529,41 @@ async fn own_llm_generation(
     {
         terminal_error = Some(RuntimeError::Core(error));
     }
-    let worker_healthy = lease.is_healthy();
-    drop(inference);
-    drop(lease);
+    let worker_healthy = active.is_healthy();
+    drop(active);
     retire_unhealthy_llm(&state, model, worker_healthy).await;
     drop(events);
+    let succeeded = terminal_error.is_none() && terminal.is_some();
     if client_connected {
         let delivery = terminal_error.map_or_else(|| terminal.map(Ok), |error| Some(Err(error)));
         if let Some(delivery) = delivery {
             let _ = terminal_sender.send(delivery);
         }
+    }
+    lifecycle.finish(if succeeded {
+        Outcome::Success
+    } else {
+        Outcome::ServerError
+    });
+}
+
+const fn generation_termination_reason(
+    reason: orchion::GenerationFinishReason,
+) -> TerminationReason {
+    match reason {
+        orchion::GenerationFinishReason::Stop => TerminationReason::Stop,
+        orchion::GenerationFinishReason::Length => TerminationReason::Length,
+        orchion::GenerationFinishReason::Cancelled => TerminationReason::Cancelled,
+    }
+}
+
+const fn choice_termination_reason(reason: orchion::LlmChoiceFinishReason) -> TerminationReason {
+    match reason {
+        orchion::LlmChoiceFinishReason::Stop | orchion::LlmChoiceFinishReason::ToolCalls => {
+            TerminationReason::Stop
+        }
+        orchion::LlmChoiceFinishReason::Length => TerminationReason::Length,
+        orchion::LlmChoiceFinishReason::Cancelled => TerminationReason::Cancelled,
     }
 }
 
@@ -3527,7 +5616,7 @@ impl ModelLifecycleRuntime for AppState {
             }
             if self.config.services.llm.active() {
                 for deployment in &self.config.services.llm.models {
-                    let model = LlmRuntimeKey::new(deployment.id.clone());
+                    let model = LlmRuntimeKey::for_deployment(deployment);
                     if let Some(status) = self.llm_models.status(&model).await {
                         statuses.push(model_status(
                             deployment.id.as_str(),
@@ -3656,7 +5745,7 @@ impl ModelLifecycleRuntime for AppState {
                     else {
                         return Ok(None);
                     };
-                    let model = LlmRuntimeKey::new(deployment.id.clone());
+                    let model = LlmRuntimeKey::for_deployment(deployment);
                     let Some(lease) = self
                         .llm(model.clone())
                         .await
@@ -3761,7 +5850,7 @@ impl ModelLifecycleRuntime for AppState {
                     };
                     if self
                         .llm_models
-                        .unload(LlmRuntimeKey::new(deployment.id.clone()))
+                        .unload(LlmRuntimeKey::for_deployment(deployment))
                         .await
                         .map_err(|error| model_lifecycle_error(&error))?
                         .is_none()
@@ -3813,6 +5902,15 @@ impl TranscriptionRuntime for AppState {
         with_segments: bool,
     ) -> TranscriptionFuture<'_> {
         Box::pin(async move {
+            let lifecycle = self
+                .config
+                .services
+                .asr
+                .runtime_models()
+                .contains(&model)
+                .then(|| ModelId::parse(model.as_str()).ok())
+                .flatten()
+                .map(|model| self.metrics.start_inference(InferenceOperation::Asr, model));
             let Some(asr) = AppState::asr(self, model)
                 .await
                 .map_err(|error| RuntimeError::Internal(format!("{error:#}")))?
@@ -3835,6 +5933,9 @@ impl TranscriptionRuntime for AppState {
                     RuntimeError::Internal(format!("ASR operation task failed: {error:#}"))
                 })?
                 .map_err(RuntimeError::Core)?;
+            if let Some(lifecycle) = lifecycle {
+                lifecycle.finish(Outcome::Success);
+            }
             Ok(Some(transcript))
         })
     }
@@ -3880,6 +5981,15 @@ impl SpeechRuntime for AppState {
         options: orchion::TtsOptions,
     ) -> SpeechRuntimeFuture<'_> {
         Box::pin(async move {
+            let lifecycle = self
+                .config
+                .services
+                .tts
+                .runtime_models()
+                .contains(&model)
+                .then(|| ModelId::parse(model.as_str()).ok())
+                .flatten()
+                .map(|model| self.metrics.start_inference(InferenceOperation::Tts, model));
             let Some(tts) = AppState::tts(self, model)
                 .await
                 .map_err(|error| RuntimeError::Internal(format!("{error:#}")))?
@@ -3896,6 +6006,9 @@ impl SpeechRuntime for AppState {
                     RuntimeError::Internal(format!("TTS operation task failed: {error:#}"))
                 })?
                 .map_err(RuntimeError::Core)?;
+            if let Some(lifecycle) = lifecycle {
+                lifecycle.finish(Outcome::Success);
+            }
             Ok(Some(audio))
         })
     }
@@ -3932,6 +6045,24 @@ impl OcrRuntime for AppState {
         limits: orchion::OcrLimits,
     ) -> OcrFuture<'_> {
         Box::pin(async move {
+            let metric_model = match &choice {
+                OcrServiceChoice::Ocr { model } => self
+                    .config
+                    .services
+                    .ocr
+                    .model_ids()
+                    .contains(model)
+                    .then(|| model.clone()),
+                OcrServiceChoice::OcrVl { model } => self
+                    .config
+                    .services
+                    .ocr_vl
+                    .model_ids()
+                    .contains(model)
+                    .then(|| model.clone()),
+            };
+            let lifecycle = metric_model
+                .map(|model| self.metrics.start_inference(InferenceOperation::Ocr, model));
             let layout = options
                 .layout_model
                 .clone()
@@ -3964,6 +6095,9 @@ impl OcrRuntime for AppState {
                     RuntimeError::Internal(format!("OCR operation task failed: {error:#}"))
                 })?
                 .map_err(RuntimeError::Core)?;
+            if let Some(lifecycle) = lifecycle {
+                lifecycle.finish(Outcome::Success);
+            }
             Ok(Some(result))
         })
     }
@@ -4774,6 +6908,10 @@ fn initialize_configured_llm_backend(
         .map_err(anyhow::Error::from)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "builds the complete immutable API policy from validated deployment config"
+)]
 fn api_policy(config: &ServerConfig) -> ApiPolicy {
     let mut models = Vec::new();
     if config.services.asr.enabled {
@@ -4788,6 +6926,7 @@ fn api_policy(config: &ServerConfig) -> ApiPolicy {
                     .map_or(ModelCapabilities::ASR_TRANSCRIPTION, |descriptor| {
                         descriptor.capabilities
                     }),
+                llm_max_choices: None,
             }
         }));
     }
@@ -4803,6 +6942,7 @@ fn api_policy(config: &ServerConfig) -> ApiPolicy {
                     .map_or(ModelCapabilities::NONE, |descriptor| {
                         descriptor.capabilities
                     }),
+                llm_max_choices: None,
             }
         }));
     }
@@ -4827,16 +6967,54 @@ fn api_policy(config: &ServerConfig) -> ApiPolicy {
         );
     }
     if config.services.llm.active() {
-        models.extend(config.services.llm.models.iter().map(|deployment| {
-            ApiModel {
-                id: deployment.id.clone(),
-                name: deployment.name.clone(),
-                service: ModelService::Llm,
-                capabilities: ModelCapabilities::LLM_CHAT
-                    .union(ModelCapabilities::LLM_RESPONSES)
-                    .union(ModelCapabilities::LLM_STREAMING),
-            }
-        }));
+        models.extend(
+            config
+                .services
+                .llm
+                .models
+                .iter()
+                .map(|deployment| ApiModel {
+                    id: deployment.id.clone(),
+                    name: deployment.name.clone(),
+                    service: ModelService::Llm,
+                    capabilities: match deployment.kind {
+                        LlmDeploymentKind::Generation => {
+                            let mut capabilities = ModelCapabilities::LLM_CHAT
+                                .union(ModelCapabilities::LLM_RESPONSES)
+                                .union(ModelCapabilities::LLM_STREAMING)
+                                .union(ModelCapabilities::LLM_RESUMABLE_STREAMING)
+                                .union(ModelCapabilities::LLM_COMPLETIONS)
+                                .union(ModelCapabilities::LLM_INPUT_TOKENS)
+                                .union(ModelCapabilities::LLM_TOOLS)
+                                .union(ModelCapabilities::LLM_PARALLEL_TOOLS)
+                                .union(ModelCapabilities::LLM_JSON_OBJECT)
+                                .union(ModelCapabilities::LLM_JSON_SCHEMA)
+                                .union(ModelCapabilities::LLM_LOGPROBS)
+                                .union(ModelCapabilities::LLM_LOGIT_BIAS);
+                            if deployment.runtime.parallel_sequences > 1 {
+                                capabilities =
+                                    capabilities.union(ModelCapabilities::LLM_MULTIPLE_CHOICES);
+                            }
+                            if deployment.chat_template.guarantees_reasoning {
+                                capabilities = capabilities
+                                    .union(ModelCapabilities::LLM_REASONING)
+                                    .union(ModelCapabilities::LLM_REASONING_CONTROL);
+                            }
+                            if deployment.mmproj_model.is_some() {
+                                capabilities = capabilities.union(ModelCapabilities::LLM_VISION);
+                            }
+                            capabilities
+                        }
+                        LlmDeploymentKind::Embeddings(_) => ModelCapabilities::LLM_EMBEDDINGS,
+                    },
+                    llm_max_choices: matches!(deployment.kind, LlmDeploymentKind::Generation).then(
+                        || {
+                            usize::try_from(deployment.runtime.parallel_sequences)
+                                .expect("validated slots fit usize")
+                        },
+                    ),
+                }),
+        );
     }
     ApiPolicy {
         api_key: config.auth.api_key.clone(),
@@ -4850,7 +7028,37 @@ fn api_policy(config: &ServerConfig) -> ApiPolicy {
             enabled: config.activity.enabled,
             history_capacity: config.activity.history_capacity,
         },
+        streaming: crate::application::StreamingPolicy {
+            max_active: config.streaming.max_active_sessions,
+            max_retained: config.streaming.max_retained_sessions,
+            max_events_per_session: config.streaming.max_events_per_session,
+            max_bytes_per_session: config.streaming.max_bytes_per_session,
+            max_total_bytes: config.streaming.max_total_bytes,
+            max_followers_per_session: config.streaming.max_followers_per_session,
+            ttl: config.streaming.session_ttl,
+            lookup_max: config.streaming.lookup_max_ids,
+            keepalive_interval: config.streaming.keepalive_interval,
+        },
         models,
+        llm_vision_limits: config
+            .services
+            .llm
+            .models
+            .iter()
+            .map(|deployment| {
+                (
+                    deployment.id.clone(),
+                    crate::application::LlmVisionPolicy {
+                        max_images: deployment.vision.max_images,
+                        max_bytes_per_image: deployment.vision.max_bytes_per_image,
+                        max_total_bytes: deployment.vision.max_total_bytes,
+                        max_side: deployment.vision.max_side,
+                        max_pixels_per_image: deployment.vision.max_pixels_per_image,
+                        max_total_pixels: deployment.vision.max_total_pixels,
+                    },
+                )
+            })
+            .collect(),
         asr: config.services.asr.enabled.then(|| AsrApiPolicy {
             models: config.services.asr.runtime_models(),
             stream_target_segment: config.services.asr.stream_target_segment,
@@ -4889,6 +7097,7 @@ fn ocr_api_model(
         name: deployment.name.clone(),
         service,
         capabilities,
+        llm_max_choices: None,
     }
 }
 

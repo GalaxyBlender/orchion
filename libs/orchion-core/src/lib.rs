@@ -17,8 +17,9 @@ pub use model::{
     AsrModel, KnownOcrModel, LlmModel, ModelCapabilities, ModelCapabilityRequirement,
     ModelCategory, ModelDescriptor, ModelId, ModelSourceLocators, ModelSpec, ModelUrl,
     ModelUrlSource, OcrModel, OcrModelAsset, OcrModelAssetKind, OcrModelAssetRole, OcrModelKind,
-    ParseModelIdError, ParseModelUrlError, RuntimeProvider, TtsModel, model_descriptor,
-    registered_model_descriptors,
+    ParseModelIdError, ParseModelUrlError, QWEN3_EMBEDDING_06B_DIMENSIONS,
+    QWEN3_EMBEDDING_06B_GGUF_FILE, QWEN3_EMBEDDING_06B_GGUF_SHA256, QWEN3_EMBEDDING_06B_GGUF_SIZE,
+    RuntimeProvider, TtsModel, model_descriptor, registered_model_descriptors,
 };
 pub use ocr::{
     OcrLayoutBlock, OcrLimits, OcrOptions, OcrPoint, OcrRegion, OcrResponseFormat, OcrResult,

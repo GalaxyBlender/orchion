@@ -14,7 +14,7 @@ pub struct ModelSourceLocators {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub struct ModelCapabilities(u16);
+pub struct ModelCapabilities(u32);
 
 impl ModelCapabilities {
     pub const NONE: Self = Self(0);
@@ -32,6 +32,20 @@ impl ModelCapabilities {
     pub const LLM_CHAT: Self = Self(1 << 11);
     pub const LLM_RESPONSES: Self = Self(1 << 12);
     pub const LLM_STREAMING: Self = Self(1 << 13);
+    pub const LLM_EMBEDDINGS: Self = Self(1 << 14);
+    pub const LLM_COMPLETIONS: Self = Self(1 << 15);
+    pub const LLM_INPUT_TOKENS: Self = Self(1 << 16);
+    pub const LLM_TOOLS: Self = Self(1 << 17);
+    pub const LLM_PARALLEL_TOOLS: Self = Self(1 << 18);
+    pub const LLM_JSON_OBJECT: Self = Self(1 << 19);
+    pub const LLM_JSON_SCHEMA: Self = Self(1 << 20);
+    pub const LLM_LOGPROBS: Self = Self(1 << 21);
+    pub const LLM_LOGIT_BIAS: Self = Self(1 << 22);
+    pub const LLM_MULTIPLE_CHOICES: Self = Self(1 << 23);
+    pub const LLM_REASONING: Self = Self(1 << 24);
+    pub const LLM_VISION: Self = Self(1 << 25);
+    pub const LLM_RESUMABLE_STREAMING: Self = Self(1 << 26);
+    pub const LLM_REASONING_CONTROL: Self = Self(1 << 27);
 
     #[must_use]
     pub const fn union(self, other: Self) -> Self {
@@ -136,6 +150,19 @@ const TTS_MODELS: [ModelDescriptor; 5] = [
     ),
 ];
 
+const LLM_MODELS: [ModelDescriptor; 1] = [ModelDescriptor {
+    canonical_id: "qwen/qwen3-embedding-0.6b",
+    display_name: "Qwen3 Embedding 0.6B",
+    source_locators: ModelSourceLocators {
+        hugging_face: "Qwen/Qwen3-Embedding-0.6B-GGUF",
+        model_scope: "Qwen/Qwen3-Embedding-0.6B-GGUF",
+    },
+    category: ModelCategory::Llm,
+    capabilities: ModelCapabilities::LLM_EMBEDDINGS,
+    requirements: &[],
+    runtime_provider: RuntimeProvider::LlamaCpp,
+}];
+
 const fn qwen_descriptor(
     canonical_id: &'static str,
     display_name: &'static str,
@@ -161,6 +188,7 @@ pub fn model_descriptor(id: &str) -> Option<ModelDescriptor> {
     ASR_MODELS
         .iter()
         .chain(TTS_MODELS.iter())
+        .chain(LLM_MODELS.iter())
         .find(|descriptor| descriptor.canonical_id == id)
         .copied()
         .or_else(|| {
@@ -177,6 +205,7 @@ pub fn registered_model_descriptors(
     ASR_MODELS
         .iter()
         .chain(TTS_MODELS.iter())
+        .chain(LLM_MODELS.iter())
         .copied()
         .chain(
             KnownOcrModel::ALL

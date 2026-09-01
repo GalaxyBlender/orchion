@@ -15,7 +15,10 @@ pub use descriptor::{
     RuntimeProvider, model_descriptor, registered_model_descriptors,
 };
 pub use id::{ModelId, ParseModelIdError};
-pub use llm::LlmModel;
+pub use llm::{
+    LlmModel, QWEN3_EMBEDDING_06B_DIMENSIONS, QWEN3_EMBEDDING_06B_GGUF_FILE,
+    QWEN3_EMBEDDING_06B_GGUF_SHA256, QWEN3_EMBEDDING_06B_GGUF_SIZE,
+};
 pub use ocr::{
     KnownOcrModel, OcrModel, OcrModelAsset, OcrModelAssetKind, OcrModelAssetRole, OcrModelKind,
 };
@@ -140,6 +143,29 @@ mod tests {
         );
         assert!(model_descriptor("Qwen/Qwen3-ASR-0.6B").is_none());
         assert!(model_descriptor("Qwen/Qwen3-TTS-12Hz-0.6B-Base").is_none());
+
+        let embeddings = model_descriptor("qwen/qwen3-embedding-0.6b").unwrap();
+        assert_eq!(embeddings.category, ModelCategory::Llm);
+        assert_eq!(embeddings.runtime_provider, RuntimeProvider::LlamaCpp);
+        assert_eq!(
+            embeddings.source_locators.hugging_face,
+            "Qwen/Qwen3-Embedding-0.6B-GGUF"
+        );
+        assert!(
+            embeddings
+                .capabilities
+                .contains(ModelCapabilities::LLM_EMBEDDINGS)
+        );
+        assert_eq!(
+            QWEN3_EMBEDDING_06B_GGUF_FILE,
+            "Qwen3-Embedding-0.6B-Q8_0.gguf"
+        );
+        assert_eq!(QWEN3_EMBEDDING_06B_GGUF_SIZE, 639_150_592);
+        assert_eq!(
+            QWEN3_EMBEDDING_06B_GGUF_SHA256,
+            "06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439"
+        );
+        assert_eq!(QWEN3_EMBEDDING_06B_DIMENSIONS, 1024);
     }
 
     #[test]

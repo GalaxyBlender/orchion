@@ -130,9 +130,32 @@ impl Client {
     }
 
     #[allow(dead_code)]
+    pub(crate) fn get_with_path_segment(
+        &self,
+        path: &str,
+        segment: &str,
+    ) -> Result<RequestBuilder, ClientError> {
+        let mut url = self.url(path)?;
+        url.path_segments_mut()
+            .map_err(|()| ClientError::build_request("base URL cannot contain path segments"))?
+            .pop_if_empty()
+            .push(segment);
+        Ok(self
+            .authorize(self.http.get(url))
+            .timeout(self.config.timeout))
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn post(&self, path: &str) -> Result<RequestBuilder, ClientError> {
         Ok(self
             .authorize(self.http.post(self.url(path)?))
+            .timeout(self.config.timeout))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn delete(&self, path: &str) -> Result<RequestBuilder, ClientError> {
+        Ok(self
+            .authorize(self.http.delete(self.url(path)?))
             .timeout(self.config.timeout))
     }
 

@@ -49,7 +49,7 @@ pub(crate) async fn track_activity(
     request.extensions_mut().insert(context.clone());
     let mut guard = HttpCompletionGuard::new(context.clone());
     let response = next.run(request).await;
-    if context.was_handed_off() && response.status().as_u16() == 101 {
+    if context.was_handed_off() {
         guard.disarm();
         return response;
     }
@@ -101,7 +101,10 @@ fn classify(request: &Request<Body>) -> Option<(ActivityOperation, ActivityTrans
         ("POST", "/v1/ocr") => ActivityOperation::Ocr,
         ("POST", "/v1/pdf/images") => ActivityOperation::Pdf,
         ("POST", "/v1/chat/completions") => ActivityOperation::Chat,
+        ("POST", "/v1/completions") => ActivityOperation::Completions,
         ("POST", "/v1/responses") => ActivityOperation::Responses,
+        ("POST", "/v1/responses/input_tokens") => ActivityOperation::InputTokens,
+        ("POST", "/v1/embeddings") => ActivityOperation::Embeddings,
         _ => return None,
     };
     Some((operation, ActivityTransport::Http, route))
