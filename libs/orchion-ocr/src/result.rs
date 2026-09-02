@@ -62,7 +62,7 @@ impl oar_ocr_vl::LayoutSource for OcrLayoutSource<'_> {
         let result = self
             .predictor
             .predict(vec![image.clone()])
-            .map_err(|error| oar_ocr_vl::Error::invalid_input(error.to_string()))?;
+            .map_err(|error| oar_ocr_vl::Error::invalid_input(error_chain_message(error)))?;
         let elements = result
             .elements
             .into_iter()
@@ -1153,7 +1153,7 @@ fn base_result(
 
 fn model_load_error(error: impl Into<anyhow::Error>) -> OrchionError {
     OrchionError::ModelLoad {
-        message: error.into().to_string(),
+        message: error_chain_message(error),
     }
 }
 
@@ -1382,9 +1382,12 @@ mod capability_tests {
 
 #[cfg(any(feature = "ocr", feature = "ocr-vl"))]
 fn inference_error(error: impl Into<anyhow::Error>) -> OrchionError {
-    OrchionError::Inference {
-        message: error.into().to_string(),
-    }
+    let message = error_chain_message(error);
+    OrchionError::Inference { message }
+}
+
+fn error_chain_message(error: impl Into<anyhow::Error>) -> String {
+    format!("{:#}", error.into())
 }
 
 #[cfg(all(test, feature = "ocr"))]
@@ -1396,6 +1399,36 @@ mod traditional_tests {
         assert_eq!(
             layout_model_name(KnownOcrModel::PpDocLayoutV3),
             "PP-DocLayoutV3"
+        );
+    }
+}
+
+#[cfg(all(test, any(feature = "ocr", feature = "ocr-vl")))]
+mod inference_error_tests {
+    use super::*;
+
+    #[test]
+    fn error_messages_include_the_root_cause() {
+        let error = anyhow::Error::new(std::io::Error::other("CUDA driver is insufficient"))
+            .context("ONNX Runtime session run failed");
+
+        let OrchionError::Inference { message } = inference_error(error) else {
+            panic!("expected inference error");
+        };
+
+        assert_eq!(
+            message,
+            "ONNX Runtime session run failed: CUDA driver is insufficient"
+        );
+
+        let error = anyhow::Error::new(std::io::Error::other("missing libcudnn.so.9"))
+            .context("failed to create layout session");
+        let OrchionError::ModelLoad { message } = model_load_error(error) else {
+            panic!("expected model-load error");
+        };
+        assert_eq!(
+            message,
+            "failed to create layout session: missing libcudnn.so.9"
         );
     }
 }
