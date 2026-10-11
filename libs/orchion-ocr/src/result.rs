@@ -598,14 +598,34 @@ fn run_layout_ocr(
     let image = decode_ocr_image(image_path, limits.max_pixels)?;
     let result = structure.predict_image(image).map_err(inference_error)?;
 
+    Ok(traditional_layout_result(
+        model,
+        options.response_format,
+        &result,
+    ))
+}
+
+#[cfg(feature = "ocr")]
+fn traditional_layout_result(
+    model: KnownOcrModel,
+    format: OcrResponseFormat,
+    result: &oar_ocr::domain::structure::StructureResult,
+) -> OcrResult {
     let text = result
         .layout_elements
         .iter()
         .filter_map(|element| element.text.as_deref())
         .collect::<Vec<_>>()
         .join("\n");
-    let markdown =
-        (options.response_format == OcrResponseFormat::Markdown).then(|| result.to_markdown());
+    let markdown = (format == OcrResponseFormat::Markdown).then(|| result.to_markdown());
+    let regions = result
+        .layout_elements
+        .iter()
+        .filter_map(|element| {
+            let text = element.text.as_deref()?;
+            (!text.trim().is_empty()).then(|| orchion_region(&element.bbox, text, None))
+        })
+        .collect();
     let blocks = result
         .layout_elements
         .iter()
@@ -619,15 +639,7 @@ fn run_layout_ocr(
         })
         .collect();
 
-    Ok(base_result(
-        model,
-        options.response_format,
-        text,
-        markdown,
-        None,
-        Vec::new(),
-        blocks,
-    ))
+    base_result(model, format, text, markdown, None, regions, blocks)
 }
 
 #[cfg(all(feature = "ocr-vl", not(feature = "cuda")))]
@@ -718,15 +730,31 @@ fn run_vl_layout_ocr(
     let structure = parser
         .parse(&layout_source, image)
         .map_err(inference_error)?;
+
+    Ok(vl_layout_result(
+        model,
+        options.response_format,
+        &structure,
+        &parser.config().markdown_ignore_labels,
+    ))
+}
+
+#[cfg(feature = "ocr-vl")]
+fn vl_layout_result(
+    model: KnownOcrModel,
+    format: OcrResponseFormat,
+    structure: &oar_ocr_vl::StructureResult,
+    markdown_ignore_labels: &[String],
+) -> OcrResult {
     let text = structure
         .layout_elements
         .iter()
         .filter_map(|element| element.text.as_deref())
         .collect::<Vec<_>>()
         .join("\n");
-    let markdown = (options.response_format == OcrResponseFormat::Markdown)
+    let markdown = (format == OcrResponseFormat::Markdown)
         .then(|| html_tables_to_markdown(&structure.to_markdown()));
-    let html = (options.response_format == OcrResponseFormat::Html).then(|| {
+    let html = (format == OcrResponseFormat::Html).then(|| {
         render_layout_html(
             structure.layout_elements.iter().map(|element| {
                 (
@@ -734,9 +762,21 @@ fn run_vl_layout_ocr(
                     element.text.as_deref().unwrap_or_default(),
                 )
             }),
-            &parser.config().markdown_ignore_labels,
+            markdown_ignore_labels,
         )
     });
+    let regions = structure
+        .layout_elements
+        .iter()
+        .filter_map(|element| {
+            let text = element.text.as_deref()?;
+            (!text.trim().is_empty()).then(|| orchion_core::OcrRegion {
+                text: text.to_string(),
+                confidence: None,
+                polygon: bbox_points(&element.bbox),
+            })
+        })
+        .collect();
     let blocks = structure
         .layout_elements
         .iter()
@@ -750,15 +790,7 @@ fn run_vl_layout_ocr(
         })
         .collect();
 
-    Ok(base_result(
-        model,
-        options.response_format,
-        text,
-        markdown,
-        html,
-        Vec::new(),
-        blocks,
-    ))
+    base_result(model, format, text, markdown, html, regions, blocks)
 }
 
 fn should_use_vl_layout_pipeline(options: &OcrOptions) -> bool {
@@ -1388,6 +1420,203 @@ fn inference_error(error: impl Into<anyhow::Error>) -> OrchionError {
 
 fn error_chain_message(error: impl Into<anyhow::Error>) -> String {
     format!("{:#}", error.into())
+}
+
+#[cfg(all(test, any(feature = "ocr", feature = "ocr-vl")))]
+mod layout_result_tests {
+    use super::*;
+    use orchion_core::{OcrPoint, OcrRegion};
+
+    fn assert_layout_regions(result: &OcrResult) {
+        let title_polygon = vec![
+            OcrPoint { x: 10.5, y: 20.0 },
+            OcrPoint { x: 40.0, y: 22.5 },
+            OcrPoint { x: 38.5, y: 60.0 },
+            OcrPoint { x: 9.0, y: 57.5 },
+        ];
+        let body_polygon = vec![
+            OcrPoint { x: 80.0, y: 90.0 },
+            OcrPoint { x: 120.0, y: 90.0 },
+            OcrPoint { x: 120.0, y: 150.0 },
+            OcrPoint { x: 80.0, y: 150.0 },
+        ];
+        assert_eq!(
+            result.regions,
+            vec![
+                OcrRegion {
+                    text: " 标题\nTitle ".to_string(),
+                    confidence: None,
+                    polygon: title_polygon.clone(),
+                },
+                OcrRegion {
+                    text: "正文\nBody".to_string(),
+                    confidence: None,
+                    polygon: body_polygon.clone(),
+                },
+            ]
+        );
+        let labels = ["doc_title", "image", "text", "text", "text"];
+        let polygons = [
+            title_polygon.clone(),
+            title_polygon.clone(),
+            title_polygon.clone(),
+            title_polygon,
+            body_polygon,
+        ];
+        assert_eq!(
+            result.layout_blocks,
+            labels
+                .into_iter()
+                .zip(polygons)
+                .map(|(label, polygon)| OcrLayoutBlock {
+                    label: label.to_string(),
+                    confidence: Some(0.9),
+                    polygon,
+                })
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(result.text, " 标题\nTitle \n\n \n\t\n正文\nBody");
+    }
+
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn traditional_layout_returns_text_regions_and_keeps_all_layout_blocks() {
+        use oar_ocr::domain::structure::{LayoutElement, LayoutElementType, StructureResult};
+        use oar_ocr::processors::{BoundingBox, Point};
+
+        let title_box = BoundingBox::new(vec![
+            Point::new(10.5, 20.0),
+            Point::new(40.0, 22.5),
+            Point::new(38.5, 60.0),
+            Point::new(9.0, 57.5),
+        ]);
+        let element = |text: Option<&str>, label: &str, bbox| {
+            let mut element =
+                LayoutElement::new(bbox, LayoutElementType::Text, 0.9).with_label(label);
+            element.text = text.map(str::to_string);
+            element
+        };
+        let structure = StructureResult::new("<memory>", 0).with_layout_elements(vec![
+            element(Some(" 标题\nTitle "), "doc_title", title_box.clone()),
+            element(None, "image", title_box.clone()),
+            element(Some(""), "text", title_box.clone()),
+            element(Some(" \n\t"), "text", title_box),
+            element(
+                Some("正文\nBody"),
+                "text",
+                BoundingBox::from_coords(80.0, 90.0, 120.0, 150.0),
+            ),
+        ]);
+
+        for format in [
+            OcrResponseFormat::Json,
+            OcrResponseFormat::Text,
+            OcrResponseFormat::Markdown,
+        ] {
+            let result = traditional_layout_result(KnownOcrModel::PpOcrV6Tiny, format, &structure);
+            assert_layout_regions(&result);
+            assert_eq!(result.format, format);
+            assert_eq!(
+                result.markdown.is_some(),
+                format == OcrResponseFormat::Markdown
+            );
+            assert!(result.html.is_none());
+        }
+    }
+
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn traditional_layout_without_text_returns_no_regions() {
+        use oar_ocr::domain::structure::{LayoutElement, LayoutElementType, StructureResult};
+        use oar_ocr::processors::BoundingBox;
+
+        let structure =
+            StructureResult::new("<memory>", 0).with_layout_elements(vec![LayoutElement::new(
+                BoundingBox::from_coords(10.0, 20.0, 40.0, 60.0),
+                LayoutElementType::Image,
+                0.9,
+            )]);
+        let result = traditional_layout_result(
+            KnownOcrModel::PpDocLayoutV3,
+            OcrResponseFormat::Json,
+            &structure,
+        );
+
+        assert_eq!(result.regions, Vec::<OcrRegion>::new());
+        assert_eq!(result.text, "");
+        assert_eq!(result.layout_blocks.len(), 1);
+        assert_eq!(result.layout_blocks[0].label, "Image");
+    }
+
+    #[cfg(feature = "ocr-vl")]
+    #[test]
+    fn vl_layout_returns_text_regions_and_keeps_all_layout_blocks() {
+        use oar_ocr_vl::{BoundingBox, LayoutElement, LayoutElementType, Point, StructureResult};
+
+        let title_box = BoundingBox::new(vec![
+            Point::new(10.5, 20.0),
+            Point::new(40.0, 22.5),
+            Point::new(38.5, 60.0),
+            Point::new(9.0, 57.5),
+        ]);
+        let element = |text: Option<&str>, label: &str, bbox| {
+            let mut element =
+                LayoutElement::new(bbox, LayoutElementType::Text, 0.9).with_label(label);
+            element.text = text.map(str::to_string);
+            element
+        };
+        let structure = StructureResult::new("<memory>", 0).with_layout_elements(vec![
+            element(Some(" 标题\nTitle "), "doc_title", title_box.clone()),
+            element(None, "image", title_box.clone()),
+            element(Some(""), "text", title_box.clone()),
+            element(Some(" \n\t"), "text", title_box),
+            element(
+                Some("正文\nBody"),
+                "text",
+                BoundingBox::from_coords(80.0, 90.0, 120.0, 150.0),
+            ),
+        ]);
+
+        for format in [
+            OcrResponseFormat::Json,
+            OcrResponseFormat::Text,
+            OcrResponseFormat::Markdown,
+            OcrResponseFormat::Html,
+        ] {
+            let result = vl_layout_result(KnownOcrModel::PaddleOcrVl16, format, &structure, &[]);
+            assert_layout_regions(&result);
+            assert_eq!(result.format, format);
+            assert_eq!(
+                result.markdown.is_some(),
+                format == OcrResponseFormat::Markdown
+            );
+            assert_eq!(result.html.is_some(), format == OcrResponseFormat::Html);
+        }
+    }
+
+    #[cfg(feature = "ocr-vl")]
+    #[test]
+    fn vl_layout_without_text_returns_no_regions() {
+        use oar_ocr_vl::{BoundingBox, LayoutElement, LayoutElementType, StructureResult};
+
+        let structure =
+            StructureResult::new("<memory>", 0).with_layout_elements(vec![LayoutElement::new(
+                BoundingBox::from_coords(10.0, 20.0, 40.0, 60.0),
+                LayoutElementType::Image,
+                0.9,
+            )]);
+        let result = vl_layout_result(
+            KnownOcrModel::PaddleOcrVl16,
+            OcrResponseFormat::Json,
+            &structure,
+            &[],
+        );
+
+        assert_eq!(result.regions, Vec::<OcrRegion>::new());
+        assert_eq!(result.text, "");
+        assert_eq!(result.layout_blocks.len(), 1);
+        assert_eq!(result.layout_blocks[0].label, "Image");
+    }
 }
 
 #[cfg(all(test, feature = "ocr"))]

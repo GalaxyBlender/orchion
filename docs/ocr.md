@@ -37,3 +37,9 @@ Useful fields:
 - `max_tokens`: optional OCR-VL generation limit.
 
 `layout_model` is deployment configuration, not a request parameter. Requests that send a multipart `layout_model` field are rejected with `unsupported_ocr_parameter`.
+
+## JSON regions
+
+JSON responses include `regions` with recognized text and polygon coordinates. Traditional OCR without layout returns text-line regions. The traditional OCR and OCR-VL layout pipelines return block-level regions for layout elements with non-blank text, preserving the original text and element order. Their region `confidence` is `null` because layout detection scores are not text recognition confidence scores.
+
+`layout_blocks` still includes all detected layout elements, including those without text, with their labels, detection confidence scores, and polygon coordinates. OCR-VL without the layout pipeline currently returns an empty `regions` array. The `text`, `markdown`, and `html` response formats return only the document body, not JSON region metadata.
