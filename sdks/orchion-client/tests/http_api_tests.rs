@@ -240,7 +240,7 @@ async fn list_models_preserves_the_base_url_path_prefix() {
 
     let models = client.models().list().await.unwrap();
 
-    assert!(models.data.is_empty());
+    assert_eq!(models.data.len(), 0);
 }
 
 #[cfg(feature = "asr")]

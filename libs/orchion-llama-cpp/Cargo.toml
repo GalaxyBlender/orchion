@@ -17,7 +17,7 @@ encoding_rs = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 llama-cpp-2 = { git = "https://github.com/utilityai/llama-cpp-rs", branch = "main", default-features = false, features = ["common", "mtmd"] }
 llama-cpp-sys-2 = { git = "https://github.com/utilityai/llama-cpp-rs", branch = "main", default-features = false, features = ["common", "mtmd"] }
-minijinja = { version = "2", features = ["json", "loop_controls"] }
+minijinja = { version = "3", features = ["json", "loop_controls", "serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -33,7 +33,7 @@ pedantic = "warn"
 
 [build-dependencies]
 cc = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 
 [dev-dependencies]
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }

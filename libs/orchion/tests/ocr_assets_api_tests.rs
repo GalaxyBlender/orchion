@@ -187,3 +187,28 @@ async fn ocr_facade_dispatches_through_an_object_safe_engine_with_limits() {
     assert_eq!(result.text, "recognized");
     assert_eq!(*limits_seen.lock().unwrap(), Some(limits));
 }
+
+#[cfg(all(feature = "ocr", feature = "cuda"))]
+#[tokio::test]
+#[ignore = "requires CUDA, ORCHION_TEST_OCR_ROOT, and ORCHION_TEST_IMAGE"]
+async fn traditional_ocr_runs_on_cuda_with_local_assets() {
+    let root = PathBuf::from(std::env::var("ORCHION_TEST_OCR_ROOT").unwrap());
+    let image = PathBuf::from(std::env::var("ORCHION_TEST_IMAGE").unwrap());
+    let assets = OcrAssets::Traditional {
+        detector: root.join("PP-OCRv6_tiny_det_onnx/inference.onnx"),
+        recognizer: root.join("PP-OCRv6_tiny_rec_onnx/inference.onnx"),
+        dictionary: root.join("PP-OCRv6_tiny/ppocrv6_tiny_dict.txt"),
+        layout: None,
+        table_structure: None,
+    };
+    let ocr = Ocr::load_with_assets_and_device(
+        orchion::KnownOcrModel::PpOcrV6Tiny.id(),
+        assets,
+        orchion::DevicePreference::Cuda(Some(0)),
+    )
+    .await
+    .unwrap();
+    let result = ocr.recognize_file(image).await.unwrap();
+    assert!(!result.text.trim().is_empty());
+    assert!(!result.regions.is_empty());
+}

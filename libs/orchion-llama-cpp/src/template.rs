@@ -1,5 +1,5 @@
 use encoding_rs::UTF_8;
-use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaChatTemplate, LlamaModel};
+use llama_cpp_2::model::{LlamaChatMessage, LlamaChatTemplate, LlamaModel};
 use llama_cpp_2::token::LlamaToken;
 
 use crate::contract::{
@@ -7,6 +7,7 @@ use crate::contract::{
     Request, RichMessage, Role, RuntimeConfig, SemanticInput, SemanticRequest, TemplateEngine,
     ToolChoice, ToolDefinition,
 };
+use crate::tokenization::decode_piece;
 
 pub(crate) enum EffectiveTemplate {
     LlamaCpp {
@@ -145,7 +146,7 @@ pub(crate) fn prepare_semantic_messages(
     let messages = validate_and_flatten(messages, tools, tool_choice, reasoning)?;
     let prompt =
         apply_effective_template(model, template, &messages, true).map_err(Error::Generation)?;
-    tokenize_prompt(model, &prompt)
+    Ok(tokenize_prompt(model, &prompt))
 }
 
 pub(crate) fn validate_and_flatten(
@@ -252,8 +253,8 @@ pub(crate) fn apply_effective_template(
             source,
             enable_thinking,
         } => {
-            let bos_token = special_token_text(model, model.token_bos())?;
-            let eos_token = special_token_text(model, model.token_eos())?;
+            let bos_token = special_token_text(model, model.vocab().bos());
+            let eos_token = special_token_text(model, model.vocab().eos());
             render_jinja_template(
                 source,
                 &messages,
@@ -269,7 +270,7 @@ pub(crate) fn apply_effective_template(
 pub(crate) fn common_chat_template_parts<'a>(
     model: &LlamaModel,
     template: &'a EffectiveTemplate,
-) -> Result<(&'a str, String, String, bool), Error> {
+) -> (&'a str, String, String, bool) {
     let (source, enable_thinking) = match template {
         EffectiveTemplate::LlamaCpp {
             source,
@@ -281,12 +282,12 @@ pub(crate) fn common_chat_template_parts<'a>(
             enable_thinking,
         } => (source.as_str(), *enable_thinking),
     };
-    Ok((
+    (
         source,
-        special_token_text(model, model.token_bos()).map_err(Error::Generation)?,
-        special_token_text(model, model.token_eos()).map_err(Error::Generation)?,
+        special_token_text(model, model.vocab().bos()),
+        special_token_text(model, model.vocab().eos()),
         enable_thinking,
-    ))
+    )
 }
 
 pub(crate) fn normalize_text_messages(messages: &[Message]) -> Vec<Message> {
@@ -311,11 +312,12 @@ pub(crate) fn normalize_text_messages(messages: &[Message]) -> Vec<Message> {
     conversation
 }
 
-fn special_token_text(model: &LlamaModel, token: LlamaToken) -> Result<String, String> {
+fn special_token_text(model: &LlamaModel, token: LlamaToken) -> String {
     let mut decoder = UTF_8.new_decoder();
-    model
-        .token_to_piece(token, &mut decoder, true, None)
-        .map_err(|error| error.to_string())
+    decode_piece(
+        &mut decoder,
+        &model.vocab().token_to_piece(token, true, None),
+    )
 }
 
 pub(crate) fn render_jinja_template(
@@ -343,8 +345,10 @@ pub(crate) fn render_jinja_template(
             }
             "split" => {
                 let (separator,): (String,) = from_args(args)?;
-                Ok(Value::from_serialize(
-                    text.split(&separator).collect::<Vec<_>>(),
+                Ok(Value::from(
+                    text.split(&separator)
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>(),
                 ))
             }
             "rstrip" => {
@@ -381,7 +385,7 @@ pub(crate) fn render_jinja_template(
         .get_template("chat")
         .map_err(|error| error.to_string())?
         .render(minijinja::context! {
-            messages => messages,
+            messages => minijinja::value::Serde(messages),
             add_generation_prompt => add_generation_prompt,
             bos_token => bos_token,
             eos_token => eos_token,
@@ -392,8 +396,6 @@ pub(crate) fn render_jinja_template(
         .map_err(|error| error.to_string())
 }
 
-pub(crate) fn tokenize_prompt(model: &LlamaModel, prompt: &str) -> Result<Vec<LlamaToken>, Error> {
-    model
-        .str_to_token(prompt, AddBos::Always)
-        .map_err(|error| Error::Generation(error.to_string()))
+pub(crate) fn tokenize_prompt(model: &LlamaModel, prompt: &str) -> Vec<LlamaToken> {
+    model.vocab().tokenize(prompt.as_bytes(), true, true)
 }

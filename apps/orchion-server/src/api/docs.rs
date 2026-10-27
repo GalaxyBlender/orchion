@@ -77,7 +77,7 @@ fn add_json_response_content(openapi: &mut utoipa::openapi::OpenApi, path: &str,
     };
     response.content.insert(
         "application/json".to_string(),
-        Content::new(Some(Ref::from_schema_name(schema))),
+        Content::new(Some(Ref::from_schema_name(schema))).into(),
     );
 }
 

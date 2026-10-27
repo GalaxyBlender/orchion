@@ -278,6 +278,10 @@
 
 /* Responsive adaptations */
 @media (max-width: 768px) {
+  .grid-cols-2 {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   .app-layout {
     grid-template-columns: 1fr;
   }

@@ -11,6 +11,7 @@ mod scheduler;
 mod slot;
 mod template;
 mod test_support;
+mod tokenization;
 mod worker;
 
 pub use constraints::validate_strict_schema;

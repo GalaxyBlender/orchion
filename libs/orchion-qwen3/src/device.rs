@@ -124,14 +124,14 @@ fn resolve_cuda_device_with_most_free_memory() -> Option<ResolvedDevice> {
 
 #[cfg(feature = "cuda")]
 fn cuda_candidate_with_most_free_memory() -> Option<CudaMemoryCandidate> {
-    use candle_core::cuda::cudarc::driver::CudaContext;
+    use candle_core::cuda::cudarc::driver::{CudaContext, result};
 
     let count = usize::try_from(CudaContext::device_count().ok()?).ok()?;
     (0..count)
         .filter_map(|ordinal| {
             let context = CudaContext::new(ordinal).ok()?;
-            let (free, total) = context.mem_get_info().ok()?;
-            let _ = total;
+            context.bind_to_thread().ok()?;
+            let (free, _) = result::mem_get_info().ok()?;
             Some(CudaMemoryCandidate {
                 ordinal,
                 free_bytes: free,
@@ -192,6 +192,26 @@ mod tests {
             Err(other) => panic!("expected ModelLoad error, got {other:?}"),
             Ok(_) => panic!("expected explicit Metal to fail without metal feature"),
         }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires a CUDA GPU and driver"]
+    fn cuda_auto_selects_a_device_with_available_memory() {
+        let candidate = cuda_candidate_with_most_free_memory().expect("available CUDA device");
+        assert!(candidate.free_bytes > 0);
+
+        let resolved = resolve_device(DevicePreference::Auto).unwrap();
+        assert!(matches!(resolved.kind, ResolvedDeviceKind::Cuda(_)));
+        assert!(resolved.device.is_cuda());
+
+        let values = candle_core::Tensor::new(&[2.0_f32, 3.0], &resolved.device)
+            .unwrap()
+            .sqr()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(values, [4.0, 9.0]);
     }
 
     #[cfg(feature = "cuda")]

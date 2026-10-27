@@ -348,7 +348,8 @@ mod tests {
     async fn body_timeout_is_a_transport_error_with_the_reqwest_source() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        std::thread::spawn(move || {
+        let (release_body, hold_body) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0; 1024];
             let _ = stream.read(&mut request).unwrap();
@@ -358,10 +359,10 @@ mod tests {
                 )
                 .unwrap();
             stream.flush().unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            let _ = hold_body.recv();
         });
         let response = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_millis(20))
+            .timeout(std::time::Duration::from_secs(10))
             .build()
             .unwrap()
             .get(format!("http://{address}"))
@@ -369,7 +370,11 @@ mod tests {
             .await
             .unwrap();
 
+        // Only advance the deadline after headers have arrived; the body stays open.
+        tokio::time::pause();
         let error = decode_text(response).await.unwrap_err();
+        drop(release_body);
+        server.join().unwrap();
 
         match error {
             ClientError::Transport { source } => assert!(source.is_timeout()),
@@ -399,7 +404,7 @@ mod tests {
 
     fn assert_body_transport(error: ClientError) {
         match error {
-            ClientError::Transport { source } => assert!(!source.to_string().is_empty()),
+            ClientError::Transport { source } => assert_ne!(source.to_string(), ""),
             unexpected => panic!("unexpected error variant: {unexpected:?}"),
         }
     }

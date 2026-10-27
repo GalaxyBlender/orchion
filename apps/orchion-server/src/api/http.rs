@@ -2352,8 +2352,9 @@ mod tests {
             connect_async(format!("ws://{address}/v1/audio/transcriptions/stream"))
                 .await
                 .unwrap();
+        // Flush both frames together so early input is observable before model loading finishes.
         socket
-            .send(Message::Text(
+            .feed(Message::Text(
                 r#"{"type":"start","model":"alibaba/qwen3-asr-0.6b","input_audio_format":"pcm_s16le","sample_rate":16000}"#
                     .into(),
             ))

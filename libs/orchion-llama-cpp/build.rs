@@ -1,5 +1,6 @@
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -182,10 +183,11 @@ fn emit_resolved_cache(sys_out_dir: &Path, cache: &CacheCandidate) {
         .unwrap_or(&cache.path)
         .to_string_lossy();
     emit_env("ORCHION_BUILD_CMAKE_CACHE_RELATIVE_PATH", &relative);
-    emit_env(
-        "ORCHION_BUILD_CMAKE_CACHE_SHA256",
-        &format!("{:x}", Sha256::digest(&cache.contents)),
-    );
+    let mut checksum = String::with_capacity(64);
+    for byte in Sha256::digest(&cache.contents) {
+        write!(checksum, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    emit_env("ORCHION_BUILD_CMAKE_CACHE_SHA256", &checksum);
 
     let cmake_root = cache.path.parent().expect("CMake cache has a parent");
     for language in ["C", "CXX"] {

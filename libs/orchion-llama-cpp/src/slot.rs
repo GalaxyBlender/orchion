@@ -487,17 +487,17 @@ impl SamplingState {
         mut candidates: LlamaTokenDataArray,
         top_logprobs: Option<usize>,
     ) -> Result<(LlamaToken, Option<TokenLogprobs>), Error> {
-        if let Some(bias) = &self.bias {
+        if let Some(bias) = &mut self.bias {
             bias.apply(&mut candidates);
         }
         if let Some(control) = &self.reasoning_control {
             control.apply(&mut candidates)?;
         }
         self.penalties.apply(&mut candidates);
-        if let Some(grammar) = &self.grammar {
+        if let Some(grammar) = &mut self.grammar {
             grammar.apply(&mut candidates);
         }
-        if let Some(filters) = &self.filters {
+        if let Some(filters) = &mut self.filters {
             filters.apply(&mut candidates);
         }
         if candidates.data.is_empty() {
@@ -536,7 +536,7 @@ impl SamplingState {
                 Ok(TokenLogprobs {
                     chosen: TokenAlternative {
                         token_id: token.0,
-                        bytes: token_bytes(model, token)?,
+                        bytes: token_bytes(model, token),
                         logprob: chosen_logprob,
                     },
                     top: probabilities.top,
@@ -629,14 +629,12 @@ fn normalized_logprobs(
     let top = all
         .iter()
         .take(top_count)
-        .map(|(token_id, logprob)| {
-            Ok(TokenAlternative {
-                token_id: *token_id,
-                bytes: token_bytes(model, LlamaToken(*token_id))?,
-                logprob: *logprob,
-            })
+        .map(|(token_id, logprob)| TokenAlternative {
+            token_id: *token_id,
+            bytes: token_bytes(model, LlamaToken(*token_id)),
+            logprob: *logprob,
         })
-        .collect::<Result<Vec<_>, Error>>()?;
+        .collect::<Vec<_>>();
     Ok(NormalizedLogprobs { all, top })
 }
 
@@ -688,46 +686,16 @@ struct NormalizedLogprobs {
     top: Vec<TokenAlternative>,
 }
 
-fn token_bytes(model: &LlamaModel, token: LlamaToken) -> Result<Vec<u8>, Error> {
-    token_bytes_with(|buffer_size, special| {
-        model.token_to_piece_bytes(token, buffer_size, special, None)
-    })
+fn token_bytes(model: &LlamaModel, token: LlamaToken) -> Vec<u8> {
+    token_bytes_with(|special| model.vocab().token_to_piece(token, special, None))
 }
 
-fn token_bytes_with(
-    mut convert: impl FnMut(usize, bool) -> Result<Vec<u8>, llama_cpp_2::TokenToStringError>,
-) -> Result<Vec<u8>, Error> {
-    match token_piece_bytes(&mut convert, false) {
-        Ok(bytes) => Ok(bytes),
-        Err(llama_cpp_2::TokenToStringError::UnknownTokenType) => {
-            match token_piece_bytes(&mut convert, true) {
-                Ok(bytes) => Ok(bytes),
-                Err(llama_cpp_2::TokenToStringError::UnknownTokenType) => Ok(Vec::new()),
-                Err(error) => Err(Error::Generation(error.to_string())),
-            }
-        }
-        Err(error) => Err(Error::Generation(error.to_string())),
-    }
-}
-
-fn token_piece_bytes(
-    convert: &mut impl FnMut(usize, bool) -> Result<Vec<u8>, llama_cpp_2::TokenToStringError>,
-    special: bool,
-) -> Result<Vec<u8>, llama_cpp_2::TokenToStringError> {
-    match convert(256, special) {
-        Err(llama_cpp_2::TokenToStringError::InsufficientBufferSpace(required)) => {
-            let Some(required) = required
-                .checked_neg()
-                .and_then(|value| usize::try_from(value).ok())
-                .filter(|value| *value <= 1024 * 1024)
-            else {
-                return Err(llama_cpp_2::TokenToStringError::InsufficientBufferSpace(
-                    required,
-                ));
-            };
-            convert(required, special)
-        }
-        result => result,
+fn token_bytes_with(mut convert: impl FnMut(bool) -> Vec<u8>) -> Vec<u8> {
+    let bytes = convert(false);
+    if bytes.is_empty() {
+        convert(true)
+    } else {
+        bytes
     }
 }
 
@@ -1258,40 +1226,31 @@ mod tests {
     }
 
     #[test]
-    fn token_piece_conversion_retries_special_tokens_with_the_required_buffer() {
+    fn token_piece_conversion_renders_special_tokens_when_plaintext_is_empty() {
         let mut calls = Vec::new();
-        let convert = |buffer_size, special| {
-            calls.push((buffer_size, special));
-            match calls.len() {
-                1 => Err(llama_cpp_2::TokenToStringError::UnknownTokenType),
-                2 => Err(llama_cpp_2::TokenToStringError::InsufficientBufferSpace(
-                    -300,
-                )),
-                3 => Ok(b"<special>".to_vec()),
-                _ => unreachable!(),
+        let convert = |special| {
+            calls.push(special);
+            if special {
+                b"<special>".to_vec()
+            } else {
+                Vec::new()
             }
         };
 
-        let bytes = token_bytes_with(convert).unwrap();
+        let bytes = token_bytes_with(convert);
 
         assert_eq!(bytes, b"<special>");
-        assert_eq!(calls, [(256, false), (256, true), (300, true)]);
+        assert_eq!(calls, [false, true]);
     }
 
     #[test]
-    fn token_piece_conversion_only_degrades_unknown_special_tokens() {
-        let bytes = token_bytes_with(|_, _| Err(llama_cpp_2::TokenToStringError::UnknownTokenType))
-            .unwrap();
-        assert!(bytes.is_empty());
-
-        let utf8_error = String::from_utf8(vec![0xff]).unwrap_err();
-        let error = token_bytes_with(|_, _| {
-            Err(llama_cpp_2::TokenToStringError::FromUtf8Error(
-                utf8_error.clone(),
-            ))
-        })
-        .unwrap_err();
-        assert!(matches!(error, Error::Generation(_)));
+    fn token_piece_conversion_preserves_empty_and_non_utf8_bytes() {
+        assert!(token_bytes_with(|_| Vec::new()).is_empty());
+        let bytes = token_bytes_with(|special| {
+            assert!(!special);
+            vec![0xff, 0]
+        });
+        assert_eq!(bytes, [0xff, 0]);
     }
 
     #[test]

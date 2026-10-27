@@ -2,8 +2,8 @@ use llama_cpp_2::context::params::{LlamaContextParams, LlamaPoolingType};
 use llama_cpp_2::context::session::{LlamaStateSeqFlags, SeqState};
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
+use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::token::LlamaToken;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
@@ -29,6 +29,7 @@ use crate::template::{
     EffectiveTemplate, common_chat_template_parts, effective_template,
     legacy_request_from_semantic, prepare_legacy_messages, tokenize_prompt,
 };
+use crate::tokenization::decode_piece;
 
 #[cfg(test)]
 use crate::slot::finite_nonnegative;
@@ -2019,7 +2020,7 @@ fn worker_main(
             return;
         }
     };
-    let projector = match &config.vision {
+    let mut projector = match &config.vision {
         Some(vision) => match Projector::load(
             &vision.mmproj,
             &model,
@@ -2095,7 +2096,7 @@ fn worker_main(
     match config.mode {
         RuntimeMode::Generation => generation_worker_loop(
             &model,
-            projector.as_ref(),
+            projector.as_mut(),
             &mut context,
             template
                 .as_ref()
@@ -2117,7 +2118,7 @@ fn worker_main(
 )]
 fn generation_worker_loop(
     model: &LlamaModel,
-    projector: Option<&Projector>,
+    mut projector: Option<&mut Projector>,
     context: &mut llama_cpp_2::context::LlamaContext<'_>,
     template: &EffectiveTemplate,
     config: &RuntimeConfig,
@@ -2140,7 +2141,7 @@ fn generation_worker_loop(
         let tick = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             generation_tick(
                 model,
-                projector,
+                projector.as_deref_mut(),
                 context,
                 template,
                 config,
@@ -2204,7 +2205,7 @@ enum TickResult {
 )]
 fn generation_tick(
     model: &LlamaModel,
-    projector: Option<&Projector>,
+    mut projector: Option<&mut Projector>,
     context: &mut llama_cpp_2::context::LlamaContext<'_>,
     template: &EffectiveTemplate,
     config: &RuntimeConfig,
@@ -2224,7 +2225,7 @@ fn generation_tick(
     finalize_draining_slots(context, slots)?;
     let media_prefilled = poll_generation_decisions(
         model,
-        projector,
+        projector.as_deref_mut(),
         context,
         template,
         config,
@@ -2246,7 +2247,14 @@ fn generation_tick(
         }
     }
     if let Some(command) = pending_command.take() {
-        match admit_generation_command(model, projector, template, config, slots, command) {
+        match admit_generation_command(
+            model,
+            projector.as_deref(),
+            template,
+            config,
+            slots,
+            command,
+        ) {
             Admission::Admitted => {}
             Admission::Blocked(command) => *pending_command = Some(command),
             Admission::Shutdown => return Ok(TickResult::Shutdown),
@@ -2490,7 +2498,7 @@ fn flush_active_content(slots: &mut [Slot]) {
 )]
 fn poll_generation_decisions(
     model: &LlamaModel,
-    projector: Option<&Projector>,
+    mut projector: Option<&mut Projector>,
     context: &mut llama_cpp_2::context::LlamaContext<'_>,
     template: &EffectiveTemplate,
     config: &RuntimeConfig,
@@ -2565,22 +2573,23 @@ fn poll_generation_decisions(
             });
             continue;
         }
-        let mut prepared = match prepare_generation(model, projector, template, config, &request) {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                if let Some(readiness) = reserved.lifecycle.readiness.take() {
-                    let _ = readiness.send(Err(error.clone()));
+        let mut prepared =
+            match prepare_generation(model, projector.as_deref(), template, config, &request) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    if let Some(readiness) = reserved.lifecycle.readiness.take() {
+                        let _ = readiness.send(Err(error.clone()));
+                    }
+                    slot.state = SlotState::Draining(DrainingSlot {
+                        lifecycle: reserved.lifecycle,
+                        pending_tokens: std::collections::VecDeque::new(),
+                        pending_content: None,
+                        pending_semantic: std::collections::VecDeque::new(),
+                        outcome: Err(error),
+                    });
+                    continue;
                 }
-                slot.state = SlotState::Draining(DrainingSlot {
-                    lifecycle: reserved.lifecycle,
-                    pending_tokens: std::collections::VecDeque::new(),
-                    pending_content: None,
-                    pending_semantic: std::collections::VecDeque::new(),
-                    outcome: Err(error),
-                });
-                continue;
-            }
-        };
+            };
         let tokens = &prepared.tokens;
         let prompt_tokens = prepared
             .media
@@ -2691,7 +2700,9 @@ fn poll_generation_decisions(
             predicted_wall: std::time::Duration::ZERO,
         };
         if let Some(media) = prepared.media {
-            let projector = projector.expect("media preparation requires configured projector");
+            let projector = projector
+                .as_deref_mut()
+                .expect("media preparation requires configured projector");
             if active.lifecycle.cancelled.load(Ordering::Acquire) {
                 slot.state =
                     SlotState::Draining(active.into_draining(Err(Error::Cancelled), false));
@@ -2894,7 +2905,7 @@ fn accept_sampled_token(
     token: LlamaToken,
     logprobs: Option<TokenLogprobs>,
 ) -> Result<Option<FinishReason>, Error> {
-    if model.is_eog_token(token) {
+    if model.vocab().is_eog(token) {
         return Ok(Some(FinishReason::Stop));
     }
     active.completion_tokens += 1;
@@ -2903,9 +2914,8 @@ fn accept_sampled_token(
         active.reasoning_tokens += 1;
     }
     let render_special = active.preserved_tokens.contains(&token);
-    let piece = model
-        .token_to_piece(token, &mut active.decoder, render_special, None)
-        .map_err(|error| Error::Generation(error.to_string()))?;
+    let bytes = model.vocab().token_to_piece(token, render_special, None);
+    let piece = decode_piece(&mut active.decoder, &bytes);
     let stopped = if let Some(logprobs) = logprobs {
         let (stopped, output) = active.stop_filter.push_token(piece, logprobs);
         active.pending_tokens.extend(output);
@@ -3336,10 +3346,9 @@ fn prepare_generation(
     let mut reasoning_control = None;
     let tokens = match &request.input {
         Input::Messages(messages) => prepare_messages(model, template, messages)?,
-        Input::Prompt(prompt) => tokenize_prompt(model, prompt)?,
+        Input::Prompt(prompt) => tokenize_prompt(model, prompt),
         Input::Semantic(semantic) => {
-            let (source, bos, eos, template_thinking) =
-                common_chat_template_parts(model, template)?;
+            let (source, bos, eos, template_thinking) = common_chat_template_parts(model, template);
             let mut reasoning = semantic.reasoning;
             let reasoning_enabled =
                 reasoning.enabled.unwrap_or(template_thinking) || reasoning.effort.is_some();
@@ -3375,9 +3384,7 @@ fn prepare_generation(
                 reasoning_control = Some(reasoning_control_for(model, &prepared.metadata)?);
             }
             for piece in &prepared.metadata.preserved_tokens {
-                let ids = model
-                    .str_to_token(piece, AddBos::Never)
-                    .map_err(|error| Error::Generation(error.to_string()))?;
+                let ids = model.vocab().tokenize(piece.as_bytes(), false, true);
                 if let [token] = ids.as_slice() {
                     preserved_tokens.push(*token);
                 }
@@ -3397,7 +3404,7 @@ fn prepare_generation(
                 })
                 .collect::<Vec<_>>();
             let tokens = if images.is_empty() {
-                tokenize_prompt(model, &prepared.metadata.prompt)?
+                tokenize_prompt(model, &prepared.metadata.prompt)
             } else {
                 let projector = projector.ok_or_else(|| Error::Unsupported {
                     field: "messages.content.image",
@@ -3477,21 +3484,23 @@ fn reasoning_control_for(
     }
     let tokenize = |value: &str| {
         model
-            .str_to_token(value, AddBos::Never)
-            .map(|tokens| tokens.into_iter().map(|token| token.0).collect::<Vec<_>>())
-            .map_err(|error| Error::Generation(error.to_string()))
+            .vocab()
+            .tokenize(value.as_bytes(), false, true)
+            .into_iter()
+            .map(|token| token.0)
+            .collect::<Vec<_>>()
     };
-    let start = tokenize(&metadata.thinking_start_tag)?;
+    let start = tokenize(&metadata.thinking_start_tag);
     let ends = metadata
         .thinking_end_tags
         .iter()
         .map(|tag| tokenize(tag))
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Vec<_>>();
     let forced = ends.first().cloned().ok_or_else(|| Error::Unsupported {
         field: "reasoning_control",
         detail: "selected template has no forceable reasoning end tag".to_string(),
     })?;
-    let prompt = tokenize(&metadata.generation_prompt)?;
+    let prompt = tokenize(&metadata.generation_prompt);
     ReasoningControl::new(&start, &ends, &forced, &prompt)
 }
 
@@ -3592,7 +3601,7 @@ fn prepare_semantic_count(
     config: &RuntimeConfig,
     request: &SemanticTokenCountRequest,
 ) -> Result<usize, Error> {
-    let (source, bos, eos, template_thinking) = common_chat_template_parts(model, template)?;
+    let (source, bos, eos, template_thinking) = common_chat_template_parts(model, template);
     let mut reasoning = request.reasoning;
     reasoning.enabled =
         Some(reasoning.enabled.unwrap_or(template_thinking) || reasoning.effort.is_some());
@@ -3617,7 +3626,7 @@ fn prepare_semantic_count(
         })
         .collect::<Vec<_>>();
     if images.is_empty() {
-        return tokenize_prompt(model, &prepared.metadata.prompt).map(|tokens| tokens.len());
+        return Ok(tokenize_prompt(model, &prepared.metadata.prompt).len());
     }
     let projector = projector.ok_or_else(|| Error::Unsupported {
         field: "messages.content.image",
@@ -3686,9 +3695,7 @@ fn run_embeddings(
             return Err(Error::Cancelled);
         }
         let tokens = match input {
-            EmbeddingInput::Text(text) => model
-                .str_to_token(text, AddBos::Always)
-                .map_err(|error| Error::Embedding(error.to_string()))?,
+            EmbeddingInput::Text(text) => model.vocab().tokenize(text.as_bytes(), true, true),
             EmbeddingInput::Tokens(tokens) => {
                 validate_embedding_token_ids(tokens, vocabulary_size)?
             }

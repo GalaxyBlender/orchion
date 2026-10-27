@@ -3,10 +3,7 @@ use orchion_audio::{
     decode_audio_bytes, decode_pcm_s16le_bytes, encode_tts_audio,
 };
 use orchion_core::{ASR_SAMPLE_RATE, OrchionError, TtsAudio};
-use std::fs;
 use std::io::{Cursor, Write};
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 #[cfg(unix)]
@@ -304,7 +301,7 @@ async fn streaming_decoder_decodes_regular_m4a_file_chunks_to_asr_pcm() {
 #[tokio::test]
 #[cfg(unix)]
 async fn streaming_decoder_rejects_non_empty_input_with_empty_ffmpeg_output() {
-    let fake_ffmpeg = fake_successful_ffmpeg_without_output();
+    let fake_ffmpeg = ffmpeg_fixture("ffmpeg-empty.sh");
     let mut decoder = StreamingAudioDecoder::new_for_asr_with_binary(
         AudioInputFormat::M4a,
         None,
@@ -315,7 +312,6 @@ async fn streaming_decoder_rejects_non_empty_input_with_empty_ffmpeg_output() {
 
     decoder.push(b"not empty").await.unwrap();
     let error = decoder.finish().await.unwrap_err();
-    fs::remove_file(fake_ffmpeg).unwrap();
 
     assert!(
         matches!(error, OrchionError::InvalidAudio { reason } if reason.contains("empty sample buffer"))
@@ -325,7 +321,7 @@ async fn streaming_decoder_rejects_non_empty_input_with_empty_ffmpeg_output() {
 #[tokio::test(flavor = "current_thread")]
 #[cfg(unix)]
 async fn streaming_decoder_push_yields_when_ffmpeg_stops_reading() {
-    let fake_ffmpeg = fake_ffmpeg_with_stalled_stdin();
+    let fake_ffmpeg = ffmpeg_fixture("ffmpeg-stalled.sh");
     let mut decoder = StreamingAudioDecoder::new_for_asr_with_binary(
         AudioInputFormat::M4a,
         None,
@@ -344,13 +340,12 @@ async fn streaming_decoder_push_yields_when_ffmpeg_stops_reading() {
         "push blocked the Tokio runtime instead of yielding"
     );
     drop(decoder);
-    fs::remove_file(fake_ffmpeg).unwrap();
 }
 
 #[tokio::test]
 #[cfg(unix)]
 async fn streaming_decoder_rejects_ffmpeg_output_before_it_exceeds_sample_limit() {
-    let fake_ffmpeg = fake_ffmpeg_with_expanding_output();
+    let fake_ffmpeg = ffmpeg_fixture("ffmpeg-expanding.sh");
     let mut decoder = StreamingAudioDecoder::new_for_asr_with_binary_and_max_samples(
         AudioInputFormat::M4a,
         None,
@@ -365,7 +360,6 @@ async fn streaming_decoder_rejects_ffmpeg_output_before_it_exceeds_sample_limit(
         .await
         .expect("bounded decoder should reject expanding output without blocking")
         .unwrap_err();
-    fs::remove_file(fake_ffmpeg).unwrap();
 
     assert!(matches!(
         error,
@@ -522,59 +516,9 @@ fn encode_regular_m4a_file_for_test(audio: &TtsAudio) -> Vec<u8> {
 }
 
 #[cfg(unix)]
-fn fake_successful_ffmpeg_without_output() -> PathBuf {
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "orchion-fake-ffmpeg-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    fs::write(&path, "#!/bin/sh\ncat >/dev/null\nexit 0\n").unwrap();
-    let mut permissions = fs::metadata(&path).unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&path, permissions).unwrap();
-    path
-}
-
-#[cfg(unix)]
-fn fake_ffmpeg_with_stalled_stdin() -> PathBuf {
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "orchion-stalled-ffmpeg-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    fs::write(&path, "#!/bin/sh\nsleep 2\nexit 0\n").unwrap();
-    let mut permissions = fs::metadata(&path).unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&path, permissions).unwrap();
-    path
-}
-
-#[cfg(unix)]
-fn fake_ffmpeg_with_expanding_output() -> PathBuf {
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "orchion-expanding-ffmpeg-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    fs::write(
-        &path,
-        "#!/bin/sh\ndd bs=1 count=1 of=/dev/null 2>/dev/null\ndd if=/dev/zero bs=4096 count=4 2>/dev/null\ncat >/dev/null\n",
-    )
-    .unwrap();
-    let mut permissions = fs::metadata(&path).unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&path, permissions).unwrap();
-    path
+fn ffmpeg_fixture(name: &str) -> PathBuf {
+    // These scripts must be closed before parallel tests start spawning processes.
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
 }

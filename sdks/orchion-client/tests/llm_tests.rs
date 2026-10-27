@@ -666,7 +666,7 @@ async fn chat_stream_forces_options_decodes_chunks_usage_and_done() {
     let Some(ChatCompletionEvent::Chunk(usage)) = stream.next_event().await.unwrap() else {
         panic!("missing usage chunk");
     };
-    assert!(usage.choices.is_empty());
+    assert_eq!(usage.choices.len(), 0);
     assert_eq!(usage.usage.unwrap().total_tokens, 3);
     assert_eq!(usage.timings.unwrap().predicted_n, 1);
     assert!(stream.next_event().await.unwrap().is_none());

@@ -9,11 +9,32 @@ use std::sync::{Arc, Mutex};
 pub struct Asr {
     model: AsrModel,
     engine: Arc<Mutex<qwen3_asr::AsrInference>>,
+    #[cfg(feature = "cuda")]
+    device: candle_core::Device,
 }
 
 pub struct AsrStream {
     engine: Arc<Mutex<qwen3_asr::AsrInference>>,
-    state: Arc<Mutex<qwen3_asr::StreamingState>>,
+    state: Arc<Mutex<AsrStreamingState>>,
+}
+
+struct AsrStreamingState {
+    state: qwen3_asr::StreamingState,
+    #[cfg(feature = "cuda")]
+    device: candle_core::Device,
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for AsrStreamingState {
+    fn drop(&mut self) {
+        // cudarc 0.17's default-stream buffers require a current context on free.
+        // Async completion or cancellation can drop the encoder cache on any thread.
+        if let candle_core::Device::Cuda(device) = &self.device
+            && let Err(error) = device.cuda_stream().context().bind_to_thread()
+        {
+            tracing::error!(%error, "failed to bind CUDA context before dropping ASR stream state");
+        }
+    }
 }
 
 impl Asr {
@@ -37,8 +58,9 @@ impl Asr {
                 "ASR device selected"
             );
             tracing::debug!(device_debug, "ASR device details selected");
+            let device = resolved.device;
             let engine =
-                qwen3_asr::AsrInference::load(&model_dir, resolved.device).map_err(|source| {
+                qwen3_asr::AsrInference::load(&model_dir, device.clone()).map_err(|source| {
                     OrchionError::ModelLoad {
                         message: source.to_string(),
                     }
@@ -46,6 +68,8 @@ impl Asr {
             Ok(Self {
                 model,
                 engine: Arc::new(Mutex::new(engine)),
+                #[cfg(feature = "cuda")]
+                device,
             })
         })
         .await
@@ -122,6 +146,8 @@ impl Asr {
     pub async fn start_streaming_with(&self, options: AsrStreamingOptions) -> Result<AsrStream> {
         validate_streaming_options(&options)?;
         let upstream_options = streaming_options_into_upstream_options(options);
+        #[cfg(feature = "cuda")]
+        let device = self.device.clone();
         let engine = Arc::clone(&self.engine);
         let state = crate::blocking::run({
             let engine = Arc::clone(&engine);
@@ -129,7 +155,11 @@ impl Asr {
                 let engine = engine.lock().map_err(|error| OrchionError::Inference {
                     message: error.to_string(),
                 })?;
-                Ok(engine.init_streaming(upstream_options))
+                Ok(AsrStreamingState {
+                    state: engine.init_streaming(upstream_options),
+                    #[cfg(feature = "cuda")]
+                    device,
+                })
             }
         })
         .await?;
@@ -157,7 +187,7 @@ impl AsrStream {
                 message: error.to_string(),
             })?;
             let transcript = engine
-                .feed_audio(&mut state, &prepared)
+                .feed_audio(&mut state.state, &prepared)
                 .map_err(|source| OrchionError::Inference {
                     message: source.to_string(),
                 })?
@@ -178,7 +208,7 @@ impl AsrStream {
                 message: error.to_string(),
             })?;
             engine
-                .finish_streaming(&mut state)
+                .finish_streaming(&mut state.state)
                 .map(transcript_from_upstream)
                 .map_err(|source| OrchionError::Inference {
                     message: source.to_string(),
@@ -190,10 +220,21 @@ impl AsrStream {
 
 fn transcript_from_upstream(result: qwen3_asr::TranscribeResult) -> AsrTranscript {
     AsrTranscript {
-        text: result.text,
+        text: transcript_text(result.text, &result.language),
         language: result.language,
         raw_output: result.raw_output,
         segments: Vec::new(),
+    }
+}
+
+fn transcript_text(text: String, language: &str) -> String {
+    // Upstream skips separator parsing for forced languages; retain raw_output separately.
+    if language == "forced"
+        && let Some(content) = text.strip_prefix("<asr_text>")
+    {
+        content.trim_start().to_string()
+    } else {
+        text
     }
 }
 
@@ -246,6 +287,24 @@ fn streaming_options_into_upstream_options(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forced_language_transcript_excludes_model_separator() {
+        for (text, expected) in [
+            ("<asr_text>Hello world.", "Hello world."),
+            ("<asr_text> 你好。", "你好。"),
+            ("<asr_text>", ""),
+            ("Hello world.", "Hello world."),
+        ] {
+            assert_eq!(transcript_text(text.to_string(), "forced"), expected);
+        }
+    }
+
+    #[test]
+    fn auto_detected_transcript_preserves_decoded_text() {
+        let text = "Hello <asr_text> world.";
+        assert_eq!(transcript_text(text.to_string(), "English"), text);
+    }
 
     fn assert_f32_close(actual: f32, expected: f32) {
         assert!(
@@ -329,5 +388,57 @@ mod tests {
             orchion_core::DevicePreference::Cpu,
         );
         std::mem::drop(future);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires CUDA, ORCHION_TEST_ASR_DIR, and ORCHION_TEST_ASR_PCM"]
+    fn cuda_streaming_sessions_can_finish_on_the_async_caller_thread() {
+        let model_dir = std::env::var("ORCHION_TEST_ASR_DIR").unwrap();
+        let audio = std::fs::read(std::env::var("ORCHION_TEST_ASR_PCM").unwrap()).unwrap();
+        assert_eq!(audio.len() % 2, 0);
+        let samples = audio
+            .chunks_exact(2)
+            .map(|bytes| f32::from(i16::from_le_bytes([bytes[0], bytes[1]])) / 32768.0)
+            .collect::<Vec<_>>();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let asr = Asr::load_with_device(
+                AsrModel::parse("alibaba/qwen3-asr-0.6b").unwrap(),
+                model_dir,
+                DevicePreference::Cuda(Some(0)),
+            )
+            .await
+            .unwrap();
+            for session in 0..3 {
+                let mut stream = asr
+                    .start_streaming_with(AsrStreamingOptions {
+                        language: Some("english".to_string()),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                if session == 1 {
+                    stream
+                        .feed(&samples[..32000], ASR_SAMPLE_RATE)
+                        .await
+                        .unwrap();
+                    drop(stream);
+                    continue;
+                }
+                for (chunk_index, chunk) in samples.chunks(32000).enumerate() {
+                    stream
+                        .feed(chunk, ASR_SAMPLE_RATE)
+                        .await
+                        .unwrap_or_else(|error| {
+                            panic!("session {session} chunk {chunk_index}: {error}")
+                        });
+                }
+                let transcript = stream.finish().await.unwrap();
+                assert!(transcript.text.to_lowercase().contains("mankind"));
+            }
+        });
     }
 }

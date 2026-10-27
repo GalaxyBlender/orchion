@@ -122,15 +122,15 @@ impl Projector {
     }
 
     pub(crate) fn eval(
-        &self,
+        &mut self,
         prepared: &PreparedMedia,
-        context: &LlamaContext<'_>,
+        context: &mut LlamaContext<'_>,
         sequence: i32,
         batch: i32,
     ) -> Result<i32, Error> {
         prepared
             .chunks
-            .eval_chunks(&self.context, context, 0, sequence, batch, true)
+            .eval_chunks(&mut self.context, context, 0, sequence, batch, true)
             .map_err(|error| Error::Generation(format!("multimodal prefill failed: {error}")))
     }
 }

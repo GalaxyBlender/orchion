@@ -12,7 +12,7 @@ default = ["health", "models", "activity", "llm", "asr", "tts", "ocr", "pdf"]
 health = []
 models = []
 activity = ["dep:eventsource-stream", "dep:futures-util", "reqwest/query", "reqwest/stream"]
-llm = ["dep:eventsource-stream", "dep:futures-util", "reqwest/stream"]
+llm = ["dep:eventsource-stream", "dep:futures-util", "reqwest/query", "reqwest/stream"]
 asr = ["dep:futures-util", "dep:tokio-tungstenite", "tokio/net"]
 tts = []
 ocr = []
@@ -33,7 +33,7 @@ eventsource-stream = { version = "0.2.3", optional = true }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"], optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "test-util", "time"] }
 wiremock = "0.6"
 
 [lints.rust]

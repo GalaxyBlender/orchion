@@ -1,8 +1,8 @@
 #include "common_chat_bridge.h"
 
 #include "common/chat.h"
+#include "common/json.h"
 #include "common/reasoning-budget.h"
-#include "nlohmann/json.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -12,8 +12,6 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
-
-using ordered_json = nlohmann::ordered_json;
 
 struct orchion_common_chat_prepared {
     common_chat_templates_ptr templates;
@@ -78,10 +76,10 @@ void write_error(orchion_common_chat_buffer * error, const char * message) noexc
     }
 }
 
-ordered_json prepare_result_json(const common_chat_params & params,
-                                 const common_chat_templates * templates,
-                                 const common_chat_parser_params & parser) {
-    ordered_json triggers = ordered_json::array();
+common_json prepare_result_json(const common_chat_params & params,
+                                const common_chat_templates * templates,
+                                const common_chat_parser_params & parser) {
+    common_json triggers = common_json::array();
     for (const auto & trigger : params.grammar_triggers) {
         triggers.push_back({
             {"type", static_cast<int>(trigger.type)},
@@ -131,7 +129,7 @@ extern "C" int32_t orchion_common_chat_prepare(
         if (prepared == nullptr) {
             throw std::invalid_argument("prepared output pointer is null");
         }
-        auto request = ordered_json::parse(read_bytes(request_json, request_len, "request JSON"));
+        auto request = common_json::parse(read_bytes(request_json, request_len, "request JSON"));
         auto templates = common_chat_templates_init(
             nullptr,
             read_bytes(template_data, template_len, "template"),
@@ -143,7 +141,7 @@ extern "C" int32_t orchion_common_chat_prepare(
 
         common_chat_templates_inputs inputs;
         inputs.messages = common_chat_msgs_parse_oaicompat(request.at("messages"));
-        inputs.tools = common_chat_tools_parse_oaicompat(request.value("tools", ordered_json::array()));
+        inputs.tools = common_chat_tools_parse_oaicompat(request.value("tools", common_json::array()));
         inputs.tool_choice = common_chat_tool_choice_parse_oaicompat(request.value("tool_choice", "none"));
         inputs.parallel_tool_calls = request.value("parallel_tool_calls", false);
         inputs.reasoning_format = common_reasoning_format_from_name(request.value("reasoning_format", "none"));
