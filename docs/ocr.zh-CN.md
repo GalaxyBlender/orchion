@@ -38,6 +38,12 @@ curl -X POST http://127.0.0.1:9090/v1/ocr \
 
 `layout_model` 属于 deployment 配置，不是请求参数。multipart 请求若仍发送 `layout_model` 字段，服务端会以 `unsupported_ocr_parameter` 拒绝。
 
+## CUDA 显存策略
+
+所有 CUDA ONNX 会话采用统一的运行时策略：关闭 memory pattern，并在每次推理后收缩可释放的闲置内存池区域。该策略覆盖传统 OCR、文档结构模型及 OCR-VL 的版面检测。CPU 和 WebGPU 策略不变；Candle OCR-VL 主模型独立管理自身缓存。
+
+重复请求、任务/格式切换和混合图片尺寸的验证方法见[真实模型显存回归测试](ocr-memory-testing.md)。
+
 ## JSON 文字区域
 
 JSON 响应包含 `regions`，提供识别文字和多边形坐标。未使用 layout 的传统 OCR 返回行级文字区域；传统 OCR 和 OCR-VL 的 layout 流水线则为有非空白文字的版面元素返回块级区域，保留原始文字和元素顺序。这些区域的 `confidence` 为 `null`，因为版面检测得分不是文字识别置信度。

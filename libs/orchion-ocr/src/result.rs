@@ -1013,7 +1013,39 @@ fn ort_session_config(policy: ProviderPolicy) -> oar_ocr::core::config::OrtSessi
         }
     };
 
-    OrtSessionConfig::new().with_execution_providers(vec![provider])
+    let config = OrtSessionConfig::new().with_execution_providers(vec![provider]);
+    if matches!(policy, ProviderPolicy::OrtCuda(_)) {
+        // All CUDA OCR sessions share this policy, including structure models and
+        // OCR-VL layout detection. A cached memory pattern can require a new large
+        // contiguous allocation on the second run; separate session arenas cannot
+        // reuse each other's idle memory. Avoid that allocation and release idle
+        // arena regions after each run instead of retaining every model's peak.
+        config.with_memory_pattern(false).with_arena_shrinkage(true)
+    } else {
+        config
+    }
+}
+
+#[cfg(all(test, any(feature = "ocr", feature = "ocr-vl")))]
+mod session_memory_tests {
+    use super::*;
+
+    #[test]
+    fn cuda_sessions_do_not_preallocate_patterns_or_retain_idle_arenas() {
+        for index in [None, Some(0), Some(2)] {
+            let config = ort_session_config(ProviderPolicy::OrtCuda(index));
+            assert_eq!(config.enable_mem_pattern, Some(false));
+            assert_eq!(config.arena_shrinkage, Some(true));
+        }
+    }
+
+    #[test]
+    fn non_cuda_sessions_do_not_request_cuda_arena_shrinkage() {
+        for provider in [ProviderPolicy::OrtCpu, ProviderPolicy::OrtWebGpu] {
+            let config = ort_session_config(provider);
+            assert_ne!(config.arena_shrinkage, Some(true));
+        }
+    }
 }
 
 #[cfg(any(feature = "ocr", feature = "ocr-vl"))]

@@ -38,6 +38,16 @@ Useful fields:
 
 `layout_model` is deployment configuration, not a request parameter. Requests that send a multipart `layout_model` field are rejected with `unsupported_ocr_parameter`.
 
+## CUDA memory policy
+
+CUDA ONNX sessions use a shared runtime policy: memory patterns are disabled and
+idle arena regions are eligible for release after each inference. This covers
+traditional OCR, document structure models, and OCR-VL layout detection. CPU and
+WebGPU policies are unchanged; the Candle OCR-VL model manages its own caches.
+
+See [real-model memory regression tests](ocr-memory-testing.md) for repeated
+requests, task/format switching, and mixed image sizes.
+
 ## JSON regions
 
 JSON responses include `regions` with recognized text and polygon coordinates. Traditional OCR without layout returns text-line regions. The traditional OCR and OCR-VL layout pipelines return block-level regions for layout elements with non-blank text, preserving the original text and element order. Their region `confidence` is `null` because layout detection scores are not text recognition confidence scores.
