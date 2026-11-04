@@ -4,7 +4,7 @@
 
 Orchion exposes traditional OCR and OCR-VL through `POST /v1/ocr` with `multipart/form-data`.
 
-Server `default_model` selects one `[[services.ocr.models]]` or `[[services.ocr-vl.models]]` deployment for startup provisioning. Each deployment may configure its own `layout_model` artifact. Requests select only the primary deployment with `model`; the server loads and uses that deployment's layout asset automatically.
+Startup provisions every `[[services.ocr.models]]` and `[[services.ocr-vl.models]]` deployment in enabled services, including their configured dependencies, regardless of `default_model`. Each deployment may configure its own `layout_model` artifact. Requests select only the primary deployment with `model`; the server loads and uses that deployment's layout asset automatically.
 
 ## Traditional OCR
 

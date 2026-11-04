@@ -938,9 +938,11 @@ mod tests {
             *factory.layouts.lock().unwrap(),
             vec![None, Some(layout_id)]
         );
+        let mut provisioned = provisioner.models.lock().unwrap().clone();
+        provisioned.sort();
         assert_eq!(
-            *provisioner.models.lock().unwrap(),
-            vec!["PaddlePaddle/PP-OCRv6_tiny", "PaddlePaddle/PP-DocLayoutV3"]
+            provisioned,
+            vec!["PaddlePaddle/PP-DocLayoutV3", "PaddlePaddle/PP-OCRv6_tiny"]
         );
         state.shutdown().await;
     }
@@ -3310,83 +3312,84 @@ impl AppState {
 
     #[allow(
         clippy::too_many_lines,
-        reason = "provisions each service default and its deployment-owned OCR auxiliaries"
+        reason = "provisions every enabled deployment and its model dependencies before serving"
     )]
     async fn ensure_startup_models(self: &Arc<Self>) -> anyhow::Result<ProvisionedModelCounts> {
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_MODEL_PROVISIONS));
         let mut tasks = JoinSet::new();
 
         if self.config.services.asr.enabled {
-            spawn_model_provision(
-                &mut tasks,
-                Arc::clone(&semaphore),
-                self.asr_models.clone(),
-                self.config.services.asr.default_model.clone(),
-                ProvisionedModelKind::Asr,
-                "provision default ASR model",
-            );
+            for model in self.config.services.asr.runtime_models() {
+                spawn_model_provision(
+                    &mut tasks,
+                    Arc::clone(&semaphore),
+                    self.asr_models.clone(),
+                    model,
+                    ProvisionedModelKind::Asr,
+                    "provision ASR model",
+                );
+            }
         }
         if self.config.services.tts.enabled {
-            spawn_model_provision(
-                &mut tasks,
-                Arc::clone(&semaphore),
-                self.tts_models.clone(),
-                self.config.services.tts.default_model.clone(),
-                ProvisionedModelKind::Tts,
-                "provision default TTS model",
-            );
-        }
-        if self.config.services.ocr.active()
-            && let Some(model) = &self.config.services.ocr.default_model
-            && !self
-                .ocr_deployment_plans
-                .keys()
-                .any(|key| key.primary.id() == model)
-        {
-            spawn_model_provision(
-                &mut tasks,
-                Arc::clone(&semaphore),
-                self.ocr_assets.clone(),
-                OcrModel::new(model.clone(), OcrModelKind::TraditionalOcr),
-                ProvisionedModelKind::Ocr,
-                "provision default OCR model",
-            );
-        }
-        if self.config.services.ocr_vl.active()
-            && let Some(model) = &self.config.services.ocr_vl.default_model
-        {
-            spawn_model_provision(
-                &mut tasks,
-                Arc::clone(&semaphore),
-                self.ocr_assets.clone(),
-                OcrModel::new(model.clone(), OcrModelKind::OcrVl),
-                ProvisionedModelKind::OcrVl,
-                "provision default OCR-VL model",
-            );
+            for model in self.config.services.tts.runtime_models() {
+                spawn_model_provision(
+                    &mut tasks,
+                    Arc::clone(&semaphore),
+                    self.tts_models.clone(),
+                    model,
+                    ProvisionedModelKind::Tts,
+                    "provision TTS model",
+                );
+            }
         }
 
         let mut required_layouts = HashSet::new();
-        if self.config.services.ocr.active()
-            && let Some(deployment_id) = &self.config.services.ocr.default_model
-            && !self
-                .ocr_deployment_plans
-                .keys()
-                .any(|key| key.primary.id() == deployment_id)
-            && let Some(model) = self.config.services.ocr.default_layout_runtime()
-        {
-            required_layouts.insert(DeploymentLayoutModel::new(
-                deployment_id.clone(),
-                model.clone(),
-            ));
+        for (active, deployments, kind, context) in [
+            (
+                self.config.services.ocr.active(),
+                &self.config.services.ocr.models,
+                ProvisionedModelKind::Ocr,
+                "provision OCR model",
+            ),
+            (
+                self.config.services.ocr_vl.active(),
+                &self.config.services.ocr_vl.models,
+                ProvisionedModelKind::OcrVl,
+                "provision OCR-VL model",
+            ),
+        ] {
+            if !active {
+                continue;
+            }
+            for deployment in deployments {
+                // Table deployments publish their primary and auxiliary artifacts together below.
+                if deployment.table_structure.is_some() {
+                    continue;
+                }
+                spawn_model_provision(
+                    &mut tasks,
+                    Arc::clone(&semaphore),
+                    self.ocr_assets.clone(),
+                    deployment.runtime.clone(),
+                    kind,
+                    context,
+                );
+                if let Some(model) = &deployment.layout_runtime {
+                    required_layouts.insert(DeploymentLayoutModel::new(
+                        deployment.id.clone(),
+                        model.clone(),
+                    ));
+                }
+            }
         }
-        if self.config.services.ocr_vl.active()
-            && let Some(deployment_id) = &self.config.services.ocr_vl.default_model
-            && let Some(model) = self.config.services.ocr_vl.default_layout_runtime()
-        {
-            required_layouts.insert(DeploymentLayoutModel::new(
-                deployment_id.clone(),
-                model.clone(),
-            ));
+        // Primary caches establish each deployment's provider before a shared dependency can
+        // commit its own cached provider. Do not let task scheduling reverse that dependency.
+        let mut counts = ProvisionedModelCounts::default();
+        while let Some(result) = tasks.join_next().await {
+            counts
+                .record(result.map_err(|error| {
+                    anyhow::anyhow!("model provision task failed: {error:#}")
+                })??);
         }
         for layout in required_layouts {
             spawn_model_provision(
@@ -3395,53 +3398,41 @@ impl AppState {
                 self.layout_models.clone(),
                 layout,
                 ProvisionedModelKind::Layout,
-                "provision default OCR layout model",
+                "provision OCR layout model",
             );
         }
 
-        let mut counts = ProvisionedModelCounts::default();
         while let Some(result) = tasks.join_next().await {
             counts
                 .record(result.map_err(|error| {
                     anyhow::anyhow!("model provision task failed: {error:#}")
                 })??);
         }
-        if let (Some(default), Some(provisioner)) = (
-            self.config.services.ocr.default_model.as_ref(),
-            self.ocr_deployment_provisioner.as_ref(),
-        ) && let Some((key, plan)) = self
-            .ocr_deployment_plans
-            .iter()
-            .find(|(key, _)| key.primary.id() == default)
-        {
-            provisioner
-                .provision_deployment(
-                    key.primary.clone(),
-                    plan.clone(),
-                    self.config.models.dir.clone(),
-                )
-                .await
-                .context("provision default OCR deployment")?;
-            counts.ocr += 1;
+        if let Some(provisioner) = &self.ocr_deployment_provisioner {
+            for (key, plan) in &self.ocr_deployment_plans {
+                provisioner
+                    .provision_deployment(
+                        key.primary.clone(),
+                        plan.clone(),
+                        self.config.models.dir.clone(),
+                    )
+                    .await
+                    .with_context(|| format!("provision OCR deployment `{}`", key.primary))?;
+                counts.ocr += 1;
+            }
         }
-        if let (Some(default), Some(provisioner)) = (
-            self.config.services.llm.default_model.as_ref(),
-            self.llm_deployment_provisioner.as_ref(),
-        ) && self.config.services.llm.active()
-            && let Some((model, plan)) = self
-                .llm_deployment_plans
-                .iter()
-                .find(|(model, _)| model.id() == default)
-        {
-            provisioner
-                .provision_llm_deployment(
-                    model.id().clone(),
-                    plan.clone(),
-                    self.config.models.dir.clone(),
-                )
-                .await
-                .context("provision default LLM deployment")?;
-            counts.llm += 1;
+        if let Some(provisioner) = &self.llm_deployment_provisioner {
+            for (model, plan) in &self.llm_deployment_plans {
+                provisioner
+                    .provision_llm_deployment(
+                        model.id().clone(),
+                        plan.clone(),
+                        self.config.models.dir.clone(),
+                    )
+                    .await
+                    .with_context(|| format!("provision LLM deployment `{}`", model.id()))?;
+                counts.llm += 1;
+            }
         }
         Ok(counts)
     }

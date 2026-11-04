@@ -35,6 +35,7 @@ const DEPLOYMENT_MANIFEST_SCHEMA_VERSION: u64 = 2;
 const MODELS_LOCK_FILE: &str = "orchion-models.lock";
 const MODELS_LOCK_SCHEMA_VERSION: u64 = 1;
 const CACHE_STATE_DIR: &str = ".orchion";
+const PROVIDER_CACHE_DIR: &str = "providers";
 const DOWNLOAD_STAGING_DIR: &str = "staging";
 const MODEL_LOCK_DIR: &str = "locks";
 const PUBLICATION_LOCK_FILE: &str = "publish.lock";
@@ -1004,43 +1005,60 @@ impl ModelDownloader {
         };
         let downloader = self.for_model_url_source(model_url.source(), Some(source));
         let assets = model_hub_assets(&model);
-        let deployment_root = deployment_cache_root(cache_dir);
-        let expected = expected_remote_model_path(&model, model_url, &effective_intent, cache_dir)?;
-        let cached = if let Some(path) = model_url.path() {
-            if assets.len() != 1 || assets[0].repo != repository || assets[0].file != path {
-                return Err(incompatible_model_url(
-                    &model,
-                    model_url,
-                    "exact file locator does not match the runtime recipe's sole required asset",
-                ));
+        for (relative, _) in model_url_cache_prefixes(model_url, &[source]) {
+            let root = cache_dir.join(&relative);
+            if !relative.as_os_str().is_empty() {
+                validate_cache_relative_ancestors(cache_dir, &relative, true)
+                    .await
+                    .map_err(|error| prepared_cache_error(&model, error.to_string()))?;
+                if !path_exists(&root)
+                    .await
+                    .map_err(|error| prepared_cache_error(&model, error.to_string()))?
+                {
+                    continue;
+                }
             }
-            downloader
-                .reuse_cached_model(model, &deployment_root, source)
-                .await?
-        } else if !assets.is_empty() {
-            if repository != model.huggingface_repo() {
-                return Err(incompatible_model_url(
-                    &model,
-                    model_url,
-                    "repository locator cannot replace a multi-repository runtime recipe",
-                ));
+            let expected = expected_remote_model_path(&model, model_url, &effective_intent, &root)?;
+            let cached = if let Some(path) = model_url.path() {
+                if assets.len() != 1 || assets[0].repo != repository || assets[0].file != path {
+                    return Err(incompatible_model_url(
+                        &model,
+                        model_url,
+                        "exact file locator does not match the runtime recipe's sole required asset",
+                    ));
+                }
+                downloader
+                    .reuse_cached_model(model.clone(), &root, source)
+                    .await?
+            } else if !assets.is_empty() {
+                if repository != model.huggingface_repo() {
+                    return Err(incompatible_model_url(
+                        &model,
+                        model_url,
+                        "repository locator cannot replace a multi-repository runtime recipe",
+                    ));
+                }
+                downloader
+                    .reuse_cached_model(model.clone(), &root, source)
+                    .await?
+            } else {
+                downloader
+                    .reuse_cached_model(
+                        LocatedRepositoryModel {
+                            model: model.clone(),
+                            repository: repository.clone(),
+                        },
+                        &root,
+                        source,
+                    )
+                    .await?
+            };
+            if let Some(path) = cached {
+                debug_assert_eq!(path, expected);
+                return Ok(Some(path));
             }
-            downloader
-                .reuse_cached_model(model, &deployment_root, source)
-                .await?
-        } else {
-            downloader
-                .reuse_cached_model(
-                    LocatedRepositoryModel { model, repository },
-                    &deployment_root,
-                    source,
-                )
-                .await?
-        };
-        if let Some(path) = cached.as_ref() {
-            debug_assert_eq!(path, &expected);
         }
-        Ok(cached)
+        Ok(None)
     }
 
     #[allow(
@@ -1570,8 +1588,9 @@ impl ModelDownloader {
 
     /// Resolves the package path used by prepared and networked provisioning.
     ///
-    /// Local locators are validated and returned directly. Remote paths are deterministic and do
-    /// not require the package to exist yet.
+    /// Local locators are validated and returned directly. Repository locators use their stable
+    /// package path. Exact-file locators resolve an existing provider-scoped or legacy package;
+    /// when none exists, provisioning selects the provider-specific destination.
     ///
     /// # Errors
     ///
@@ -1586,6 +1605,30 @@ impl ModelDownloader {
         if model_url.source() == ModelUrlSource::File {
             validate_local_model_path(model, model_url).await
         } else {
+            if model_url.path().is_some() {
+                let sources = locator_cache_sources(model_url);
+                for (relative, allowed_sources) in model_url_cache_prefixes(model_url, &sources) {
+                    if !relative.as_os_str().is_empty() {
+                        validate_cache_relative_ancestors(cache_dir.as_ref(), &relative, true)
+                            .await
+                            .map_err(|error| prepared_cache_error(model, error.to_string()))?;
+                    }
+                    let root = cache_dir.as_ref().join(relative);
+                    let path = expected_remote_model_path(model, model_url, source_intent, &root)?;
+                    let manifest = match tokio::fs::read(path.join(READY_MANIFEST_FILE)).await {
+                        Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes).ok(),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(error) => return Err(prepared_cache_error(model, error.to_string())),
+                    };
+                    if manifest.is_some_and(|manifest| {
+                        allowed_sources.iter().any(|source| {
+                            manifest["source"].as_str() == Some(download_source_label(*source))
+                        })
+                    }) {
+                        return Ok(path);
+                    }
+                }
+            }
             expected_remote_model_path(model, model_url, source_intent, cache_dir.as_ref())
         }
     }
@@ -1609,32 +1652,22 @@ impl ModelDownloader {
         if model_url.source() == ModelUrlSource::File {
             validate_local_model_path_sync(model, model_url)
         } else {
-            let path =
-                expected_remote_model_path(model, model_url, source_intent, cache_dir.as_ref())?;
-            let allowed_sources = match model_url.source() {
-                ModelUrlSource::HuggingFace => vec![DownloadSource::HuggingFace],
-                ModelUrlSource::ModelScope => vec![DownloadSource::ModelScope],
-                ModelUrlSource::Neutral => {
-                    vec![DownloadSource::HuggingFace, DownloadSource::ModelScope]
-                }
-                ModelUrlSource::File => unreachable!(),
-            };
+            let allowed_sources = locator_cache_sources(model_url);
             let artifacts = Self::model_artifact_plan(model, model_url)?;
-            validate_prepared_ready_cache(
+            resolve_prepared_remote_model_path(
                 model,
                 model_url,
+                source_intent,
                 cache_dir.as_ref(),
-                &path,
                 &allowed_sources,
                 Some(&artifacts),
-            )?;
-            Ok(path)
+            )
         }
     }
 
     /// Resolves a prepared path under a deployment provider policy.
     ///
-    /// The locator-derived cache path is checked for each provider candidate in policy order.
+    /// Provider-scoped packages and the legacy cache are checked under the configured policy.
     ///
     /// # Errors
     ///
@@ -1661,16 +1694,14 @@ impl ModelDownloader {
                 message: "neutral deployment has no provider candidates".to_string(),
             });
         }
-        let path = expected_remote_model_path(model, model_url, source_intent, cache_dir.as_ref())?;
-        validate_prepared_ready_cache(
+        resolve_prepared_remote_model_path(
             model,
             model_url,
+            source_intent,
             cache_dir.as_ref(),
-            &path,
             &plan.candidates,
             Some(&plan.artifacts),
-        )?;
-        Ok(path)
+        )
     }
 
     #[cfg(test)]
@@ -1785,9 +1816,20 @@ impl ModelDownloader {
         );
         let downloader = self.for_model_url_source(model_url.source(), source_override);
         let assets = model_hub_assets(&model);
-        let deployment_root = deployment_cache_root(cache_dir.as_ref());
+        // Single-file dependencies can be shared by deployments pinned to different providers.
+        // Keep their physical files and ready metadata separate, not just the in-memory keys.
+        let deployment_root = if model_url.path().is_some() {
+            let source = source_override.expect("remote provisioning resolves a concrete provider");
+            let relative = provider_cache_relative_path(source);
+            validate_cache_relative_ancestors(cache_dir.as_ref(), &relative, true)
+                .await
+                .map_err(|error| prepared_cache_error(&model, error.to_string()))?;
+            cache_dir.as_ref().join(relative)
+        } else {
+            deployment_cache_root(cache_dir.as_ref())
+        };
         let expected =
-            expected_remote_model_path(&model, model_url, source_intent, cache_dir.as_ref())?;
+            expected_remote_model_path(&model, model_url, source_intent, &deployment_root)?;
         if let Some(path) = model_url.path() {
             if assets.len() != 1 || assets[0].repo != repository || assets[0].file != path {
                 return Err(incompatible_model_url(
@@ -2360,6 +2402,70 @@ const fn download_source_label(source: DownloadSource) -> &'static str {
 struct LocatedRepositoryModel<M> {
     model: M,
     repository: String,
+}
+
+fn locator_cache_sources(model_url: &ModelUrl) -> Vec<DownloadSource> {
+    match model_url.source() {
+        ModelUrlSource::HuggingFace => vec![DownloadSource::HuggingFace],
+        ModelUrlSource::ModelScope => vec![DownloadSource::ModelScope],
+        ModelUrlSource::Neutral => vec![DownloadSource::HuggingFace, DownloadSource::ModelScope],
+        ModelUrlSource::File => Vec::new(),
+    }
+}
+
+fn provider_cache_relative_path(source: DownloadSource) -> PathBuf {
+    PathBuf::from(CACHE_STATE_DIR)
+        .join(PROVIDER_CACHE_DIR)
+        .join(download_source_label(source))
+}
+
+fn model_url_cache_prefixes(
+    model_url: &ModelUrl,
+    sources: &[DownloadSource],
+) -> Vec<(PathBuf, Vec<DownloadSource>)> {
+    let mut roots = Vec::new();
+    if model_url.path().is_some() {
+        roots.extend(
+            sources
+                .iter()
+                .map(|source| (provider_cache_relative_path(*source), vec![*source])),
+        );
+    }
+    // Reuse an existing cache only under its recorded provenance. Never relabel or overwrite it
+    // when another deployment needs the same dependency from a different provider.
+    roots.push((PathBuf::new(), sources.to_vec()));
+    roots
+}
+
+fn resolve_prepared_remote_model_path<M: ModelSpec>(
+    model: &M,
+    model_url: &ModelUrl,
+    source_intent: &str,
+    cache_dir: &Path,
+    sources: &[DownloadSource],
+    artifacts: Option<&[ArtifactRequest]>,
+) -> Result<PathBuf> {
+    let mut failure = None;
+    for (relative, allowed_sources) in model_url_cache_prefixes(model_url, sources) {
+        if !relative.as_os_str().is_empty() {
+            validate_cache_relative_ancestors_sync(cache_dir, &relative, true)
+                .map_err(|error| prepared_cache_error(model, error.to_string()))?;
+        }
+        let root = cache_dir.join(relative);
+        let path = expected_remote_model_path(model, model_url, source_intent, &root)?;
+        match validate_prepared_ready_cache(
+            model,
+            model_url,
+            &root,
+            &path,
+            &allowed_sources,
+            artifacts,
+        ) {
+            Ok(()) => return Ok(path),
+            Err(error) => failure = Some(error),
+        }
+    }
+    Err(failure.expect("remote model resolution always checks the legacy cache"))
 }
 
 fn expected_remote_model_path<M: ModelSpec>(
@@ -5926,6 +6032,7 @@ mod downloader_tests {
         empty_preflight_plan: bool,
         failure_repo: Option<&'static str>,
         echo_requested_revision: bool,
+        write_provider_payloads: bool,
     }
 
     struct FakeProbe {
@@ -6223,7 +6330,12 @@ mod downloader_tests {
                     })?;
                 if let Some(files) = files {
                     for file_name in files {
-                        tokio::fs::write(target.join(file_name), b"asset")
+                        let payload = if self.write_provider_payloads {
+                            source_name.as_bytes()
+                        } else {
+                            b"asset"
+                        };
+                        tokio::fs::write(target.join(file_name), payload)
                             .await
                             .map_err(|error| OrchionError::Download {
                                 source_name,
@@ -7597,6 +7709,269 @@ mod downloader_tests {
     }
 
     #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "covers two startups and preserves legacy provenance under both integrity policies"
+    )]
+    async fn shared_layout_keeps_each_deployments_provider_across_restarts() {
+        for verify_integrity in [false, true] {
+            let cache = tempfile::tempdir().unwrap();
+            let layout = KnownOcrModel::PpDocLayoutV3.into_model();
+            let layout_url =
+                ModelUrl::parse("//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx").unwrap();
+            let primaries = [
+                (
+                    qwen_asr_06b(),
+                    "//Mirror/HfPrimary",
+                    ResolvedSource::HuggingFace,
+                ),
+                (
+                    AsrModel::parse("alibaba/qwen3-asr-1.7b").unwrap(),
+                    "//Mirror/MsPrimary",
+                    ResolvedSource::ModelScope,
+                ),
+            ];
+            for (primary, url, source) in &primaries {
+                ModelDownloader::from_provider(FixtureProvider {
+                    source: *source,
+                    client: Arc::new(FakeDownloadClient::default()),
+                })
+                .download_model_url(
+                    primary.clone(),
+                    &ModelUrl::parse(url).unwrap(),
+                    cache.path(),
+                )
+                .await
+                .unwrap();
+            }
+            let legacy = ModelDownloader::from_provider(FixtureProvider {
+                source: ResolvedSource::ModelScope,
+                client: Arc::new(FakeDownloadClient {
+                    write_provider_payloads: true,
+                    ..FakeDownloadClient::default()
+                }),
+            })
+            .download(layout.clone(), cache.path())
+            .await
+            .unwrap();
+            let legacy_manifest = tokio::fs::read(legacy.join(READY_MANIFEST_FILE))
+                .await
+                .unwrap();
+            let legacy_file = cache
+                .path()
+                .join("PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx");
+            let mut previous_paths = None;
+
+            for startup in 0..2 {
+                let client = Arc::new(FakeDownloadClient {
+                    write_provider_payloads: true,
+                    ..FakeDownloadClient::default()
+                });
+                let downloader =
+                    fixture_downloader(&client).with_file_integrity_verification(verify_integrity);
+                let mut paths = Vec::new();
+                for (primary, url, source) in &primaries {
+                    let url = ModelUrl::parse(url).unwrap();
+                    let plan = DeploymentSourcePlan {
+                        key: url.to_string(),
+                        artifacts: ModelDownloader::model_artifact_plan(primary, &url)
+                            .unwrap()
+                            .into_iter()
+                            .chain(
+                                ModelDownloader::model_artifact_plan(&layout, &layout_url).unwrap(),
+                            )
+                            .collect(),
+                        candidates: vec![DownloadSource::HuggingFace, DownloadSource::ModelScope],
+                    };
+                    downloader
+                        .download_model_url_with_plan(
+                            primary.clone(),
+                            &url,
+                            url.as_str(),
+                            None,
+                            Some(&plan),
+                            cache.path(),
+                        )
+                        .await
+                        .unwrap();
+                    let path = downloader
+                        .download_model_url_with_plan(
+                            layout.clone(),
+                            &layout_url,
+                            layout_url.as_str(),
+                            None,
+                            Some(&plan),
+                            cache.path(),
+                        )
+                        .await
+                        .unwrap();
+                    let root = path.parent().and_then(Path::parent).unwrap();
+                    assert_eq!(
+                        tokio::fs::read(
+                            root.join("PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx")
+                        )
+                        .await
+                        .unwrap(),
+                        source.label().as_bytes()
+                    );
+                    paths.push(path);
+                }
+                assert_ne!(
+                    paths[0], paths[1],
+                    "different providers must not overwrite one layout"
+                );
+                assert_eq!(paths[1], legacy);
+                assert_eq!(
+                    tokio::fs::read(legacy.join(READY_MANIFEST_FILE))
+                        .await
+                        .unwrap(),
+                    legacy_manifest
+                );
+                assert_eq!(tokio::fs::read(&legacy_file).await.unwrap(), b"modelscope");
+                if startup == 0 {
+                    assert_eq!(*client.calls.lock().unwrap(), ["huggingface"]);
+                    assert_eq!(
+                        *client.repos.lock().unwrap(),
+                        ["PaddlePaddle/PP-DocLayoutV3_onnx"]
+                    );
+                } else {
+                    assert_eq!(*client.preflight_calls.lock().unwrap(), 0);
+                    assert!(client.calls.lock().unwrap().is_empty());
+                    assert_eq!(previous_paths.as_ref(), Some(&paths));
+                }
+                previous_paths = Some(paths);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_file_dependencies_are_isolated_and_resolve_offline_for_each_provider() {
+        let cache = tempfile::tempdir().unwrap();
+        let layout = KnownOcrModel::PpDocLayoutV3.into_model();
+        let urls = [
+            ModelUrl::parse("hf://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx").unwrap(),
+            ModelUrl::parse("ms://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx").unwrap(),
+        ];
+        let client = Arc::new(FakeDownloadClient {
+            write_provider_payloads: true,
+            ..FakeDownloadClient::default()
+        });
+        let downloader = fixture_downloader(&client).with_file_integrity_verification(false);
+        let (first, second) = tokio::join!(
+            downloader.download_model_url(layout.clone(), &urls[0], cache.path()),
+            downloader.download_model_url(layout.clone(), &urls[1], cache.path()),
+        );
+        let paths = [first.unwrap(), second.unwrap()];
+        assert_ne!(paths[0], paths[1]);
+        assert_eq!(client.calls.lock().unwrap().len(), 2);
+
+        let reuse_client = Arc::new(FakeDownloadClient::default());
+        let downloader = fixture_downloader(&reuse_client).with_file_integrity_verification(false);
+        for (index, (url, source)) in urls
+            .iter()
+            .zip([DownloadSource::HuggingFace, DownloadSource::ModelScope])
+            .enumerate()
+        {
+            let path = &paths[index];
+            let root = path.parent().and_then(Path::parent).unwrap();
+            assert_eq!(
+                tokio::fs::read(root.join("PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"))
+                    .await
+                    .unwrap(),
+                download_source_label(source).as_bytes()
+            );
+            assert_eq!(
+                downloader
+                    .download_model_url(layout.clone(), url, cache.path())
+                    .await
+                    .unwrap(),
+                *path
+            );
+            assert_eq!(
+                ModelDownloader::resolve_model_url_path(&layout, url, url.as_str(), cache.path())
+                    .await
+                    .unwrap(),
+                *path
+            );
+            assert_eq!(
+                ModelDownloader::resolve_prepared_model_url_path(
+                    &layout,
+                    url,
+                    url.as_str(),
+                    cache.path()
+                )
+                .unwrap(),
+                *path
+            );
+            let neutral_url =
+                ModelUrl::parse("//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx").unwrap();
+            let plan = DeploymentSourcePlan {
+                key: "prepared-layout".to_string(),
+                artifacts: ModelDownloader::model_artifact_plan(&layout, &neutral_url).unwrap(),
+                candidates: vec![source],
+            };
+            assert_eq!(
+                ModelDownloader::resolve_prepared_model_url_path_with_plan(
+                    &layout,
+                    &neutral_url,
+                    neutral_url.as_str(),
+                    &plan,
+                    cache.path()
+                )
+                .unwrap(),
+                *path
+            );
+        }
+        assert_eq!(*reuse_client.preflight_calls.lock().unwrap(), 0);
+        assert!(reuse_client.calls.lock().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exact_file_dependency_rejects_symlinked_provider_cache_ancestor() {
+        let cache = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(cache.path().join(CACHE_STATE_DIR)).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path(),
+            cache.path().join(CACHE_STATE_DIR).join(PROVIDER_CACHE_DIR),
+        )
+        .unwrap();
+        let layout = KnownOcrModel::PpDocLayoutV3.into_model();
+        let url = ModelUrl::parse("hf://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx").unwrap();
+        let client = Arc::new(FakeDownloadClient::default());
+        let downloader = fixture_downloader(&client);
+        assert!(
+            downloader
+                .download_model_url(layout.clone(), &url, cache.path())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("symlink")
+        );
+        assert!(
+            ModelDownloader::resolve_model_url_path(&layout, &url, url.as_str(), cache.path())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("symlink")
+        );
+        assert!(
+            ModelDownloader::resolve_prepared_model_url_path(
+                &layout,
+                &url,
+                url.as_str(),
+                cache.path()
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("symlink")
+        );
+        assert!(client.calls.lock().unwrap().is_empty());
+        assert!(outside.path().read_dir().unwrap().next().is_none());
+    }
+
+    #[tokio::test]
     async fn cached_resource_pins_provider_when_deployment_dependency_is_missing() {
         let cache = tempfile::tempdir().unwrap();
         let primary = qwen_asr_06b();
@@ -7647,10 +8022,12 @@ mod downloader_tests {
             )
             .await
             .unwrap();
-        assert_eq!(path, cache.path().join("PaddlePaddle/PP-DocLayoutV3"));
+        let provider_root = cache
+            .path()
+            .join(provider_cache_relative_path(DownloadSource::ModelScope));
+        assert_eq!(path, provider_root.join("PaddlePaddle/PP-DocLayoutV3"));
         assert!(
-            cache
-                .path()
+            provider_root
                 .join("PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx")
                 .is_file()
         );

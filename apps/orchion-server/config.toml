@@ -28,6 +28,8 @@ lookup_max_ids = 100
 keepalive_interval = "15s"
 
 [models]
+# Startup downloads all models and dependencies configured under enabled services.
+# Runtime loading remains on demand; max_loaded limits memory residency, not downloads.
 dir = "models"
 source = "auto"
 max_loaded = 2

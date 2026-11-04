@@ -2,25 +2,37 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-Orchion 提供统一的 Rust API 库和 OpenAI 兼容服务端，面向本地语音、文档与文本生成工作流。目前支持 Qwen3 ASR/TTS、PaddleOCR/OCR-VL 和 text-only llama.cpp runtime。
+Orchion 通过统一的 Rust 库、OpenAI 兼容服务端和浏览器界面，在本地运行语音、文档与语言模型，支持 Qwen3 ASR/TTS、PaddleOCR/OCR-VL 和 llama.cpp 模型。
 
 ## 亮点
 
-- OpenAI 风格 HTTP API，覆盖 ASR、TTS、OCR/OCR-VL 和 PDF 页面渲染。
-- `/ui` 提供 React WebUI。
-- 异步 Rust API 和 SDK 示例。
-- 通过 `model-hub` 从 HuggingFace 或 ModelScope 下载模型。
-- Swagger UI 位于 `/docs`，OpenAPI JSON 位于 `/openapi/v1.json`。
+- 语音识别、流式转录与语音合成。
+- OCR、文档版面识别与 PDF 页面渲染。
+- LLM 对话、文本生成、工具调用与向量嵌入。
+- WebUI 支持模型推理、模型管理与请求活动查看。
+- 异步 Rust 库和 HTTP 客户端 SDK。
+- 自动从 Hugging Face 或 ModelScope 下载模型。
+- `/docs` 提供交互式 API 文档。
 
 ## 环境要求
 
-- Rust `1.95` 或更高版本。
-- `PATH` 中可用的 Bun `1.3.14`，用于构建 WebUI。
+- 从源码构建时，需要 Rust `1.95` 或更高版本。
+- 从源码构建 WebUI 时，需要 `PATH` 中可用的 Bun `1.3.14`。
 - `PATH` 中可用的 `ffmpeg`，用于音频解码/编码。
 - 足够的本地磁盘空间保存模型文件。
 - 如需加速，可准备 Metal 或 CUDA 运行环境。
 
 ## 运行服务
+
+在发布包目录中运行：
+
+```sh
+./orchion-server --config config.toml
+```
+
+Windows 下使用 `.\orchion-server.exe --config config.toml`。
+
+从源码运行：
 
 ```sh
 cargo run -p orchion-server -- --config apps/orchion-server/config.toml --models-dir data/models
@@ -28,68 +40,61 @@ cargo run -p orchion-server --features metal -- --config apps/orchion-server/con
 cargo run -p orchion-server --features cuda -- --config apps/orchion-server/config.toml --models-dir data/models
 ```
 
-配置文件位于 `apps/orchion-server/`。以上开发命令会覆盖发布包使用的默认模型目录，改用仓库根目录下的 `data/models`。未启用后端 feature 时，服务默认使用 CPU。
+以上源码命令使用[配置示例](apps/orchion-server/config.toml)，并将模型保存到 `data/models`。可根据硬件选择 CPU、Metal 或 CUDA 对应的命令。
+
+服务会在接收请求前下载所有已启用服务配置的模型及依赖，并复用有效本地缓存；下载失败会阻止启动。模型按需加载到内存，`max_loaded` 限制内存驻留数量，不限制下载数量。可禁用不需要的服务或移除不用的模型，以减少首次启动的下载量和磁盘占用。
 
 ## WebUI
 
-服务运行后打开 `/ui`。前端开发可运行：
+服务运行后打开 `/ui`，即可转录音频、生成语音、识别文档、与模型对话，以及管理模型加载。
 
-```sh
-cd web
-bun run dev
-```
-
-API key 和表单偏好会存储在浏览器 `localStorage`；不要在共享或不可信浏览器中保存 key。
+WebUI 可以在浏览器中保存 API key 和表单偏好。不要在共享或不可信设备中保存 key。
 
 ## API 路由
 
 - `GET /healthz`：健康检查。
-- `GET /readyz`：公开 readiness JSON；shutdown 开始、resident worker 不健康或 required/default deployment load 失败时返回 `503`。
-- `GET /metrics`：OpenMetrics 1.0 指标；启用认证时沿用全局 bearer API key。
-- `GET /v1/models`：已配置 primary deployment ID、可选展示名称和派生能力。
-- `GET /v1/models/{model}`：查询单个已配置公开模型，不暴露驻留状态。
-- `GET /api/models/status`：已配置模型的运行时驻留状态。
-- `POST /api/models/load`：加载已配置模型的运行时。
-- `POST /api/models/unload`：卸载已配置模型的运行时。
+- `GET /readyz`：就绪状态检查。
+- `GET /metrics`：监控指标。
+- `GET /v1/models`：列出已配置模型及其能力。
+- `GET /v1/models/{model}`：查询模型信息。
+- `GET /api/models/status`：模型加载状态。
+- `POST /api/models/load`：加载模型。
+- `POST /api/models/unload`：卸载模型。
 - `POST /v1/audio/transcriptions`：ASR 文件转录。
 - `GET /v1/audio/transcriptions/stream`：ASR WebSocket 流式转录。
 - `POST /v1/audio/speech`：TTS。
 - `POST /v1/ocr`：OCR 和 OCR-VL。
-- `POST /v1/chat/completions`：支持索引 choice 的 JSON/SSE，并支持函数工具、富 tool/reasoning 消息、严格 JSON 格式、logprobs、logit bias、受 deployment 限制的 `n`，以及显式启用的 `reasoning_control`。`chat_template.enable_thinking` 只控制请求省略 reasoning 时的默认值；仅当已验证模板能分离 reasoning 输出并提供可控起止标签时，才应设置 `chat_template.guarantees_reasoning = true` 并发布 reasoning 能力。
-- `POST /v1/chat/completions/control`：对已启用 Chat stream 提供 authenticated、process-local 的 `reasoning_end` 控制。
-- `POST /v1/completions`：legacy raw-prompt JSON/SSE，支持索引 `n`、logprobs 和 logit bias。
-- `POST /v1/responses`：无状态 JSON 或生命周期 SSE，支持函数调用/输出 item、工具、严格 text format、reasoning item/event，以及语义 parser 能真实归因时的 logprobs；省略 `store` 或设置为 `false` 均可。
-- `POST /v1/responses/input_tokens`：按 Responses instructions/input prompt preparation 统计 token。
-- `POST /v1/embeddings`：兼容 OpenAI 的文本或 token embedding，支持 float 和 base64。
-- `GET|DELETE /v1/stream`：恢复/跟随或幂等取消当前 principal 拥有的可恢复 LLM 流。
-- `POST /v1/streams/lookup`：仅查询显式给出的、当前 principal 拥有的流。
+- `POST /v1/chat/completions`：对话补全，支持流式输出。
+- `POST /v1/chat/completions/control`：控制对话流的思考过程。
+- `POST /v1/completions`：文本补全。
+- `POST /v1/responses`：无状态 Responses API，支持流式输出。
+- `POST /v1/responses/input_tokens`：统计 Responses 输入 token 数。
+- `POST /v1/embeddings`：文本和 token 向量嵌入。
+- `GET|DELETE /v1/stream`：恢复或取消 LLM 流。
+- `POST /v1/streams/lookup`：查询可恢复的流。
 - `POST /v1/pdf/images`：PDF 页面渲染。
-- `GET /api/activity`：进行中的请求、保留历史和摘要统计。
-- `GET /api/activity/events`：需要认证的 Activity 服务端事件流。
+- `GET /api/activity`：请求活动、历史与统计。
+- `GET /api/activity/events`：实时请求活动更新。
 - `GET /docs`：Swagger UI。
 - `GET /openapi/v1.json`：OpenAPI 文档。
 
 详细 API 文档：
 
-- [SDK 契约矩阵](docs/sdk-matrix.md)
-- [可恢复 LLM 流契约](docs/llm-resumable-streaming.md)
+- [Rust SDK 与 HTTP API 功能对照](docs/sdk-matrix.md)
+- [可恢复 LLM 流](docs/llm-resumable-streaming.md)
 - [ASR](docs/asr.zh-CN.md)
 - [ASR 流式协议](docs/asr-streaming.zh-CN.md)
 - [TTS](docs/tts.zh-CN.md)
 - [OCR 和 OCR-VL](docs/ocr.zh-CN.md)
 - [PDF 页面渲染](docs/pdf.zh-CN.md)
 
-如果配置了 `[auth] api_key`，所有 `/v1/*`、`/api/models/*` 和 `/api/activity*` 请求都需要传入 `Authorization: Bearer <api_key>`。
+如果配置了 `[auth] api_key`，`/v1/*`、`/api/models/*`、`/api/activity*` 和 `/metrics` 请求需要传入 `Authorization: Bearer <api_key>`。
 
-OpenAI chat 和 Responses 请求解析会忽略未知字段，以及显式设为 `null` 的已识别但不支持字段。已识别且非 `null` 的不支持值仍返回参数级错误；已知支持字段的错误类型仍会被拒绝。
-
-Generation deployment 会根据配置发布 bridge 支持的工具、并行工具、JSON 格式、logprobs、logit bias 和 choice 上限。`chat_template.enable_thinking` 只控制请求省略 reasoning 时的默认值，不会发布 reasoning。仅当已确认精确部署的模板能分离 reasoning 输出并提供可控起止标签时，才应设置 `chat_template.guarantees_reasoning = true`；否则 catalog 保守不发布，运行时仍可对请求返回类型化拒绝。
-
-Activity 页面只记录路由模板、模型 ID、状态、耗时和输入大小等白名单元数据。请求进行期间，Activity 客户端还可以看到 peer 地址和 User-Agent；这些仅限实时展示的字段会在写入历史前清除。Activity 接口遵循全局 API key 配置，因此未配置 API key 的部署会向所有能访问服务的客户端开放实时元数据。Activity 不存储请求正文、响应正文、凭据、文件名或生成结果。HTTP 耗时从请求进入匹配路由起，覆盖解析、排队、推理，直到响应 body 完成；WebSocket 耗时覆盖升级后的完整会话。历史数量有上限，并且仅在当前服务进程生命周期内存在。
+请求活动展示模型 ID、状态、耗时和输入大小，不存储请求正文、凭据、文件名或生成结果；实时活动还会展示客户端地址和 User-Agent。历史保存在内存中，服务退出后清除。向不可信网络开放服务前，请配置 API key。
 
 ## 原生 Rust SDK
 
-`orchion` facade 位于 `libs/orchion`，为 ASR、TTS、OCR/OCR-VL 以及文本或图像 LLM 提供类型化的加载、下载、推理与流式接口。由于部分原生 adapter 尚不能从 registry 发布，该 facade 当前仅供 workspace 使用，尚未发布到 crates.io。重型领域和硬件后端均通过 feature 按需启用；以下示例显式选择 CPU。
+[`orchion`](libs/orchion) 库可将模型下载、加载、推理与流式输出集成到 Rust 应用中。通过 Cargo feature 选择需要的模型类型和硬件后端；以下示例使用 CPU。
 
 ```rust,no_run
 use orchion::{Asr, AsrModel, Result};
@@ -115,18 +120,18 @@ cargo run -p orchion-example-ocr-basic --features cpu -- image.png models
 cargo run -p orchion-example-llm-complete --features cpu -- local/demo hf://org/repo/model.gguf "Hello" models
 ```
 
-`llm-complete` 和 `llm-streaming-cancel` 要求传入精确 GGUF URL。OCR provisioning 可能下载多个仓库，并在加载前组装类型化 assets。同步 `LlmEngine::load` 接口会阻塞；`LlmEngine::load_deployment` 会把加载移出 async runtime worker。
+更多示例位于 [`examples/orchion`](examples/orchion)。
 
-## Server Rust SDK
+## 服务端 Rust 客户端
 
-`sdks/orchion-client` 中的 `orchion-client` crate 是上述全部公开数据路由的类型化异步客户端。默认 feature 启用 health、models、Activity、LLM、ASR、TTS、OCR 和 PDF；应用也可以关闭默认 feature 后只选择需要的领域。
+[`orchion-client`](sdks/orchion-client) 库提供异步 Rust 客户端，用于访问服务端的语音、文档、LLM 和管理接口。
 
 ```rust,no_run
 use orchion_client::{Client, ClientError};
 
 #[tokio::main]
 async fn main() -> Result<(), ClientError> {
-    let client = Client::new("http://127.0.0.1:8080")?;
+    let client = Client::new("http://127.0.0.1:9090")?;
     client.health().check().await?;
     for model in client.models().list().await?.data {
         println!("{}: {:?}", model.id, model.capabilities);
@@ -135,41 +140,34 @@ async fn main() -> Result<(), ClientError> {
 }
 ```
 
-Server SDK 示例：
+客户端示例：
 
 ```sh
-cargo run -p orchion-example-client-discovery -- http://127.0.0.1:8080
-cargo run -p orchion-example-client-asr-file -- http://127.0.0.1:8080 audio.wav alibaba/qwen3-asr-0.6b
-cargo run -p orchion-example-client-asr-streaming -- http://127.0.0.1:8080 audio.wav alibaba/qwen3-asr-0.6b
-cargo run -p orchion-example-client-tts -- http://127.0.0.1:8080 MODEL "Hello" VOICE output.wav
-cargo run -p orchion-example-client-ocr -- http://127.0.0.1:8080 image.png MODEL json
-cargo run -p orchion-example-client-pdf -- http://127.0.0.1:8080 document.pdf pages.zip
-cargo run -p orchion-example-client-llm -- http://127.0.0.1:8080 MODEL "Hello"
-cargo run -p orchion-example-client-operations -- http://127.0.0.1:8080 MODEL llm
+cargo run -p orchion-example-client-discovery -- http://127.0.0.1:9090
+cargo run -p orchion-example-client-asr-file -- http://127.0.0.1:9090 audio.wav alibaba/qwen3-asr-0.6b
+cargo run -p orchion-example-client-tts -- http://127.0.0.1:9090 MODEL "Hello" VOICE output.wav
+cargo run -p orchion-example-client-ocr -- http://127.0.0.1:9090 image.png MODEL json
+cargo run -p orchion-example-client-llm -- http://127.0.0.1:9090 MODEL "Hello"
 ```
 
-服务启用认证时设置 `ORCHION_API_KEY`。`start_streaming` 会等待 ASR `Ready` 后再返回。LLM 流必须收到协议终态；Activity 流在服务断开时正常结束，且不会自动重连。推理 POST 请求不会自动重试。
+服务启用认证时设置 `ORCHION_API_KEY`。更多示例位于 [`examples/orchion-client`](examples/orchion-client)。
 
 ## 配置
 
-完整本地配置示例在 `apps/orchion-server/config.toml`。主要配置段：
+完整配置示例见 [`apps/orchion-server/config.toml`](apps/orchion-server/config.toml)。
 
-- `[server]`：监听地址、CORS 允许来源、上传大小限制，以及 PDF 页数、像素和输出大小限制。CORS 默认允许所有来源（`["*"]`）。
-- `[activity]`：启用请求活动并设置内存中的已完成历史容量（默认 `500`）。
-- `[models]`：模型目录、下载来源、全局驻留上限和文件完整性校验。有效的本地缓存直接复用，不访问远程 provider，多资源部署同样如此。复用中立定位符对应的缓存资源后，该部署的中立资源固定使用缓存记录的 provider；缺失或无效的依赖从同一 provider 补齐，显式 provider 定位符仍遵循其配置来源。`verify_file_integrity` 默认是 `false`；设为 `true` 后，在本地按 manifest 中记录的 SHA-256 校验文件，不需要联网检查。
-- `[services.asr]`、`[services.tts]`、`[services.ocr]`、`[services.ocr-vl]`、`[services.llm]`：服务 deployment 与驻留策略。LLM 主 GGUF 和可选 mmproj 必须使用精确文件 locator。配置 mmproj 后，静态 catalog 会为 Chat `image_url` 与 Responses `input_image` 发布 `llm_vision`；worker 加载时会验证 projector 的视觉支持及其与模型的兼容性，失败时返回真实加载错误。图像只接受严格的 `data:image/png;base64,...` 或 `data:image/jpeg;base64,...`；HTTP(S)、文件、路径、媒体参数以及非 auto detail 模式都会被拒绝。`vision` 限制可配置且受硬上限约束；默认最多 4 张、单张 10 MiB、合计 20 MiB、单边 8192 像素、单张 16,777,216 像素、合计 33,554,432 像素。Embedding deployment 必须使用 `parallel_sequences=1`，并拒绝 mmproj/vision。多模态请求要求 `n=1`，不使用 prompt 前缀快照，并在独占 projector prefill 后回到共享连续 decode。文本 generation 可继续使用 worker 本地、仅内存且绑定当前 worker epoch 的 `prompt_cache`。
-- `[auth]`：可选 API key。
+- `[server]`：监听地址、CORS、上传限制和 PDF 限制。
+- `[models]`：模型目录、下载来源、内存驻留上限和可选文件完整性校验。
+- `[services.asr]`、`[services.tts]`、`[services.ocr]`、`[services.ocr-vl]`、`[services.llm]`：启用服务、选择模型和设置推理选项。
+- `[activity]`：请求活动与历史容量。
+- `[auth]`：API key 认证。
 
-`CORS_ALLOWED_ORIGINS` 使用逗号分隔的来源列表覆盖 `server.cors_allowed_origins`，例如 `https://app.example.com,https://admin.example.com`；使用 `*` 允许所有来源。`ORCHION_MODEL_SOURCE` 和 `models.source` 支持 `auto`、`huggingface`、`modelscope`。`RUST_LOG` 控制运行日志。
+`models.source` 支持 `auto`、`huggingface` 和 `modelscope`。有效模型缓存无需联网即可复用。`verify_file_integrity = true` 可启用缓存文件的本地 SHA-256 校验，默认关闭。LLM 模型需要精确的 GGUF 文件 URL；如需图像输入，可额外配置兼容的 `mmproj` 文件。
 
-## 开发
+LLM 图像输入必须使用 PNG 或 JPEG 的 base64 data URL，不支持远程图片 URL。
 
-```sh
-cargo fmt --all -- --check
-cargo test --workspace --features full,cpu
-cargo check --workspace
-cargo clippy -p orchion-client --all-features --all-targets -- -D warnings
-RUSTDOCFLAGS="-D warnings" cargo doc -p orchion-client --all-features --no-deps
-```
+环境变量覆盖：
 
-Orchion 仍处于早期阶段。项目稳定前，公开 Rust API 和服务端请求扩展都可能调整。
+- `ORCHION_MODEL_SOURCE`：模型下载来源。
+- `CORS_ALLOWED_ORIGINS`：逗号分隔的允许来源，或用 `*` 允许所有来源；默认允许所有来源。
+- `RUST_LOG`：日志级别与过滤规则。

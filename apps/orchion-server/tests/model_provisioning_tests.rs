@@ -6,7 +6,7 @@ use orchion::{
 };
 use orchion_server::application::ServerApplication;
 use orchion_server::application::model_lifecycle::{
-    ModelLifecycleRuntime, ModelSelector, ModelService,
+    ModelLifecycleRuntime, ModelResidency, ModelSelector, ModelService,
 };
 use orchion_server::config::ServerConfig;
 use orchion_server::model_cache::{
@@ -17,7 +17,7 @@ use orchion_server::state::{
     AppState, AsrRuntimeFuture, ModelRuntimeFactory, OcrDeploymentFuture, OcrDeploymentProvisioner,
     OcrRuntimeFuture, TtsRuntimeFuture,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -32,9 +32,11 @@ struct FakeProvisioner {
     deployment_plans: Mutex<Vec<DeploymentArtifactPlan>>,
     failures: Mutex<HashSet<String>>,
     locator_failures: Mutex<HashSet<String>>,
+    events: Mutex<Vec<String>>,
     active: AtomicUsize,
     max_active: AtomicUsize,
     delay: Mutex<Option<Duration>>,
+    model_delays: Mutex<HashMap<String, Duration>>,
 }
 
 struct TestOcrEngine {
@@ -177,6 +179,7 @@ impl FakeProvisioner {
             .as_ref()
             .map(|provisioning| provisioning.model_url.to_string());
         self.calls.lock().unwrap().push(id.clone());
+        self.events.lock().unwrap().push(format!("start:{id}"));
         self.locators.lock().unwrap().push(locator.clone());
         self.sources.lock().unwrap().push(
             provisioning
@@ -187,7 +190,13 @@ impl FakeProvisioner {
             || locator
                 .as_ref()
                 .is_some_and(|locator| self.locator_failures.lock().unwrap().contains(locator));
-        let delay = *self.delay.lock().unwrap();
+        let delay = self
+            .model_delays
+            .lock()
+            .unwrap()
+            .get(&id)
+            .copied()
+            .or(*self.delay.lock().unwrap());
         let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_active.fetch_max(active, Ordering::SeqCst);
         let path = model.cache_path(models_dir);
@@ -201,6 +210,7 @@ impl FakeProvisioner {
             if should_fail {
                 anyhow::bail!("injected download failure for {id}");
             }
+            self.events.lock().unwrap().push(format!("ready:{id}"));
             Ok(path)
         })
     }
@@ -221,6 +231,11 @@ id = "paddlepaddle/pp-ocrv6-tiny"
 model = "//PaddlePaddle/PP-OCRv6_tiny"
 layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
 table_structure = { model = "//Acme/Table/table.onnx", dictionary = "//Acme/Table/table_dict.txt", table_type = "wireless" }
+[[services.ocr.models]]
+id = "paddlepaddle/pp-ocrv6-small"
+model = "//PaddlePaddle/PP-OCRv6_small"
+layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
+table_structure = { model = "//Acme/Table/table.onnx", dictionary = "//Acme/Table/table_dict.txt", table_type = "wireless" }
 "#,
         &temp_dir.path().join("orchion-server"),
     )
@@ -232,22 +247,28 @@ table_structure = { model = "//Acme/Table/table.onnx", dictionary = "//Acme/Tabl
         .unwrap();
 
     let plans = provisioner.deployment_plans();
-    let plan = &plans[0];
-    assert!(plan.artifacts.iter().any(|artifact| {
-        artifact.role == ArtifactRole::OcrTableStructureModel
-            && artifact.repository.as_deref() == Some("Acme/Table")
-            && artifact.files == ["table.onnx".to_string()]
-    }));
-    assert!(plan.artifacts.iter().any(|artifact| {
-        artifact.role == ArtifactRole::OcrTableStructureDictionary
-            && artifact.repository.as_deref() == Some("Acme/Table")
-            && artifact.files == ["table_dict.txt".to_string()]
-    }));
-    assert!(
-        plan.artifacts
-            .iter()
-            .all(|artifact| !artifact.files.is_empty())
+    assert_eq!(
+        plans.len(),
+        2,
+        "each OCR deployment should be provisioned once"
     );
+    for plan in plans {
+        assert!(plan.artifacts.iter().any(|artifact| {
+            artifact.role == ArtifactRole::OcrTableStructureModel
+                && artifact.repository.as_deref() == Some("Acme/Table")
+                && artifact.files == ["table.onnx".to_string()]
+        }));
+        assert!(plan.artifacts.iter().any(|artifact| {
+            artifact.role == ArtifactRole::OcrTableStructureDictionary
+                && artifact.repository.as_deref() == Some("Acme/Table")
+                && artifact.files == ["table_dict.txt".to_string()]
+        }));
+        assert!(
+            plan.artifacts
+                .iter()
+                .all(|artifact| !artifact.files.is_empty())
+        );
+    }
 }
 
 #[tokio::test]
@@ -563,10 +584,10 @@ impl ModelProvisioner<OcrModel> for FakeProvisioner {
     }
 }
 
-impl OcrDeploymentProvisioner for FakeProvisioner {
+impl FakeProvisioner {
     fn provision_deployment(
         &self,
-        primary: OcrModel,
+        primary_dir: PathBuf,
         plan: DeploymentArtifactPlan,
         models_dir: PathBuf,
     ) -> OcrDeploymentFuture<'_> {
@@ -592,7 +613,7 @@ impl OcrDeploymentProvisioner for FakeProvisioner {
             if let Some(locator) = failed {
                 anyhow::bail!("injected download failure for {locator}");
             }
-            tokio::fs::create_dir_all(ModelSpec::cache_path(&primary, &models_dir)).await?;
+            tokio::fs::create_dir_all(primary_dir).await?;
             let mut published = Vec::new();
             for artifact in plan.artifacts {
                 let mut files = Vec::new();
@@ -631,6 +652,135 @@ impl OcrDeploymentProvisioner for FakeProvisioner {
     }
 }
 
+impl OcrDeploymentProvisioner for FakeProvisioner {
+    fn provision_deployment(
+        &self,
+        primary: OcrModel,
+        plan: DeploymentArtifactPlan,
+        models_dir: PathBuf,
+    ) -> OcrDeploymentFuture<'_> {
+        self.provision_deployment(primary.cache_path(&models_dir), plan, models_dir)
+    }
+
+    fn provision_llm_deployment(
+        &self,
+        _primary: ModelId,
+        plan: DeploymentArtifactPlan,
+        models_dir: PathBuf,
+    ) -> OcrDeploymentFuture<'_> {
+        self.provision_deployment(models_dir.clone(), plan, models_dir)
+    }
+}
+
+#[tokio::test]
+async fn all_configured_models_are_provisioned_without_loading_runtimes() {
+    for with_ocr_defaults in [true, false] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut config = ServerConfig::from_toml_str(
+            include_str!("../config.toml"),
+            &temp_dir.path().join("orchion-server"),
+        )
+        .unwrap();
+        if !with_ocr_defaults {
+            config.services.ocr.default_model = None;
+            config.services.ocr_vl.default_model = None;
+        }
+        let mut expected_locators = config
+            .services
+            .asr
+            .models
+            .iter()
+            .map(|model| Some(model.model.to_string()))
+            .chain(
+                config
+                    .services
+                    .tts
+                    .models
+                    .iter()
+                    .map(|model| Some(model.model.to_string())),
+            )
+            .chain(
+                config
+                    .services
+                    .ocr
+                    .models
+                    .iter()
+                    .chain(&config.services.ocr_vl.models)
+                    .flat_map(|model| {
+                        std::iter::once(Some(model.model.to_string())).chain(
+                            model
+                                .layout_model
+                                .iter()
+                                .map(|layout| Some(layout.to_string())),
+                        )
+                    }),
+            )
+            .collect::<Vec<_>>();
+        expected_locators.sort();
+        let provisioner = Arc::new(FakeProvisioner::default());
+
+        let state = AppState::load_with_provisioner(config, Arc::clone(&provisioner))
+            .await
+            .unwrap();
+
+        let mut locators = provisioner.locators();
+        locators.sort();
+        assert_eq!(locators, expected_locators);
+        let plans = provisioner.deployment_plans();
+        assert_eq!(plans.len(), 2, "both LLM deployments must be provisioned");
+        assert!(
+            plans
+                .iter()
+                .any(|plan| plan.artifacts.iter().any(|artifact| {
+                    artifact.repository.as_deref() == Some("unsloth/Qwen3.5-0.8B-GGUF")
+                        && artifact.files == ["mmproj-BF16.gguf".to_string()]
+                }))
+        );
+        assert!(
+            plans
+                .iter()
+                .any(|plan| plan.artifacts.iter().any(|artifact| {
+                    artifact.repository.as_deref() == Some("Qwen/Qwen3-Embedding-0.6B-GGUF")
+                        && artifact.files == ["Qwen3-Embedding-0.6B-Q8_0.gguf".to_string()]
+                }))
+        );
+        let statuses = state.model_statuses().await;
+        assert_eq!(statuses.len(), 16);
+        assert!(
+            statuses
+                .iter()
+                .all(|model| model.status == ModelResidency::Unloaded)
+        );
+        state.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn disabled_services_do_not_provision_models_or_dependencies() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut config = ServerConfig::from_toml_str(
+        include_str!("../config.toml"),
+        &temp_dir.path().join("orchion-server"),
+    )
+    .unwrap();
+    config.services.asr.enabled = false;
+    config.services.tts.enabled = false;
+    config.services.ocr.enabled = false;
+    config.services.ocr_vl.enabled = false;
+    config.services.llm.enabled = false;
+    let models_dir = config.models.dir.clone();
+    let provisioner = Arc::new(FakeProvisioner::default());
+
+    let state = AppState::load_with_provisioner(config, Arc::clone(&provisioner))
+        .await
+        .unwrap();
+
+    assert!(provisioner.calls().is_empty());
+    assert!(provisioner.deployment_plans().is_empty());
+    assert!(!models_dir.exists());
+    state.shutdown().await;
+}
+
 #[test]
 fn prepared_state_rejects_programmatic_duplicate_ids() {
     let mut config = ServerConfig::default_for_exe(std::path::Path::new("/tmp/orchion-server"));
@@ -661,7 +811,7 @@ async fn load_with_provisioner_rejects_programmatic_default_mismatch() {
 }
 
 #[tokio::test]
-async fn non_default_model_download_failure_does_not_block_startup() {
+async fn non_default_model_download_failure_blocks_startup() {
     let temp_dir = tempfile::tempdir().unwrap();
     let config = ServerConfig::from_toml_str(
         r#"
@@ -680,17 +830,14 @@ model = "//Qwen/Qwen3-ASR-1.7B"
     .unwrap();
     let provisioner = Arc::new(FakeProvisioner::failing("Qwen/Qwen3-ASR-1.7B"));
 
-    AppState::load_with_provisioner(config, Arc::clone(&provisioner))
-        .await
-        .unwrap();
-
-    let calls = provisioner.calls();
-    assert!(calls.contains(&"Qwen/Qwen3-ASR-0.6B".to_string()));
-    assert!(!calls.contains(&"Qwen/Qwen3-ASR-1.7B".to_string()));
+    let Err(error) = AppState::load_with_provisioner(config, Arc::clone(&provisioner)).await else {
+        panic!("non-default model failure should block startup");
+    };
+    assert!(format!("{error:#}").contains("injected download failure for Qwen/Qwen3-ASR-1.7B"));
 }
 
 #[tokio::test]
-async fn only_default_asr_model_is_provisioned_at_startup() {
+async fn all_asr_models_are_provisioned_at_startup() {
     let temp_dir = tempfile::tempdir().unwrap();
     let config = ServerConfig::from_toml_str(
         r#"
@@ -715,7 +862,7 @@ model = "//Qwen/Qwen3-ASR-1.7B"
 
     let calls = provisioner.calls();
     assert!(calls.contains(&"Qwen/Qwen3-ASR-0.6B".to_string()));
-    assert!(!calls.contains(&"Qwen/Qwen3-ASR-1.7B".to_string()));
+    assert!(calls.contains(&"Qwen/Qwen3-ASR-1.7B".to_string()));
 }
 
 #[tokio::test]
@@ -745,7 +892,7 @@ model = "hf://Mirror/Qwen3-ASR-Package"
 }
 
 #[tokio::test]
-async fn only_default_ocr_model_is_provisioned_at_startup() {
+async fn all_ocr_models_are_provisioned_at_startup() {
     let temp_dir = tempfile::tempdir().unwrap();
     let config = ServerConfig::from_toml_str(
         r#"
@@ -773,7 +920,55 @@ model = "//PaddlePaddle/PP-OCRv6_small"
 
     let calls = provisioner.calls();
     assert!(calls.contains(&"PaddlePaddle/PP-OCRv6_tiny".to_string()));
-    assert!(!calls.contains(&"PaddlePaddle/PP-OCRv6_small".to_string()));
+    assert!(calls.contains(&"PaddlePaddle/PP-OCRv6_small".to_string()));
+}
+
+#[tokio::test]
+async fn primary_models_are_ready_before_shared_layout_provisioning() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let config = ServerConfig::from_toml_str(
+        r#"
+[services.ocr]
+enabled = true
+default_model = "paddlepaddle/pp-ocrv6-tiny"
+[[services.ocr.models]]
+id = "paddlepaddle/pp-ocrv6-tiny"
+model = "//PaddlePaddle/PP-OCRv6_tiny"
+layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
+[[services.ocr.models]]
+id = "paddlepaddle/pp-ocrv6-small"
+model = "//PaddlePaddle/PP-OCRv6_small"
+layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
+"#,
+        &temp_dir.path().join("orchion-server"),
+    )
+    .unwrap();
+    let provisioner = Arc::new(FakeProvisioner::default());
+    provisioner.model_delays.lock().unwrap().insert(
+        "PaddlePaddle/PP-OCRv6_small".to_string(),
+        Duration::from_millis(100),
+    );
+
+    let state = AppState::load_with_provisioner(config, Arc::clone(&provisioner))
+        .await
+        .unwrap();
+
+    let events = provisioner.events.lock().unwrap().clone();
+    let first_layout = events
+        .iter()
+        .position(|event| event == "start:PaddlePaddle/PP-DocLayoutV3")
+        .expect("shared layout must be provisioned");
+    for primary in ["PP-OCRv6_tiny", "PP-OCRv6_small"] {
+        let ready = events
+            .iter()
+            .position(|event| event == &format!("ready:PaddlePaddle/{primary}"))
+            .expect("primary must be provisioned");
+        assert!(
+            ready < first_layout,
+            "a shared layout must not override a primary's cached provider"
+        );
+    }
+    state.shutdown().await;
 }
 
 #[tokio::test]
@@ -845,6 +1040,70 @@ layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
             vec![orchion::DownloadSource::ModelScope],
         ]
     );
+}
+
+#[tokio::test]
+async fn non_default_layout_download_failure_blocks_startup() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let config = ServerConfig::from_toml_str(
+        r#"
+[services.ocr]
+enabled = true
+default_model = "paddlepaddle/pp-ocrv6-tiny"
+[[services.ocr.models]]
+id = "paddlepaddle/pp-ocrv6-tiny"
+model = "//PaddlePaddle/PP-OCRv6_tiny"
+[[services.ocr.models]]
+id = "paddlepaddle/pp-ocrv6-small"
+model = "//PaddlePaddle/PP-OCRv6_small"
+layout_model = "hf://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
+"#,
+        &temp_dir.path().join("orchion-server"),
+    )
+    .unwrap();
+    let provisioner = Arc::new(FakeProvisioner::failing_locator(
+        "hf://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx",
+    ));
+
+    let Err(error) = AppState::load_with_provisioner(config, Arc::clone(&provisioner)).await else {
+        panic!("non-default layout failure should block startup");
+    };
+    assert!(
+        format!("{error:#}").contains("injected download failure for PaddlePaddle/PP-DocLayoutV3"),
+        "unexpected error: {error:#}"
+    );
+    assert!(provisioner.locators().contains(&Some(
+        "hf://PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx".to_string()
+    )));
+}
+
+#[tokio::test]
+async fn non_default_llm_artifact_failure_blocks_startup() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let config = ServerConfig::from_toml_str(
+        r#"
+[services.llm]
+enabled = true
+default_model = "acme/first"
+[[services.llm.models]]
+id = "acme/first"
+model = "hf://Acme/First/model.gguf"
+[[services.llm.models]]
+id = "acme/second"
+model = "hf://Acme/Second/model.gguf"
+mmproj_model = "hf://Acme/Second/mmproj.gguf"
+"#,
+        &temp_dir.path().join("orchion-server"),
+    )
+    .unwrap();
+    let provisioner = Arc::new(FakeProvisioner::failing_locator(
+        "hf://Acme/Second/mmproj.gguf",
+    ));
+
+    let Err(error) = AppState::load_with_provisioner(config, provisioner).await else {
+        panic!("non-default LLM artifact failure should block startup");
+    };
+    assert!(format!("{error:#}").contains("hf://Acme/Second/mmproj.gguf"));
 }
 
 #[tokio::test]
