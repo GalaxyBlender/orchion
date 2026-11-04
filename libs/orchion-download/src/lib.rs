@@ -298,10 +298,14 @@ impl DeploymentPublication {
 #[derive(Debug, Clone)]
 struct DeploymentSelectionState {
     source: DownloadSource,
-    artifacts: Vec<ArtifactRequest>,
+    // A cached artifact commits the provider without needing remote metadata. Resolve the
+    // deployment's exact file plan only if a later artifact actually needs provisioning.
+    resolved_artifacts: Option<Vec<ArtifactRequest>>,
     committed: bool,
     rejected: Vec<DownloadSource>,
 }
+
+type DeploymentSelection = Arc<tokio::sync::Mutex<Option<DeploymentSelectionState>>>;
 
 #[derive(Clone)]
 pub struct ModelDownloader {
@@ -311,7 +315,7 @@ pub struct ModelDownloader {
     repository_revisions: HashMap<String, String>,
     verify_file_integrity: bool,
     huggingface_available: Arc<tokio::sync::OnceCell<bool>>,
-    deployment_sources: Arc<tokio::sync::Mutex<HashMap<String, DeploymentSelectionState>>>,
+    deployment_sources: Arc<tokio::sync::Mutex<HashMap<(PathBuf, String), DeploymentSelection>>>,
 }
 
 impl std::fmt::Debug for ModelDownloader {
@@ -878,9 +882,11 @@ impl ModelDownloader {
 
     /// Provisions one artifact under a deployment-scoped neutral-provider plan.
     ///
-    /// Selection and download are serialized per downloader so a deployment cannot mix neutral
-    /// providers. Retryable failure before the first committed artifact advances to the next
-    /// candidate; after any artifact commits, changing provider is terminal.
+    /// Valid cached artifacts are reused before remote preflight and commit their recorded
+    /// provider for the deployment. Retryable failure before the first committed artifact advances
+    /// to the next candidate; after any artifact commits, changing provider is terminal.
+    /// Only operations for the same deployment and cache directory serialize; unrelated
+    /// deployments do not wait on each other's cache checks or provider I/O.
     ///
     /// # Errors
     ///
@@ -1057,49 +1063,82 @@ impl ModelDownloader {
         probe: &P,
         env: &DownloadEnv,
     ) -> Result<PathBuf> {
-        let mut selections = self.deployment_sources.lock().await;
-        loop {
-            if !selections.contains_key(&plan.key) {
-                if plan.artifacts.len() == 1 {
-                    for source in plan.candidates.iter().copied().filter(|source| {
+        let selection = {
+            let mut selections = self.deployment_sources.lock().await;
+            Arc::clone(
+                selections
+                    .entry((cache_dir.to_path_buf(), plan.key.clone()))
+                    .or_default(),
+            )
+        };
+        let mut selection = selection.lock().await;
+        let cached_sources = selection.as_ref().map_or_else(
+            || {
+                plan.candidates
+                    .iter()
+                    .copied()
+                    .filter(|source| {
                         plan.artifacts.iter().all(|artifact| {
                             artifact
                                 .required_source
                                 .is_none_or(|required| required == *source)
                         })
-                    }) {
-                        if let Some(path) = self
-                            .reuse_cached_neutral_deployment_artifact(
-                                model.clone(),
-                                model_url,
-                                source_intent,
-                                source,
-                                cache_dir,
-                            )
-                            .await?
-                        {
-                            return Ok(path);
-                        }
-                    }
-                }
-                let (source, artifacts) = self
-                    .preflight_deployment_candidates(plan, &[], client, env)
-                    .await?;
-                selections.insert(
-                    plan.key.clone(),
-                    DeploymentSelectionState {
+                    })
+                    .collect::<Vec<_>>()
+            },
+            |selection| vec![selection.source],
+        );
+        for source in cached_sources {
+            if let Some(path) = self
+                .reuse_cached_neutral_deployment_artifact(
+                    model.clone(),
+                    model_url,
+                    source_intent,
+                    source,
+                    cache_dir,
+                )
+                .await?
+            {
+                selection
+                    .get_or_insert_with(|| DeploymentSelectionState {
                         source,
-                        artifacts,
-                        committed: false,
+                        resolved_artifacts: None,
+                        committed: true,
                         rejected: Vec::new(),
-                    },
-                );
+                    })
+                    .committed = true;
+                return Ok(path);
             }
-            let state = selections
-                .get(&plan.key)
-                .expect("deployment selection inserted");
+        }
+        loop {
+            if selection
+                .as_ref()
+                .is_none_or(|state| state.resolved_artifacts.is_none())
+            {
+                let mut pending_plan = plan.clone();
+                let committed = if let Some(state) = selection.as_ref() {
+                    pending_plan.candidates = vec![state.source];
+                    state.committed
+                } else {
+                    false
+                };
+                let (source, artifacts) = self
+                    .preflight_deployment_candidates(&pending_plan, &[], client, env)
+                    .await?;
+                *selection = Some(DeploymentSelectionState {
+                    source,
+                    resolved_artifacts: Some(artifacts),
+                    committed,
+                    rejected: Vec::new(),
+                });
+            }
+            let state = selection.as_ref().expect("deployment selection inserted");
             let source = state.source;
-            let artifacts = state.artifacts.clone();
+            let artifacts = state
+                .resolved_artifacts
+                .as_ref()
+                .expect("deployment preflight resolved artifacts")
+                .clone();
             let committed = state.committed;
             let effective_intent = if model_url.source() == ModelUrlSource::Neutral {
                 format!(
@@ -1124,17 +1163,15 @@ impl ModelDownloader {
                 .await;
             match result {
                 Ok(path) => {
-                    selections
-                        .get_mut(&plan.key)
+                    selection
+                        .as_mut()
                         .expect("deployment selection retained")
                         .committed = true;
                     return Ok(path);
                 }
                 Err(error) if !committed && is_retryable_candidate_error(&error) => {
                     let rejected = {
-                        let state = selections
-                            .get_mut(&plan.key)
-                            .expect("deployment selection retained");
+                        let state = selection.as_mut().expect("deployment selection retained");
                         if !state.rejected.contains(&source) {
                             state.rejected.push(source);
                         }
@@ -1143,11 +1180,9 @@ impl ModelDownloader {
                     let (next, artifacts) = self
                         .preflight_deployment_candidates(plan, &rejected, client, env)
                         .await?;
-                    let state = selections
-                        .get_mut(&plan.key)
-                        .expect("deployment selection retained");
+                    let state = selection.as_mut().expect("deployment selection retained");
                     state.source = next;
-                    state.artifacts = artifacts;
+                    state.resolved_artifacts = Some(artifacts);
                 }
                 Err(error) => return Err(error),
             }
@@ -5906,6 +5941,108 @@ mod downloader_tests {
         failure: DownloadRetryability,
     }
 
+    struct FixtureProvider {
+        source: ResolvedSource,
+        client: Arc<FakeDownloadClient>,
+    }
+
+    impl DownloadProvider for FixtureProvider {
+        fn label(&self) -> &'static str {
+            self.source.label()
+        }
+
+        fn default_revision(&self) -> &'static str {
+            self.source.default_revision()
+        }
+
+        fn repository(&self, model: ProviderModel<'_>) -> String {
+            self.source.repository(model)
+        }
+
+        fn preflight<'a>(&'a self, request: ProviderPreflightRequest<'a>) -> PreflightFuture<'a> {
+            self.client.preflight(self, request)
+        }
+
+        fn download<'a>(&'a self, request: ProviderDownloadRequest<'a>) -> DownloadFuture<'a> {
+            Box::pin(async move { self.download_with_result(request).await.map(|_| ()) })
+        }
+
+        fn download_with_result<'a>(
+            &'a self,
+            request: ProviderDownloadRequest<'a>,
+        ) -> ResolvedDownloadFuture<'a> {
+            Box::pin(async move {
+                self.client
+                    .download(
+                        self,
+                        request.repository(),
+                        request.cache_dir(),
+                        request.target(),
+                        request.files(),
+                        request.revision(),
+                        &DownloadEnv {
+                            orchion_model_source: None,
+                            hf_endpoint: None,
+                        },
+                    )
+                    .await
+            })
+        }
+    }
+
+    struct BlockingPreflightProvider {
+        fixture: FixtureProvider,
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl DownloadProvider for BlockingPreflightProvider {
+        fn label(&self) -> &'static str {
+            self.fixture.label()
+        }
+
+        fn default_revision(&self) -> &'static str {
+            self.fixture.source.default_revision()
+        }
+
+        fn repository(&self, model: ProviderModel<'_>) -> String {
+            self.fixture.repository(model)
+        }
+
+        fn preflight<'a>(&'a self, request: ProviderPreflightRequest<'a>) -> PreflightFuture<'a> {
+            Box::pin(async move {
+                self.started.notify_one();
+                self.release.notified().await;
+                self.fixture.preflight(request).await
+            })
+        }
+
+        fn download<'a>(&'a self, request: ProviderDownloadRequest<'a>) -> DownloadFuture<'a> {
+            self.fixture.download(request)
+        }
+
+        fn download_with_result<'a>(
+            &'a self,
+            request: ProviderDownloadRequest<'a>,
+        ) -> ResolvedDownloadFuture<'a> {
+            self.fixture.download_with_result(request)
+        }
+    }
+
+    fn fixture_downloader(client: &Arc<FakeDownloadClient>) -> ModelDownloader {
+        ModelDownloader::from_registry(
+            DownloadProviderRegistry::new()
+                .with_provider(FixtureProvider {
+                    source: ResolvedSource::HuggingFace,
+                    client: Arc::clone(client),
+                })
+                .with_provider(FixtureProvider {
+                    source: ResolvedSource::ModelScope,
+                    client: Arc::clone(client),
+                }),
+        )
+    }
+
     impl DownloadProvider for FakePlanningProvider {
         fn label(&self) -> &'static str {
             self.label
@@ -7375,6 +7512,308 @@ mod downloader_tests {
         assert!(path.is_dir());
         assert_eq!(*reuse_client.preflight_calls.lock().unwrap(), 0);
         assert!(reuse_client.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cached_multi_resource_deployment_is_reused_without_provider_requests() {
+        let cache = tempfile::tempdir().unwrap();
+        let primary = qwen_asr_06b();
+        let primary_url = ModelUrl::parse("//Qwen/Qwen3-ASR-0.6B").unwrap();
+        let layout = KnownOcrModel::PpDocLayoutV3.into_model();
+        let layout_url =
+            ModelUrl::parse("//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx").unwrap();
+        let mut plan = DeploymentSourcePlan {
+            key: "cached-multi-resource".to_string(),
+            artifacts: ModelDownloader::model_artifact_plan(&primary, &primary_url)
+                .unwrap()
+                .into_iter()
+                .chain(ModelDownloader::model_artifact_plan(&layout, &layout_url).unwrap())
+                .collect(),
+            candidates: vec![DownloadSource::ModelScope],
+        };
+        let populate = ModelDownloader::from_provider(FixtureProvider {
+            source: ResolvedSource::ModelScope,
+            client: Arc::new(FakeDownloadClient::default()),
+        });
+        let primary_path = populate
+            .download_model_url_with_plan(
+                primary.clone(),
+                &primary_url,
+                primary_url.as_str(),
+                None,
+                Some(&plan),
+                cache.path(),
+            )
+            .await
+            .unwrap();
+        let layout_path = populate
+            .download_model_url_with_plan(
+                layout.clone(),
+                &layout_url,
+                layout_url.as_str(),
+                None,
+                Some(&plan),
+                cache.path(),
+            )
+            .await
+            .unwrap();
+        plan.candidates.insert(0, DownloadSource::HuggingFace);
+
+        for verify_integrity in [false, true] {
+            let client = Arc::new(FakeDownloadClient::default());
+            let downloader =
+                fixture_downloader(&client).with_file_integrity_verification(verify_integrity);
+            assert_eq!(
+                downloader
+                    .download_model_url_with_plan(
+                        primary.clone(),
+                        &primary_url,
+                        primary_url.as_str(),
+                        None,
+                        Some(&plan),
+                        cache.path(),
+                    )
+                    .await
+                    .unwrap(),
+                primary_path
+            );
+            assert_eq!(
+                downloader
+                    .download_model_url_with_plan(
+                        layout.clone(),
+                        &layout_url,
+                        layout_url.as_str(),
+                        None,
+                        Some(&plan),
+                        cache.path(),
+                    )
+                    .await
+                    .unwrap(),
+                layout_path
+            );
+            assert_eq!(*client.preflight_calls.lock().unwrap(), 0);
+            assert!(client.calls.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_resource_pins_provider_when_deployment_dependency_is_missing() {
+        let cache = tempfile::tempdir().unwrap();
+        let primary = qwen_asr_06b();
+        let primary_url = ModelUrl::parse("//Qwen/Qwen3-ASR-0.6B").unwrap();
+        let layout = KnownOcrModel::PpDocLayoutV3.into_model();
+        let layout_url =
+            ModelUrl::parse("//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx").unwrap();
+        ModelDownloader::from_provider(FixtureProvider {
+            source: ResolvedSource::ModelScope,
+            client: Arc::new(FakeDownloadClient::default()),
+        })
+        .download_model_url(primary.clone(), &primary_url, cache.path())
+        .await
+        .unwrap();
+        let plan = DeploymentSourcePlan {
+            key: "missing-layout".to_string(),
+            artifacts: ModelDownloader::model_artifact_plan(&primary, &primary_url)
+                .unwrap()
+                .into_iter()
+                .chain(ModelDownloader::model_artifact_plan(&layout, &layout_url).unwrap())
+                .collect(),
+            candidates: vec![DownloadSource::HuggingFace, DownloadSource::ModelScope],
+        };
+        let client = Arc::new(FakeDownloadClient::default());
+        let downloader = fixture_downloader(&client);
+        downloader
+            .download_model_url_with_plan(
+                primary,
+                &primary_url,
+                primary_url.as_str(),
+                None,
+                Some(&plan),
+                cache.path(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(*client.preflight_calls.lock().unwrap(), 0);
+        assert!(client.calls.lock().unwrap().is_empty());
+
+        let path = downloader
+            .download_model_url_with_plan(
+                layout,
+                &layout_url,
+                layout_url.as_str(),
+                None,
+                Some(&plan),
+                cache.path(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(path, cache.path().join("PaddlePaddle/PP-DocLayoutV3"));
+        assert!(
+            cache
+                .path()
+                .join("PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx")
+                .is_file()
+        );
+        assert_eq!(*client.calls.lock().unwrap(), ["modelscope"]);
+        assert_eq!(*client.preflight_calls.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn cached_deployment_is_not_blocked_by_another_deployments_remote_preflight() {
+        let cache = tempfile::tempdir().unwrap();
+        let cached_url = ModelUrl::parse("//Mirror/Cached-Speech").unwrap();
+        ModelDownloader::from_provider(FixtureProvider {
+            source: ResolvedSource::ModelScope,
+            client: Arc::new(FakeDownloadClient::default()),
+        })
+        .download_model_url(qwen_asr_06b(), &cached_url, cache.path())
+        .await
+        .unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let downloader = ModelDownloader::from_provider(BlockingPreflightProvider {
+            fixture: FixtureProvider {
+                source: ResolvedSource::ModelScope,
+                client: Arc::new(FakeDownloadClient::default()),
+            },
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+        });
+        let cold_downloader = downloader.clone();
+        let cold_cache = cache.path().to_path_buf();
+        let cold = tokio::spawn(async move {
+            cold_downloader
+                .download_model_url(
+                    qwen_asr_06b(),
+                    &ModelUrl::parse("//Mirror/Cold-Speech").unwrap(),
+                    cold_cache,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("cold deployment should reach remote preflight");
+        let cached = tokio::time::timeout(
+            Duration::from_secs(2),
+            downloader.download_model_url(qwen_asr_06b(), &cached_url, cache.path()),
+        )
+        .await;
+        release.notify_one();
+        cold.await.unwrap().unwrap();
+        assert!(
+            cached
+                .expect("cached deployment must not wait for unrelated provider I/O")
+                .unwrap()
+                .join("config.json")
+                .is_file()
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_provider_selection_is_scoped_to_its_cache_directory() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let url = ModelUrl::parse("//Mirror/Shared-Speech").unwrap();
+        for (source, cache) in [
+            (ResolvedSource::HuggingFace, first.path()),
+            (ResolvedSource::ModelScope, second.path()),
+        ] {
+            ModelDownloader::from_provider(FixtureProvider {
+                source,
+                client: Arc::new(FakeDownloadClient::default()),
+            })
+            .download_model_url(qwen_asr_06b(), &url, cache)
+            .await
+            .unwrap();
+        }
+        let client = Arc::new(FakeDownloadClient::default());
+        let downloader = fixture_downloader(&client);
+        for cache in [first.path(), second.path()] {
+            let path = downloader
+                .download_model_url(qwen_asr_06b(), &url, cache)
+                .await
+                .unwrap();
+            assert_eq!(path, cache.join("Mirror/Shared-Speech"));
+        }
+        assert_eq!(*client.preflight_calls.lock().unwrap(), 0);
+        assert!(client.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cached_provider_is_not_replaced_when_a_missing_dependency_cannot_be_provisioned() {
+        let cache = tempfile::tempdir().unwrap();
+        let primary = qwen_asr_06b();
+        let primary_url = ModelUrl::parse("//Qwen/Qwen3-ASR-0.6B").unwrap();
+        let layout = KnownOcrModel::PpDocLayoutV3.into_model();
+        let layout_url =
+            ModelUrl::parse("//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx").unwrap();
+        ModelDownloader::from_provider(FixtureProvider {
+            source: ResolvedSource::ModelScope,
+            client: Arc::new(FakeDownloadClient::default()),
+        })
+        .download_model_url(primary.clone(), &primary_url, cache.path())
+        .await
+        .unwrap();
+        let plan = DeploymentSourcePlan {
+            key: "cached-provider-unavailable".to_string(),
+            artifacts: ModelDownloader::model_artifact_plan(&primary, &primary_url)
+                .unwrap()
+                .into_iter()
+                .chain(ModelDownloader::model_artifact_plan(&layout, &layout_url).unwrap())
+                .collect(),
+            candidates: vec![DownloadSource::HuggingFace, DownloadSource::ModelScope],
+        };
+        let client = Arc::new(FakeDownloadClient::default());
+        let preflight = Arc::new(Mutex::new(Vec::new()));
+        let downloader = ModelDownloader::from_registry(
+            DownloadProviderRegistry::new()
+                .with_provider(FixtureProvider {
+                    source: ResolvedSource::HuggingFace,
+                    client: Arc::clone(&client),
+                })
+                .with_provider(FakePlanningProvider {
+                    label: "modelscope",
+                    calls: Arc::clone(&preflight),
+                    failure_repo: Some("PaddlePaddle/PP-DocLayoutV3_onnx"),
+                    failure: DownloadRetryability::RetryableNetwork,
+                }),
+        );
+        downloader
+            .download_model_url_with_plan(
+                primary,
+                &primary_url,
+                primary_url.as_str(),
+                None,
+                Some(&plan),
+                cache.path(),
+            )
+            .await
+            .unwrap();
+        let error = downloader
+            .download_model_url_with_plan(
+                layout,
+                &layout_url,
+                layout_url.as_str(),
+                None,
+                Some(&plan),
+                cache.path(),
+            )
+            .await
+            .unwrap_err();
+        let OrchionError::DownloadFallbackExhausted { failures, .. } = error else {
+            panic!("expected the pinned provider to fail explicitly");
+        };
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].source_name, "modelscope");
+        assert_eq!(
+            *preflight.lock().unwrap(),
+            [
+                "modelscope:Qwen/Qwen3-ASR-0.6B",
+                "modelscope:PaddlePaddle/PP-DocLayoutV3_onnx",
+            ]
+        );
+        assert_eq!(*client.preflight_calls.lock().unwrap(), 0);
+        assert!(client.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

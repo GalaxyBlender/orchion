@@ -156,7 +156,7 @@ cargo run -p orchion-example-client-operations -- http://127.0.0.1:8080 MODEL ll
 
 - `[server]`：监听地址、CORS 允许来源、上传大小限制，以及 PDF 页数、像素和输出大小限制。CORS 默认允许所有来源（`["*"]`）。
 - `[activity]`：启用请求活动并设置内存中的已完成历史容量（默认 `500`）。
-- `[models]`：模型目录、下载来源、全局驻留上限和文件完整性校验。`verify_file_integrity` 默认是 `false`；设为 `true` 后，复用已下载模型时会按 manifest 中记录的 SHA-256 校验文件。
+- `[models]`：模型目录、下载来源、全局驻留上限和文件完整性校验。有效的本地缓存直接复用，不访问远程 provider，多资源部署同样如此。复用中立定位符对应的缓存资源后，该部署的中立资源固定使用缓存记录的 provider；缺失或无效的依赖从同一 provider 补齐，显式 provider 定位符仍遵循其配置来源。`verify_file_integrity` 默认是 `false`；设为 `true` 后，在本地按 manifest 中记录的 SHA-256 校验文件，不需要联网检查。
 - `[services.asr]`、`[services.tts]`、`[services.ocr]`、`[services.ocr-vl]`、`[services.llm]`：服务 deployment 与驻留策略。LLM 主 GGUF 和可选 mmproj 必须使用精确文件 locator。配置 mmproj 后，静态 catalog 会为 Chat `image_url` 与 Responses `input_image` 发布 `llm_vision`；worker 加载时会验证 projector 的视觉支持及其与模型的兼容性，失败时返回真实加载错误。图像只接受严格的 `data:image/png;base64,...` 或 `data:image/jpeg;base64,...`；HTTP(S)、文件、路径、媒体参数以及非 auto detail 模式都会被拒绝。`vision` 限制可配置且受硬上限约束；默认最多 4 张、单张 10 MiB、合计 20 MiB、单边 8192 像素、单张 16,777,216 像素、合计 33,554,432 像素。Embedding deployment 必须使用 `parallel_sequences=1`，并拒绝 mmproj/vision。多模态请求要求 `n=1`，不使用 prompt 前缀快照，并在独占 projector prefill 后回到共享连续 decode。文本 generation 可继续使用 worker 本地、仅内存且绑定当前 worker epoch 的 `prompt_cache`。
 - `[auth]`：可选 API key。
 
