@@ -10,13 +10,13 @@ const VOICE_CLONE_ICL_PREFILL_TOKENS: usize = 9;
 const VOICE_CLONE_ICL_CODEC_BOS_TOKENS: usize = 1;
 const VOICE_CLONE_ICL_MIN_GENERATED_FRAMES: usize = 75;
 const VOICE_CLONE_ICL_EXTRA_CACHE_TOKENS: usize = 256;
-const LATIN_LANGUAGE_CONFIDENCE_THRESHOLD: f64 = 0.90;
+const LATIN_LANGUAGE_CONFIDENCE_THRESHOLD: f64 = 0.70;
 
 /// Qwen TTS inference engine.
 ///
 /// [`TtsLanguage::Auto`] uses fast script detection for Japanese, Korean, Chinese, and
-/// Cyrillic text. Latin text must be detected as a Qwen-supported language with confidence
-/// greater than 0.90; otherwise synthesis returns an error and the caller must select a language.
+/// Cyrillic text. Other text defaults to English when language detection is unavailable or
+/// confidence is at most 0.70. Confidently detected unsupported languages still return an error.
 #[derive(Clone)]
 pub struct Tts {
     model: TtsModel,
@@ -235,21 +235,19 @@ fn detect_language(text: &str) -> Result<qwen3_tts::Language> {
 }
 
 fn detect_latin_language(text: &str) -> Result<qwen3_tts::Language> {
-    let info = whatlang::detect(text).ok_or_else(|| {
-        auto_language_error("could not determine a language from the provided text")
-    })?;
+    let Some(info) = whatlang::detect(text) else {
+        return Ok(qwen3_tts::Language::English);
+    };
+
+    if info.confidence() <= LATIN_LANGUAGE_CONFIDENCE_THRESHOLD {
+        return Ok(qwen3_tts::Language::English);
+    }
 
     if info.script() != whatlang::Script::Latin {
         return Err(auto_language_error(
             "detected a script that Qwen does not support",
         ));
     }
-    if info.confidence() <= LATIN_LANGUAGE_CONFIDENCE_THRESHOLD {
-        return Err(auto_language_error(
-            "did not meet the required confidence threshold",
-        ));
-    }
-
     match info.lang() {
         whatlang::Lang::Eng => Ok(qwen3_tts::Language::English),
         whatlang::Lang::Deu => Ok(qwen3_tts::Language::German),
@@ -429,15 +427,37 @@ mod tests {
     }
 
     #[test]
-    fn auto_language_rejects_ambiguous_latin_text_without_exposing_it() {
-        let text = "Hello";
-        let error = language_to_upstream(TtsLanguage::Auto, text).unwrap_err();
-        let message = error.to_string();
+    fn auto_language_defaults_to_english_for_ambiguous_text() {
+        for text in ["Hello", "Hello from Orchion."] {
+            assert!(matches!(
+                language_to_upstream(TtsLanguage::Auto, text),
+                Ok(qwen3_tts::Language::English)
+            ));
+        }
+    }
 
-        assert!(matches!(error, OrchionError::Inference { .. }));
-        assert!(message.contains("confidence threshold"));
-        assert!(message.contains("specify the language explicitly"));
-        assert!(!message.contains(text));
+    #[test]
+    fn auto_language_detects_short_spanish_text() {
+        assert!(matches!(
+            language_to_upstream(TtsLanguage::Auto, "Hola, ¿cómo estás?"),
+            Ok(qwen3_tts::Language::Spanish)
+        ));
+    }
+
+    #[test]
+    fn auto_language_defaults_to_english_when_detection_is_unavailable() {
+        assert!(matches!(
+            language_to_upstream(TtsLanguage::Auto, "12345?!"),
+            Ok(qwen3_tts::Language::English)
+        ));
+    }
+
+    #[test]
+    fn explicit_language_overrides_auto_detection_for_ambiguous_text() {
+        assert!(matches!(
+            language_to_upstream(TtsLanguage::German, "Hello"),
+            Ok(qwen3_tts::Language::German)
+        ));
     }
 
     #[test]

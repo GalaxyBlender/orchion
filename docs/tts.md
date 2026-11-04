@@ -4,6 +4,10 @@
 
 Orchion exposes speech synthesis through `POST /v1/audio/speech`.
 
+## Language Selection
+
+Omitting `language` or setting it to `auto` enables automatic language selection. Japanese, Korean, Chinese, and Cyrillic text use script detection. For other text, a supported language detected with confidence greater than `0.70` is used; lower-confidence or unrecognizable text defaults to English. A confidently detected unsupported language or script still returns an error. An explicit `language` bypasses automatic detection.
+
 ## Preset Voice
 
 ```sh
