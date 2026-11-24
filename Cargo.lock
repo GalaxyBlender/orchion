@@ -3608,6 +3608,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -3766,6 +3767,7 @@ dependencies = [
  "candle-core 0.11.0",
  "htmd",
  "image",
+ "markup5ever_rcdom",
  "oar-ocr",
  "oar-ocr-vl",
  "orchion-core",

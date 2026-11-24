@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="360" viewBox="0 0 960 360">
+<rect width="960" height="360" fill="white"/>
+<rect x="40" y="40" width="880" height="56" fill="#e2efda"/>
+<g stroke="#888" stroke-width="1" fill="none">
+<path d="M40 40H920V320H40Z M40 96H920 M40 152H920 M40 208H920 M40 264H920 M480 40V320 M620 40V320 M780 40V320"/>
+</g>
+<g font-family="DejaVu Sans" font-size="24" fill="#111">
+<text x="56" y="76">Product</text><text x="500" y="76">Qty</text><text x="640" y="76">Price</text><text x="800" y="76">Total</text>
+<text x="56" y="132">Keyboard</text><text x="500" y="132">2</text><text x="640" y="132">49.00</text><text x="800" y="132">98.00</text>
+<text x="56" y="188">Mouse</text><text x="500" y="188">3</text><text x="640" y="188">19.00</text><text x="800" y="188">57.00</text>
+<text x="56" y="244">Monitor</text><text x="500" y="244">1</text><text x="640" y="244">299.00</text><text x="800" y="244">299.00</text>
+<text x="56" y="300">Grand Total</text><text x="800" y="300">454.00</text>
+</g>
+</svg>

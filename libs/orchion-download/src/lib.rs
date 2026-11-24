@@ -599,6 +599,11 @@ impl ModelDownloader {
         let target_relative = deployment_publication_relative_path(plan);
         let target = cache_dir.join(&target_relative);
         let lock_key = deployment_model_lock_key(plan);
+        tracing::info!(
+            deployment = %plan.deployment_id,
+            path = %target.display(),
+            "checking deployment cache"
+        );
         ensure_cache_state_dir(cache_dir)
             .await
             .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
@@ -614,21 +619,42 @@ impl ModelDownloader {
         validate_cache_relative_ancestors(cache_dir, &target_relative, true)
             .await
             .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
-        if let Ok(publication) =
+        let cached =
             read_deployment_publication(&target, cache_dir, plan, self.verify_file_integrity)
-            && (plan.category != ModelCategory::Llm
-                || validate_llm_lock_sync(
-                    cache_dir,
-                    plan,
-                    &publication,
-                    self.verify_file_integrity,
-                )
-                .is_ok())
-        {
-            return Ok(publication);
+                .and_then(|publication| {
+                    if plan.category == ModelCategory::Llm {
+                        validate_llm_lock_sync(
+                            cache_dir,
+                            plan,
+                            &publication,
+                            self.verify_file_integrity,
+                        )?;
+                    }
+                    Ok(publication)
+                });
+        match cached {
+            Ok(publication) => {
+                tracing::info!(
+                    deployment = %plan.deployment_id,
+                    path = %target.display(),
+                    "reusing cached deployment"
+                );
+                return Ok(publication);
+            }
+            Err(error) => tracing::info!(
+                deployment = %plan.deployment_id,
+                path = %target.display(),
+                reason = %error,
+                "preparing deployment cache"
+            ),
         }
         if plan.category == ModelCategory::Llm && llm_lock_has_matching_entry(cache_dir, plan) {
-            return recover_llm_from_lock(self, cache_dir, plan, client, env, true).await;
+            tracing::info!(deployment = %plan.deployment_id, "recovering deployment cache from model lock");
+            return recover_llm_from_lock(self, cache_dir, plan, client, env, true)
+                .await
+                .inspect(
+                    |_| tracing::info!(deployment = %plan.deployment_id, "deployment cache ready"),
+                );
         }
 
         let resolved = self.resolve_deployment_artifacts(plan, client, env).await?;
@@ -716,6 +742,11 @@ impl ModelDownloader {
         .map_err(|error| deployment_cache_error(plan, error.to_string()))?;
         let publication = read_deployment_publication(&target, cache_dir, plan, true)?;
         validate_llm_lock_sync(cache_dir, plan, &publication, true)?;
+        tracing::info!(
+            deployment = %plan.deployment_id,
+            path = %target.display(),
+            "deployment cache ready"
+        );
         Ok(publication)
     }
 
@@ -1207,6 +1238,10 @@ impl ModelDownloader {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "preflights each provider's exact artifact groups with observable progress"
+    )]
     async fn preflight_deployment_candidates<C: DownloadClient>(
         &self,
         plan: &DeploymentSourcePlan,
@@ -1248,6 +1283,12 @@ impl ModelDownloader {
                     .files
                     .as_ref()
                     .map(|files| files.iter().map(String::as_str).collect::<Vec<_>>());
+                tracing::info!(
+                    source = provider.label(),
+                    repo = %artifact.repository,
+                    files = ?artifact.files,
+                    "checking deployment source"
+                );
                 let result = client
                     .preflight(
                         provider.as_ref(),
@@ -1283,14 +1324,29 @@ impl ModelDownloader {
                 }
             }
             match candidate_error {
-                None => return Ok((source, resolved_artifacts)),
+                None => {
+                    tracing::info!(
+                        source = provider.label(),
+                        repository_count = resolved_artifacts.len(),
+                        "deployment source selected"
+                    );
+                    return Ok((source, resolved_artifacts));
+                }
                 Some(error) if is_retryable_candidate_error(&error) => {
+                    tracing::info!(
+                        source = provider.label(),
+                        reason = %error,
+                        "deployment source rejected"
+                    );
                     failures.push(DownloadFailure {
                         source_name: provider.label(),
                         message: error.to_string(),
                     });
                 }
-                Some(error) => return Err(error),
+                Some(error) => {
+                    tracing::warn!(source = provider.label(), error = %error, "deployment source check failed");
+                    return Err(error);
+                }
             }
         }
         Err(OrchionError::DownloadFallbackExhausted {
@@ -1416,6 +1472,13 @@ impl ModelDownloader {
                     .as_ref()
                     .expect("grouped preflight has exact files");
                 let file_refs = files.iter().map(String::as_str).collect::<Vec<_>>();
+                tracing::info!(
+                    deployment = %plan.deployment_id,
+                    source = provider.label(),
+                    repo = %group.repository,
+                    files = ?files,
+                    "checking deployment source"
+                );
                 let preflight = client
                     .preflight(
                         provider.as_ref(),
@@ -1527,6 +1590,15 @@ impl ModelDownloader {
                 let requested_revision = group.resolved_revision.as_str();
                 let provider_repository =
                     provider.repository(ProviderModel::for_repository(&group.repository));
+                let started = std::time::Instant::now();
+                tracing::info!(
+                    deployment = %plan.deployment_id,
+                    source = provider.label(),
+                    repo = %provider_repository,
+                    revision = requested_revision,
+                    files = ?group.files,
+                    "downloading deployment artifacts"
+                );
                 let result = client
                     .download(
                         provider.as_ref(),
@@ -1537,7 +1609,16 @@ impl ModelDownloader {
                         requested_revision,
                         env,
                     )
-                    .await?;
+                    .await
+                    .inspect_err(|error| {
+                        tracing::warn!(
+                            deployment = %plan.deployment_id,
+                            source = provider.label(),
+                            repo = %provider_repository,
+                            error = %error,
+                            "deployment artifact download failed"
+                        );
+                    })?;
                 let resolved_revision = result.resolved_revision().ok_or_else(|| {
                     deployment_cache_error(
                         plan,
@@ -1581,6 +1662,13 @@ impl ModelDownloader {
                         resolved_revision: Some(resolved_revision.to_string()),
                     });
                 }
+                tracing::info!(
+                    deployment = %plan.deployment_id,
+                    source = provider.label(),
+                    repo = %provider_repository,
+                    elapsed_secs = started.elapsed().as_secs_f64(),
+                    "deployment artifact download completed"
+                );
             }
         }
         Ok(published)

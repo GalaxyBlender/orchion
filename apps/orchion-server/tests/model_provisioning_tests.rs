@@ -217,6 +217,73 @@ impl FakeProvisioner {
 }
 
 #[tokio::test]
+async fn shipped_table_profile_is_provisioned_and_passed_to_the_layout_runtime() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut config = ServerConfig::from_toml_str(
+        include_str!("../config.toml"),
+        &temp_dir.path().join("orchion-server"),
+    )
+    .unwrap();
+    config.services.asr.enabled = false;
+    config.services.tts.enabled = false;
+    config.services.ocr_vl.enabled = false;
+    config.services.llm.enabled = false;
+    let default = config.services.ocr.default_model.clone().unwrap();
+    config
+        .services
+        .ocr
+        .models
+        .retain(|model| model.id == default);
+    let models_dir = config.models.dir.clone();
+    let primary = config.services.ocr.models[0].runtime.clone();
+    let model_dir = primary.cache_path(&models_dir);
+    let layout = config.services.ocr.models[0].layout_runtime.clone();
+    let provisioner = Arc::new(FakeProvisioner::default());
+    let paths = Arc::new(Mutex::new(Vec::new()));
+    let state = AppState::load_with_components(
+        config,
+        Arc::clone(&provisioner),
+        Arc::new(SuccessfulOcrRuntimeFactory {
+            fail: false,
+            paths: Arc::clone(&paths),
+        }),
+    )
+    .await
+    .unwrap();
+
+    let plans = provisioner.deployment_plans();
+    assert_eq!(plans.len(), 1);
+    for role in [
+        ArtifactRole::OcrTableStructureModel,
+        ArtifactRole::OcrTableStructureDictionary,
+    ] {
+        let artifact = plans[0]
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.role == role)
+            .unwrap();
+        assert_eq!(artifact.source, DeploymentArtifactSource::Neutral);
+        assert_eq!(artifact.required_source, None);
+    }
+    let _lease = state.ocr(primary, layout).await.unwrap().unwrap();
+    assert_eq!(
+        paths.lock().unwrap().as_slice(),
+        [ObservedOcrRuntimePaths {
+            model_dir,
+            cache_root: models_dir.clone(),
+            layout: models_dir.join("PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"),
+            table_model: models_dir.join("greatv/oar-ocr/slanet_plus.onnx"),
+            table_dictionary: models_dir.join("greatv/oar-ocr/table_structure_dict_ch.txt"),
+        }]
+    );
+    assert!(
+        state.model_catalog().await[0]
+            .capabilities
+            .contains(ModelCapabilities::OCR_TABLE_STRUCTURE)
+    );
+}
+
+#[tokio::test]
 async fn table_structure_uses_exact_model_and_dictionary_deployment_plan() {
     let temp_dir = tempfile::tempdir().unwrap();
     let config = ServerConfig::from_toml_str(
@@ -706,6 +773,7 @@ async fn all_configured_models_are_provisioned_without_loading_runtimes() {
                     .models
                     .iter()
                     .chain(&config.services.ocr_vl.models)
+                    .filter(|model| model.table_structure.is_none())
                     .flat_map(|model| {
                         std::iter::once(Some(model.model.to_string())).chain(
                             model
@@ -717,6 +785,23 @@ async fn all_configured_models_are_provisioned_without_loading_runtimes() {
             )
             .collect::<Vec<_>>();
         expected_locators.sort();
+        let mut expected_deployments = config
+            .services
+            .ocr
+            .models
+            .iter()
+            .filter(|model| model.table_structure.is_some())
+            .map(|model| model.id.to_string())
+            .chain(
+                config
+                    .services
+                    .llm
+                    .models
+                    .iter()
+                    .map(|model| model.id.to_string()),
+            )
+            .collect::<Vec<_>>();
+        expected_deployments.sort();
         let provisioner = Arc::new(FakeProvisioner::default());
 
         let state = AppState::load_with_provisioner(config, Arc::clone(&provisioner))
@@ -727,7 +812,12 @@ async fn all_configured_models_are_provisioned_without_loading_runtimes() {
         locators.sort();
         assert_eq!(locators, expected_locators);
         let plans = provisioner.deployment_plans();
-        assert_eq!(plans.len(), 2, "both LLM deployments must be provisioned");
+        let mut deployments = plans
+            .iter()
+            .map(|plan| plan.deployment_id.to_string())
+            .collect::<Vec<_>>();
+        deployments.sort();
+        assert_eq!(deployments, expected_deployments);
         assert!(
             plans
                 .iter()

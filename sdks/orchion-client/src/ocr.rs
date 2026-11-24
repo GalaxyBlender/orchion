@@ -234,8 +234,11 @@ impl OcrTask {
 pub struct OcrJsonResponse {
     pub model: String,
     pub format: OcrResponseFormatValue,
+    /// Readable text; table rows use newlines and cells use tabs, not HTML tags.
     pub text: String,
+    /// Markdown with pipe tables, when available; merged cells are flattened.
     pub markdown: Option<String>,
+    /// Sanitized structured layout/table representation, when available.
     pub html: Option<String>,
     #[serde(default)]
     pub regions: Vec<OcrRegion>,

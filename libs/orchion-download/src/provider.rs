@@ -571,8 +571,11 @@ fn preflight_hugging_face<'a>(
         let revision_response = client.get(revision_url).send().await.map_err(|error| {
             classify_reqwest_error(provider.label(), request.repository(), &error)
         })?;
-        let revision_response =
-            require_preflight_success(provider.label(), request.repository(), revision_response)?;
+        let revision_response = require_hugging_face_revision_success(
+            provider,
+            request.repository(),
+            revision_response,
+        )?;
         let revision_metadata = revision_response
             .json::<serde_json::Value>()
             .await
@@ -883,6 +886,34 @@ fn preflight_client(
         .map_err(|error| classify_reqwest_error(source_name, repo, &error))
 }
 
+fn require_hugging_face_revision_success(
+    provider: &HuggingFaceProvider,
+    repo: &str,
+    response: reqwest::Response,
+) -> Result<reqwest::Response> {
+    let error_code = response.headers().get("x-error-code");
+    let error_message = response.headers().get("x-error-message");
+    // HF hides missing/private repositories behind 401, sometimes without RepoNotFound.
+    // Only anonymous repository discovery may reject this candidate like a 404;
+    // configured credentials, gated/disabled repositories, and tree/download errors stay terminal.
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED
+        && provider.options.token.is_none()
+        && error_code.is_none_or(|code| code == "RepoNotFound")
+        && !error_message.is_some_and(|message| {
+            message == "Invalid credentials in Authorization header"
+                || message == "Access to this resource is disabled."
+        })
+    {
+        return Err(provider_error(
+            provider.label(),
+            repo,
+            "HTTP 401 Unauthorized: repository is unavailable to anonymous access",
+            DownloadRetryability::RetryableNotFound,
+        ));
+    }
+    require_preflight_success(provider.label(), repo, response)
+}
+
 fn require_preflight_success(
     source_name: &'static str,
     repo: &str,
@@ -1133,6 +1164,39 @@ mod tests {
         (endpoint, requests, task)
     }
 
+    fn table_artifact_plan(
+        source: &crate::DeploymentArtifactSource,
+    ) -> crate::DeploymentArtifactPlan {
+        crate::DeploymentArtifactPlan {
+            deployment_id: ModelId::parse("paddlepaddle/pp-ocrv5-server").unwrap(),
+            category: orchion_core::ModelCategory::Ocr,
+            source_intent: "//greatv/oar-ocr/table-assets".to_string(),
+            artifacts: [
+                (
+                    crate::ArtifactRole::OcrTableStructureModel,
+                    "slanet_plus.onnx",
+                ),
+                (
+                    crate::ArtifactRole::OcrTableStructureDictionary,
+                    "table_structure_dict_ch.txt",
+                ),
+            ]
+            .into_iter()
+            .map(|(role, file)| crate::DeploymentArtifactRequest {
+                role,
+                source: source.clone(),
+                repository: Some("greatv/oar-ocr".to_string()),
+                files: vec![file.to_string()],
+                required_source: None,
+            })
+            .collect(),
+            neutral_candidates: vec![
+                crate::DownloadSource::HuggingFace,
+                crate::DownloadSource::ModelScope,
+            ],
+        }
+    }
+
     struct DownloadOnlyProvider;
 
     impl DownloadProvider for DownloadOnlyProvider {
@@ -1180,6 +1244,222 @@ mod tests {
     fn mutable_or_abbreviated_refs_are_not_immutable_revisions() {
         assert!(!is_immutable_revision("main"));
         assert!(!is_immutable_revision("0123456789abcdef"));
+    }
+
+    #[tokio::test]
+    async fn anonymous_hugging_face_repository_401_allows_neutral_deployment_fallback() {
+        let (endpoint, requests, task) = serve_metadata_responses(|_| {
+            vec!["HTTP/1.1 401 Unauthorized\r\nX-Error-Message: Invalid username or password.\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()]
+        });
+        // Bypass environment tokens: this fixture specifically exercises anonymous access.
+        let hugging_face = HuggingFaceProvider {
+            options: HubProviderOptions::default().with_metadata_endpoint(endpoint),
+        };
+        let revision = "2222222222222222222222222222222222222222";
+        let (endpoint, ms_requests, ms_task) = serve_metadata_responses(|_| {
+            let body = serde_json::json!({
+                "Code": 200,
+                "Success": true,
+                "Data": {"Revision": revision, "Files": [
+                    {"Type": "blob", "Path": "slanet_plus.onnx", "Revision": revision},
+                    {"Type": "blob", "Path": "table_structure_dict_ch.txt", "Revision": revision}
+                ]}
+            })
+            .to_string();
+            vec![format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )]
+        });
+        let downloader = crate::ModelDownloader::from_registry(
+            DownloadProviderRegistry::new()
+                .with_provider(hugging_face)
+                .with_provider(ModelScopeProvider::with_options(
+                    HubProviderOptions::default().with_metadata_endpoint(endpoint),
+                )),
+        );
+        let plan = table_artifact_plan(&crate::DeploymentArtifactSource::Neutral);
+        let resolved = downloader
+            .resolve_deployment_artifacts(
+                &plan,
+                &crate::LibraryDownloadClient,
+                &crate::DownloadEnv {
+                    orchion_model_source: None,
+                    hf_endpoint: None,
+                },
+            )
+            .await
+            .unwrap();
+        task.join().unwrap();
+        ms_task.join().unwrap();
+
+        assert_eq!(resolved.len(), 2);
+        for artifact in resolved {
+            assert_eq!(artifact.source, crate::DeploymentArtifactSource::ModelScope);
+            assert_eq!(artifact.resolved_revision.as_deref(), Some(revision));
+        }
+        assert_eq!(
+            *requests.lock().unwrap(),
+            ["GET /api/models/greatv/oar-ocr/revision/main HTTP/1.1"]
+        );
+        assert_eq!(ms_requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn anonymous_hugging_face_repository_401_does_not_override_explicit_source() {
+        let (endpoint, requests, task) = serve_metadata_responses(|_| {
+            vec![
+                "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_string(),
+            ]
+        });
+        let downloader = crate::ModelDownloader::from_registry(
+            DownloadProviderRegistry::new()
+                .with_provider(HuggingFaceProvider {
+                    options: HubProviderOptions::default().with_metadata_endpoint(endpoint.clone()),
+                })
+                .with_provider(ModelScopeProvider::with_options(
+                    HubProviderOptions::default().with_metadata_endpoint(endpoint),
+                )),
+        );
+        let plan = table_artifact_plan(&crate::DeploymentArtifactSource::HuggingFace);
+        let error = downloader
+            .resolve_deployment_artifacts(
+                &plan,
+                &crate::LibraryDownloadClient,
+                &crate::DownloadEnv {
+                    orchion_model_source: None,
+                    hf_endpoint: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        task.join().unwrap();
+        assert!(matches!(
+            error,
+            OrchionError::ProviderDownload {
+                source_name: "huggingface",
+                ..
+            }
+        ));
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn hugging_face_repository_authentication_and_access_errors_are_terminal() {
+        for (token, status, headers) in [
+            (Some("test-token"), "401 Unauthorized", ""),
+            (
+                Some("test-token"),
+                "401 Unauthorized",
+                "X-Error-Code: RepoNotFound\r\n",
+            ),
+            (
+                None,
+                "401 Unauthorized",
+                "X-Error-Message: Invalid credentials in Authorization header\r\n",
+            ),
+            (None, "401 Unauthorized", "X-Error-Code: GatedRepo\r\n"),
+            (None, "401 Unauthorized", "X-Error-Code: UnknownError\r\n"),
+            (
+                None,
+                "401 Unauthorized",
+                "X-Error-Message: Access to this resource is disabled.\r\n",
+            ),
+            (None, "403 Forbidden", "X-Error-Code: GatedRepo\r\n"),
+        ] {
+            let (endpoint, _, task) = serve_metadata_responses(|_| {
+                vec![format!(
+                    "HTTP/1.1 {status}\r\n{headers}Content-Length: 0\r\nConnection: close\r\n\r\n"
+                )]
+            });
+            let mut options = HubProviderOptions::default().with_metadata_endpoint(endpoint);
+            options.token = token.map(str::to_string);
+            let provider = HuggingFaceProvider { options };
+            let error = provider
+                .preflight(ProviderPreflightRequest::new(
+                    "greatv/oar-ocr",
+                    "main",
+                    Some(&["slanet_plus.onnx"]),
+                ))
+                .await
+                .unwrap_err();
+            task.join().unwrap();
+            assert!(
+                matches!(
+                    error,
+                    OrchionError::ProviderDownload {
+                        retryability: DownloadRetryability::Terminal,
+                        ..
+                    }
+                ),
+                "{error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn anonymous_hugging_face_tree_401_remains_terminal() {
+        let revision = "1111111111111111111111111111111111111111";
+        let (endpoint, _, task) = serve_metadata_responses(|_| {
+            let body = serde_json::json!({"sha": revision}).to_string();
+            vec![
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                ),
+                "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_string(),
+            ]
+        });
+        let provider = HuggingFaceProvider {
+            options: HubProviderOptions::default().with_metadata_endpoint(endpoint),
+        };
+        let error = provider
+            .preflight(ProviderPreflightRequest::new(
+                "greatv/oar-ocr",
+                "main",
+                Some(&["slanet_plus.onnx"]),
+            ))
+            .await
+            .unwrap_err();
+        task.join().unwrap();
+        assert!(matches!(
+            error,
+            OrchionError::ProviderDownload {
+                retryability: DownloadRetryability::Terminal,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn modelscope_repository_401_remains_terminal() {
+        let (endpoint, _, task) = serve_metadata_responses(|_| {
+            vec![
+                "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_string(),
+            ]
+        });
+        let provider = ModelScopeProvider::with_options(
+            HubProviderOptions::default().with_metadata_endpoint(endpoint),
+        );
+        let error = provider
+            .preflight(ProviderPreflightRequest::new(
+                "greatv/oar-ocr",
+                "master",
+                Some(&["slanet_plus.onnx"]),
+            ))
+            .await
+            .unwrap_err();
+        task.join().unwrap();
+        assert!(matches!(
+            error,
+            OrchionError::ProviderDownload {
+                retryability: DownloadRetryability::Terminal,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

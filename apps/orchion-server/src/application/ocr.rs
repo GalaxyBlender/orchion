@@ -222,7 +222,19 @@ pub fn validate_parameters(
         OcrResponseFormat::Markdown => ModelCapabilities::OCR_MARKDOWN,
         OcrResponseFormat::Html => ModelCapabilities::OCR_HTML,
     };
-    if !capabilities.contains(required_format_capability) {
+    let structured = matches!(
+        response_format,
+        OcrResponseFormat::Markdown | OcrResponseFormat::Html
+    );
+    if supports_vision_language && structured && !matches!(task, OcrTask::Ocr | OcrTask::Table) {
+        return Err(UseCaseError::invalid(
+            "structured response formats are only supported for OCR and table tasks",
+            Some("response_format"),
+            "unsupported_response_format",
+        ));
+    }
+    let table_format = supports_vision_language && task == OcrTask::Table && structured;
+    if !table_format && !capabilities.contains(required_format_capability) {
         return Err(UseCaseError::invalid(
             "selected OCR deployment does not support the requested response format",
             Some("response_format"),
@@ -473,6 +485,102 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn vl_table_formats_do_not_require_document_layout() {
+        let choice = OcrServiceChoice::OcrVl {
+            model: ocr_vl_model(),
+        };
+        for format in [
+            OcrResponseFormat::Json,
+            OcrResponseFormat::Text,
+            OcrResponseFormat::Markdown,
+            OcrResponseFormat::Html,
+        ] {
+            validate_parameters(&choice, format, OcrTask::Table, None, Some(32), &policy())
+                .unwrap();
+        }
+        let error = validate_parameters(
+            &choice,
+            OcrResponseFormat::Markdown,
+            OcrTask::Formula,
+            None,
+            None,
+            &policy(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            UseCaseError::InvalidRequest {
+                code: "unsupported_response_format",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn all_ocr_task_and_format_combinations_follow_the_output_contract() {
+        use OcrResponseFormat::{Html, Json, Markdown, Text};
+        let policy = policy();
+        let layout = ModelId::parse("PaddlePaddle/PP-DocLayoutV3").unwrap();
+        for (choice, has_layout, allowed_ocr, allowed_table) in [
+            (
+                OcrServiceChoice::ocr(traditional_model()),
+                false,
+                vec![Json, Text],
+                vec![],
+            ),
+            (
+                OcrServiceChoice::ocr(traditional_model()),
+                true,
+                vec![Json, Text, Markdown],
+                vec![],
+            ),
+            (
+                OcrServiceChoice::ocr_vl(ocr_vl_model()),
+                false,
+                vec![Json, Text],
+                vec![Json, Text, Markdown, Html],
+            ),
+            (
+                OcrServiceChoice::ocr_vl(ocr_vl_model()),
+                true,
+                vec![Json, Text, Markdown, Html],
+                vec![Json, Text, Markdown, Html],
+            ),
+        ] {
+            for task in [
+                OcrTask::Ocr,
+                OcrTask::Table,
+                OcrTask::Formula,
+                OcrTask::Chart,
+                OcrTask::Spotting,
+                OcrTask::Seal,
+            ] {
+                let allowed = match task {
+                    OcrTask::Ocr => allowed_ocr.as_slice(),
+                    OcrTask::Table => allowed_table.as_slice(),
+                    _ if choice.is_ocr_vl() => &[Json, Text],
+                    _ => &[],
+                };
+                for format in [Json, Text, Markdown, Html] {
+                    let result = validate_parameters(
+                        &choice,
+                        format,
+                        task,
+                        has_layout.then_some(&layout),
+                        None,
+                        &policy,
+                    );
+                    assert_eq!(
+                        result.is_ok(),
+                        allowed.contains(&format),
+                        "choice={choice:?}, layout={has_layout}, task={task:?}, format={format:?}: {result:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

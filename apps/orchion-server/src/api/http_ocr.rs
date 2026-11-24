@@ -127,7 +127,11 @@ where
     if let Some(Extension(activity)) = &activity {
         activity.set_model(result.model.to_string());
     }
-    Ok(match response_format {
+    Ok(ocr_response(response_format, result))
+}
+
+fn ocr_response(response_format: OcrApiFormat, result: orchion::OcrResult) -> Response {
+    match response_format {
         OcrApiFormat::Json => Json(OcrJsonResponse {
             model: result.model.to_string(),
             format: response_format,
@@ -165,7 +169,7 @@ where
                 .unwrap_or_else(|| escaped_text_html(&result.text)),
         )
             .into_response(),
-    })
+    }
 }
 
 fn escaped_text_html(text: &str) -> String {
@@ -180,6 +184,198 @@ fn escaped_text_html(text: &str) -> String {
     }
     html.push_str("</pre>");
     html
+}
+
+#[cfg(test)]
+mod response_tests {
+    use super::*;
+
+    fn table_result(format: OcrApiFormat) -> orchion::OcrResult {
+        orchion::OcrResult {
+            model: "paddlepaddle/paddleocr-vl-1.6".parse().unwrap(),
+            format: format.into(),
+            text: "Product\tTotal\nKeyboard\t98.00".to_string(),
+            markdown: Some("| Product | Total |\n| --- | --- |\n| Keyboard | 98.00 |".to_string()),
+            html: Some("<table><tr><td>Product</td><td>Total</td></tr><tr><td>Keyboard</td><td>98.00</td></tr></table>".to_string()),
+            regions: vec![orchion::OcrRegion {
+                text: "Product\tTotal\nKeyboard\t98.00".to_string(),
+                confidence: None,
+                polygon: Vec::new(),
+            }],
+            layout_blocks: Vec::new(),
+            usage: orchion::OcrUsage { input_pages: 1, output_tokens: None },
+        }
+    }
+
+    fn document_result(format: OcrApiFormat) -> orchion::OcrResult {
+        let mut result = table_result(format);
+        result.text = "Project Notes\nReference number 4827.".to_string();
+        result.markdown = Some("# Project Notes\n\nReference number 4827.".to_string());
+        result.html = Some("<h1>Project Notes</h1>\n<p>Reference number 4827.</p>".to_string());
+        result.regions[0].text.clone_from(&result.text);
+        result
+    }
+
+    async fn assert_response_body(format: OcrApiFormat, result: orchion::OcrResult) -> String {
+        let content_type = match format {
+            OcrApiFormat::Json => "application/json",
+            OcrApiFormat::Text => "text/plain; charset=utf-8",
+            OcrApiFormat::Markdown => "text/markdown; charset=utf-8",
+            OcrApiFormat::Html => "text/html; charset=utf-8",
+        };
+        let response = ocr_response(format, result.clone());
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(response.headers()[CONTENT_TYPE], content_type);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        match format {
+            OcrApiFormat::Json => {
+                let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(json["format"], "json");
+                assert_eq!(json["text"], result.text);
+                assert_eq!(json["regions"][0]["text"], result.regions[0].text);
+                assert_eq!(json["markdown"], result.markdown.unwrap());
+                assert_eq!(json["html"], result.html.unwrap());
+            }
+            OcrApiFormat::Text => assert_eq!(body, result.text),
+            OcrApiFormat::Markdown => assert_eq!(body, result.markdown.unwrap()),
+            OcrApiFormat::Html => assert_eq!(body, result.html.unwrap()),
+        }
+        body
+    }
+
+    #[tokio::test]
+    async fn each_ocr_format_selects_its_own_body_and_content_type_for_tables_and_documents() {
+        for format in [
+            OcrApiFormat::Json,
+            OcrApiFormat::Text,
+            OcrApiFormat::Markdown,
+            OcrApiFormat::Html,
+        ] {
+            for result in [table_result(format), document_result(format)] {
+                assert_response_body(format, result).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local OCR, layout, SLANet+ models and table dictionary"]
+    async fn real_ocr_images_keep_their_format_through_the_http_response_boundary() {
+        use orchion::{
+            DevicePreference, KnownOcrModel, Ocr, OcrAssets, OcrOptions, TableStructureAssets,
+        };
+        use std::path::PathBuf;
+
+        let root = PathBuf::from(std::env::var_os("ORCHION_OCR_TEST_MODELS").unwrap());
+        let assets = OcrAssets::from_cache_layout(
+            KnownOcrModel::PpOcrV6Tiny,
+            root.join("PaddlePaddle/PP-OCRv6_tiny"),
+            &root,
+        )
+        .with_layout(Some(
+            root.join("PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"),
+        ))
+        .with_table_structure(Some(TableStructureAssets {
+            model: std::env::var_os("ORCHION_OCR_TEST_TABLE_MODEL")
+                .unwrap()
+                .into(),
+            dictionary: std::env::var_os("ORCHION_OCR_TEST_TABLE_DICTIONARY")
+                .unwrap()
+                .into(),
+            table_type: "wireless".to_string(),
+            score_threshold: 0.5,
+            max_structure_length: 500,
+        }));
+        let engine = Ocr::load_with_assets_and_device(
+            KnownOcrModel::PpOcrV6Tiny.id(),
+            assets,
+            DevicePreference::Cpu,
+        )
+        .await
+        .unwrap();
+        let fixtures =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../libs/orchion-ocr/tests/fixtures");
+        let mut images = vec![
+            (
+                fixtures.join("table.png"),
+                vec!["Product", "Keyboard", "98.00", "454.00"],
+                true,
+            ),
+            (
+                fixtures.join("merged-table.png"),
+                vec!["Product", "Keyboard", "98.00", "454.00"],
+                true,
+            ),
+            (
+                fixtures.join("document.png"),
+                vec!["Project Notes", "deployment check passed", "4827"],
+                false,
+            ),
+        ];
+        if let Some(image) = std::env::var_os("ORCHION_OCR_TEST_IMAGE") {
+            images.push((image.into(), vec!["235.00", "14008.00", "2961.00"], true));
+        }
+        for (image, expected, has_table) in images {
+            for format in [
+                OcrApiFormat::Json,
+                OcrApiFormat::Text,
+                OcrApiFormat::Markdown,
+            ] {
+                let result = engine
+                    .recognize_file_with(
+                        &image,
+                        OcrOptions {
+                            response_format: format.into(),
+                            layout_model: Some(KnownOcrModel::PpDocLayoutV3.id().parse().unwrap()),
+                            ..OcrOptions::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert!(!result.text.contains("<table"));
+                let markdown = result.markdown.as_deref();
+                if let Some(markdown) = markdown {
+                    assert!(!markdown.contains("<table"), "{markdown}");
+                    assert_eq!(
+                        markdown.lines().any(|line| line.starts_with('|')),
+                        has_table
+                    );
+                }
+                let body = assert_response_body(format, result).await;
+                for text in &expected {
+                    assert!(
+                        body.contains(text),
+                        "{} {format:?}: missing {text:?}: {body}",
+                        image.display()
+                    );
+                }
+                if format != OcrApiFormat::Json {
+                    assert!(!body.contains("<table"), "{body}");
+                }
+                println!(
+                    "[ocr-http-format] image={} format={format:?} passed",
+                    image.display()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn html_fallback_escapes_literal_recognized_text() {
+        let mut result = table_result(OcrApiFormat::Html);
+        result.html = None;
+        result.text = "A & B <script>literal</script>".to_string();
+        let response = ocr_response(OcrApiFormat::Html, result);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            &body[..],
+            b"<pre>A &amp; B &lt;script&gt;literal&lt;/script&gt;</pre>"
+        );
+    }
 }
 
 pub(super) fn parse_ocr_task(value: &str) -> Result<OcrTask, ApiError> {

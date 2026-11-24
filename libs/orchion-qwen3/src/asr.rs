@@ -1,3 +1,4 @@
+use crate::device_resource::DeviceResource;
 use orchion_core::{
     ASR_SAMPLE_RATE, AsrModel, AsrOptions, AsrStreamingOptions, AsrTranscript, DevicePreference,
     OrchionError, Result, prepare_asr_samples,
@@ -8,33 +9,12 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone)]
 pub struct Asr {
     model: AsrModel,
-    engine: Arc<Mutex<qwen3_asr::AsrInference>>,
-    #[cfg(feature = "cuda")]
-    device: candle_core::Device,
+    engine: Arc<Mutex<DeviceResource<qwen3_asr::AsrInference>>>,
 }
 
 pub struct AsrStream {
-    engine: Arc<Mutex<qwen3_asr::AsrInference>>,
-    state: Arc<Mutex<AsrStreamingState>>,
-}
-
-struct AsrStreamingState {
-    state: qwen3_asr::StreamingState,
-    #[cfg(feature = "cuda")]
-    device: candle_core::Device,
-}
-
-#[cfg(feature = "cuda")]
-impl Drop for AsrStreamingState {
-    fn drop(&mut self) {
-        // cudarc 0.17's default-stream buffers require a current context on free.
-        // Async completion or cancellation can drop the encoder cache on any thread.
-        if let candle_core::Device::Cuda(device) = &self.device
-            && let Err(error) = device.cuda_stream().context().bind_to_thread()
-        {
-            tracing::error!(%error, "failed to bind CUDA context before dropping ASR stream state");
-        }
-    }
+    state: Arc<Mutex<DeviceResource<qwen3_asr::StreamingState>>>,
+    engine: Arc<Mutex<DeviceResource<qwen3_asr::AsrInference>>>,
 }
 
 impl Asr {
@@ -58,18 +38,16 @@ impl Asr {
                 "ASR device selected"
             );
             tracing::debug!(device_debug, "ASR device details selected");
-            let device = resolved.device;
-            let engine =
+            let engine = DeviceResource::load(&resolved.device, |device| {
                 qwen3_asr::AsrInference::load(&model_dir, device.clone()).map_err(|source| {
                     OrchionError::ModelLoad {
-                        message: source.to_string(),
+                        message: format!("{:#}", anyhow::Error::new(source)),
                     }
-                })?;
+                })
+            })?;
             Ok(Self {
                 model,
                 engine: Arc::new(Mutex::new(engine)),
-                #[cfg(feature = "cuda")]
-                device,
             })
         })
         .await
@@ -94,9 +72,7 @@ impl Asr {
             let path_text = path.to_str().ok_or_else(|| OrchionError::NonUtf8Path {
                 path: PathBuf::from(&path),
             })?;
-            let engine = engine.lock().map_err(|error| OrchionError::Inference {
-                message: error.to_string(),
-            })?;
+            let engine = DeviceResource::lock(&engine)?;
             engine
                 .transcribe(path_text, transcribe_options_into_upstream(options))
                 .map(transcript_from_upstream)
@@ -125,9 +101,7 @@ impl Asr {
         let prepared = prepare_asr_samples(samples, sample_rate)?.into_owned();
         let engine = Arc::clone(&self.engine);
         crate::blocking::run(move || {
-            let engine = engine.lock().map_err(|error| OrchionError::Inference {
-                message: error.to_string(),
-            })?;
+            let engine = DeviceResource::lock(&engine)?;
             engine
                 .transcribe_samples(&prepared, transcribe_options_into_upstream(options))
                 .map(transcript_from_upstream)
@@ -146,19 +120,13 @@ impl Asr {
     pub async fn start_streaming_with(&self, options: AsrStreamingOptions) -> Result<AsrStream> {
         validate_streaming_options(&options)?;
         let upstream_options = streaming_options_into_upstream_options(options);
-        #[cfg(feature = "cuda")]
-        let device = self.device.clone();
         let engine = Arc::clone(&self.engine);
         let state = crate::blocking::run({
             let engine = Arc::clone(&engine);
             move || {
-                let engine = engine.lock().map_err(|error| OrchionError::Inference {
-                    message: error.to_string(),
-                })?;
-                Ok(AsrStreamingState {
-                    state: engine.init_streaming(upstream_options),
-                    #[cfg(feature = "cuda")]
-                    device,
+                let engine = DeviceResource::lock(&engine)?;
+                DeviceResource::load(engine.device(), |_| {
+                    Ok(engine.init_streaming(upstream_options))
                 })
             }
         })
@@ -180,14 +148,10 @@ impl AsrStream {
         let engine = Arc::clone(&self.engine);
         let state = Arc::clone(&self.state);
         crate::blocking::run(move || {
-            let engine = engine.lock().map_err(|error| OrchionError::Inference {
-                message: error.to_string(),
-            })?;
-            let mut state = state.lock().map_err(|error| OrchionError::Inference {
-                message: error.to_string(),
-            })?;
+            let engine = DeviceResource::lock(&engine)?;
+            let mut state = DeviceResource::lock(&state)?;
             let transcript = engine
-                .feed_audio(&mut state.state, &prepared)
+                .feed_audio(&mut state, &prepared)
                 .map_err(|source| OrchionError::Inference {
                     message: source.to_string(),
                 })?
@@ -201,14 +165,10 @@ impl AsrStream {
         let engine = Arc::clone(&self.engine);
         let state = Arc::clone(&self.state);
         crate::blocking::run(move || {
-            let engine = engine.lock().map_err(|error| OrchionError::Inference {
-                message: error.to_string(),
-            })?;
-            let mut state = state.lock().map_err(|error| OrchionError::Inference {
-                message: error.to_string(),
-            })?;
+            let engine = DeviceResource::lock(&engine)?;
+            let mut state = DeviceResource::lock(&state)?;
             engine
-                .finish_streaming(&mut state.state)
+                .finish_streaming(&mut state)
                 .map(transcript_from_upstream)
                 .map_err(|source| OrchionError::Inference {
                     message: source.to_string(),
@@ -388,6 +348,25 @@ mod tests {
             orchion_core::DevicePreference::Cpu,
         );
         std::mem::drop(future);
+    }
+
+    #[test]
+    fn model_load_error_includes_the_underlying_io_error() {
+        let not_a_directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let cause = std::fs::read_to_string(not_a_directory.join("config.json")).unwrap_err();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(Asr::load_with_device(
+            AsrModel::parse("alibaba/qwen3-asr-0.6b").unwrap(),
+            not_a_directory,
+            DevicePreference::Cpu,
+        ));
+        let Err(OrchionError::ModelLoad { message }) = result else {
+            panic!("expected a model load error");
+        };
+        assert!(message.contains("load config"), "{message}");
+        assert!(message.contains(&cause.to_string()), "{message}");
     }
 
     #[cfg(feature = "cuda")]

@@ -107,30 +107,36 @@ id = "paddlepaddle/pp-ocrv5-mobile"
 name = "PP-OCRv5 Mobile"
 model = "//PaddlePaddle/PP-OCRv5_mobile"
 layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
+# Layout detects tables; SLANet+ supplies their structure and cell matching.
+table_structure = { model = "//greatv/oar-ocr/slanet_plus.onnx", dictionary = "//greatv/oar-ocr/table_structure_dict_ch.txt", table_type = "wireless" }
 
 [[services.ocr.models]]
 id = "paddlepaddle/pp-ocrv5-server"
 name = "PP-OCRv5 Server"
 model = "//PaddlePaddle/PP-OCRv5_server"
 layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
+table_structure = { model = "//greatv/oar-ocr/slanet_plus.onnx", dictionary = "//greatv/oar-ocr/table_structure_dict_ch.txt", table_type = "wireless" }
 
 [[services.ocr.models]]
 id = "paddlepaddle/pp-ocrv6-tiny"
 name = "PP-OCRv6 Tiny"
 model = "//PaddlePaddle/PP-OCRv6_tiny"
 layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
+table_structure = { model = "//greatv/oar-ocr/slanet_plus.onnx", dictionary = "//greatv/oar-ocr/table_structure_dict_ch.txt", table_type = "wireless" }
 
 [[services.ocr.models]]
 id = "paddlepaddle/pp-ocrv6-small"
 name = "PP-OCRv6 Small"
 model = "//PaddlePaddle/PP-OCRv6_small"
 layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
+table_structure = { model = "//greatv/oar-ocr/slanet_plus.onnx", dictionary = "//greatv/oar-ocr/table_structure_dict_ch.txt", table_type = "wireless" }
 
 [[services.ocr.models]]
 id = "paddlepaddle/pp-ocrv6-medium"
 name = "PP-OCRv6 Medium"
 model = "//PaddlePaddle/PP-OCRv6_medium"
 layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
+table_structure = { model = "//greatv/oar-ocr/slanet_plus.onnx", dictionary = "//greatv/oar-ocr/table_structure_dict_ch.txt", table_type = "wireless" }
 
 [services.ocr-vl]
 enabled = true

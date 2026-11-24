@@ -1149,35 +1149,41 @@ async fn traditional_ocr_html_is_rejected_even_with_a_deployment_layout_model() 
             .with_supported_layout();
     });
     let boundary = "orchion-ocr-traditional-html";
-    let body = multipart_body(
-        boundary,
-        &[
-            ("model", "paddlepaddle/pp-ocrv6-tiny"),
-            ("response_format", "html"),
-        ],
-        "file",
-        "input.png",
-        b"not an image",
-    );
-    let response = router(state)
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/ocr")
-                .header(
-                    "content-type",
-                    format!("multipart/form-data; boundary={boundary}"),
-                )
-                .body(Body::from(body))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    for image in [
+        b"not an image".as_slice(),
+        include_bytes!("../../../libs/orchion-ocr/tests/fixtures/table.png").as_slice(),
+        include_bytes!("../../../libs/orchion-ocr/tests/fixtures/document.png").as_slice(),
+    ] {
+        let body = multipart_body(
+            boundary,
+            &[
+                ("model", "paddlepaddle/pp-ocrv6-tiny"),
+                ("response_format", "html"),
+            ],
+            "file",
+            "input.png",
+            image,
+        );
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/ocr")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let body = json_body(response).await;
-    assert_eq!(body["error"]["param"], "response_format");
-    assert_eq!(body["error"]["code"], "unsupported_response_format");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["param"], "response_format");
+        assert_eq!(body["error"]["code"], "unsupported_response_format");
+    }
 }
 
 #[tokio::test]
@@ -1256,6 +1262,42 @@ async fn ocr_vl_rejects_structured_format_without_layout_before_model_load() {
     let body = json_body(response).await;
     assert_eq!(body["error"]["param"], "response_format");
     assert_eq!(body["error"]["code"], "unsupported_response_format");
+}
+
+#[tokio::test]
+async fn ocr_vl_table_structured_formats_reach_image_validation_without_layout() {
+    for format in ["markdown", "html"] {
+        let boundary = "orchion-vl-table-format";
+        let body = multipart_body(
+            boundary,
+            &[
+                ("model", "paddlepaddle/paddleocr-vl-1.6"),
+                ("task", "table"),
+                ("response_format", format),
+            ],
+            "file",
+            "input.png",
+            b"not an image",
+        );
+        let response = router(test_state_with_ocr_services(None))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/ocr")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["param"], "file");
+        assert_eq!(body["error"]["code"], "invalid_file");
+    }
 }
 
 #[tokio::test]

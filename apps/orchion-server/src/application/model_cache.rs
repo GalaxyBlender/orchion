@@ -205,10 +205,15 @@ struct ExecutionController {
 
 #[must_use = "the model lease must be held while the model is in use"]
 pub struct ModelLease<E> {
+    // Release the engine clone before the last lease announces it can be retired.
     engine: E,
+    liveness: LeaseLiveness,
+    execution: Arc<ExecutionController>,
+}
+
+struct LeaseLiveness {
     last_used: Arc<StdMutex<Instant>>,
     active_leases: Arc<AtomicUsize>,
-    execution: Arc<ExecutionController>,
     residency: ResidencyDomain,
 }
 
@@ -238,10 +243,12 @@ impl<E> ModelLease<E> {
         active_leases.fetch_add(1, Ordering::SeqCst);
         Self {
             engine,
-            last_used,
-            active_leases,
+            liveness: LeaseLiveness {
+                last_used,
+                active_leases,
+                residency,
+            },
             execution,
-            residency,
         }
     }
 }
@@ -329,10 +336,10 @@ impl<E: Clone> Clone for ModelLease<E> {
     fn clone(&self) -> Self {
         Self::new(
             self.engine.clone(),
-            Arc::clone(&self.last_used),
-            Arc::clone(&self.active_leases),
+            Arc::clone(&self.liveness.last_used),
+            Arc::clone(&self.liveness.active_leases),
             Arc::clone(&self.execution),
-            self.residency.clone(),
+            self.liveness.residency.clone(),
         )
     }
 }
@@ -359,7 +366,7 @@ impl<E: std::fmt::Debug> std::fmt::Debug for ModelLease<E> {
     }
 }
 
-impl<E> Drop for ModelLease<E> {
+impl Drop for LeaseLiveness {
     fn drop(&mut self) {
         *self
             .last_used
@@ -2388,6 +2395,66 @@ mod tests {
 
         assert!(deadline >= before_drop.checked_add(idle_timeout).unwrap());
         assert!(deadline <= after_drop.checked_add(idle_timeout).unwrap());
+    }
+
+    #[tokio::test]
+    async fn idle_unload_waits_until_the_last_lease_releases_its_engine() {
+        struct BlockingLease(BlockingDropProbe);
+
+        impl Clone for BlockingLease {
+            fn clone(&self) -> Self {
+                let mut probe = self.0.clone();
+                probe.blocks_on_drop = true;
+                Self(probe)
+            }
+        }
+
+        let model = qwen_asr_06b();
+        let cache = ModelCache::new(
+            "asr",
+            vec![model.clone()],
+            Duration::ZERO,
+            1,
+            PathBuf::from("models"),
+        );
+        let started = Arc::new(Notify::new());
+        let release = Arc::new((StdMutex::new(false), Condvar::new()));
+        let last_lease = cache
+            .get_or_load(model.clone(), {
+                let started = Arc::clone(&started);
+                let release = Arc::clone(&release);
+                move |_, _| async move {
+                    Ok(BlockingLease(BlockingDropProbe {
+                        blocks_on_drop: false,
+                        started,
+                        release,
+                    }))
+                }
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let dropping = tokio::task::spawn_blocking(move || drop(last_lease));
+        if tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .is_err()
+        {
+            release_blocking_drop(&release);
+            dropping.await.unwrap();
+            panic!("last lease did not start releasing its engine");
+        }
+
+        cache.cleanup_idle().await;
+        let status_during_drop = cache.status(&model).await;
+        release_blocking_drop(&release);
+        dropping.await.unwrap();
+        assert_eq!(status_during_drop, Some(ModelResidencyStatus::Loaded));
+
+        cache.cleanup_idle().await;
+        assert_eq!(
+            cache.status(&model).await,
+            Some(ModelResidencyStatus::Unloaded)
+        );
     }
 
     #[tokio::test]

@@ -49,6 +49,52 @@ fn defaults_are_executable_relative_and_use_neutral_deployments() {
 }
 
 #[test]
+fn shipped_traditional_layout_deployments_include_table_dependencies() {
+    let config = ServerConfig::from_toml_str(include_str!("../config.toml"), exe()).unwrap();
+    assert!(!config.services.ocr.models.is_empty());
+    for deployment in &config.services.ocr.models {
+        assert!(deployment.layout_model.is_some());
+        let table = deployment.table_structure.as_ref().unwrap_or_else(|| {
+            panic!(
+                "{} must be able to recognize table screenshots",
+                deployment.id
+            )
+        });
+        assert_eq!(table.model.source(), ModelUrlSource::Neutral);
+        assert_eq!(table.dictionary.source(), ModelUrlSource::Neutral);
+        assert!(table.model.as_str().ends_with("/slanet_plus.onnx"));
+        assert!(
+            table
+                .dictionary
+                .as_str()
+                .ends_with("/table_structure_dict_ch.txt")
+        );
+        assert_eq!(table.table_type, TableStructureType::Wireless);
+    }
+}
+
+#[test]
+fn layout_only_configuration_does_not_infer_table_dependencies() {
+    let config = ServerConfig::from_toml_str(
+        r#"
+[[services.ocr.models]]
+id = "paddlepaddle/pp-ocrv6-tiny"
+model = "//PaddlePaddle/PP-OCRv6_tiny"
+layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
+
+[[services.ocr-vl.models]]
+id = "paddlepaddle/paddleocr-vl-1.6"
+model = "//PaddlePaddle/PaddleOCR-VL-1.6"
+layout_model = "//PaddlePaddle/PP-DocLayoutV3_onnx/inference.onnx"
+"#,
+        exe(),
+    )
+    .unwrap();
+    assert!(config.services.ocr.models[0].table_structure.is_none());
+    assert!(config.services.ocr_vl.models[0].table_structure.is_none());
+}
+
+#[test]
 fn deployment_arrays_parse_and_replace_defaults() {
     let config = ServerConfig::from_toml_str(
         r#"

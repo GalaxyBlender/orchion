@@ -1,6 +1,8 @@
 use crate::OcrAssets;
 #[cfg(any(feature = "ocr", feature = "ocr-vl"))]
 use crate::device::{ProviderPolicy, try_provider_candidates};
+#[cfg(any(feature = "ocr", feature = "ocr-vl"))]
+use crate::table::{escape_html, html_tables_to_markdown, table_to_html, table_to_text};
 use image::{ImageReader, Limits};
 #[cfg(feature = "ocr")]
 use orchion_core::OcrPoint;
@@ -193,10 +195,10 @@ fn validate_builtin_request(
                 options.response_format,
                 OcrResponseFormat::Markdown | OcrResponseFormat::Html
             );
-            if structured && options.task != OcrTask::Ocr {
+            if structured && !matches!(options.task, OcrTask::Ocr | OcrTask::Table) {
                 return unsupported(model, structured_task_capability(options.response_format));
             }
-            if options.layout_model.is_some() || structured {
+            if options.task == OcrTask::Ocr && (options.layout_model.is_some() || structured) {
                 require_layout(model, has_layout)?;
             }
             if should_use_vl_layout_pipeline(options) {
@@ -255,8 +257,8 @@ const fn task_capability(task: OcrTask) -> &'static str {
 
 const fn structured_task_capability(format: OcrResponseFormat) -> &'static str {
     match format {
-        OcrResponseFormat::Markdown => "Markdown response format for non-OCR tasks",
-        OcrResponseFormat::Html => "HTML response format for non-OCR tasks",
+        OcrResponseFormat::Markdown => "Markdown response format for tasks other than OCR or table",
+        OcrResponseFormat::Html => "HTML response format for tasks other than OCR or table",
         OcrResponseFormat::Json | OcrResponseFormat::Text => "structured response format",
     }
 }
@@ -611,18 +613,67 @@ fn traditional_layout_result(
     format: OcrResponseFormat,
     result: &oar_ocr::domain::structure::StructureResult,
 ) -> OcrResult {
-    let text = result
+    use oar_ocr::domain::structure::LayoutElementType;
+
+    let elements = result
         .layout_elements
         .iter()
-        .filter_map(|element| element.text.as_deref())
+        .map(|element| {
+            // The structure pipeline stores table content separately from the
+            // layout element. Match it using the same rule as to_markdown().
+            let table_text = if element.element_type == LayoutElementType::Table {
+                result
+                    .tables
+                    .iter()
+                    .find(|table| table.bbox.iou(&element.bbox) > 0.5)
+                    .and_then(|table| table.html_structure.as_deref())
+            } else {
+                None
+            };
+            (element, table_text.or(element.text.as_deref()))
+        })
+        .collect::<Vec<_>>();
+    let markdown = matches!(
+        format,
+        OcrResponseFormat::Json | OcrResponseFormat::Markdown
+    )
+    .then(|| html_tables_to_markdown(&result.to_markdown()));
+    // JSON keeps structure in its dedicated markup fields, never in text/regions.
+    let html = (format == OcrResponseFormat::Json).then(|| {
+        render_layout_html(
+            elements.iter().map(|(element, text)| {
+                let label = if element.element_type == LayoutElementType::Table {
+                    "table"
+                } else {
+                    element.label.as_deref().unwrap_or("text")
+                };
+                (label, text.unwrap_or_default())
+            }),
+            &[],
+        )
+    });
+    let elements = elements
+        .into_iter()
+        .map(|(element, text)| {
+            let text = text.map(|text| {
+                if element.element_type == LayoutElementType::Table {
+                    table_to_text(text).unwrap_or_else(|| text.to_string())
+                } else {
+                    text.to_string()
+                }
+            });
+            (element, text)
+        })
+        .collect::<Vec<_>>();
+    let text = elements
+        .iter()
+        .filter_map(|(_, text)| text.as_deref())
         .collect::<Vec<_>>()
         .join("\n");
-    let markdown = (format == OcrResponseFormat::Markdown).then(|| result.to_markdown());
-    let regions = result
-        .layout_elements
+    let regions = elements
         .iter()
-        .filter_map(|element| {
-            let text = element.text.as_deref()?;
+        .filter_map(|(element, text)| {
+            let text = text.as_deref()?;
             (!text.trim().is_empty()).then(|| orchion_region(&element.bbox, text, None))
         })
         .collect();
@@ -639,7 +690,7 @@ fn traditional_layout_result(
         })
         .collect();
 
-    base_result(model, format, text, markdown, None, regions, blocks)
+    base_result(model, format, text, markdown, html, regions, blocks)
 }
 
 #[cfg(all(feature = "ocr-vl", not(feature = "cuda")))]
@@ -696,15 +747,32 @@ fn run_vl_ocr_with_image(
             message: "OCR-VL returned no results".to_string(),
         })?
         .map_err(inference_error)?;
-    Ok(base_result(
+    Ok(vl_task_result(model, options, text))
+}
+
+#[cfg(feature = "ocr-vl")]
+fn vl_task_result(model: KnownOcrModel, options: &OcrOptions, text: String) -> OcrResult {
+    let table_task = options.task == OcrTask::Table;
+    let markdown = (options.response_format == OcrResponseFormat::Markdown
+        || table_task && options.response_format == OcrResponseFormat::Json)
+        .then(|| html_tables_to_markdown(&text));
+    let html = (options.response_format == OcrResponseFormat::Html
+        || table_task && options.response_format == OcrResponseFormat::Json)
+        .then(|| render_layout_html([("table", text.as_str())], &[]));
+    let text = if table_task {
+        table_to_text(&text).unwrap_or(text)
+    } else {
+        text
+    };
+    base_result(
         model,
         options.response_format,
         text,
-        None,
-        None,
+        markdown,
+        html,
         Vec::new(),
         Vec::new(),
-    ))
+    )
 }
 
 #[cfg(feature = "ocr-vl")]
@@ -746,30 +814,49 @@ fn vl_layout_result(
     structure: &oar_ocr_vl::StructureResult,
     markdown_ignore_labels: &[String],
 ) -> OcrResult {
-    let text = structure
+    let elements = structure
         .layout_elements
         .iter()
-        .filter_map(|element| element.text.as_deref())
+        .map(|element| {
+            let text = element.text.as_deref().map(|text| {
+                if element.element_type == oar_ocr_vl::LayoutElementType::Table {
+                    table_to_text(text).unwrap_or_else(|| text.to_string())
+                } else {
+                    text.to_string()
+                }
+            });
+            (element, text)
+        })
+        .collect::<Vec<_>>();
+    let text = elements
+        .iter()
+        .filter_map(|(_, text)| text.as_deref())
         .collect::<Vec<_>>()
         .join("\n");
-    let markdown = (format == OcrResponseFormat::Markdown)
-        .then(|| html_tables_to_markdown(&structure.to_markdown()));
-    let html = (format == OcrResponseFormat::Html).then(|| {
+    let markdown = matches!(
+        format,
+        OcrResponseFormat::Json | OcrResponseFormat::Markdown
+    )
+    .then(|| html_tables_to_markdown(&structure.to_markdown()));
+    let html = matches!(format, OcrResponseFormat::Json | OcrResponseFormat::Html).then(|| {
         render_layout_html(
             structure.layout_elements.iter().map(|element| {
                 (
-                    element.label.as_deref().unwrap_or("text"),
+                    if element.element_type == oar_ocr_vl::LayoutElementType::Table {
+                        "table"
+                    } else {
+                        element.label.as_deref().unwrap_or("text")
+                    },
                     element.text.as_deref().unwrap_or_default(),
                 )
             }),
             markdown_ignore_labels,
         )
     });
-    let regions = structure
-        .layout_elements
+    let regions = elements
         .iter()
-        .filter_map(|element| {
-            let text = element.text.as_deref()?;
+        .filter_map(|(element, text)| {
+            let text = text.as_deref()?;
             (!text.trim().is_empty()).then(|| orchion_core::OcrRegion {
                 text: text.to_string(),
                 confidence: None,
@@ -860,12 +947,7 @@ fn invalid_image_error(error: impl std::fmt::Display) -> OrchionError {
     }
 }
 
-#[cfg(feature = "ocr-vl")]
-fn html_tables_to_markdown(input: &str) -> String {
-    htmd::convert(input).unwrap_or_else(|_| input.to_string())
-}
-
-#[cfg(feature = "ocr-vl")]
+#[cfg(any(feature = "ocr", feature = "ocr-vl"))]
 fn render_layout_html<'a>(
     elements: impl IntoIterator<Item = (&'a str, &'a str)>,
     ignore_labels: &[String],
@@ -899,7 +981,8 @@ fn render_layout_html<'a>(
             "formula" | "display_formula" | "inline_formula" => {
                 format!("<pre data-ocr-kind=\"formula\">{escaped}</pre>")
             }
-            "table" => format!("<pre data-ocr-kind=\"table\">{escaped}</pre>"),
+            "table" => table_to_html(text)
+                .unwrap_or_else(|| format!("<pre data-ocr-kind=\"table\">{escaped}</pre>")),
             "image" | "figure" | "chart" | "seal" => {
                 format!(
                     "<figure><figcaption>{}</figcaption></figure>",
@@ -914,20 +997,7 @@ fn render_layout_html<'a>(
     html.trim_end().to_string()
 }
 
-#[cfg(feature = "ocr-vl")]
-fn escape_html(text: &str) -> String {
-    text.chars().fold(String::new(), |mut escaped, character| {
-        match character {
-            '&' => escaped.push_str("&amp;"),
-            '<' => escaped.push_str("&lt;"),
-            '>' => escaped.push_str("&gt;"),
-            _ => escaped.push(character),
-        }
-        escaped
-    })
-}
-
-#[cfg(feature = "ocr-vl")]
+#[cfg(any(feature = "ocr", feature = "ocr-vl"))]
 fn html_lines(escaped_text: &str) -> String {
     escaped_text.replace('\n', "<br>\n")
 }
@@ -1399,19 +1469,19 @@ mod capability_tests {
     }
 
     #[test]
-    fn vl_structured_formats_require_ocr_task_and_loaded_layout() {
+    fn vl_document_structured_formats_require_loaded_layout() {
         for (format, capability) in [
             (
                 OcrResponseFormat::Markdown,
-                "Markdown response format for non-OCR tasks",
+                "Markdown response format for tasks other than OCR or table",
             ),
             (
                 OcrResponseFormat::Html,
-                "HTML response format for non-OCR tasks",
+                "HTML response format for tasks other than OCR or table",
             ),
         ] {
             assert_unsupported(
-                validate_builtin_request(VL, &options(OcrTask::Table, format), true),
+                validate_builtin_request(VL, &options(OcrTask::Formula, format), true),
                 VL,
                 capability,
             );
@@ -1441,6 +1511,18 @@ mod capability_tests {
             OcrPipeline::VlTask
         );
         assert!(!should_use_vl_layout_pipeline(&table));
+    }
+
+    #[test]
+    fn vl_table_structured_formats_use_task_pipeline_without_layout() {
+        for format in [OcrResponseFormat::Markdown, OcrResponseFormat::Html] {
+            let request = options(OcrTask::Table, format);
+            assert_eq!(
+                validate_builtin_request(VL, &request, false).unwrap(),
+                OcrPipeline::VlTask
+            );
+            assert!(!should_use_vl_layout_pipeline(&request));
+        }
     }
 }
 
@@ -1550,9 +1632,12 @@ mod layout_result_tests {
             assert_eq!(result.format, format);
             assert_eq!(
                 result.markdown.is_some(),
-                format == OcrResponseFormat::Markdown
+                matches!(
+                    format,
+                    OcrResponseFormat::Json | OcrResponseFormat::Markdown
+                )
             );
-            assert!(result.html.is_none());
+            assert_eq!(result.html.is_some(), format == OcrResponseFormat::Json);
         }
     }
 
@@ -1578,6 +1663,62 @@ mod layout_result_tests {
         assert_eq!(result.text, "");
         assert_eq!(result.layout_blocks.len(), 1);
         assert_eq!(result.layout_blocks[0].label, "Image");
+    }
+
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn traditional_layout_includes_table_contents_in_reading_order() {
+        use oar_ocr::domain::structure::{
+            LayoutElement, LayoutElementType, StructureResult, TableResult, TableType,
+        };
+        use oar_ocr::processors::BoundingBox;
+
+        let first_box = BoundingBox::from_coords(10.0, 30.0, 210.0, 130.0);
+        let second_box = BoundingBox::from_coords(10.0, 160.0, 210.0, 260.0);
+        let first_html = "<table><tr><td>Keyboard</td><td>98.00</td></tr></table>";
+        let second_html = "<table><tr><td>Grand Total</td><td>454.00</td></tr></table>";
+        let structure = StructureResult::new("<memory>", 0)
+            .with_layout_elements(vec![
+                LayoutElement::new(
+                    BoundingBox::from_coords(10.0, 0.0, 210.0, 20.0),
+                    LayoutElementType::Text,
+                    0.9,
+                )
+                .with_text("Invoice"),
+                LayoutElement::new(first_box.clone(), LayoutElementType::Table, 0.9),
+                LayoutElement::new(second_box.clone(), LayoutElementType::Table, 0.9),
+            ])
+            .with_tables(vec![
+                TableResult::new(second_box.clone(), TableType::Wireless)
+                    .with_html_structure(second_html),
+                TableResult::new(first_box.clone(), TableType::Wireless)
+                    .with_html_structure(first_html),
+            ]);
+
+        for format in [
+            OcrResponseFormat::Json,
+            OcrResponseFormat::Text,
+            OcrResponseFormat::Markdown,
+        ] {
+            let result = traditional_layout_result(KnownOcrModel::PpOcrV6Tiny, format, &structure);
+            assert_eq!(result.text, "Invoice\nKeyboard\t98.00\nGrand Total\t454.00");
+            assert_eq!(result.regions.len(), 3);
+            assert_eq!(result.regions[1].text, "Keyboard\t98.00");
+            assert_eq!(result.regions[1].polygon, polygon_points(&first_box));
+            assert_eq!(result.regions[2].text, "Grand Total\t454.00");
+            assert_eq!(result.regions[2].polygon, polygon_points(&second_box));
+            assert_eq!(result.layout_blocks.len(), 3);
+            if format == OcrResponseFormat::Json {
+                assert_eq!(
+                    result.html.as_deref(),
+                    Some(format!("<p>Invoice</p>\n{first_html}\n{second_html}").as_str())
+                );
+            }
+            if let Some(markdown) = result.markdown {
+                assert!(markdown.contains("| Keyboard | 98.00 |"));
+                assert!(markdown.contains("Grand Total"));
+            }
+        }
     }
 
     #[cfg(feature = "ocr-vl")]
@@ -1620,9 +1761,70 @@ mod layout_result_tests {
             assert_eq!(result.format, format);
             assert_eq!(
                 result.markdown.is_some(),
-                format == OcrResponseFormat::Markdown
+                matches!(
+                    format,
+                    OcrResponseFormat::Json | OcrResponseFormat::Markdown
+                )
             );
-            assert_eq!(result.html.is_some(), format == OcrResponseFormat::Html);
+            assert_eq!(
+                result.html.is_some(),
+                matches!(format, OcrResponseFormat::Json | OcrResponseFormat::Html)
+            );
+        }
+    }
+
+    #[cfg(feature = "ocr-vl")]
+    #[test]
+    fn vl_layout_table_formats_keep_plain_text_separate_from_markup() {
+        use oar_ocr_vl::{BoundingBox, LayoutElement, LayoutElementType, StructureResult};
+
+        let bbox = BoundingBox::from_coords(10.0, 30.0, 210.0, 130.0);
+        let table = "<html><body><table onclick=evil()><tr><td colspan=2>Sales</td></tr><tr><td>A &amp; B</td><td>98.00<script>evil()</script></td></tr></table></body></html>";
+        let structure = StructureResult::new("<memory>", 0).with_layout_elements(vec![
+            LayoutElement::new(bbox.clone(), LayoutElementType::Text, 0.9)
+                .with_label("text")
+                .with_text("Invoice <literal>"),
+            LayoutElement::new(bbox, LayoutElementType::Table, 0.9)
+                .with_label("table")
+                .with_text(table),
+        ]);
+        for model in [KnownOcrModel::PaddleOcrVl15, KnownOcrModel::PaddleOcrVl16] {
+            for format in [
+                OcrResponseFormat::Json,
+                OcrResponseFormat::Text,
+                OcrResponseFormat::Markdown,
+                OcrResponseFormat::Html,
+            ] {
+                let result = vl_layout_result(model, format, &structure, &[]);
+                assert_eq!(result.text, "Invoice <literal>\nSales\nA & B\t98.00");
+                assert_eq!(result.regions[1].text, "Sales\nA & B\t98.00");
+                for markup in [result.html.as_deref(), result.markdown.as_deref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    assert!(markup.contains("98.00"));
+                    assert!(!markup.contains("onclick"));
+                    assert!(!markup.contains("evil()"));
+                }
+                if let Some(html) = &result.html {
+                    assert!(html.contains("colspan=\"2\""), "{html}");
+                }
+                if let Some(markdown) = &result.markdown {
+                    assert!(markdown.contains("| Sales"), "{markdown}");
+                    assert!(!markdown.contains("<table"), "{markdown}");
+                }
+                assert_eq!(
+                    result.markdown.is_some(),
+                    matches!(
+                        format,
+                        OcrResponseFormat::Json | OcrResponseFormat::Markdown
+                    )
+                );
+                assert_eq!(
+                    result.html.is_some(),
+                    matches!(format, OcrResponseFormat::Json | OcrResponseFormat::Html)
+                );
+            }
         }
     }
 
@@ -1719,20 +1921,130 @@ mod tests {
     }
 
     #[test]
+    fn vl_table_task_formats_generated_table_content() {
+        let table = "<table><tr><td>Product</td><td>Total</td></tr><tr><td>Keyboard</td><td>98.00</td></tr></table>";
+        for format in [
+            OcrResponseFormat::Json,
+            OcrResponseFormat::Text,
+            OcrResponseFormat::Markdown,
+            OcrResponseFormat::Html,
+        ] {
+            let options = OcrOptions {
+                task: OcrTask::Table,
+                response_format: format,
+                ..OcrOptions::default()
+            };
+            let result = vl_task_result(KnownOcrModel::PaddleOcrVl16, &options, table.to_string());
+            assert_eq!(result.text, "Product\tTotal\nKeyboard\t98.00");
+            assert_eq!(result.regions, Vec::<orchion_core::OcrRegion>::new());
+            match format {
+                OcrResponseFormat::Markdown => {
+                    let markdown = result.markdown.unwrap();
+                    assert!(markdown.contains("| Product"));
+                    assert!(markdown.contains("| Keyboard"));
+                }
+                OcrResponseFormat::Html => assert_eq!(result.html.as_deref(), Some(table)),
+                OcrResponseFormat::Json => {
+                    assert!(result.markdown.as_deref().unwrap().contains("| Keyboard"));
+                    assert_eq!(result.html.as_deref(), Some(table));
+                }
+                OcrResponseFormat::Text => {
+                    assert!(result.markdown.is_none());
+                    assert!(result.html.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn vl_table_task_flattens_merged_cells_in_markdown_but_not_html() {
+        let table = "<table><tr><td colspan=2>Sales</td></tr><tr><td rowspan=2>A</td><td>10</td></tr><tr><td>20</td></tr></table>";
+        for format in [
+            OcrResponseFormat::Json,
+            OcrResponseFormat::Text,
+            OcrResponseFormat::Markdown,
+            OcrResponseFormat::Html,
+        ] {
+            let result = vl_task_result(
+                KnownOcrModel::PaddleOcrVl16,
+                &OcrOptions {
+                    task: OcrTask::Table,
+                    response_format: format,
+                    ..OcrOptions::default()
+                },
+                table.to_string(),
+            );
+            assert_eq!(result.text, "Sales\nA\t10\n20");
+            if let Some(markdown) = &result.markdown {
+                assert!(!markdown.contains("<table"), "{markdown}");
+                assert!(markdown.contains("| Sales"));
+                assert!(markdown.contains("10"));
+                assert!(markdown.contains("20"));
+            }
+            if let Some(html) = &result.html {
+                assert!(html.contains("colspan=\"2\""));
+                assert!(html.contains("rowspan=\"2\""));
+            }
+            assert_eq!(
+                result.markdown.is_some(),
+                matches!(
+                    format,
+                    OcrResponseFormat::Json | OcrResponseFormat::Markdown
+                )
+            );
+            assert_eq!(
+                result.html.is_some(),
+                matches!(format, OcrResponseFormat::Json | OcrResponseFormat::Html)
+            );
+        }
+    }
+
+    #[test]
+    fn non_table_vl_tasks_preserve_literal_text_and_formula_notation() {
+        let text = r"x < y & y > z; \frac{a}{b}; <literal>";
+        for task in [
+            OcrTask::Ocr,
+            OcrTask::Formula,
+            OcrTask::Chart,
+            OcrTask::Spotting,
+            OcrTask::Seal,
+        ] {
+            for format in [OcrResponseFormat::Json, OcrResponseFormat::Text] {
+                let result = vl_task_result(
+                    KnownOcrModel::PaddleOcrVl16,
+                    &OcrOptions {
+                        task,
+                        response_format: format,
+                        ..OcrOptions::default()
+                    },
+                    text.to_string(),
+                );
+                assert_eq!(result.text, text);
+                assert!(result.html.is_none());
+                assert!(result.markdown.is_none());
+            }
+        }
+    }
+
+    #[test]
     fn ocr_vl_html_is_semantic_and_escapes_recognized_content() {
         let html = render_layout_html(
             [
                 ("doc_title", "Invoice <script>alert(1)</script>"),
                 ("text", "Total & tax"),
-                ("table", "<table><tr><td>unsafe</td></tr></table>"),
+                (
+                    "table",
+                    "<table onclick=\"evil()\"><tr><td>safe<script>evil()</script></td></tr></table>",
+                ),
             ],
             &[],
         );
 
         assert!(html.contains("<h1>Invoice &lt;script&gt;alert(1)&lt;/script&gt;</h1>"));
         assert!(html.contains("<p>Total &amp; tax</p>"));
-        assert!(html.contains("data-ocr-kind=\"table\""));
-        assert!(html.contains("&lt;table&gt;"));
+        assert!(html.contains("<table><tr><td>safe</td></tr></table>"));
+        assert!(!html.contains("onclick"));
+        assert!(!html.contains("evil()"));
         assert!(!html.contains("<script>"));
     }
 
@@ -1755,5 +2067,33 @@ mod tests {
             html_tables_to_markdown(html),
             "| Name | Value |\n| ---- | ----- |\n| A    | 1     |"
         );
+    }
+
+    #[test]
+    fn ocr_tables_without_header_tags_keep_their_rows_and_columns() {
+        let html = "<table><tr><td>Product</td><td>Total</td></tr><tr><td>Keyboard</td><td>98.00</td></tr><tr><td>Grand Total</td><td>454.00</td></tr></table>";
+        let markdown = html_tables_to_markdown(html);
+        assert!(markdown.contains("| Product"));
+        assert!(markdown.contains("| Keyboard"));
+        assert!(markdown.contains("| Grand Total"));
+        assert!(markdown.contains("454.00 |"));
+    }
+
+    #[test]
+    fn merged_ocr_table_cells_are_flattened_only_in_markdown() {
+        let html = "<table onclick=\"evil()\"><tr><td colspan=\"2\">Sales</td></tr><tr><td rowspan=\"2\">A &amp; B</td><td>10</td></tr><tr><td>20</td></tr></table>";
+        let markdown = html_tables_to_markdown(html);
+        assert!(!markdown.contains("<table"), "{markdown}");
+        assert!(markdown.contains("| Sales"));
+        assert!(markdown.contains("A &amp; B"));
+        assert!(markdown.lines().last().unwrap().contains("20"));
+        assert_eq!(markdown.matches("A &amp; B").count(), 1);
+        assert!(!markdown.contains("onclick"));
+
+        let rendered = render_layout_html([("table", html)], &[]);
+        assert!(rendered.starts_with("<table>"));
+        assert!(rendered.contains("colspan=\"2\""));
+        assert!(!rendered.contains("onclick"));
+        assert!(!rendered.contains("&lt;table"));
     }
 }

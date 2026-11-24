@@ -2,6 +2,8 @@
 
 mod blocking;
 mod device;
+#[cfg(any(feature = "asr", feature = "tts"))]
+mod device_resource;
 
 #[cfg(feature = "asr")]
 pub mod asr;

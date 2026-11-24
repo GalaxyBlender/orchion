@@ -729,9 +729,12 @@ impl From<OcrResponseFormat> for OcrApiFormat {
 pub struct OcrJsonResponse {
     pub model: String,
     pub format: OcrApiFormat,
+    /// Readable recognition text; table rows use newlines and cells use tabs.
     pub text: String,
+    /// Markdown with pipe tables when available; merged cells are flattened.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub markdown: Option<String>,
+    /// Sanitized HTML representation when structured layout/table output is available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub html: Option<String>,
     pub regions: Vec<orchion::OcrRegion>,

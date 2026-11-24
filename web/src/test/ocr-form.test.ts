@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { normalizeOcrFormForCapabilities, ocrStateToForm } from "../features/ocr/form";
+import { normalizeOcrFormForCapabilities, ocrResponseFormatsForCapabilities, ocrStateToForm } from "../features/ocr/form";
 import type { OcrFormState } from "../features/ocr/types";
 
 const form: OcrFormState = {
@@ -36,5 +36,35 @@ describe("OCR form contract", () => {
         ["ocr_text", "ocr_layout", "ocr_markdown"],
       ).responseFormat,
     ).toBe("json");
+  });
+
+  test("table tasks support all formats without a document layout model", () => {
+    const capabilities = ["ocr_text", "ocr_vision_language"] as const;
+    expect(ocrResponseFormatsForCapabilities(capabilities, "table")).toEqual(["json", "text", "markdown", "html"]);
+    expect(normalizeOcrFormForCapabilities({ ...form, responseFormat: "html" }, capabilities)).toEqual({
+      ...form,
+      responseFormat: "html",
+    });
+    expect(ocrResponseFormatsForCapabilities(capabilities, "ocr")).toEqual(["json", "text"]);
+  });
+
+  test("non-document VL tasks expose only JSON and text even with layout capabilities", () => {
+    const capabilities = ["ocr_text", "ocr_vision_language", "ocr_markdown", "ocr_html"] as const;
+    for (const task of ["formula", "chart", "spotting", "seal"] as const) {
+      expect(ocrResponseFormatsForCapabilities(capabilities, task)).toEqual(["json", "text"]);
+      expect(normalizeOcrFormForCapabilities({ ...form, task, responseFormat: "html" }, capabilities)).toEqual({
+        ...form,
+        task,
+        responseFormat: "json",
+      });
+      expect(normalizeOcrFormForCapabilities({ ...form, task, responseFormat: "text" }, capabilities).responseFormat).toBe("text");
+    }
+  });
+
+  test("traditional model normalization uses the OCR task before choosing formats", () => {
+    expect(normalizeOcrFormForCapabilities(
+      { ...form, task: "formula", responseFormat: "markdown" },
+      ["ocr_text", "ocr_layout", "ocr_markdown"],
+    )).toEqual({ ...form, task: "ocr", responseFormat: "markdown", maxTokens: "" });
   });
 });

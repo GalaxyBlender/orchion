@@ -69,6 +69,8 @@ pub struct OcrLimits {
 )]
 #[cfg_attr(feature = "schema", derive(ToSchema))]
 pub struct OcrRegion {
+    /// Recognized text, with table rows separated by newlines and cells by tabs.
+    /// Generated table markup belongs to the result's dedicated markup fields.
     pub text: String,
     pub confidence: Option<f32>,
     pub polygon: Vec<OcrPoint>,
@@ -121,8 +123,12 @@ pub struct OcrUsage {
 pub struct OcrResult {
     pub model: ModelId,
     pub format: OcrResponseFormat,
+    /// Readable recognition output, not model-generated table HTML.
     pub text: String,
+    /// Markdown document with pipe tables, when requested or included in JSON.
+    /// Merged cells are flattened; their spans remain available in `html`.
     pub markdown: Option<String>,
+    /// Sanitized HTML document when requested, or included in structured JSON results.
     pub html: Option<String>,
     pub regions: Vec<OcrRegion>,
     pub layout_blocks: Vec<OcrLayoutBlock>,

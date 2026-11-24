@@ -41,8 +41,8 @@ export function OcrPage() {
   const selectedCapabilities = selectedModel?.capabilities ?? [];
   const supportsOcrVlParameters = selectedCapabilities.includes("ocr_vision_language");
   const responseFormats = useMemo(
-    () => ocrResponseFormatsForCapabilities(selectedCapabilities),
-    [selectedCapabilities],
+    () => ocrResponseFormatsForCapabilities(selectedCapabilities, form.task),
+    [selectedCapabilities, form.task],
   );
   const effectiveForm = useMemo(
     () => normalizeOcrFormForCapabilities(form, selectedCapabilities),

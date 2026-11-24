@@ -3,6 +3,8 @@ mod assets;
 mod device;
 mod result;
 mod runtime;
+#[cfg(any(feature = "ocr", feature = "ocr-vl"))]
+mod table;
 #[cfg(all(feature = "ocr-vl", feature = "cuda"))]
 mod vl_worker;
 

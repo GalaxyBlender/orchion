@@ -1,3 +1,4 @@
+use crate::device_resource::DeviceResource;
 use orchion_core::{
     DevicePreference, OrchionError, Result, TtsAudio, TtsLanguage, TtsModel, TtsOptions,
     TtsSpeaker, TtsVoice, ensure_voice_supported,
@@ -20,7 +21,7 @@ const LATIN_LANGUAGE_CONFIDENCE_THRESHOLD: f64 = 0.70;
 #[derive(Clone)]
 pub struct Tts {
     model: TtsModel,
-    engine: Arc<Mutex<qwen3_tts::Qwen3TTS>>,
+    engine: Arc<Mutex<DeviceResource<qwen3_tts::Qwen3TTS>>>,
 }
 
 impl Tts {
@@ -47,11 +48,13 @@ impl Tts {
                 "TTS device selected"
             );
             tracing::debug!(device_debug, "TTS device details selected");
-            let engine = qwen3_tts::Qwen3TTS::from_pretrained(path_text, resolved.device).map_err(
-                |source| OrchionError::ModelLoad {
-                    message: source.to_string(),
-                },
-            )?;
+            let engine = DeviceResource::load(&resolved.device, |device| {
+                qwen3_tts::Qwen3TTS::from_pretrained(path_text, device.clone()).map_err(|source| {
+                    OrchionError::ModelLoad {
+                        message: format!("{source:#}"),
+                    }
+                })
+            })?;
             Ok(Self {
                 model,
                 engine: Arc::new(Mutex::new(engine)),
@@ -112,9 +115,7 @@ impl Tts {
         let engine = Arc::clone(&self.engine);
         crate::blocking::run(move || {
             let started = Instant::now();
-            let engine = engine.lock().map_err(|error| OrchionError::Inference {
-                message: error.to_string(),
-            })?;
+            let engine = DeviceResource::lock(&engine)?;
             let audio = match voice {
                 TtsVoice::Preset { speaker, language } => engine
                     .synthesize_with_voice(

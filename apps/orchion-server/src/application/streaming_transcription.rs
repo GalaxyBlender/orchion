@@ -229,22 +229,38 @@ impl LeasedAsrModel {
         let stream = self
             .model
             .run_with_inference(self.inference.clone(), move |model| async move {
-                model.start_streaming_with(options).await
+                let stream = model.start_streaming_with(options).await?;
+                Ok::<_, OrchionError>(ResidentAsrStream { stream, model })
             })
             .await
             .map_err(|error| {
                 UseCaseError::Internal(format!("ASR stream task failed: {error:#}"))
             })??;
         Ok(LeasedAsrStream {
-            model: self.clone(),
             stream: Some(stream),
+            inference: self.inference.clone(),
         })
     }
 }
 
 pub struct LeasedAsrStream {
-    model: LeasedAsrModel,
-    stream: Option<orchion::AsrStream>,
+    stream: Option<ResidentAsrStream>,
+    inference: InferenceLimiter,
+}
+
+struct ResidentAsrStream {
+    // Even if a request is cancelled, drop native state before making the
+    // associated model eligible for eviction.
+    stream: orchion::AsrStream,
+    model: ModelLease<Asr>,
+}
+
+impl ResidentAsrStream {
+    async fn finish(self) -> Result<AsrTranscript, OrchionError> {
+        let result = self.stream.finish().await;
+        drop(self.model);
+        result
+    }
 }
 
 impl LeasedAsrStream {
@@ -257,13 +273,11 @@ impl LeasedAsrStream {
         sample_rate: u32,
     ) -> Result<Option<AsrTranscript>, UseCaseError> {
         let mut stream = self.take_stream()?;
+        let model = stream.model.clone();
         let samples = samples.to_vec();
-        let (stream, result) = self
-            .model
-            .model
-            .run_with_inference(self.model.inference.clone(), move |model| async move {
-                let result = stream.feed(&samples, sample_rate).await;
-                drop(model);
+        let (stream, result) = model
+            .run_with_inference(self.inference.clone(), move |_| async move {
+                let result = stream.stream.feed(&samples, sample_rate).await;
                 (stream, result)
             })
             .await
@@ -279,19 +293,15 @@ impl LeasedAsrStream {
     /// Returns a use-case error when final streaming inference fails.
     pub async fn finish(mut self) -> Result<AsrTranscript, UseCaseError> {
         let stream = self.take_stream()?;
-        self.model
-            .model
-            .run_with_inference(self.model.inference.clone(), move |model| async move {
-                let result = stream.finish().await;
-                drop(model);
-                result
-            })
+        let model = stream.model.clone();
+        model
+            .run_with_inference(self.inference.clone(), move |_| stream.finish())
             .await
             .map_err(|error| UseCaseError::Internal(format!("ASR stream task failed: {error:#}")))?
             .map_err(UseCaseError::Core)
     }
 
-    fn take_stream(&mut self) -> Result<orchion::AsrStream, UseCaseError> {
+    fn take_stream(&mut self) -> Result<ResidentAsrStream, UseCaseError> {
         self.stream.take().ok_or_else(|| {
             UseCaseError::Core(OrchionError::InvalidAudio {
                 reason: "streaming session has already finished".to_string(),
@@ -823,7 +833,7 @@ fn strong_punctuation_candidate_text(text: &str) -> Option<CaptionBoundaryCandid
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::model_cache::ModelCache;
+    use crate::application::model_cache::{ModelCache, ModelResidencyStatus};
     use crate::application::resource_policy::ResourcePolicy;
     use orchion::{AsrEngine, AsrEngineFuture, AsrOptions, AsrStreamSession};
     use std::path::PathBuf;
@@ -957,6 +967,7 @@ mod tests {
             .get_or_load(model, move |_, _| async move {
                 Ok(Asr::from_engine(Arc::new(TestAsrEngine {
                     model: engine_model,
+                    stream_drop: None,
                 })))
             })
             .await
@@ -1011,6 +1022,7 @@ mod tests {
 
     struct TestAsrEngine {
         model: AsrModel,
+        stream_drop: Option<Arc<StreamDropProbe>>,
     }
 
     impl AsrEngine for TestAsrEngine {
@@ -1039,11 +1051,26 @@ mod tests {
             &self,
             _options: AsrStreamingOptions,
         ) -> AsrEngineFuture<'_, Box<dyn AsrStreamSession>> {
-            Box::pin(async { Ok(Box::new(TestAsrStream) as Box<dyn AsrStreamSession>) })
+            let probe = self.stream_drop.clone();
+            Box::pin(async { Ok(Box::new(TestAsrStream(probe)) as Box<dyn AsrStreamSession>) })
         }
     }
 
-    struct TestAsrStream;
+    struct StreamDropProbe {
+        started: tokio::sync::Notify,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    struct TestAsrStream(Option<Arc<StreamDropProbe>>);
+
+    impl Drop for TestAsrStream {
+        fn drop(&mut self) {
+            if let Some(probe) = &self.0 {
+                probe.started.notify_one();
+                let _ = probe.release.lock().unwrap().recv();
+            }
+        }
+    }
 
     impl AsrStreamSession for TestAsrStream {
         fn feed(
@@ -1057,6 +1084,54 @@ mod tests {
         fn finish(self: Box<Self>) -> AsrEngineFuture<'static, AsrTranscript> {
             Box::pin(async { Ok(test_transcript()) })
         }
+    }
+
+    #[tokio::test]
+    async fn disconnected_stream_keeps_model_resident_until_stream_state_is_released() {
+        let model = AsrModel::parse("Acme/Test-ASR").unwrap();
+        let cache = ModelCache::new(
+            "stream-test",
+            vec![model.clone()],
+            Duration::ZERO,
+            1,
+            PathBuf::from("test-models"),
+        );
+        let (release, receiver) = std::sync::mpsc::channel();
+        let probe = Arc::new(StreamDropProbe {
+            started: tokio::sync::Notify::new(),
+            release: std::sync::Mutex::new(receiver),
+        });
+        let lease = cache
+            .get_or_load(model.clone(), {
+                let stream_drop = Some(Arc::clone(&probe));
+                |model, _| async move {
+                    Ok(Asr::from_engine(Arc::new(TestAsrEngine {
+                        model,
+                        stream_drop,
+                    })))
+                }
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let handle = LeasedAsrModel::new(lease, ResourcePolicy::new(1, 1, 1).inference_limiter());
+        let stream = handle.start(AsrStreamingOptions::default()).await.unwrap();
+        drop(handle);
+
+        let dropping = tokio::task::spawn_blocking(move || drop(stream));
+        tokio::time::timeout(Duration::from_secs(2), probe.started.notified())
+            .await
+            .unwrap();
+        cache.cleanup_idle().await;
+        let during_drop = cache.status(&model).await;
+        release.send(()).unwrap();
+        dropping.await.unwrap();
+        assert_eq!(during_drop, Some(ModelResidencyStatus::Loaded));
+        cache.cleanup_idle().await;
+        assert_eq!(
+            cache.status(&model).await,
+            Some(ModelResidencyStatus::Unloaded)
+        );
     }
 
     fn test_transcript() -> AsrTranscript {
