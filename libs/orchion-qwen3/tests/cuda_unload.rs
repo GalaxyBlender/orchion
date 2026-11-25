@@ -131,7 +131,11 @@ fn tts_releases_gpu_memory_after_multiple_requests() {
                     )
                     .await
                     .unwrap();
-                assert_ne!(audio.samples, [], "synthesis must produce audio");
+                assert_ne!(
+                    audio.samples,
+                    [] as [f32; 0],
+                    "synthesis must produce audio"
+                );
             }
             engine
         })

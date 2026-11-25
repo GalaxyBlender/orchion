@@ -1,5 +1,7 @@
 import { parseApiError, parseNetworkError } from "./errors";
-import type { ApiSettings, ModelList } from "./types";
+import type {
+  ApiSettings, ModelControlAction, ModelControlRequest, ModelList, ModelStatus, ModelStatusList,
+} from "./types";
 
 export function apiUrl(_settings: ApiSettings, path: string): string {
   const normalizedPath = path.startsWith("/") ? path : `/${path}`;
@@ -53,6 +55,26 @@ export function requestStream(
 
 export function fetchModels(settings: ApiSettings): Promise<ModelList> {
   return requestJson<ModelList>(settings, "/v1/models", { method: "GET" });
+}
+
+export function fetchModelStatuses(settings: ApiSettings, signal?: AbortSignal): Promise<ModelStatusList> {
+  return requestJson<ModelStatusList>(settings, "/api/models/status", {
+    method: "GET",
+    cache: "no-store",
+    signal,
+  });
+}
+
+export function changeModelResidency(
+  settings: ApiSettings,
+  action: ModelControlAction,
+  target: ModelControlRequest,
+): Promise<ModelStatus> {
+  return requestJson<ModelStatus>(settings, `/api/models/${action}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(target),
+  });
 }
 
 async function request(settings: ApiSettings, path: string, init: RequestInit): Promise<Response> {

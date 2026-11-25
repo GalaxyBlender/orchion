@@ -58,6 +58,27 @@ export interface ModelList {
   data: ModelObject[];
 }
 
+export type ModelService = ModelType | "ocr_vl";
+export type ModelResidency = "unloaded" | "loading" | "loaded" | "unloading";
+export type ModelControlAction = "load" | "unload";
+
+export interface ModelStatus {
+  object: "model_status";
+  id: string;
+  service: ModelService;
+  status: ModelResidency;
+}
+
+export interface ModelStatusList {
+  object: "list";
+  data: ModelStatus[];
+}
+
+export interface ModelControlRequest {
+  model: string;
+  service: ModelService;
+}
+
 export interface ApiErrorDetail {
   message: string;
   type?: string;
