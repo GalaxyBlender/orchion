@@ -50,9 +50,34 @@ inferences. Run each test separately with the appropriate weights:
 ```sh
 export ORCHION_ASR_TEST_MODEL_DIR="$PWD/data/models/Qwen/Qwen3-ASR-0.6B"
 export ORCHION_TTS_TEST_MODEL_DIR="$PWD/data/models/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
-export CUDA_COMPUTE_CAP=86 CUDARC_CUDA_VERSION=13000 # RTX 3080, CUDA 13 toolkit
+export CUDA_COMPUTE_CAP=86 # RTX 3080
 cargo test --release --locked -p orchion-qwen3 --features asr,tts,cuda \
   --test cuda_unload asr_releases_gpu_memory_after_multiple_requests -- --exact --ignored --nocapture
 cargo test --release --locked -p orchion-qwen3 --features asr,tts,cuda \
   --test cuda_unload tts_releases_gpu_memory_after_multiple_requests -- --exact --ignored --nocapture
 ```
+
+### Temporary workspace while the model stays loaded
+
+These Linux CUDA tests check a four-minute ASR input and a long Chinese TTS
+request. They assert a peak CUDA memory-pool budget and verify that in-use bytes
+return to the loaded baseline without unloading the model. Reserved bytes may
+remain slightly above baseline because of allocator granularity. Run the tests
+on an otherwise idle test GPU, with the model directories set as above:
+
+```sh
+cargo test --release --locked -p orchion-qwen3 --features asr,cuda \
+  --test cuda_unload long_asr_bounds_workspace_and_releases_it_without_unloading_the_model \
+  -- --exact --ignored --nocapture
+cargo test --release --locked -p orchion-qwen3 --features tts,cuda \
+  --test cuda_unload long_tts_bounds_workspace_and_releases_it_without_unloading_the_model \
+  -- --exact --ignored --nocapture
+```
+
+For a Windows comparison, measure the isolated server PID's dedicated WDDM
+memory after explicit model load, during inference, after the response, and
+after unload. Sample through the whole request rather than using only a
+post-request reading. Keep the GPU, model, input and generation options fixed
+across binaries, and record whether another process loads a model on the same
+adapter. Compare the outputs separately; these memory tests are not recognition
+accuracy or speech quality benchmarks.

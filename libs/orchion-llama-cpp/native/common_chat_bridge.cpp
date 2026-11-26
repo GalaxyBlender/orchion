@@ -77,8 +77,7 @@ void write_error(orchion_common_chat_buffer * error, const char * message) noexc
 }
 
 common_json prepare_result_json(const common_chat_params & params,
-                                const common_chat_templates * templates,
-                                const common_chat_parser_params & parser) {
+                                const common_chat_templates * templates) {
     common_json triggers = common_json::array();
     for (const auto & trigger : params.grammar_triggers) {
         triggers.push_back({
@@ -88,7 +87,7 @@ common_json prepare_result_json(const common_chat_params & params,
         });
     }
     return {
-        {"prompt", params.prompt},
+        {"prompt", params.prompt.str()},
         {"grammar", params.grammar},
         {"grammar_lazy", params.grammar_lazy},
         {"grammar_triggers", std::move(triggers)},
@@ -99,9 +98,6 @@ common_json prepare_result_json(const common_chat_params & params,
         {"supports_thinking", params.supports_thinking},
         {"thinking_start_tag", params.thinking_start_tag},
         {"thinking_end_tags", params.thinking_end_tags},
-        {"reasoning_format", common_reasoning_format_name(parser.reasoning_format)},
-        {"reasoning_in_content", parser.reasoning_in_content},
-        {"parse_tool_calls", parser.parse_tool_calls},
         {"template_caps", common_chat_templates_get_caps(templates)},
     };
 }
@@ -156,15 +152,12 @@ extern "C" int32_t orchion_common_chat_prepare(
 
         auto params = common_chat_templates_apply(templates.get(), inputs);
         common_chat_parser_params parser(params);
-        parser.reasoning_format = inputs.reasoning_format;
-        parser.reasoning_in_content = false;
-        parser.parse_tool_calls = !inputs.tools.empty() && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
-        parser.parser.load(params.parser);
+        parser.parser = std::move(params.parser);
 
         auto owned = std::make_unique<orchion_common_chat_prepared>();
         owned->templates = std::move(templates);
         owned->parser = std::move(parser);
-        write(result_json, prepare_result_json(params, owned->templates.get(), owned->parser).dump());
+        write(result_json, prepare_result_json(params, owned->templates.get()).dump());
         *prepared = owned.release();
         return 0;
     } catch (const std::exception & exception) {
@@ -190,7 +183,7 @@ extern "C" int32_t orchion_common_chat_parse(
             throw std::invalid_argument("prepared handle is null");
         }
         auto message = common_chat_parse(
-            read_bytes(generated, generated_len, "generated text"),
+            common_chat_input(read_bytes(generated, generated_len, "generated text")),
             is_partial != 0,
             prepared->parser);
         write(result_json, message.to_json_oaicompat().dump());

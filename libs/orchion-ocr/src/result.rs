@@ -1153,12 +1153,7 @@ fn probe_ort_cuda(index: Option<usize>) -> Result<()> {
         .with_device_id(index)
         .build()
         .error_on_failure();
-    let builder = ort::session::Session::builder().map_err(|error| {
-        model_load_error(anyhow::anyhow!(
-            "failed to create ONNX Runtime session builder: {error}"
-        ))
-    })?;
-    builder
+    ort_probe_session()?
         .with_execution_providers([provider])
         .map(|_| ())
         .map_err(|error| {
@@ -1178,12 +1173,7 @@ fn probe_ort_cuda(_index: Option<usize>) -> Result<()> {
 #[cfg(all(any(feature = "ocr", feature = "ocr-vl"), feature = "metal"))]
 fn probe_ort_webgpu() -> Result<()> {
     let provider = ort::ep::WebGPU::default().build().error_on_failure();
-    let builder = ort::session::Session::builder().map_err(|error| {
-        model_load_error(anyhow::anyhow!(
-            "failed to create ONNX Runtime session builder: {error}"
-        ))
-    })?;
-    builder
+    ort_probe_session()?
         .with_execution_providers([provider])
         .map(|_| ())
         .map_err(|error| {
@@ -1191,6 +1181,24 @@ fn probe_ort_webgpu() -> Result<()> {
                 "failed to initialize ONNX Runtime WebGPU provider: {error}"
             ))
         })
+}
+
+#[cfg(all(
+    any(feature = "ocr", feature = "ocr-vl"),
+    any(feature = "cuda", feature = "metal")
+))]
+fn ort_probe_session() -> Result<ort::session::builder::SessionBuilder> {
+    // Probes and model sessions must share OAR's process-wide environment.
+    let environment = oar_ocr::core::inference::initialize_ort_environment().map_err(|error| {
+        model_load_error(anyhow::anyhow!(
+            "failed to initialize the ONNX Runtime environment: {error}"
+        ))
+    })?;
+    ort::session::Session::builder(&environment).map_err(|error| {
+        model_load_error(anyhow::anyhow!(
+            "failed to create ONNX Runtime session builder: {error}"
+        ))
+    })
 }
 
 #[cfg(all(any(feature = "ocr", feature = "ocr-vl"), not(feature = "metal")))]

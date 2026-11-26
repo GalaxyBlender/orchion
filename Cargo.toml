@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["vendor/qwen3-asr", "vendor/qwen3-tts"]
 members = [
     "examples/orchion/asr-file",
     "examples/orchion/asr-streaming",

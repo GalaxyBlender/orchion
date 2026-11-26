@@ -116,7 +116,7 @@ impl Tts {
         crate::blocking::run(move || {
             let started = Instant::now();
             let engine = DeviceResource::lock(&engine)?;
-            let audio = match voice {
+            let audio = (|| match voice {
                 TtsVoice::Preset { speaker, language } => engine
                     .synthesize_with_voice(
                         text.as_str(),
@@ -165,7 +165,8 @@ impl Tts {
                     .map_err(|source| OrchionError::Inference {
                         message: source.to_string(),
                     }),
-            }?;
+            })();
+            let audio = engine.finish_request(audio)?;
             tracing::debug!(
                 text_chars = text_len,
                 samples = audio.samples.len(),

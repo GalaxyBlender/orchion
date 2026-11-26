@@ -5,12 +5,6 @@ cd "$(dirname "$0")/.."
 
 export CUDA_COMPUTE_CAP="${CUDA_COMPUTE_CAP:-80}"
 
-# Candle 0.9's cudarc supports CUDA 13.0 bindings, not newer 13.x version detection.
-nvcc_version="$(nvcc --version)"
-if [[ -z "${CUDARC_CUDA_VERSION:-}" && "$nvcc_version" == *"release 13."* ]]; then
-  export CUDARC_CUDA_VERSION="13000"
-fi
-
 cargo build --release -p orchion-server --no-default-features --features cuda
 
 # ort copies providers beside build artifacts, which can be outside target/ when

@@ -25,6 +25,10 @@ curl http://127.0.0.1:9090/v1/audio/transcriptions \
 
 `timestamp_granularities[]=segment` 会在 `verbose_json` 中启用片段时间戳；暂不支持词级时间戳。
 
+### CUDA 显存
+
+CUDA 文件转写会把音频编码器的卷积拆成小批次执行，不需要把输入拆成多个推理请求。返回前会同步 CUDA，让临时显存可被回收，模型保持加载。此优化不改变 WebSocket 流式识别。长录音仍可能达到显存上限，因为注意力和解码仍需要当前转写输入的上下文。
+
 ## 流式识别
 
 WebSocket 流式识别使用 `GET /v1/audio/transcriptions/stream`。

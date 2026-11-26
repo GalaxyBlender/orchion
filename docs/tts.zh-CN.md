@@ -56,3 +56,7 @@ curl http://127.0.0.1:9090/v1/audio/speech \
 支持的输出格式为 `wav`、`mp3`、`aac`、`opus`、`flac` 和 `pcm`。如果省略 `response_format`，服务端会使用 `config.toml` 中 `[services.tts] format` 的配置。
 
 Qwen3 TTS 请求也支持 `seed`、`temperature`、`top_k`、`top_p`、`repetition_penalty` 和 `max_length`。
+
+## CUDA 显存
+
+CUDA 下，长音频的波形上采样按带重叠的块执行，以降低显存峰值，并保留解码器的注意力上下文。HTTP API 不会因此改为流式输出。请求返回前会同步 CUDA，让临时显存可被回收，不需要卸载模型。`max_length` 仍限制生成的语音编码帧数，不是输入字数。

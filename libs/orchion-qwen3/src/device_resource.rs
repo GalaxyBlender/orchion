@@ -44,6 +44,23 @@ impl<T> DeviceResource<T> {
         }
         Ok(guard)
     }
+
+    /// Drain queued CUDA frees after request-local tensors are dropped, while
+    /// the caller still holds the model lock.
+    pub(crate) fn finish_request<R>(&self, result: Result<R>) -> Result<R> {
+        #[cfg(feature = "cuda")]
+        if self.device.is_cuda()
+            && let Err(error) = self.device.synchronize()
+        {
+            if result.is_ok() {
+                return Err(OrchionError::Inference {
+                    message: format!("synchronize CUDA after inference: {error}"),
+                });
+            }
+            tracing::warn!(%error, "failed to finish CUDA work after inference error");
+        }
+        result
+    }
 }
 
 impl<T> Deref for DeviceResource<T> {

@@ -25,6 +25,15 @@ Supported `response_format` values:
 
 `timestamp_granularities[]=segment` enables segment timestamps in `verbose_json`. Word-level timestamps are not supported.
 
+### CUDA memory
+
+On CUDA, file transcription runs the audio encoder's convolution in bounded
+batches without splitting the input into separate model requests. Temporary GPU
+allocations can be reclaimed before the request returns; the model stays
+loaded. This does not change WebSocket streaming. Long recordings can still hit
+GPU memory limits because attention and decoding retain context for the input
+being transcribed.
+
 ## Streaming
 
 Use `GET /v1/audio/transcriptions/stream` for WebSocket streaming.

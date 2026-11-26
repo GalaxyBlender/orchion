@@ -1,9 +1,7 @@
 //! Render model-generated tables without losing cells or trusting generated HTML.
 
-use htmd::{HtmlToMarkdown, Node};
-use markup5ever_rcdom::NodeData;
+use htmd::{HtmlToMarkdown, node::Node};
 use std::fmt::Write;
-use std::rc::Rc;
 
 struct Cell {
     text: String,
@@ -19,44 +17,35 @@ struct Table {
 }
 
 impl Table {
-    fn from_node(node: &Rc<Node>) -> Self {
+    fn from_node(node: &Node<'_>) -> Self {
         let mut table = Self::default();
         table.collect_rows(node);
         table
     }
 
-    fn collect_rows(&mut self, node: &Rc<Node>) {
-        for child in node.children.borrow().iter() {
-            let NodeData::Element { name, .. } = &child.data else {
-                continue;
-            };
-            match name.local.as_ref() {
-                "caption" => self.caption = Some(cell_text(child)),
-                "thead" | "tbody" | "tfoot" => self.collect_rows(child),
-                "tr" => {
+    fn collect_rows(&mut self, node: &Node<'_>) {
+        for child in &node.children() {
+            match child.tag_name() {
+                Some("caption") => self.caption = Some(cell_text(&child)),
+                Some("thead" | "tbody" | "tfoot") => self.collect_rows(&child),
+                Some("tr") => {
                     let cells = child
-                        .children
-                        .borrow()
+                        .children()
                         .iter()
                         .filter_map(|cell| {
-                            let NodeData::Element { name, attrs, .. } = &cell.data else {
-                                return None;
-                            };
-                            if !matches!(name.local.as_ref(), "td" | "th") {
+                            let tag = cell.tag_name()?;
+                            if !matches!(tag, "td" | "th") {
                                 return None;
                             }
                             let span = |attribute: &str| {
-                                attrs
-                                    .borrow()
-                                    .iter()
-                                    .find(|attr| attr.name.local.as_ref() == attribute)
-                                    .and_then(|attr| attr.value.parse::<u32>().ok())
+                                cell.attr(attribute)
+                                    .and_then(|value| value.parse::<u32>().ok())
                                     .filter(|value| *value > 0)
                                     .unwrap_or(1)
                             };
                             Some(Cell {
-                                text: cell_text(cell),
-                                header: name.local.as_ref() == "th",
+                                text: cell_text(&cell),
+                                header: tag == "th",
                                 colspan: span("colspan"),
                                 rowspan: span("rowspan"),
                             })
@@ -208,37 +197,29 @@ fn markdown_cell(text: &str) -> String {
     escaped
 }
 
-fn cell_text(node: &Rc<Node>) -> String {
-    fn collect(node: &Rc<Node>, text: &mut String) {
-        match &node.data {
-            NodeData::Text { contents } => text.push_str(&contents.borrow()),
-            NodeData::Element { name, .. } => match name.local.as_ref() {
-                "script" | "style" | "template" => return,
-                "br" => text.push('\n'),
-                "p" | "div" | "li" if !text.ends_with('\n') => text.push('\n'),
-                _ => {}
-            },
+fn cell_text(node: &Node<'_>) -> String {
+    fn collect(node: &Node<'_>, text: &mut String) {
+        if let Some(contents) = node.text() {
+            text.push_str(&contents);
+        }
+        let tag = node.tag_name();
+        let block = matches!(tag, Some("p" | "div" | "li"));
+        match tag {
+            Some("script" | "style" | "template") => return,
+            Some("br") => text.push('\n'),
+            _ if block && !text.ends_with('\n') => text.push('\n'),
             _ => {}
         }
-        for child in node.children.borrow().iter() {
-            collect(child, text);
+        for child in &node.children() {
+            collect(&child, text);
         }
-        if matches!(&node.data, NodeData::Element { name, .. } if matches!(name.local.as_ref(), "p" | "div" | "li"))
-            && !text.ends_with('\n')
-        {
+        if block && !text.ends_with('\n') {
             text.push('\n');
         }
     }
     let mut text = String::new();
     collect(node, &mut text);
     text.trim().to_string()
-}
-
-fn find_table(node: &Rc<Node>) -> Option<Rc<Node>> {
-    if matches!(&node.data, NodeData::Element { name, .. } if name.local.as_ref() == "table") {
-        return Some(Rc::clone(node));
-    }
-    node.children.borrow().iter().find_map(find_table)
 }
 
 fn unfence_table(input: &str) -> &str {
@@ -251,28 +232,27 @@ fn unfence_table(input: &str) -> &str {
 }
 
 pub(crate) fn table_to_html(input: &str) -> Option<String> {
-    fn render(node: &Rc<Node>, output: &mut String) {
+    fn render(node: &Node<'_>, output: &mut String) {
         let mut block = false;
-        match &node.data {
-            NodeData::Text { contents } => output.push_str(&escape_html(&contents.borrow())),
-            NodeData::Element { name, .. } => match name.local.as_ref() {
-                "table" => {
-                    output.push_str(&Table::from_node(node).html());
-                    return;
-                }
-                "head" | "script" | "style" | "template" => return,
-                "br" => output.push_str("<br>"),
-                "div" => output.push('\n'),
-                "p" | "h1" | "h2" | "h3" | "li" => {
-                    block = true;
-                    output.push_str("<p>");
-                }
-                _ => {}
-            },
+        if let Some(contents) = node.text() {
+            output.push_str(&escape_html(&contents));
+        }
+        match node.tag_name() {
+            Some("table") => {
+                output.push_str(&Table::from_node(node).html());
+                return;
+            }
+            Some("head" | "script" | "style" | "template") => return,
+            Some("br") => output.push_str("<br>"),
+            Some("div") => output.push('\n'),
+            Some("p" | "h1" | "h2" | "h3" | "li") => {
+                block = true;
+                output.push_str("<p>");
+            }
             _ => {}
         }
-        for child in node.children.borrow().iter() {
-            render(child, output);
+        for child in &node.children() {
+            render(&child, output);
         }
         if block {
             output.push_str("</p>");
@@ -281,13 +261,14 @@ pub(crate) fn table_to_html(input: &str) -> Option<String> {
     let tree = HtmlToMarkdown::new()
         .html_to_tree(unfence_table(input))
         .expect("parsing an in-memory HTML string cannot fail");
-    let node = find_table(&tree)?;
+    let root = tree.root();
+    let node = root.find(|node| node.tag_name() == Some("table"))?;
     let table = Table::from_node(&node);
     if table.rows.is_empty() {
         return None;
     }
     let mut html = String::new();
-    render(&tree, &mut html);
+    render(&root, &mut html);
     Some(html.trim().to_string())
 }
 
@@ -298,29 +279,28 @@ pub(crate) fn table_to_text(input: &str) -> Option<String> {
             output.push('\n');
         }
     }
-    fn render(node: &Rc<Node>, output: &mut String) {
+    fn render(node: &Node<'_>, output: &mut String) {
         let mut block = false;
-        match &node.data {
-            NodeData::Text { contents } => output.push_str(&contents.borrow()),
-            NodeData::Element { name, .. } => match name.local.as_ref() {
-                "table" => {
-                    line_break(output);
-                    output.push_str(&Table::from_node(node).text());
-                    line_break(output);
-                    return;
-                }
-                "head" | "script" | "style" | "template" => return,
-                "br" => output.push('\n'),
-                "p" | "div" | "h1" | "h2" | "h3" | "li" => {
-                    block = true;
-                    line_break(output);
-                }
-                _ => {}
-            },
+        if let Some(contents) = node.text() {
+            output.push_str(&contents);
+        }
+        match node.tag_name() {
+            Some("table") => {
+                line_break(output);
+                output.push_str(&Table::from_node(node).text());
+                line_break(output);
+                return;
+            }
+            Some("head" | "script" | "style" | "template") => return,
+            Some("br") => output.push('\n'),
+            Some("p" | "div" | "h1" | "h2" | "h3" | "li") => {
+                block = true;
+                line_break(output);
+            }
             _ => {}
         }
-        for child in node.children.borrow().iter() {
-            render(child, output);
+        for child in &node.children() {
+            render(&child, output);
         }
         if block {
             line_break(output);
@@ -329,37 +309,37 @@ pub(crate) fn table_to_text(input: &str) -> Option<String> {
     let tree = HtmlToMarkdown::new()
         .html_to_tree(unfence_table(input))
         .expect("parsing an in-memory HTML string cannot fail");
-    find_table(&tree)?;
+    let root = tree.root();
+    root.find(|node| node.tag_name() == Some("table"))?;
     let mut text = String::new();
-    render(&tree, &mut text);
+    render(&root, &mut text);
     // Keep tabs at either end: they represent empty first/last cells.
     Some(text.trim_matches('\n').to_string())
 }
 
 pub(crate) fn html_tables_to_markdown(input: &str) -> String {
-    fn render(node: &Rc<Node>, output: &mut String) {
+    fn render(node: &Node<'_>, output: &mut String) {
         let mut block = false;
-        match &node.data {
-            NodeData::Text { contents } => output.push_str(&escape_html(&contents.borrow())),
-            NodeData::Element { name, .. } => match name.local.as_ref() {
-                "table" => {
-                    output.push_str("\n\n");
-                    output.push_str(&Table::from_node(node).markdown());
-                    output.push_str("\n\n");
-                    return;
-                }
-                "head" | "script" | "style" | "template" => return,
-                "br" => output.push('\n'),
-                "p" | "div" => {
-                    block = true;
-                    output.push_str("\n\n");
-                }
-                _ => {}
-            },
+        if let Some(contents) = node.text() {
+            output.push_str(&escape_html(&contents));
+        }
+        match node.tag_name() {
+            Some("table") => {
+                output.push_str("\n\n");
+                output.push_str(&Table::from_node(node).markdown());
+                output.push_str("\n\n");
+                return;
+            }
+            Some("head" | "script" | "style" | "template") => return,
+            Some("br") => output.push('\n'),
+            Some("p" | "div") => {
+                block = true;
+                output.push_str("\n\n");
+            }
             _ => {}
         }
-        for child in node.children.borrow().iter() {
-            render(child, output);
+        for child in &node.children() {
+            render(&child, output);
         }
         if block {
             output.push_str("\n\n");
@@ -373,7 +353,7 @@ pub(crate) fn html_tables_to_markdown(input: &str) -> String {
         .html_to_tree(unfence_table(input))
         .expect("parsing an in-memory HTML string cannot fail");
     let mut markdown = String::new();
-    render(&tree, &mut markdown);
+    render(&tree.root(), &mut markdown);
     markdown.trim_matches('\n').to_string()
 }
 

@@ -56,3 +56,11 @@ curl http://127.0.0.1:9090/v1/audio/speech \
 Supported output formats are `wav`, `mp3`, `aac`, `opus`, `flac`, and `pcm`. If `response_format` is omitted, the server uses `[services.tts] format` from `config.toml`.
 
 Qwen3 TTS requests also accept `seed`, `temperature`, `top_k`, `top_p`, `repetition_penalty`, and `max_length`.
+
+## CUDA memory
+
+On CUDA, the waveform decoder upsamples long outputs in overlapping chunks to
+reduce peak GPU memory while preserving the decoder's attention context. This
+does not make the HTTP response stream audio. Temporary GPU allocations can be
+reclaimed before the request returns, without unloading the model. `max_length`
+still limits generated audio codec frames, not input characters.

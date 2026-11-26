@@ -25,13 +25,13 @@ image = { version = "0.25.10", default-features = false, features = ["jpeg", "pn
 include_dir = "0.7"
 orchion = { path = "../../libs/orchion", default-features = false, features = ["asr-qwen3", "tts-qwen3", "ocr", "ocr-vl", "llm", "server-support", "docs", "audio-ffmpeg", "download-all", "audio-vad", "serde", "schema"] }
 orchion-protocol = { path = "../../libs/orchion-protocol", features = ["schema"] }
-prometheus-client = "0.25"
+prometheus-client = "0.26"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "fs", "sync", "time"] }
-toml = "1.1"
+toml = "1.2"
 tower-http = { version = "0.7", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

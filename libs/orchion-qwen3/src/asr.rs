@@ -73,12 +73,13 @@ impl Asr {
                 path: PathBuf::from(&path),
             })?;
             let engine = DeviceResource::lock(&engine)?;
-            engine
+            let result = engine
                 .transcribe(path_text, transcribe_options_into_upstream(options))
                 .map(transcript_from_upstream)
                 .map_err(|source| OrchionError::Inference {
                     message: source.to_string(),
-                })
+                });
+            engine.finish_request(result)
         })
         .await
     }
@@ -102,12 +103,13 @@ impl Asr {
         let engine = Arc::clone(&self.engine);
         crate::blocking::run(move || {
             let engine = DeviceResource::lock(&engine)?;
-            engine
+            let result = engine
                 .transcribe_samples(&prepared, transcribe_options_into_upstream(options))
                 .map(transcript_from_upstream)
                 .map_err(|source| OrchionError::Inference {
                     message: source.to_string(),
-                })
+                });
+            engine.finish_request(result)
         })
         .await
     }

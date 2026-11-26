@@ -2,11 +2,83 @@
 #![cfg(all(feature = "cuda", target_os = "linux"))]
 
 use candle_core::cuda::cudarc::driver::CudaContext;
+use candle_core::cuda::cudarc::driver::{result, sys};
 use orchion_core::DevicePreference;
 use std::path::PathBuf;
 use std::process::Command;
+use sys::CUmemPool_attribute_enum::{
+    self, CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT, CU_MEMPOOL_ATTR_USED_MEM_CURRENT,
+    CU_MEMPOOL_ATTR_USED_MEM_HIGH,
+};
 
 const RETAINED_ALLOWANCE_MIB: u64 = 256;
+const MIB: u64 = 1024 * 1024;
+
+struct Workspace<'ctx> {
+    _context: &'ctx CudaContext,
+    pool: sys::CUmemoryPool,
+    resident_used: u64,
+    resident_reserved: u64,
+}
+
+#[allow(unsafe_code)]
+impl<'ctx> Workspace<'ctx> {
+    fn after_load(context: &'ctx CudaContext) -> Self {
+        context.synchronize().unwrap();
+        // SAFETY: the CUDA device belongs to the borrowed live context.
+        let pool = unsafe { result::device::get_mem_pool(context.cu_device()) }.unwrap();
+        let mut workspace = Self {
+            _context: context,
+            pool,
+            resident_used: 0,
+            resident_reserved: 0,
+        };
+        workspace.resident_used = workspace.read(CU_MEMPOOL_ATTR_USED_MEM_CURRENT);
+        workspace.resident_reserved = workspace.read(CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT);
+        let mut zero = 0_u64;
+        // SAFETY: CUDA accepts a pointer to a uint64_t zero to reset this counter.
+        unsafe {
+            result::mem_pool::set_attribute(
+                pool,
+                CU_MEMPOOL_ATTR_USED_MEM_HIGH,
+                (&raw mut zero).cast(),
+            )
+        }
+        .unwrap();
+        workspace
+    }
+
+    fn read(&self, attribute: CUmemPool_attribute_enum) -> u64 {
+        let mut bytes = 0_u64;
+        // SAFETY: the three memory attributes read here use writable uint64_t storage.
+        unsafe { result::mem_pool::get_attribute(self.pool, attribute, (&raw mut bytes).cast()) }
+            .unwrap();
+        bytes
+    }
+
+    fn assert_reclaimed(&self, max_workspace_mib: u64) {
+        let peak = self.read(CU_MEMPOOL_ATTR_USED_MEM_HIGH);
+        let reserved = self.read(CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT);
+        println!(
+            "resident={} MiB, peak={} MiB, reserved after return={} MiB",
+            self.resident_used / MIB,
+            peak / MIB,
+            reserved / MIB
+        );
+        assert!(
+            peak <= self.resident_used + max_workspace_mib * MIB,
+            "long inference exceeded the CUDA workspace budget"
+        );
+        assert_eq!(
+            self.read(CU_MEMPOOL_ATTR_USED_MEM_CURRENT),
+            self.resident_used
+        );
+        assert!(
+            reserved <= self.resident_reserved + RETAINED_ALLOWANCE_MIB * MIB,
+            "temporary allocations stayed reserved after the request"
+        );
+    }
+}
 
 fn process_gpu_mib() -> u64 {
     let output = Command::new("nvidia-smi")
@@ -131,13 +203,91 @@ fn tts_releases_gpu_memory_after_multiple_requests() {
                     )
                     .await
                     .unwrap();
-                assert_ne!(
-                    audio.samples,
-                    [] as [f32; 0],
-                    "synthesis must produce audio"
-                );
+                assert!(!audio.samples.is_empty(), "synthesis must produce audio");
             }
             engine
         })
     });
+}
+
+#[cfg(feature = "tts")]
+#[test]
+#[ignore = "requires an isolated CUDA GPU and local Qwen3-TTS 0.6B CustomVoice weights"]
+fn long_tts_bounds_workspace_and_releases_it_without_unloading_the_model() {
+    use orchion_core::{TtsLanguage, TtsModel, TtsOptions, TtsSpeaker, TtsVoice};
+    use orchion_qwen3::Tts;
+
+    let ordinal = std::env::var("ORCHION_TEST_CUDA_ORDINAL").map_or(0, |n| n.parse().unwrap());
+    let context = CudaContext::new(ordinal).unwrap();
+    assert!(context.has_async_alloc());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let model = TtsModel::parse("alibaba/qwen3-tts-12hz-0.6b-customvoice").unwrap();
+    let engine = rt
+        .block_on(Tts::load_with_device(
+            model,
+            model_dir("ORCHION_TTS_TEST_MODEL_DIR"),
+            DevicePreference::Cuda(Some(ordinal)),
+        ))
+        .unwrap();
+    let workspace = Workspace::after_load(&context);
+
+    let audio = rt
+        .block_on(engine.synthesize_with(
+            "清晨的河岸很安静，薄雾从水面慢慢升起。沿着石板路往前走，可以看见几棵老柳树。\
+             附近的面包店刚刚开门，烤面包的香气飘到街角。跑步的人放慢脚步，互相打个招呼。\
+             等太阳越过屋顶，整条街便渐渐热闹起来，迎来了崭新的一天。",
+            TtsVoice::Preset {
+                speaker: TtsSpeaker::Vivian,
+                language: TtsLanguage::Chinese,
+            },
+            TtsOptions {
+                seed: Some(42),
+                ..TtsOptions::default()
+            },
+        ))
+        .unwrap();
+    assert_eq!(audio.sample_rate, 24_000);
+    assert!(audio.samples.len() >= 20 * 24_000);
+    assert!(audio.samples.iter().all(|x| x.is_finite()));
+
+    workspace.assert_reclaimed(1024);
+}
+
+#[cfg(feature = "asr")]
+#[test]
+#[ignore = "requires an isolated CUDA GPU and local Qwen3-ASR 0.6B weights"]
+fn long_asr_bounds_workspace_and_releases_it_without_unloading_the_model() {
+    use orchion_core::{ASR_SAMPLE_RATE, AsrModel, AsrOptions};
+    use orchion_qwen3::Asr;
+
+    let ordinal = std::env::var("ORCHION_TEST_CUDA_ORDINAL").map_or(0, |n| n.parse().unwrap());
+    let context = CudaContext::new(ordinal).unwrap();
+    assert!(context.has_async_alloc());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let model = AsrModel::parse("alibaba/qwen3-asr-0.6b").unwrap();
+    let engine = rt
+        .block_on(Asr::load_with_device(
+            model,
+            model_dir("ORCHION_ASR_TEST_MODEL_DIR"),
+            DevicePreference::Cuda(Some(ordinal)),
+        ))
+        .unwrap();
+    let workspace = Workspace::after_load(&context);
+
+    // A non-round duration exercises the padded tail in the final convolution batch.
+    let samples = vec![0.01; 4 * 60 * ASR_SAMPLE_RATE as usize + 8_000];
+    rt.block_on(engine.transcribe_samples_with(
+        &samples,
+        ASR_SAMPLE_RATE,
+        AsrOptions {
+            max_new_tokens: 8,
+            ..AsrOptions::default()
+        },
+    ))
+    .unwrap();
+    workspace.assert_reclaimed(1600);
 }

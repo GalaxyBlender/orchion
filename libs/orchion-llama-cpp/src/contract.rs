@@ -4,8 +4,8 @@ use std::path::PathBuf;
 /// Maximum bounded event channel size accepted by the native scheduler.
 pub const MAX_EVENT_CAPACITY: usize = 4096;
 
-pub const BINDING_REVISION: &str = "064f9e1ffc852b58de9b6fcec4c0ac1357c62890";
-pub const LLAMA_CPP_REVISION: &str = "d81235049384534c167caea52b85a694f6103d14";
+pub const BINDING_REVISION: &str = "feebf11b8f06f7bdac44a101bc226cb785920b66";
+pub const LLAMA_CPP_REVISION: &str = "cd959bae99ff4bed22bef2604f45241c09bbb8c8";
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct BuildMetadata {
