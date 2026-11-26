@@ -406,19 +406,20 @@ impl TalkerModel {
 
         // RoPE - use MRoPE if mrope_section is configured
         let rope = if let Some(mrope_section) = config.mrope_section {
-            RoPEType::Multimodal(MRoPE::new(
-                config.head_dim,
-                config.rope_theta,
-                mrope_section,
-                device,
-            )?)
+            RoPEType::Multimodal(
+                MRoPE::new(config.head_dim, config.rope_theta, mrope_section, device)?
+                    .with_cuda_table(config.max_position_embeddings, dtype)?,
+            )
         } else {
-            RoPEType::Standard(RotaryEmbedding::new(
-                config.head_dim,
-                config.max_position_embeddings,
-                config.rope_theta,
-                device,
-            )?)
+            RoPEType::Standard(
+                RotaryEmbedding::new(
+                    config.head_dim,
+                    config.max_position_embeddings,
+                    config.rope_theta,
+                    device,
+                )?
+                .with_cuda_dtype(dtype)?,
+            )
         };
 
         Ok(Self {

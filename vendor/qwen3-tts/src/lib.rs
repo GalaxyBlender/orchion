@@ -539,6 +539,8 @@ impl Qwen3TTS {
         trailing_text_len: usize,
         tts_pad_embed: &Tensor,
     ) -> Result<FrameCodes> {
+        let mut profile = profiling::stages_enabled().then(profiling::GenerationProfile::default);
+        let started = profile.as_ref().map(|_| Instant::now());
         // Pre-build the token suppression mask once (reused every frame)
         let suppression_mask = generation::build_suppression_mask(
             codec_tokens::CODEC_VOCAB_SIZE,
@@ -592,10 +594,16 @@ impl Qwen3TTS {
             #[cfg(feature = "profiling")]
             let _cp_span = tracing::info_span!("code_predictor", frame = frame_idx).entered();
 
-            let acoustic_codes_tensor = self.code_predictor.generate_acoustic_codes(
-                &last_hidden,
-                &semantic_embed,
-                &mut cp_kv_caches,
+            let acoustic_codes_tensor = profiling::measure(
+                profile.as_mut().map(|p| &mut p.code_predictor),
+                &self.device,
+                || {
+                    self.code_predictor.generate_acoustic_codes(
+                        &last_hidden,
+                        &semantic_embed,
+                        &mut cp_kv_caches,
+                    )
+                },
             )?;
 
             #[cfg(feature = "profiling")]
@@ -624,9 +632,14 @@ impl Qwen3TTS {
             #[cfg(feature = "profiling")]
             let _talker_span = tracing::info_span!("talker_step", frame = frame_idx).entered();
 
-            let (h, new_logits) =
-                self.talker
-                    .generate_step_with_embed(&step_input, kv_caches, offset)?;
+            let (h, new_logits) = profiling::measure(
+                profile.as_mut().map(|p| &mut p.talker),
+                &self.device,
+                || {
+                    self.talker
+                        .generate_step_with_embed(&step_input, kv_caches, offset)
+                },
+            )?;
             offset += 1;
             last_hidden = h;
 
@@ -636,23 +649,38 @@ impl Qwen3TTS {
             #[cfg(feature = "profiling")]
             let _sample_span = tracing::info_span!("sampling", frame = frame_idx).entered();
 
-            let logits_2d = new_logits.squeeze(1)?;
-            let logits_2d = self.apply_generation_penalties_gpu(
-                &logits_2d,
-                &penalty_mask,
-                gen_config,
-                token_count,
-                Some(&suppression_mask),
+            (semantic_token_tensor, semantic_token) = profiling::measure(
+                profile.as_mut().map(|p| &mut p.sampling),
+                &self.device,
+                || {
+                    let logits_2d = new_logits.squeeze(1)?;
+                    let logits_2d = self.apply_generation_penalties_gpu(
+                        &logits_2d,
+                        &penalty_mask,
+                        gen_config,
+                        token_count,
+                        Some(&suppression_mask),
+                    )?;
+                    let token_tensor = generation::sample(&logits_2d, gen_config, sampling_ctx)?;
+                    tracing::trace!(target: "gpu_sync", "to_vec1 in generate_codes sampling");
+                    let token = token_tensor.flatten_all()?.to_vec1::<u32>()?[0];
+                    Self::update_penalty_mask(&mut penalty_mask, token, vocab_size)?;
+                    Ok((token_tensor, token))
+                },
             )?;
-            semantic_token_tensor = generation::sample(&logits_2d, gen_config, sampling_ctx)?;
-            tracing::trace!(target: "gpu_sync", "to_vec1 in generate_codes sampling");
-            semantic_token = semantic_token_tensor.flatten_all()?.to_vec1::<u32>()?[0];
-            Self::update_penalty_mask(&mut penalty_mask, semantic_token, vocab_size)?;
             token_count += 1;
         }
 
         // Single GPU→CPU transfer: convert all accumulated GPU frames to FrameCodes
-        self.gpu_frames_to_frame_codes(&gpu_frames)
+        let codes = self.gpu_frames_to_frame_codes(&gpu_frames)?;
+        if let (Some(profile), Some(started)) = (profile, started) {
+            let ms = |time: std::time::Duration| time.as_secs_f64() * 1000.;
+            tracing::info!(target: "qwen3_tts::stages", frames = codes.len(),
+                code_predictor_ms = ms(profile.code_predictor), talker_ms = ms(profile.talker),
+                sampling_ms = ms(profile.sampling), generation_ms = ms(started.elapsed()));
+            tracing::info!(target: "qwen3_tts::stages", ?codes, "generated codec IDs");
+        }
+        Ok(codes)
     }
 
     /// Update the GPU-side penalty mask for a single token ID.
@@ -879,8 +907,16 @@ impl Qwen3TTS {
     /// Takes a slice of frames (each frame is a `Vec<u32>` of 16 codebook values)
     /// and runs the 12Hz decoder to produce an audio waveform at 24kHz.
     pub fn decode_codes(&self, codes: &[Vec<u32>]) -> Result<AudioBuffer> {
-        let tensor = self.codes_to_tensor(codes)?;
-        self.decode_tensor(&tensor)
+        let mut duration = profiling::stages_enabled().then(std::time::Duration::default);
+        let audio = profiling::measure(duration.as_mut(), &self.device, || {
+            let tensor = self.codes_to_tensor(codes)?;
+            self.decode_tensor(&tensor)
+        })?;
+        if let Some(duration) = duration {
+            tracing::info!(target: "qwen3_tts::stages", frames = codes.len(),
+                waveform_ms = duration.as_secs_f64() * 1000.);
+        }
+        Ok(audio)
     }
 
     /// Decode a codes tensor `[1, 16, T]` to audio.

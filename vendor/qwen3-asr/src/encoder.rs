@@ -334,6 +334,7 @@ impl AudioEncoder {
 
     /// Encode mel spectrogram [num_mel_bins, num_frames] → [num_tokens, output_dim]
     pub(crate) fn forward(&self, mel: &Tensor) -> Result<Tensor> {
+        let mut timer = crate::profile::PhaseTimer::start();
         let num_frames = mel.dims()[1];
         // Logical chunk = n_window * 2 = 100 mel frames (matches official windowed attention).
         let chunk_size = self.config.n_window * 2;
@@ -377,6 +378,7 @@ impl AudioEncoder {
         } else {
             self.encode_conv_batch(&chunk_mels, &chunk_valid_tokens)?
         };
+        timer.mark("convolution", mel.device())?;
         let total_tokens = hidden.dims()[0];
 
         // Add batch dim: [1, total_tokens, d_model]
@@ -401,6 +403,7 @@ impl AudioEncoder {
             .proj2
             .forward(&self.proj1.forward(&hidden)?.gelu_erf()?)?;
 
+        timer.mark("audio attention and projection", mel.device())?;
         // Remove batch dim: [num_tokens, output_dim]
         hidden.squeeze(0).map_err(Into::into)
     }

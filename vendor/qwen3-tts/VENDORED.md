@@ -14,3 +14,14 @@ overlapping windows, discards samples affected by window-local padding, and
 copies only the resulting PCM to the host. CPU and Metal still use the original
 whole-waveform path. Remove the vendored dependency when the upstream runtime
 provides equivalent bounded decoding.
+
+The talker and code predictor also use Candle's fused half-split rotary
+kernel on CUDA. The rotation, sampling, and waveform decoding are
+otherwise unchanged.
+
+The CUDA RoPE tables use the model's compute dtype. Talker MRoPE also
+caches the first 2,048 positions, using the original calculation for
+longer offsets. The code predictor writes acoustic token IDs into its
+preallocated frame tensor without copying previous IDs. The
+[performance report](../../docs/vendor-tts-attention-performance.md)
+records the profile and output checks.

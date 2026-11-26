@@ -14,8 +14,10 @@ edition = "2021"
 rust-version = "1.75"
 name = "qwen3-asr"
 version = "0.2.2"
-build = false
+build = "build.rs"
 include = [
+    "build.rs",
+    "kernels/*.cu",
     "src/**/*.rs",
     "README.md",
     "LICENSE",
@@ -48,6 +50,7 @@ no-default-features = true
 cuda = [
     "candle-core/cuda",
     "candle-nn/cuda",
+    "dep:cudaforge",
 ]
 default = ["metal"]
 hub = ["dep:reqwest"]
@@ -102,3 +105,7 @@ version = "2"
 [dependencies.tokenizers]
 version = "0.22"
 features = ["onig"]
+
+[build-dependencies.cudaforge]
+version = "0.1.6"
+optional = true

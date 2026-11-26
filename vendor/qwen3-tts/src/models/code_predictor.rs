@@ -205,12 +205,15 @@ impl CodePredictor {
         }
 
         // Rotary embeddings
-        let rope = RoPEType::Standard(RotaryEmbedding::new(
-            config.head_dim,
-            1024, // Max sequence length for code predictor
-            config.rope_theta,
-            vb.device(),
-        )?);
+        let rope = RoPEType::Standard(
+            RotaryEmbedding::new(
+                config.head_dim,
+                1024, // Max sequence length for code predictor
+                config.rope_theta,
+                vb.device(),
+            )?
+            .with_cuda_dtype(vb.dtype())?,
+        );
 
         // Pre-build the 2×2 causal mask for prefill (talker_hidden + semantic_embed).
         // This never changes, so building it once avoids per-frame allocation.
@@ -374,9 +377,8 @@ impl CodePredictor {
         let logits = self.lm_heads[0].forward(&last_hidden)?;
         let first_code = logits.argmax(D::Minus1)?.flatten_all()?; // [1] tensor on GPU
 
-        let mut all_codes = Tensor::zeros(num_acoustic, candle_core::DType::U32, device)?;
-        let range = 0..1;
-        all_codes = all_codes.slice_assign(&[range], &first_code)?;
+        let all_codes = Tensor::zeros(num_acoustic, candle_core::DType::U32, device)?;
+        all_codes.slice_set(&first_code, 0, 0)?;
 
         // Also keep a reference to the latest code for embedding lookup
         let mut prev_code = first_code;
@@ -406,8 +408,7 @@ impl CodePredictor {
             // Predict next code (stays on GPU)
             let logits = self.lm_heads[group_idx].forward(&h)?;
             let next_code = logits.argmax(D::Minus1)?.flatten_all()?; // [1] tensor on GPU
-            let range = group_idx..group_idx + 1;
-            all_codes = all_codes.slice_assign(&[range], &next_code)?;
+            all_codes.slice_set(&next_code, 0, group_idx)?;
             prev_code = next_code;
             offset += 1;
         }

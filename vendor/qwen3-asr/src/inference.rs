@@ -154,7 +154,7 @@ impl AsrInference {
 
     fn build_engine(
         config: AsrConfig,
-        weights: HashMap<String, Tensor>,
+        mut weights: HashMap<String, Tensor>,
         tokenizer: tokenizers::Tokenizer,
         device: Device,
     ) -> anyhow::Result<Self> {
@@ -169,7 +169,7 @@ impl AsrInference {
 
         info!("Loading text decoder...");
         let text_decoder = TextDecoder::load(
-            &weights,
+            &mut weights,
             "thinker.model",
             &config.thinker_config.text_config,
         )
@@ -248,9 +248,11 @@ impl AsrInferenceInner {
     /// Extract mel spectrogram and run the audio encoder.
     /// Returns audio embeddings [num_audio_tokens, output_dim].
     pub(crate) fn encode_audio(&self, samples: &[f32]) -> anyhow::Result<Tensor> {
+        let mut timer = crate::profile::PhaseTimer::start();
         let (mel_data, n_mels, n_frames) = self.mel_extractor.extract(samples)?;
         debug!("Mel: {}×{} frames", n_mels, n_frames);
         let mel = Tensor::from_vec(mel_data, (n_mels, n_frames), &self.device)?;
+        timer.mark("mel", &self.device)?;
         let audio_embeds = self.audio_encoder.forward(&mel)?;
         info!("Audio tokens: {}", audio_embeds.dims()[0]);
         Ok(audio_embeds)
@@ -270,6 +272,7 @@ impl AsrInferenceInner {
         prefix_text: Option<&str>,
         max_new_tokens: usize,
     ) -> anyhow::Result<Vec<u32>> {
+        let mut timer = crate::profile::PhaseTimer::start();
         let num_audio_tokens = audio_embeds.dims()[0];
 
         // Build prompt token IDs (with optional prefix)
@@ -315,21 +318,31 @@ impl AsrInferenceInner {
 
         // Prefill
         let mask = create_causal_mask(seq_len, 0, &self.device)?;
-        let mut kv_cache = KvCache::new(text_cfg.num_hidden_layers);
+        let grouped_cuda =
+            self.device.is_cuda() && text_cfg.num_attention_heads > text_cfg.num_key_value_heads;
+        let mut kv_cache = KvCache::new(
+            text_cfg.num_hidden_layers,
+            grouped_cuda.then_some(total_positions),
+        );
 
-        let logits =
-            self.text_decoder
-                .forward(&hidden_states, &cos, &sin, &mut kv_cache, Some(&mask))?;
+        let mut next_logits = self.text_decoder.forward_last_logits(
+            &hidden_states,
+            &cos,
+            &sin,
+            &mut kv_cache,
+            Some(&mask),
+        )?;
+        timer.mark("prefill", &self.device)?;
 
         // Autoregressive generation
         let mut generated_ids: Vec<u32> = Vec::new();
         let eos_ids: &[i64] = &[ENDOFTEXT_TOKEN_ID, IM_END_TOKEN_ID];
 
-        let mut next_logits = logits.narrow(1, seq_len - 1, 1)?.squeeze(1)?;
         let mut current_pos = seq_len;
 
         for step_idx in 0..max_new_tokens {
-            let next_token = next_logits.argmax(1)?.to_vec1::<u32>()?[0];
+            let next_id = next_logits.argmax(1)?;
+            let next_token = next_id.to_vec1::<u32>()?[0];
 
             if log::log_enabled!(log::Level::Debug) {
                 let logits_f32 = next_logits.to_dtype(candle_core::DType::F32)?;
@@ -359,27 +372,30 @@ impl AsrInferenceInner {
 
             generated_ids.push(next_token);
 
-            let next_id_t = Tensor::from_vec(vec![next_token], (1,), &self.device)?;
-            let next_emb = self.text_decoder.embed(&next_id_t)?.unsqueeze(0)?;
+            let next_emb = self.text_decoder.embed(&next_id)?.unsqueeze(0)?;
 
             let new_cos = cos_table.narrow(0, current_pos, 1)?;
             let new_sin = sin_table.narrow(0, current_pos, 1)?;
 
-            let past_len = kv_cache.seq_len();
-            let step_mask = create_causal_mask(1, past_len, &self.device)?;
-
-            let step_logits = self.text_decoder.forward(
+            // On CUDA skip uploading and adding the all-zero mask: a single
+            // new query can attend to all cached keys and itself.
+            let step_mask = if self.device.is_cuda() {
+                None
+            } else {
+                Some(create_causal_mask(1, kv_cache.seq_len(), &self.device)?)
+            };
+            next_logits = self.text_decoder.forward_last_logits(
                 &next_emb,
                 &new_cos,
                 &new_sin,
                 &mut kv_cache,
-                Some(&step_mask),
+                step_mask.as_ref(),
             )?;
 
-            next_logits = step_logits.squeeze(1)?;
             current_pos += 1;
         }
 
+        timer.mark("decode", &self.device)?;
         info!("Generated {} tokens", generated_ids.len());
         Ok(generated_ids)
     }

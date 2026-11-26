@@ -1,0 +1,32 @@
+[package]
+name = "orchion-crane"
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+publish = false
+
+[features]
+default = []
+metal = ["candle-core/metal", "crane-core/metal"]
+cuda = ["candle-core/cuda", "crane-core/cuda"]
+
+[dependencies]
+candle-core = "0.11.1"
+crane-core = "=26.9.0"
+orchion-core = { version = "0.3.0", path = "../orchion-core" }
+tracing = "0.1"
+
+[dev-dependencies]
+anyhow = "1"
+hound = "3"
+orchion-qwen3 = { path = "../orchion-qwen3", features = ["asr", "tts"] }
+tokio = { version = "1", features = ["rt"] }
+tracing-subscriber = "0.3"
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

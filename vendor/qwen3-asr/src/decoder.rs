@@ -16,6 +16,12 @@ fn get_w(weights: &HashMap<String, Tensor>, name: &str) -> anyhow::Result<Tensor
         .ok_or_else(|| anyhow::anyhow!("weight not found: {}", name))
 }
 
+fn take_w(weights: &mut HashMap<String, Tensor>, name: &str) -> Result<Tensor> {
+    weights
+        .remove(name)
+        .ok_or_else(|| anyhow::anyhow!("weight not found: {name}"))
+}
+
 fn load_linear(weights: &HashMap<String, Tensor>, prefix: &str) -> Result<LinearW> {
     Ok(LinearW::new(
         get_w(weights, &format!("{}.weight", prefix))?,
@@ -115,10 +121,12 @@ fn build_interleaved_dim_map(sections: &[usize], total: usize) -> Vec<usize> {
     map
 }
 
-/// Apply rotary embeddings.
-/// `cos` and `sin` must already be cast to `x.dtype()` and shaped [1, 1, seq, head_dim].
-/// The cast and unsqueeze are done once upstream in `TextDecoder::forward`.
+/// Apply rotary embeddings using the tables prepared once for all decoder layers.
 fn apply_rotary_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    if x.device().is_cuda() {
+        return candle_nn::rotary_emb::rope(x, cos, sin).map_err(Into::into);
+    }
+
     let x_rotated = rotate_half(x)?;
     (x.broadcast_mul(cos)? + x_rotated.broadcast_mul(sin)?).map_err(Into::into)
 }
@@ -146,29 +154,73 @@ fn repeat_kv(x: Tensor, n_rep: usize) -> Result<Tensor> {
 // ─── KV Cache ─────────────────────────────────────────────────────────────────
 
 pub(crate) struct KvCache {
-    layers: Vec<Option<(Tensor, Tensor)>>,
+    layers: Vec<LayerKvCache>,
 }
 
 impl KvCache {
-    pub(crate) fn new(num_layers: usize) -> Self {
+    pub(crate) fn new(num_layers: usize, buffered_limit: Option<usize>) -> Self {
         Self {
-            layers: vec![None; num_layers],
+            layers: (0..num_layers)
+                .map(|_| LayerKvCache::new(buffered_limit))
+                .collect(),
         }
     }
 
-    pub(crate) fn get(&self, layer: usize) -> Option<&(Tensor, Tensor)> {
-        self.layers[layer].as_ref()
-    }
-
-    pub(crate) fn set(&mut self, layer: usize, cache: (Tensor, Tensor)) {
-        self.layers[layer] = Some(cache);
-    }
-
     pub(crate) fn seq_len(&self) -> usize {
-        self.layers[0]
-            .as_ref()
-            .map(|(k, _)| k.dims()[2])
-            .unwrap_or(0)
+        self.layers[0].len
+    }
+}
+
+struct LayerKvCache {
+    data: Option<(Tensor, Tensor)>,
+    len: usize,
+    buffered_limit: Option<usize>,
+}
+
+impl LayerKvCache {
+    fn new(buffered_limit: Option<usize>) -> Self {
+        Self {
+            data: None,
+            len: 0,
+            buffered_limit,
+        }
+    }
+
+    fn append(&mut self, key: Tensor, value: Tensor) -> Result<(Tensor, Tensor)> {
+        let len = self.len + key.dim(2)?;
+        let (key, value) = match (&self.data, self.buffered_limit) {
+            (None, _) => (key, value),
+            (Some((k, v)), None) => (Tensor::cat(&[k, &key], 2)?, Tensor::cat(&[v, &value], 2)?),
+            (Some((k, v)), Some(limit)) => {
+                // Reserve only one block at a time, after prefill. The
+                // grouped GEMMs can consume the resulting strided views.
+                const GROW_TOKENS: usize = 128;
+                let (k, v) = if len <= k.dim(2)? {
+                    (k.clone(), v.clone())
+                } else {
+                    let capacity = len.saturating_add(GROW_TOKENS - 1).min(limit);
+                    (self.grow(k, capacity)?, self.grow(v, capacity)?)
+                };
+                k.slice_set(&key, 2, self.len)?;
+                v.slice_set(&value, 2, self.len)?;
+                (k, v)
+            }
+        };
+        let filled = (key.narrow(2, 0, len)?, value.narrow(2, 0, len)?);
+        self.data = Some((key, value));
+        self.len = len;
+        Ok(filled)
+    }
+
+    fn grow(&self, old: &Tensor, capacity: usize) -> Result<Tensor> {
+        let (batch, heads, _, head_dim) = old.dims4()?;
+        let new = Tensor::zeros(
+            (batch, heads, capacity, head_dim),
+            old.dtype(),
+            old.device(),
+        )?;
+        new.slice_set(&old.narrow(2, 0, self.len)?.contiguous()?, 2, 0)?;
+        Ok(new)
     }
 }
 
@@ -178,6 +230,7 @@ struct TextAttention {
     q_proj: LinearW,
     k_proj: LinearW,
     v_proj: LinearW,
+    qkv_proj: Option<LinearW>,
     o_proj: LinearW,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
@@ -188,17 +241,35 @@ struct TextAttention {
 
 impl TextAttention {
     fn load(
-        weights: &HashMap<String, Tensor>,
+        weights: &mut HashMap<String, Tensor>,
         prefix: &str,
         num_q_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
         rms_norm_eps: f64,
     ) -> Result<Self> {
+        let q = take_w(weights, &format!("{prefix}.q_proj.weight"))?;
+        let k = take_w(weights, &format!("{prefix}.k_proj.weight"))?;
+        let v = take_w(weights, &format!("{prefix}.v_proj.weight"))?;
+        let (q, k, v, qkv_proj) = if q.device().is_cuda() {
+            let (q_len, k_len, v_len) = (q.dim(0)?, k.dim(0)?, v.dim(0)?);
+            let packed = Tensor::cat(&[q, k, v], 0)?;
+            // Prefill uses the same three GEMMs, without retaining another
+            // copy of the weights. The originals are dropped layer by layer.
+            (
+                packed.narrow(0, 0, q_len)?,
+                packed.narrow(0, q_len, k_len)?,
+                packed.narrow(0, q_len + k_len, v_len)?,
+                Some(LinearW::new(packed, None)),
+            )
+        } else {
+            (q, k, v, None)
+        };
         Ok(Self {
-            q_proj: load_linear(weights, &format!("{}.q_proj", prefix))?,
-            k_proj: load_linear(weights, &format!("{}.k_proj", prefix))?,
-            v_proj: load_linear(weights, &format!("{}.v_proj", prefix))?,
+            q_proj: LinearW::new(q, None),
+            k_proj: LinearW::new(k, None),
+            v_proj: LinearW::new(v, None),
+            qkv_proj,
             o_proj: load_linear(weights, &format!("{}.o_proj", prefix))?,
             q_norm: load_rms_norm(weights, &format!("{}.q_norm", prefix), rms_norm_eps)?,
             k_norm: load_rms_norm(weights, &format!("{}.k_norm", prefix), rms_norm_eps)?,
@@ -213,29 +284,40 @@ impl TextAttention {
         x: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
-        kv_cache: Option<&(Tensor, Tensor)>,
+        kv_cache: &mut LayerKvCache,
         mask: Option<&Tensor>,
-    ) -> Result<(Tensor, (Tensor, Tensor))> {
+    ) -> Result<Tensor> {
         let (bsz, seq_len, _) = x.dims3()?;
         let nqh = self.num_q_heads;
         let nkvh = self.num_kv_heads;
         let hd = self.head_dim;
 
-        let q = self
-            .q_proj
-            .forward(x)?
+        let (q, k, v) = match &self.qkv_proj {
+            Some(proj) if seq_len == 1 && mask.is_none() => {
+                let q_len = nqh * hd;
+                let kv_len = nkvh * hd;
+                let packed = proj.forward(x)?;
+                (
+                    packed.narrow(2, 0, q_len)?,
+                    packed.narrow(2, q_len, kv_len)?,
+                    packed.narrow(2, q_len + kv_len, kv_len)?,
+                )
+            }
+            _ => (
+                self.q_proj.forward(x)?,
+                self.k_proj.forward(x)?,
+                self.v_proj.forward(x)?,
+            ),
+        };
+        let q = q
             .reshape((bsz, seq_len, nqh, hd))?
             .transpose(1, 2)?
             .contiguous()?;
-        let k = self
-            .k_proj
-            .forward(x)?
+        let k = k
             .reshape((bsz, seq_len, nkvh, hd))?
             .transpose(1, 2)?
             .contiguous()?;
-        let v = self
-            .v_proj
-            .forward(x)?
+        let v = v
             .reshape((bsz, seq_len, nkvh, hd))?
             .transpose(1, 2)?
             .contiguous()?;
@@ -249,22 +331,25 @@ impl TextAttention {
         let k = apply_rotary_emb(&k, cos, sin)?;
 
         // Append to KV cache
-        let (k, v) = if let Some((past_k, past_v)) = kv_cache {
-            let k = Tensor::cat(&[past_k, &k], 2)?;
-            let v = Tensor::cat(&[past_v, &v], 2)?;
-            (k, v)
-        } else {
-            (k, v)
-        };
+        let (k, v) = kv_cache.append(k, v)?;
 
         let n_rep = nqh / nkvh;
-        let new_cache = (k.clone(), v.clone());
+        let scale = 1.0 / (hd as f64).sqrt();
+        if x.device().is_cuda() && seq_len == 1 && n_rep > 1 && mask.is_none() {
+            // Treat the query heads sharing one KV head as rows of a single
+            // matmul instead of materializing copies of the whole K/V history.
+            let q = q.reshape((bsz, nkvh, n_rep, hd))?;
+            let scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
+            let output = softmax_last_dim(&scores)?
+                .matmul(&v)?
+                .reshape((bsz, 1, nqh * hd))?;
+            return self.o_proj.forward(&output).map_err(Into::into);
+        }
         let k = repeat_kv(k, n_rep)?;
         let v = repeat_kv(v, n_rep)?;
 
         // Attention
-        let scale = (hd as f64).sqrt();
-        let mut attn: Tensor = (q.matmul(&k.transpose(2, 3)?.contiguous()?)? * (1.0 / scale))?;
+        let mut attn = (q.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?;
 
         if let Some(m) = mask {
             // Cast mask to attn's dtype (mask is F32, attn may be BF16).
@@ -277,9 +362,7 @@ impl TextAttention {
             .transpose(1, 2)?
             .contiguous()?
             .reshape((bsz, seq_len, nqh * hd))?;
-        let out = self.o_proj.forward(&out)?;
-
-        Ok((out, new_cache))
+        self.o_proj.forward(&out).map_err(Into::into)
     }
 }
 
@@ -288,22 +371,53 @@ impl TextAttention {
 struct TextMlp {
     gate_proj: LinearW,
     up_proj: LinearW,
+    gate_up_proj: Option<LinearW>,
     down_proj: LinearW,
 }
 
 impl TextMlp {
-    fn load(weights: &HashMap<String, Tensor>, prefix: &str) -> Result<Self> {
+    fn load(weights: &mut HashMap<String, Tensor>, prefix: &str) -> Result<Self> {
+        let gate = take_w(weights, &format!("{prefix}.gate_proj.weight"))?;
+        let up = take_w(weights, &format!("{prefix}.up_proj.weight"))?;
+        let (gate, up, gate_up_proj) = if gate.device().is_cuda() {
+            let (intermediate, hidden) = gate.dims2()?;
+            let packed = Tensor::stack(&[gate, up], 0)?.reshape((2 * intermediate, hidden))?;
+            // Preserve the prefill GEMMs, using views rather than keeping
+            // another copy of the weights.
+            (
+                packed.narrow(0, 0, intermediate)?,
+                packed.narrow(0, intermediate, intermediate)?,
+                Some(LinearW::new(packed, None)),
+            )
+        } else {
+            (gate, up, None)
+        };
         Ok(Self {
-            gate_proj: load_linear(weights, &format!("{}.gate_proj", prefix))?,
-            up_proj: load_linear(weights, &format!("{}.up_proj", prefix))?,
+            gate_proj: LinearW::new(gate, None),
+            up_proj: LinearW::new(up, None),
+            gate_up_proj,
             down_proj: load_linear(weights, &format!("{}.down_proj", prefix))?,
         })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        if let Some(proj) = &self.gate_up_proj {
+            if x.dim(1)? == 1 {
+                let activated = Self::activate_packed_decode(&proj.forward(x)?)?;
+                return self.down_proj.forward(&activated).map_err(Into::into);
+            }
+        }
         let gate = self.gate_proj.forward(x)?.silu()?;
         let up = self.up_proj.forward(x)?;
         self.down_proj.forward(&(gate * up)?).map_err(Into::into)
+    }
+
+    fn activate_packed_decode(packed: &Tensor) -> candle_core::Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        if packed.dtype() == candle_core::DType::BF16 && packed.dim(0)? == 1 {
+            return crate::swiglu::decode_bf16(packed);
+        }
+        candle_nn::ops::swiglu(packed)
     }
 }
 
@@ -318,7 +432,7 @@ struct TextDecoderLayer {
 
 impl TextDecoderLayer {
     fn load(
-        weights: &HashMap<String, Tensor>,
+        weights: &mut HashMap<String, Tensor>,
         prefix: &str,
         num_q_heads: usize,
         num_kv_heads: usize,
@@ -353,20 +467,18 @@ impl TextDecoderLayer {
         x: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
-        kv_cache: Option<&(Tensor, Tensor)>,
+        kv_cache: &mut LayerKvCache,
         mask: Option<&Tensor>,
-    ) -> Result<(Tensor, (Tensor, Tensor))> {
+    ) -> Result<Tensor> {
         // Pre-norm + attention + residual
         let h = self.input_layernorm.forward(x)?;
-        let (h, new_cache) = self.self_attn.forward(&h, cos, sin, kv_cache, mask)?;
+        let h = self.self_attn.forward(&h, cos, sin, kv_cache, mask)?;
         let x = (x + &h)?;
 
         // Pre-norm + MLP + residual
         let h = self.post_attention_layernorm.forward(&x)?;
         let h = self.mlp.forward(&h)?;
-        let out = (&x + &h)?;
-
-        Ok((out, new_cache))
+        (&x + &h).map_err(Into::into)
     }
 }
 
@@ -400,7 +512,7 @@ pub(crate) struct TextDecoder {
 
 impl TextDecoder {
     pub(crate) fn load(
-        weights: &HashMap<String, Tensor>,
+        weights: &mut HashMap<String, Tensor>,
         prefix: &str,
         config: &TextDecoderConfig,
     ) -> Result<Self> {
@@ -438,7 +550,8 @@ impl TextDecoder {
             .map_err(Into::into)
     }
 
-    pub(crate) fn forward(
+    /// Update the KV cache for every input position and return next-token logits `[1, vocab]`.
+    pub(crate) fn forward_last_logits(
         &self,
         hidden_states: &Tensor, // [1, seq, hidden]
         cos: &Tensor,           // [seq, head_dim], F32
@@ -448,23 +561,32 @@ impl TextDecoder {
     ) -> Result<Tensor> {
         let mut hidden = hidden_states.clone();
 
-        // Cast cos/sin to compute dtype and unsqueeze to [1, 1, seq, head_dim] once.
+        // The fused CUDA kernel takes [seq, head_dim / 2]; MRoPE repeats
+        // those values in the other half for the broadcast implementation.
         let compute_dtype = hidden.dtype();
-        let cos4d = cos.to_dtype(compute_dtype)?.unsqueeze(0)?.unsqueeze(0)?;
-        let sin4d = sin.to_dtype(compute_dtype)?.unsqueeze(0)?.unsqueeze(0)?;
+        let prepare = |table: &Tensor| -> candle_core::Result<Tensor> {
+            if hidden_states.device().is_cuda() {
+                table
+                    .narrow(1, 0, table.dim(1)? / 2)?
+                    .to_dtype(compute_dtype)?
+                    .contiguous()
+            } else {
+                table.to_dtype(compute_dtype)?.unsqueeze(0)?.unsqueeze(0)
+            }
+        };
+        let cos = prepare(cos)?;
+        let sin = prepare(sin)?;
 
-        for (i, layer) in self.layers.iter().enumerate() {
-            let cache = kv_cache.get(i);
-            let (h, new_cache) = layer.forward(&hidden, &cos4d, &sin4d, cache, mask)?;
-            kv_cache.set(i, new_cache);
-            hidden = h;
+        for (layer, cache) in self.layers.iter().zip(&mut kv_cache.layers) {
+            hidden = layer.forward(&hidden, &cos, &sin, cache, mask)?;
         }
 
-        // LN → lm_head (weight-tied to embed_tokens).
-        // LinearW::Dense: candle_nn::Linear::forward has 3D fast path.
-        // LinearW::Quant: QMatMul::forward uses broadcast_matmul (also 3D-safe).
+        // Earlier positions are needed for attention and the KV cache, not for
+        // the final normalization or vocabulary projection.
+        let last = hidden.narrow(1, hidden.dim(1)? - 1, 1)?;
         self.lm_head
-            .forward(&self.norm.forward(&hidden)?)
+            .forward(&self.norm.forward(&last)?)?
+            .squeeze(1)
             .map_err(Into::into)
     }
 }
@@ -473,6 +595,63 @@ impl TextDecoder {
 mod tests {
     use super::*;
     use candle_core::Device;
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn cuda_mlp_matches_separate_projections() -> Result<()> {
+        let device = Device::new_cuda(0)?;
+        let gate = Tensor::new(&[[1f32, -2.], [-2., 1.], [0., 2.]], &device)?;
+        let up = Tensor::new(&[[-1f32, 1.], [2., -1.], [1., 1.]], &device)?;
+        let down = Tensor::new(&[[1f32, 2., -1.], [2., -1., 3.]], &device)?;
+        let mut weights = HashMap::from([
+            ("mlp.gate_proj.weight".into(), gate.clone()),
+            ("mlp.up_proj.weight".into(), up.clone()),
+            ("mlp.down_proj.weight".into(), down.clone()),
+        ]);
+        let mlp = TextMlp::load(&mut weights, "mlp")?;
+        let input = Tensor::new(&[[[0.5f32, 1.], [-0.5, -2.]]], &device)?;
+        for len in [1, 2] {
+            let x = input.narrow(1, 0, len)?;
+            let gate = LinearW::new(gate.clone(), None).forward(&x)?.silu()?;
+            let up = LinearW::new(up.clone(), None).forward(&x)?;
+            let expected = LinearW::new(down.clone(), None).forward(&(gate * up)?)?;
+            let actual = mlp.forward(&x)?;
+            assert_eq!(actual.dims(), expected.dims());
+            assert!(
+                (&actual - &expected)?
+                    .abs()?
+                    .max_all()?
+                    .to_scalar::<f32>()?
+                    < 1e-5
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn buffered_cache_preserves_each_heads_history_across_growth() -> Result<()> {
+        let mut cache = LayerKvCache::new(Some(140));
+        for (start, end) in std::iter::once((0, 3)).chain((3..140).map(|i| (i, i + 1))) {
+            let rows = |start: usize, end| {
+                (start..end)
+                    .chain(start + 1000..end + 1000)
+                    .map(|n| n as f32)
+                    .collect::<Vec<_>>()
+            };
+            let k = Tensor::from_vec(rows(start, end), (1, 2, end - start, 1), &Device::Cpu)?;
+            let v = (&k + 2000.0)?;
+            let (k, v) = cache.append(k, v)?;
+            let expected = rows(0, end);
+            assert_eq!(k.dims(), &[1, 2, end, 1]);
+            assert_eq!(k.flatten_all()?.to_vec1::<f32>()?, expected);
+            assert_eq!(
+                v.flatten_all()?.to_vec1::<f32>()?,
+                expected.iter().map(|n| n + 2000.0).collect::<Vec<_>>()
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_causal_mask_prefill() {

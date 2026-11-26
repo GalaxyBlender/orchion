@@ -7,7 +7,10 @@ pub(crate) mod hub;
 mod inference;
 mod linear;
 mod mel;
+mod profile;
 mod streaming;
+#[cfg(feature = "cuda")]
+mod swiglu;
 
 pub use encoder::EncoderCache;
 pub use error::{AsrError, Result};

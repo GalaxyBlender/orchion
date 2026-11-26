@@ -19,6 +19,7 @@ members = [
     "examples/orchion-client/pdf",
     "examples/orchion-client/tts",
     "libs/orchion-core",
+    "libs/orchion-crane",
     "libs/orchion-audio",
     "libs/orchion-audio-vad",
     "libs/orchion-download",

@@ -4,7 +4,7 @@
 //! and `DecoderLayer` — used by both `TalkerModel` and `CodePredictor`.
 
 use anyhow::Result;
-use candle_core::{Device, IndexOp, Module, Tensor, D};
+use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
 use candle_nn::{linear_no_bias, rms_norm, Linear, RmsNorm, VarBuilder};
 
 use super::fused_ops::FusedRmsNorm;
@@ -40,6 +40,13 @@ pub fn create_causal_mask(seq_len: usize, offset: usize, device: &Device) -> Res
 /// `x` has shape `[batch, heads, seq_len, head_dim]`.
 /// `cos` and `sin` have shape `[seq_len, head_dim/2]`.
 fn apply_rope_rotation(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    if x.device().is_cuda() {
+        // Same half-split rotation without materializing products and concatenating them.
+        let cos = cos.to_dtype(x.dtype())?;
+        let sin = sin.to_dtype(x.dtype())?;
+        return Ok(candle_nn::rotary_emb::rope(&x.contiguous()?, &cos, &sin)?);
+    }
+
     let (_b, _h, _seq, d) = x.dims4()?;
     let x1 = x.narrow(D::Minus1, 0, d / 2)?;
     let x2 = x.narrow(D::Minus1, d / 2, d / 2)?;
@@ -82,14 +89,25 @@ impl RotaryEmbedding {
             .collect();
 
         let inv_freq = Tensor::new(inv_freq.as_slice(), device)?;
-        let positions: Vec<f32> = (0..max_seq_len).map(|i| i as f32).collect();
-        let positions = Tensor::new(positions.as_slice(), device)?.unsqueeze(1)?;
+        Self::from_inv_freq(&inv_freq, max_seq_len)
+    }
 
+    fn from_inv_freq(inv_freq: &Tensor, max_seq_len: usize) -> Result<Self> {
+        let positions: Vec<f32> = (0..max_seq_len).map(|i| i as f32).collect();
+        let positions = Tensor::new(positions.as_slice(), inv_freq.device())?.unsqueeze(1)?;
         let freqs = positions.matmul(&inv_freq.unsqueeze(0)?)?;
         let cos = freqs.cos()?;
         let sin = freqs.sin()?;
 
         Ok(Self { cos, sin })
+    }
+
+    pub(super) fn with_cuda_dtype(mut self, dtype: DType) -> Result<Self> {
+        if self.cos.device().is_cuda() {
+            self.cos = self.cos.to_dtype(dtype)?;
+            self.sin = self.sin.to_dtype(dtype)?;
+        }
+        Ok(self)
     }
 
     pub fn apply(&self, q: &Tensor, k: &Tensor, offset: usize) -> Result<(Tensor, Tensor)> {
@@ -112,6 +130,7 @@ impl RotaryEmbedding {
 pub struct MRoPE {
     inv_freq: Tensor,
     device: Device,
+    cuda_table: Option<RotaryEmbedding>,
 }
 
 impl MRoPE {
@@ -139,7 +158,20 @@ impl MRoPE {
         Ok(Self {
             inv_freq,
             device: device.clone(),
+            cuda_table: None,
         })
+    }
+
+    pub(super) fn with_cuda_table(mut self, max_positions: usize, dtype: DType) -> Result<Self> {
+        // Keep the resident table bounded. Longer offsets still use the
+        // original calculation, so this does not impose a new context limit.
+        const CACHE_POSITIONS: usize = 2048;
+        if self.device.is_cuda() {
+            let len = max_positions.min(CACHE_POSITIONS);
+            self.cuda_table =
+                Some(RotaryEmbedding::from_inv_freq(&self.inv_freq, len)?.with_cuda_dtype(dtype)?);
+        }
+        Ok(self)
     }
 
     /// Apply MRoPE to query and key tensors
@@ -158,6 +190,15 @@ impl MRoPE {
         offset: usize,
         seq_len: usize,
     ) -> Result<(Tensor, Tensor)> {
+        if let Some(table) = &self.cuda_table {
+            if offset
+                .checked_add(seq_len)
+                .is_some_and(|end| end <= table.cos.dims()[0])
+            {
+                return table.apply(q, k, offset);
+            }
+        }
+
         // Generate position IDs for all 3 dimensions (same values for TTS)
         let positions: Vec<f32> = (offset..offset + seq_len).map(|i| i as f32).collect();
         let pos = Tensor::new(positions.as_slice(), &self.device)?; // [seq_len]
@@ -494,6 +535,35 @@ mod tests {
             rms_norm_eps: 1e-6,
             ..Default::default()
         }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn cached_cuda_mrope_matches_on_demand_tables() -> Result<()> {
+        let device = Device::new_cuda(0)?;
+        let make = || MRoPE::new(128, 1_000_000., [24, 20, 20], &device);
+        let reference = make()?;
+        let cached = make()?.with_cuda_table(2048, DType::BF16)?;
+        for (offset, len) in [(0, 8), (173, 1), (2047, 1), (2047, 2), (2048, 1)] {
+            let q = Tensor::ones((1, 4, len, 128), DType::BF16, &device)?;
+            let k = q.narrow(1, 0, 2)?.contiguous()?;
+            let (actual_q, actual_k) = cached.apply(&q, &k, offset, len)?;
+            let (expected_q, expected_k) = reference.apply(&q, &k, offset, len)?;
+            for (actual, expected) in [(actual_q, expected_q), (actual_k, expected_k)] {
+                assert_eq!(
+                    actual
+                        .flatten_all()?
+                        .to_dtype(DType::F32)?
+                        .to_vec1::<f32>()?,
+                    expected
+                        .flatten_all()?
+                        .to_dtype(DType::F32)?
+                        .to_vec1::<f32>()?
+                );
+            }
+        }
+        Ok(())
     }
 
     #[test]

@@ -377,10 +377,11 @@ mod tests {
     fn cuda_streaming_sessions_can_finish_on_the_async_caller_thread() {
         let model_dir = std::env::var("ORCHION_TEST_ASR_DIR").unwrap();
         let audio = std::fs::read(std::env::var("ORCHION_TEST_ASR_PCM").unwrap()).unwrap();
-        assert_eq!(audio.len() % 2, 0);
-        let samples = audio
-            .chunks_exact(2)
-            .map(|bytes| f32::from(i16::from_le_bytes([bytes[0], bytes[1]])) / 32768.0)
+        let (frames, remainder) = audio.as_chunks::<2>();
+        assert_eq!(remainder, b"");
+        let samples = frames
+            .iter()
+            .map(|&bytes| f32::from(i16::from_le_bytes(bytes)) / 32768.0)
             .collect::<Vec<_>>();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()

@@ -6,6 +6,8 @@
 //!
 //! When the feature is disabled, [`init`] returns `None` and has zero overhead.
 
+use std::time::{Duration, Instant};
+
 /// Guard that flushes the trace file on drop.
 ///
 /// Hold this in `main()` — the trace is written when the guard is dropped.
@@ -52,4 +54,31 @@ pub fn init() -> Option<ProfilingGuard> {
     {
         None
     }
+}
+
+#[derive(Default)]
+pub(crate) struct GenerationProfile {
+    pub(crate) code_predictor: Duration,
+    pub(crate) talker: Duration,
+    pub(crate) sampling: Duration,
+}
+
+pub(crate) fn stages_enabled() -> bool {
+    std::env::var_os("ORCHION_TTS_PROFILE").is_some()
+        && tracing::enabled!(target: "qwen3_tts::stages", tracing::Level::INFO)
+}
+
+/// Diagnostic only: draining work here changes overlap between stages.
+pub(crate) fn measure<T>(
+    duration: Option<&mut Duration>,
+    device: &candle_core::Device,
+    f: impl FnOnce() -> crate::Result<T>,
+) -> crate::Result<T> {
+    let Some(duration) = duration else { return f() };
+    crate::sync_device(device)?;
+    let started = Instant::now();
+    let result = f()?;
+    crate::sync_device(device)?;
+    *duration += started.elapsed();
+    Ok(result)
 }
