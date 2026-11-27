@@ -246,6 +246,7 @@ pub struct Attention {
     q_proj: Linear,
     k_proj: Linear,
     v_proj: Linear,
+    qkv_proj: Option<Linear>,
     o_proj: Linear,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
@@ -257,14 +258,33 @@ pub struct Attention {
 
 impl Attention {
     pub fn new(config: &Qwen3TTSConfig, vb: VarBuilder) -> Result<Self> {
+        Self::load(config, vb, false)
+    }
+
+    fn load(config: &Qwen3TTSConfig, vb: VarBuilder, pack_qkv: bool) -> Result<Self> {
         let hidden_size = config.hidden_size;
         let num_heads = config.num_attention_heads;
         let num_kv_heads = config.num_kv_heads();
         let head_dim = config.head_dim();
 
-        let q_proj = linear_no_bias(hidden_size, num_heads * head_dim, vb.pp("q_proj"))?;
-        let k_proj = linear_no_bias(hidden_size, num_kv_heads * head_dim, vb.pp("k_proj"))?;
-        let v_proj = linear_no_bias(hidden_size, num_kv_heads * head_dim, vb.pp("v_proj"))?;
+        let q_width = num_heads * head_dim;
+        let kv_width = num_kv_heads * head_dim;
+        let q_proj = linear_no_bias(hidden_size, q_width, vb.pp("q_proj"))?;
+        let k_proj = linear_no_bias(hidden_size, kv_width, vb.pp("k_proj"))?;
+        let v_proj = linear_no_bias(hidden_size, kv_width, vb.pp("v_proj"))?;
+        let (q_proj, k_proj, v_proj, qkv_proj) = if pack_qkv {
+            // The checkpoint builder loads only this layer's source weights.
+            // Keep views of the packed storage for the original prefill GEMMs.
+            let packed = Tensor::cat(&[q_proj.weight(), k_proj.weight(), v_proj.weight()], 0)?;
+            (
+                Linear::new(packed.narrow(0, 0, q_width)?, None),
+                Linear::new(packed.narrow(0, q_width, kv_width)?, None),
+                Linear::new(packed.narrow(0, q_width + kv_width, kv_width)?, None),
+                Some(Linear::new(packed, None)),
+            )
+        } else {
+            (q_proj, k_proj, v_proj, None)
+        };
         let o_proj = linear_no_bias(num_heads * head_dim, hidden_size, vb.pp("o_proj"))?;
 
         // QK normalization: RMSNorm applied per-head after projection
@@ -275,6 +295,7 @@ impl Attention {
             q_proj,
             k_proj,
             v_proj,
+            qkv_proj,
             o_proj,
             q_norm,
             k_norm,
@@ -295,10 +316,23 @@ impl Attention {
     ) -> Result<Tensor> {
         let (batch, seq_len, _) = hidden_states.dims3()?;
 
-        // Project Q, K, V
-        let q = self.q_proj.forward(hidden_states)?;
-        let k = self.k_proj.forward(hidden_states)?;
-        let v = self.v_proj.forward(hidden_states)?;
+        let (q, k, v) = match &self.qkv_proj {
+            Some(proj) if batch == 1 && seq_len == 1 => {
+                let packed = proj.forward(hidden_states)?;
+                let q_width = self.num_heads * self.head_dim;
+                let kv_width = self.num_kv_heads * self.head_dim;
+                (
+                    packed.narrow(2, 0, q_width)?,
+                    packed.narrow(2, q_width, kv_width)?,
+                    packed.narrow(2, q_width + kv_width, kv_width)?,
+                )
+            }
+            _ => (
+                self.q_proj.forward(hidden_states)?,
+                self.k_proj.forward(hidden_states)?,
+                self.v_proj.forward(hidden_states)?,
+            ),
+        };
 
         // Reshape to [batch, seq, heads, head_dim] for QK norm
         let q = q.reshape((batch, seq_len, self.num_heads, self.head_dim))?;
@@ -385,6 +419,12 @@ impl Attention {
                 seq_len,
                 self.num_heads * self.head_dim,
             ))?
+        } else if q.device().is_cuda()
+            && seq_len == 1
+            && attention_mask.is_none()
+            && self.num_heads > self.num_kv_heads
+        {
+            grouped_decode(&q, &k, &v, self.scale)?
         } else {
             // CPU/CUDA-without-flash fallback: manual scaled dot-product attention
             let k = self.repeat_kv(&k)?;
@@ -427,6 +467,18 @@ impl Attention {
     }
 }
 
+fn grouped_decode(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Tensor> {
+    let (batch, heads, _, head_dim) = q.dims4()?;
+    let kv_heads = k.dim(1)?;
+    // Group queries instead of materializing a copy of K and V for every head.
+    // Keep score scaling after the matmul, as in the expanded path.
+    let q = q.reshape((batch, kv_heads, heads / kv_heads, head_dim))?;
+    let scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
+    Ok(candle_nn::ops::softmax_last_dim(&scores)?
+        .matmul(v)?
+        .reshape((batch, 1, heads * head_dim))?)
+}
+
 /// MLP block with SwiGLU activation
 pub struct MLP {
     gate_proj: Linear,
@@ -464,8 +516,12 @@ pub struct DecoderLayer {
 
 impl DecoderLayer {
     pub fn new(config: &Qwen3TTSConfig, vb: VarBuilder) -> Result<Self> {
+        Self::load(config, vb, false)
+    }
+
+    pub(super) fn load(config: &Qwen3TTSConfig, vb: VarBuilder, pack_qkv: bool) -> Result<Self> {
         Ok(Self {
-            self_attn: Attention::new(config, vb.pp("self_attn"))?,
+            self_attn: Attention::load(config, vb.pp("self_attn"), pack_qkv)?,
             mlp: MLP::new(config, vb.pp("mlp"))?,
             input_layernorm: rms_norm(
                 config.hidden_size,
@@ -535,6 +591,45 @@ mod tests {
             rms_norm_eps: 1e-6,
             ..Default::default()
         }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn grouped_cuda_decode_agrees_with_expanded_heads() -> Result<()> {
+        let device = Device::new_cuda(0)?;
+        let dtype = DType::BF16;
+        let cache = |step| {
+            let values = (0..(2 * 17 * 16))
+                .map(|i| ((i * step % 61) as f32 - 30.) / 32.)
+                .collect::<Vec<_>>();
+            Tensor::from_vec(values, (1, 2, 17, 16), &device)?.to_dtype(dtype)
+        };
+        let k = cache(13)?;
+        let v = cache(17)?;
+        let q = k.narrow(2, 0, 2)?.contiguous()?.reshape((1, 4, 1, 16))?;
+        for len in [1, 2, 11, 17] {
+            let k = k.narrow(2, 0, len)?;
+            let v = v.narrow(2, 0, len)?;
+            let expand = |kv: &Tensor| {
+                kv.unsqueeze(2)?
+                    .expand((1, 2, 2, len, 16))?
+                    .reshape((1, 4, len, 16))
+            };
+            let scale = 0.25;
+            let logits = (q.matmul(&expand(&k)?.transpose(2, 3)?.contiguous()?)? * scale)?;
+            let expected = candle_nn::ops::softmax_last_dim(&logits)?
+                .matmul(&expand(&v)?)?
+                .reshape((1, 1, 64))?;
+            let actual = grouped_decode(&q, &k, &v, scale)?;
+            let error = (&actual - &expected)?
+                .abs()?
+                .to_dtype(DType::F32)?
+                .max_all()?
+                .to_scalar::<f32>()?;
+            assert!(error <= 0.008, "attention error {error} for {len} keys");
+        }
+        Ok(())
     }
 
     #[cfg(feature = "cuda")]

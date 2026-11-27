@@ -25,3 +25,10 @@ longer offsets. The code predictor writes acoustic token IDs into its
 preallocated frame tensor without copying previous IDs. The
 [performance report](../../docs/vendor-tts-attention-performance.md)
 records the profile and output checks.
+
+CUDA checkpoint loading packs the Talker and CodePredictor Q/K/V
+weights a layer at a time. Single-token CUDA attention groups query
+heads around shared K/V cache rows. File-backed checkpoints without
+a speaker encoder skip the unused reference-audio encoder. See the
+[packed-attention report](../../docs/vendor-tts-packed-attention-performance.md)
+for latency, memory, and the fixed-seed output differences.

@@ -156,6 +156,14 @@ pub struct CodePredictor {
 impl CodePredictor {
     /// Create new code predictor
     pub fn new(config: CodePredictorConfig, vb: VarBuilder) -> Result<Self> {
+        Self::load(config, vb, false)
+    }
+
+    pub(crate) fn load(
+        config: CodePredictorConfig,
+        vb: VarBuilder,
+        pack_qkv: bool,
+    ) -> Result<Self> {
         let layer_config = config.to_layer_config();
         let num_acoustic_groups = config.num_code_groups - 1;
         let codec_embed_dim = config.codec_embed_dim();
@@ -185,9 +193,10 @@ impl CodePredictor {
         // Create transformer layers
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
-            layers.push(DecoderLayer::new(
+            layers.push(DecoderLayer::load(
                 &layer_config,
                 vb.pp(format!("model.layers.{}", i)),
+                pack_qkv,
             )?);
         }
 

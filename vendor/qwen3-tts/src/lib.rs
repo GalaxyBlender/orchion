@@ -90,9 +90,11 @@ pub mod models;
 pub mod profiling;
 pub mod tokenizer;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use candle_core::safetensors::{BufferedSafetensors, Load, SliceSafetensors};
 use candle_core::{DType, Device, IndexOp, Tensor};
 use serde::Serialize;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
@@ -229,31 +231,21 @@ impl Qwen3TTS {
                 model_path.display()
             );
         }
-        let weights = Self::load_weights(&model_path, &device)?;
-
-        // Load speech tokenizer for decoder
+        // Locate the speech tokenizer, falling back to a shared parent directory.
         let st_path = Path::new(model_id).join("speech_tokenizer/model.safetensors");
-        let st_weights = if st_path.exists() {
-            Self::load_weights(&st_path, &device)?
+        let st_path = if st_path.exists() {
+            st_path
         } else {
-            // Fall back to looking in parent dir
-            let alt_path = Path::new(model_id)
+            Path::new(model_id)
                 .parent()
-                .map(|p| p.join("speech_tokenizer/model.safetensors"));
-            if let Some(p) = alt_path {
-                if p.exists() {
-                    Self::load_weights(&p, &device)?
-                } else {
-                    anyhow::bail!("Speech tokenizer weights not found");
-                }
-            } else {
-                anyhow::bail!("Speech tokenizer weights not found");
-            }
+                .map(|p| p.join("speech_tokenizer/model.safetensors"))
+                .filter(|path| path.exists())
+                .context("Speech tokenizer weights not found")?
         };
 
-        Self::build_from_components(
-            &weights,
-            &st_weights,
+        Self::from_weight_files(
+            &model_path,
+            &st_path,
             text_tokenizer,
             parsed_config.as_ref(),
             &device,
@@ -270,7 +262,22 @@ impl Qwen3TTS {
         text_tokenizer: tokenizer::TextTokenizer,
         device: &Device,
     ) -> Result<Self> {
-        Self::build_from_components(model_weights, decoder_weights, text_tokenizer, None, device)
+        let vb = candle_nn::VarBuilder::from_tensors(
+            model_weights.clone(),
+            compute_dtype_for_device(device),
+            device,
+        );
+        let has_speaker_weights = model_weights
+            .keys()
+            .any(|k| k.starts_with("speaker_encoder."));
+        Self::build_from_components(
+            vb,
+            has_speaker_weights,
+            || Ok(Cow::Borrowed(decoder_weights)),
+            text_tokenizer,
+            None,
+            false,
+        )
     }
 
     /// Load from downloaded model paths.
@@ -291,37 +298,81 @@ impl Qwen3TTS {
         tracing::info!("Loading Qwen3-TTS from downloaded paths...");
 
         let text_tokenizer = tokenizer::TextTokenizer::from_file(&paths.tokenizer)?;
-        let weights = Self::load_weights(&paths.model_weights, &device)?;
-        let st_weights = Self::load_weights(&paths.decoder_weights, &device)?;
-
-        Self::build_from_components(&weights, &st_weights, text_tokenizer, None, &device)
+        Self::from_weight_files(
+            &paths.model_weights,
+            &paths.decoder_weights,
+            text_tokenizer,
+            None,
+            &device,
+        )
     }
 
-    /// Shared builder: assembles all model components from pre-loaded weights.
-    ///
-    /// When `parsed_config` is `Some`, uses config.json dimensions and model type.
-    /// When `None`, auto-detects the model variant from weight shapes.
-    fn build_from_components(
-        model_weights: &HashMap<String, Tensor>,
-        decoder_weights: &HashMap<String, Tensor>,
+    fn from_weight_files(
+        model_path: &Path,
+        tokenizer_path: &Path,
         text_tokenizer: tokenizer::TextTokenizer,
         parsed_config: Option<&ParsedModelConfig>,
         device: &Device,
     ) -> Result<Self> {
-        let compute_dtype = compute_dtype_for_device(device);
+        // Keep the checkpoint on the host and upload weights on demand. Packing
+        // Q/K/V then frees the source projections after each layer, instead of
+        // pinning a second set of all projections for the entire model load.
+        let weights = BufferedSafetensors::new(std::fs::read(model_path)?)?;
+        let has_speaker_weights = weights
+            .tensors()
+            .iter()
+            .any(|(name, _)| name.starts_with("speaker_encoder."));
+        let vb = candle_nn::VarBuilder::from_backend(
+            Box::new(weights),
+            compute_dtype_for_device(device),
+            device.clone(),
+        );
+        let load_decoder_weights = || {
+            let tokenizer_bytes = std::fs::read(tokenizer_path)?;
+            let tokenizer = SliceSafetensors::new(&tokenizer_bytes)?;
+            // The reference-audio path needs a speaker encoder. Without one,
+            // the speech tokenizer's encoder weights are never used.
+            let weights = tokenizer
+                .tensors()
+                .into_iter()
+                .filter(|(name, _)| has_speaker_weights || name.starts_with("decoder."))
+                .map(|(name, tensor)| Ok((name, tensor.load(device)?)))
+                .collect::<candle_core::Result<HashMap<_, _>>>()?;
+            Ok(Cow::Owned(weights))
+        };
+        let pack_qkv = device.is_cuda() && !cfg!(feature = "flash-attn");
+        Self::build_from_components(
+            vb,
+            has_speaker_weights,
+            load_decoder_weights,
+            text_tokenizer,
+            parsed_config,
+            pack_qkv,
+        )
+    }
+
+    /// Shared builder: assembles model components from checkpoint weights.
+    ///
+    /// When `parsed_config` is `Some`, uses config.json dimensions and model type.
+    /// When `None`, auto-detects the model variant from weight shapes.
+    fn build_from_components<'a>(
+        vb: candle_nn::VarBuilder,
+        has_speaker_weights: bool,
+        load_decoder_weights: impl FnOnce() -> Result<Cow<'a, HashMap<String, Tensor>>>,
+        text_tokenizer: tokenizer::TextTokenizer,
+        parsed_config: Option<&ParsedModelConfig>,
+        pack_qkv: bool,
+    ) -> Result<Self> {
+        let compute_dtype = vb.dtype();
+        let device = vb.device().clone();
 
         // Build TalkerModel
         let talker_config = if let Some(cfg) = parsed_config {
             TalkerConfig::from_parsed(cfg)
         } else {
-            Self::detect_talker_config(model_weights)?
+            Self::detect_talker_config(&vb)?
         };
-        let talker = TalkerModel::from_weights_with_config_dtype(
-            model_weights,
-            talker_config,
-            device,
-            compute_dtype,
-        )?;
+        let talker = TalkerModel::load(talker_config, vb.clone(), pack_qkv)?;
 
         // Build CodePredictor
         let cp_config = if let Some(cfg) = parsed_config {
@@ -337,20 +388,30 @@ impl Qwen3TTS {
                 CodePredictorConfig::default()
             }
         };
-        let cp_weights = Self::filter_weights(model_weights, "talker.code_predictor.");
-        let cp_vb = candle_nn::VarBuilder::from_tensors(cp_weights, compute_dtype, device);
-        let code_predictor = CodePredictor::new(cp_config, cp_vb)?;
-
-        // Decoder (always F32 — convolutional, no attention)
-        let decoder = Decoder12Hz::from_weights(decoder_weights, Default::default())?;
+        let code_predictor =
+            CodePredictor::load(cp_config, vb.pp("talker.code_predictor"), pack_qkv)?;
 
         // Speaker encoder (always F32, only present in Base models)
-        let se_config = parsed_config.and_then(|c| c.speaker_encoder_config.clone());
-        let speaker_encoder =
-            Self::try_load_speaker_encoder(model_weights, se_config.as_ref(), device)?;
+        let speaker_encoder = if has_speaker_weights {
+            let config = parsed_config
+                .and_then(|c| c.speaker_encoder_config.clone())
+                .unwrap_or_default();
+            tracing::info!(
+                enc_dim = config.enc_dim,
+                "Loading speaker encoder for voice cloning"
+            );
+            // A separate builder dtype is needed for the F32 speaker encoder.
+            let se_vb = vb.pp("speaker_encoder").to_dtype(DType::F32);
+            Some(SpeakerEncoder::new(config, se_vb)?)
+        } else {
+            None
+        };
 
-        // Speech encoder for ICL voice cloning
-        let speech_encoder = Self::try_load_speech_encoder(decoder_weights, device)?;
+        // Release the host checkpoint before reading the speech tokenizer.
+        drop(vb);
+        let decoder_weights = load_decoder_weights()?;
+        let decoder = Decoder12Hz::from_weights(&decoder_weights, Default::default())?;
+        let speech_encoder = Self::try_load_speech_encoder(&decoder_weights, &device)?;
 
         let model_type = parsed_config.map(|c| c.model_type);
 
@@ -362,16 +423,14 @@ impl Qwen3TTS {
             speaker_encoder,
             speech_encoder,
             model_type,
-            device: device.clone(),
+            device,
             compute_dtype,
         })
     }
 
     /// Detect talker config from weight shapes (fallback when no config.json).
-    fn detect_talker_config(weights: &HashMap<String, Tensor>) -> Result<TalkerConfig> {
-        let norm_weight = weights
-            .get("talker.model.norm.weight")
-            .ok_or_else(|| anyhow::anyhow!("Missing talker.model.norm.weight"))?;
+    fn detect_talker_config(vb: &candle_nn::VarBuilder) -> Result<TalkerConfig> {
+        let norm_weight = vb.get_unchecked("talker.model.norm.weight")?;
         let hidden_size = norm_weight.dim(0)?;
         Ok(if hidden_size == 2048 {
             TalkerConfig::custom_voice()
@@ -1368,32 +1427,6 @@ impl Qwen3TTS {
 
     // ── Private helpers ─────────────────────────────────────────────────
 
-    /// Attempt to load the speaker encoder from model weights.
-    ///
-    /// Returns `Ok(Some(encoder))` if `speaker_encoder.*` keys are found,
-    /// `Ok(None)` if they are absent. When `config` is provided, uses the
-    /// parsed enc_dim; otherwise falls back to defaults (enc_dim=1024).
-    fn try_load_speaker_encoder(
-        weights: &HashMap<String, Tensor>,
-        config: Option<&SpeakerEncoderConfig>,
-        device: &Device,
-    ) -> Result<Option<SpeakerEncoder>> {
-        let has_se_weights = weights.keys().any(|k| k.starts_with("speaker_encoder."));
-        if !has_se_weights {
-            return Ok(None);
-        }
-
-        let config = config.cloned().unwrap_or_default();
-        tracing::info!(
-            "Loading speaker encoder (ECAPA-TDNN, enc_dim={}) for voice cloning...",
-            config.enc_dim
-        );
-        let se_weights = Self::filter_weights(weights, "speaker_encoder.");
-        let se_vb = candle_nn::VarBuilder::from_tensors(se_weights, DType::F32, device);
-        let encoder = SpeakerEncoder::new(config, se_vb)?;
-        Ok(Some(encoder))
-    }
-
     /// Attempt to load the speech encoder (Mimi) from speech tokenizer weights.
     ///
     /// The speech encoder encodes raw audio to 12Hz codec codes, needed for
@@ -1425,28 +1458,6 @@ impl Qwen3TTS {
                 Ok(None)
             }
         }
-    }
-
-    /// Load weights from safetensors file.
-    ///
-    /// Tensors are loaded in their native dtype (typically BF16 for Qwen3-TTS).
-    /// Each component's VarBuilder handles casting to its target dtype.
-    fn load_weights(path: &Path, device: &Device) -> Result<HashMap<String, Tensor>> {
-        Ok(candle_core::safetensors::load(path, device)?)
-    }
-
-    /// Filter weights by prefix, removing the prefix from keys.
-    pub(crate) fn filter_weights(
-        weights: &HashMap<String, Tensor>,
-        prefix: &str,
-    ) -> HashMap<String, Tensor> {
-        weights
-            .iter()
-            .filter_map(|(k, v)| {
-                k.strip_prefix(prefix)
-                    .map(|stripped| (stripped.to_string(), v.clone()))
-            })
-            .collect()
     }
 }
 

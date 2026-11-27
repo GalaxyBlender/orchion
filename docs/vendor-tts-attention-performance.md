@@ -5,6 +5,10 @@ follow-up measures the Talker and CodePredictor generation paths
 without changing the sampling algorithm, seed, `top_k`, or codec
 decoder context.
 
+The [packed-attention follow-up](vendor-tts-packed-attention-performance.md)
+revisits Q/K/V packing and grouped attention with lower load memory
+and compares the resulting speech.
+
 ## Where the time goes
 
 Synchronized CUDA stage medians on the RTX 3080, after model warm-up:

@@ -378,6 +378,12 @@ impl TalkerModel {
         dtype: DType,
     ) -> Result<Self> {
         let vb = VarBuilder::from_tensors(weights.clone(), dtype, device);
+        Self::load(config, vb, false)
+    }
+
+    pub(crate) fn load(config: TalkerConfig, vb: VarBuilder, pack_qkv: bool) -> Result<Self> {
+        let device = vb.device();
+        let dtype = vb.dtype();
         let talker = vb.pp("talker");
         let model = talker.pp("model");
         let layer_config = config.to_layer_config();
@@ -401,7 +407,7 @@ impl TalkerModel {
         )?;
 
         let layers = (0..config.num_hidden_layers)
-            .map(|i| DecoderLayer::new(&layer_config, model.pp(format!("layers.{}", i))))
+            .map(|i| DecoderLayer::load(&layer_config, model.pp(format!("layers.{}", i)), pack_qkv))
             .collect::<Result<Vec<_>>>()?;
 
         // RoPE - use MRoPE if mrope_section is configured
